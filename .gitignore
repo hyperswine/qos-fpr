@@ -4,3 +4,4 @@ dist-newstyle/
 target/
 *.img
 zip-project.sh
+build/
