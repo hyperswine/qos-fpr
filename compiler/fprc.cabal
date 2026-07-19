@@ -2,13 +2,15 @@ cabal-version:      2.4
 name:               fprc
 version:            0.1.0.0
 build-type:         Simple
-synopsis:           FPRISC -> RISC-V compiler (fpriscrv2)
+synopsis:           FPRISC to RISC-V compiler
 
 executable fprc
     main-is:          Main.hs
     other-modules:    FPRISC
                     , Codegen
                     , Modules
+                    , Infer
+                    , Struct
     hs-source-dirs:   .
     default-language: Haskell2010
     ghc-options:      -Wall

@@ -45,6 +45,7 @@ orig2|||shadowed (+): 2 + 3    = 7;typeid plus strings    = 5
 orig3|||main => 585
 orig4|||main => 60
 orig5|||ok 100;:done
+typed|||ops: 42 fprisc;generic: total Int=10 total Str=abc;sstring: len=2 at1=104 str=hi;vlist: fold=60
 '
 
 echo "$TESTS" | while IFS='|' read -r name vars stdin expects; do

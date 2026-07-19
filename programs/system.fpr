@@ -28,7 +28,7 @@
 
 # ---- console over raw MMIO (registers threaded, made once in main) ----------
 
-isOdd v = v - (v / 2) * 2 == 1.
+isOdd v = Int.mod v 2 == 1.
 
 putc con c =
   (lsr, dat) = con;
@@ -65,7 +65,7 @@ getcV me lsr dat v =
 TimeFmt = use "mods/timefmt#48c8226ba0480e57".
 QLog    = use "mods/qlog#9c8b89e0dd258d0e".
 MK      = use "mods/matrixkpd".
-TUI     = use "mods/tui#80f7fa55d2f05547".
+TUI     = use "mods/tui#dd2f2f35bad3f6bb".
 
 # ---- small prelude ----------------------------------------------------------
 
@@ -898,7 +898,7 @@ cfgGo lns key =
   case lns of
     Nil -> ""
   | ln :: rest -> case asKV (trim ln) of
-      Ok kv -> case kv of (k, v) -> case strEq k key of True -> v | False -> cfgGo rest key
+      Ok kv -> (case kv of (k, v) -> (case strEq k key of True -> v | False -> cfgGo rest key))
     | Err _ -> cfgGo rest key.
 
 # ---- System.qa main : actor 0, THE system process --------------------------

@@ -37,7 +37,7 @@ echo "target=$TARGET  _proc_arena_start=0x$ARENA_HEX  PROC_SLOT_BASE=$SLOT_BASE"
 BASE=$(basename "$APP_FPR" .fpr)
 ./fprc --target="$TARGET" --prelude=programs/prelude.fpr "$APP_FPR" "build/${BASE}.s"
 
-RT="runtime/proc_entry.c runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/buddy.c runtime/mod.c runtime/vec.c"
+RT="runtime/proc_entry.c runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/buddy.c runtime/mod.c runtime/vec.c runtime/sstr.c"
 riscv64-unknown-elf-gcc $ARCHFLAGS -DFPR_NHARTS=1 -ffreestanding -nostdlib -nostartfiles -O2 \
   -Wl,--defsym=PROC_SLOT_BASE=$SLOT_BASE \
   -Wl,--defsym=_heap_start=_proc_image_end \

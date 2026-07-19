@@ -669,6 +669,22 @@ static V g_strlen(V s) {
   return TAG(t->len);
 }
 
+/* parseInt : String -> Int — decimal, leading '-' allowed, stops at the
+ * first non-digit. Empty or all-non-digit yields 0 (the pI idiom). */
+static V g_parseInt(V sv) {
+  if (ISINT(sv) || ((str_t *)sv)->tid != T_STR) fpr_cpanic("parseInt: not a String");
+  str_t *s = (str_t *)sv;
+  uw i = 0;
+  sw sign = 1, acc = 0;
+  if (i < s->len && s->bytes[i] == '-') { sign = -1; i++; }
+  for (; i < s->len; i++) {
+    uint8_t c = s->bytes[i];
+    if (c < '0' || c > '9') break;
+    acc = acc * 10 + (c - '0');
+  }
+  return TAG(sign * acc);
+}
+
 /* chr : Int -> String -- the inverse of charAt. One byte. The line
  * editor and path splitter build strings incrementally with this. */
 static V g_chr(V c) {
@@ -698,6 +714,7 @@ FPR_FN(fpr_prim_obj_error, fpr_prim_fn_error, 1);
 FPR_FN(fpr_g_charAt, g_charAt, 2);
 FPR_FN(fpr_g_strlen, g_strlen, 1);
 FPR_FN(fpr_g_chr, g_chr, 1);
+FPR_FN(fpr_g_parseInt, g_parseInt, 1);
 FPR_FN(fpr_g_substr, g_substr, 3);
 FPR_FN(fpr_g_drop, g_drop, 1);
 FPR_FN(fpr_g_arcLive, g_arcLive, 1);

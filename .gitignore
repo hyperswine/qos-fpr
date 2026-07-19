@@ -7,3 +7,4 @@ zip-project.sh
 build/
 NOTES.txt
 *.zip
+.DS_Store

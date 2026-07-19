@@ -24,7 +24,7 @@ enum {
   T_TUP2 = 4, T_TUP3 = 5, T_ATOM = 6,
   /* runtime-internal typeids, far above user types (10+) and shapes (100+) */
   T_STR = 9000, T_PAP = 9001, T_DEVICE = 9002, T_REGISTER = 9003, T_BITS = 9004,
-  T_ACTOR = 9005, T_VEC = 9006,
+  T_ACTOR = 9005, T_VEC = 9006, T_SSTR = 9007,
 };
 
 typedef struct { uint32_t tid, var; } __attribute__((aligned(8))) hdr_t;
@@ -209,3 +209,7 @@ void hal_poweroff(int code); /* hal.c: terminate the machine if the
   const pap0_t sym = {T_PAP, 0, (uw)(uintptr_t)(cfn), (ar), 0}
 
 #endif
+
+/* SString: fixed 128-byte inline string (sstr.c). len is the live count. */
+#define SSTR_CAP 128
+typedef struct { uint32_t tid, var; uw len; uint8_t bytes[SSTR_CAP]; } __attribute__((aligned(8))) sstr_t;

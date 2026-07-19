@@ -1,0 +1,45 @@
+# typed.fpr — the ML-style modules + SString regression.
+#
+# Exercises, ON THE METAL (QEMU virt):
+#   1. operator dispatch: + on Int (prim opcode) and String (Str.+)
+#   2. structure methods as flat globals: Int.max / Int.mod / Str.len
+#   3. a generic over a sig carrier, monomorphized at compile time:
+#      total (s : Add) resolves s.(+) / s.zero per structure
+#   4. SString: the fixed 128B linear inline string, push/at/toStr
+#   5. VList grouping over the SoA vector (map/fold via the namespace)
+
+# generic over the Add sig: works for any structure implementing it
+total (s : Add) xs = case xs of Nil -> s.zero | x :: rest -> x + total s rest.
+
+main =
+  # -- 1. operator dispatch --
+  a = 40 + 2;
+  b = "fp" + "risc";
+
+  # -- 2. structure methods --
+  m = Int.max 3 9;
+  d = Int.mod 17 5;
+  n = Str.len b;
+
+  # -- 3. monomorphized generics: Int sum and Str concat via ONE generic --
+  si = total Int (1 :: 2 :: 3 :: 4 :: Nil);
+  ss = total Str ("a" :: "b" :: "c" :: Nil);
+
+  # -- 4. SString: linear 128B inline string --
+  s0 = SStr.new Unit;
+  s1 = SStr.push s0 104;
+  s2 = SStr.push s1 105;
+  ln = SStr.len s2;
+  c1 = SStr.at s2 1;
+  hs = SStr.toStr s2;
+
+  # -- 5. VList over the SoA vector --
+  v0 = Vec.fromList (1 :: 2 :: 3 :: Nil);
+  v1 = VList.map (fn x -> x * 10) v0;
+  sm = VList.fold (fn acc x -> acc + x) 0 v1;
+
+  _ = print "ops: {a} {b}";
+  _ = print "methods: max={m} mod={d} len={n}";
+  _ = print "generic: total Int={si} total Str={ss}";
+  _ = print "sstring: len={ln} at1={c1} str={hs}";
+  print "vlist: fold={sm}".

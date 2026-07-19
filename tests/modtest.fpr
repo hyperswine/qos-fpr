@@ -1,7 +1,7 @@
 # modtest.fpr -- exercises the use-module system end to end.
 
-MyMod = use "mods/mymod#ddbe5fa48f1a5018".
-V2    = use "mods/mymod2#ae1e13504d5ffa2a".
+MyMod = use "mods/mymod#f37a5c03ec96844a".
+V2    = use "mods/mymod2#25726eb439d609b0".
 
 x   = MyMod.x.
 res = MyMod.f "hi".

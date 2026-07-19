@@ -17,6 +17,7 @@ import Data.Bits (xor)
 import Data.Char (isAlphaNum, isLetter, isLower, isUpper, ord)
 import Data.List (foldl', intercalate, nub, sort, sortOn)
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import Data.Maybe (fromMaybe)
 import Data.Void (Void)
 import Data.Word (Word32)
@@ -62,19 +63,22 @@ data SPat
   | PCon Name [SPat]
   | PTup [SPat]
   | PRec [Name]
+  | PSig Name Name -- (s : Functor) — a param constrained by a named sig
   deriving (Show)
 
 data STop
   = TBind Name [SPat] (Maybe SExpr) SExpr
-  | TType Name Bool [(Name, [Ty])]
-  | TShape [Name]
+  | TType Name Bool [Name] [(Name, [Ty])]
+  | TShape Name [(Name, Ty)]
   | TSig Name ([Ty], Ty)
+  | TSigDef Name [(Name, Maybe Ty)] -- `Functor = Sig { map : ... }.`
+  | TStruct Name [Name] [(Name, SExpr)] -- `Numeric = Struct Arith { ... }.`
   | TUse Name String -- MyMod = use "MyMod#hash".  (compile-time module import)
   | TAlias Name Name -- T = MyMod.T.  (name alias: types, constructors, values)
   | TSkip
   deriving (Show)
 
-data Ty = TCon Name [Ty] | TVarT Name | TTup [Ty] | TOther
+data Ty = TCon Name [Ty] | TVarT Name | TTup [Ty] | TArrT Ty Ty | TVApp Name [Ty] | TOther
   deriving (Show)
 
 --------------------------------------------------------------------------------
@@ -116,7 +120,7 @@ identChar :: Char -> Bool
 identChar c = isAlphaNum c || c == '_' || c == '\''
 
 reserved :: [String]
-reserved = ["fn", "case", "of", "Type"]
+reserved = ["fn", "case", "of", "Type", "Sig", "Struct", "use"]
 
 dottedIdent :: P [String]
 dottedIdent = lexeme $ do
@@ -385,7 +389,12 @@ patAtom =
       _ <- char '"'
       s <- manyTill (satisfy (/= '"')) (char '"')
       pure (PStr s)
-    patInParens = do
+    patInParens = try sigParam <|> tupleOrOne
+    sigParam = do
+      n <- lowerName
+      _ <- lexeme (char ':' <* notFollowedBy (char ':'))
+      PSig n <$> upperName
+    tupleOrOne = do
       p <- pattern'
       ps <- many (symbol "," *> pattern')
       pure $ if null ps then p else PTup (p : ps)
@@ -400,13 +409,46 @@ program = sc *> many topDecl <* eof
 topDecl :: P STop
 topDecl =
   choice
-    [ try typeDecl,
+    [ sigDecl,
+      structDecl,
+      try typeDecl,
       try shapeAlias,
       try useDecl,
       try otherAlias,
       try signature,
       binding
     ]
+
+keyword :: String -> P ()
+keyword w = lexeme . try $ void (string w <* notFollowedBy (satisfy identChar))
+
+-- `Functor = Sig { map : (a -> b) -> t a -> t b }.`  (a named row)
+sigDecl :: P STop
+sigDecl = try $ do
+  n <- upperName
+  eqSign
+  keyword "Sig"
+  fs <- braces (sigField `sepBy1` symbol ",")
+  dotTerm
+  pure (TSigDef n fs)
+  where
+    sigField = do
+      f <- pName
+      mt <- optional (lexeme (char ':') *> (foldr1 TArrT <$> tyApp `sepBy1` symbol "->"))
+      pure (f, mt)
+
+-- `Numeric = Struct Arith { add = fn a b -> a + b, zero = 0 }.`
+structDecl :: P STop
+structDecl = try $ do
+  n <- upperName
+  eqSign
+  keyword "Struct"
+  sigs <- many upperName
+  fs <- braces (fieldAssign `sepBy1` symbol ",")
+  dotTerm
+  pure (TStruct n sigs fs)
+  where
+    fieldAssign = do f <- pName; eqSign; (f,) <$> expr
 
 -- MyMod = use "MyMod#4f2a...".   The spec is a plain (uninterpolated)
 -- string: module name, optionally #-pinned to an AST hash.  Resolution,
@@ -442,20 +484,26 @@ tyApp = do
   pure $ case atoms of
     [t] -> t
     (TCon n [] : args) -> TCon n args
+    (TVarT n : args) -> TVApp n args
     _ -> TOther
 
 tyAtom :: P Ty
 tyAtom =
   choice
-    [ parens tyTuple,
+    [ parens tyParenBody,
       flip TCon [] <$> upperName,
       TVarT <$> lowerName
     ]
   where
-    tyTuple = do
+    -- inside parens: a possibly-arrowed, possibly-tupled type
+    tyParenBody = do
       t <- tyApp
-      ts <- many (symbol "," *> tyApp)
-      pure $ if null ts then t else TTup (t : ts)
+      arrows <- many (try (symbol "->") *> tyApp)
+      if not (null arrows)
+        then pure (foldr1 TArrT (t : arrows))
+        else do
+          ts <- many (symbol "," *> tyApp)
+          pure $ if null ts then t else TTup (t : ts)
 
 skipTillDot :: P ()
 skipTillDot = void (skipManyTill anySingle dotTerm)
@@ -464,14 +512,14 @@ typeDecl :: P STop
 typeDecl = do
   n <- upperName
   mult <- optional integer
-  _params <- many lowerName
+  params <- many lowerName
   eqSign
   _ <- symbol "Type"
   cons <-
     parens (conDecl `sepBy1` pipeSep)
       <|> newtypeCon n
   dotTerm
-  pure (TType n (mult == Just 1) cons)
+  pure (TType n (mult == Just 1) params cons)
   where
     conDecl = do
       c <- upperName
@@ -483,17 +531,17 @@ typeDecl = do
 
 shapeAlias :: P STop
 shapeAlias = do
-  _ <- upperName
+  n <- upperName
   eqSign
   fs <- braces (fieldDecl `sepBy1` symbol ",")
   dotTerm
-  pure (TShape fs)
+  pure (TShape n fs)
   where
     fieldDecl = do
       f <- pName
       _ <- lexeme (char ':')
-      _ <- some (noneOf ",}")
-      pure f
+      t <- foldr1 TArrT <$> tyApp `sepBy1` symbol "->"
+      pure (f, t)
 
 otherAlias :: P STop
 otherAlias = do
@@ -590,7 +638,7 @@ tidFor h n = 0x20000000 + fnv32 (h ++ "." ++ n) `mod` 0x5F000000
 collectCons :: String -> [STop] -> M.Map Name (Int, Int, Int)
 collectCons unitHash tops = M.union builtinCons (M.fromList user)
   where
-    tdecls = [(n, cs) | TType n _ cs <- tops]
+    tdecls = [(n, cs) | TType n _ _ cs <- tops]
     user = concat [one (tidFor unitHash n) cs | (n, cs) <- tdecls]
     one tid cs = [(c, (tid, v, length tys)) | ((c, tys), v) <- zip cs [0 ..]]
 
@@ -599,7 +647,7 @@ collectShapes tops = M.fromList [(fs, shapeIdFor fs) | fs <- allShapes]
   where
     shapeIdFor fs = 0x00010000 + fnv32 (intercalate "," fs) `mod` 0x0FF00000
     allShapes = nub (concatMap topShapes tops)
-    topShapes (TShape fs) = [sort fs]
+    topShapes (TShape _ fs) = [sort (map fst fs)]
     topShapes (TBind _ ps g b) =
       concatMap patShapes ps
         ++ maybe [] exprShapes g
@@ -1085,15 +1133,17 @@ shapeOfTy lin = \case
   TTup ts -> LTupS (map (shapeOfTy lin) ts)
   TCon n as -> if n `elem` lin || any (isLin . shapeOfTy lin) as then LL else LU
   TVarT _ -> LU
+  TArrT _ _ -> LU
+  TVApp _ _ -> LU
   TOther -> LU
 
 buildLinInfo :: [STop] -> LinInfo
 buildLinInfo tops = LinInfo lin sigs conSh conAr
   where
-    lin = [n | TType n True _ <- tops]
+    lin = [n | TType n True _ _ <- tops]
     sigs = M.fromList [(n, (map sh ps, sh r)) | TSig n (ps, r) <- tops]
-    conSh = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear cs <- tops, (c, tys) <- cs]
-    conAr = M.fromList [(c, length tys) | TType _ _ cs <- tops, (c, tys) <- cs]
+    conSh = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
+    conAr = M.fromList [(c, length tys) | TType _ _ _ cs <- tops, (c, tys) <- cs]
     sh = shapeOfTy lin
 
 type Cnt = M.Map Name Int
@@ -1306,3 +1356,50 @@ sFree = nub . go
     blockF [] e = go e
     blockF (SBind n ps rhs : rest) e = filter (`notElem` ps) (go rhs) ++ filter (/= n) (blockF rest e)
     blockF (SBindPat p rhs : rest) e = go rhs ++ filter (`notElem` patB p) (blockF rest e)
+
+--------------------------------------------------------------------------------
+-- Generic expr traversal + pattern vars (shared by Struct/Infer)
+--------------------------------------------------------------------------------
+
+patVars :: SPat -> [Name]
+patVars = \case
+  PVar n -> [n]
+  PSig n _ -> [n]
+  PCon _ ps -> concatMap patVars ps
+  PTup ps -> concatMap patVars ps
+  PRec ns -> ns
+  _ -> []
+
+-- generic bottom-up expr transform threading the set of locally-bound names
+transformE :: (S.Set Name -> SExpr -> SExpr) -> S.Set Name -> SExpr -> SExpr
+transformE f = transformEP f id
+
+transformEP :: (S.Set Name -> SExpr -> SExpr) -> (SPat -> SPat) -> S.Set Name -> SExpr -> SExpr
+transformEP f pf = go
+  where
+    go bs e0 = f bs $ case e0 of
+      SApp a b -> SApp (go bs a) (go bs b)
+      SLam ps b -> SLam ps (go (bs `S.union` S.fromList ps) b)
+      SBlock stmts fin ->
+        let (stmts', bs') = goStmts bs stmts
+         in SBlock stmts' (go bs' fin)
+      SCase s alts -> SCase (go bs s) [(pf p, go (bs `S.union` S.fromList (patVars p)) e) | (p, e) <- alts]
+      SBin op a b -> SBin op (go bs a) (go bs b)
+      SProj e path -> SProj (go bs e) path
+      SRec fs -> SRec [(n, go bs e) | (n, e) <- fs]
+      SUpd m as -> SUpd (go bs m) [(p, go bs e) | (p, e) <- as]
+      STup es -> STup (map (go bs) es)
+      SList es -> SList (map (go bs) es)
+      SStrI segs -> SStrI [case s of SegExpr e -> SegExpr (go bs e); o -> o | s <- segs]
+      other -> other
+    goStmts bs [] = ([], bs)
+    goStmts bs (SBind n ps x : rest) =
+      let x' = go (bs `S.union` S.fromList (n : ps)) x
+          (rest', bs') = goStmts (S.insert n bs) rest
+       in (SBind n ps x' : rest', bs')
+    goStmts bs (SBindPat p x : rest) =
+      let x' = go bs x
+          (rest', bs') = goStmts (bs `S.union` S.fromList (patVars p)) rest
+       in (SBindPat (pf p) x' : rest', bs')
+
+-- import list needs S/M already imported in FPRISC.hs

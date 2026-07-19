@@ -236,10 +236,15 @@ renameTops env qh = concatMap top
       TUse {} -> [] -- consumed by the loader
       TAlias {} -> [] -- folded into reAliasSubst
       TSkip -> []
-      TShape fs -> [TShape fs] -- structural: never qualified
+      TShape n fs -> [TShape n [(f, ty t) | (f, t) <- fs]] -- structural: never qualified
       TSig n (as, r) -> [TSig (qual n) (map ty as, ty r)]
-      TType n lin cons ->
-        [TType (qual n) lin [(qual c, map ty ts) | (c, ts) <- cons]]
+      TType n lin ps cons ->
+        [TType (qual n) lin ps [(qual c, map ty ts) | (c, ts) <- cons]]
+      TSigDef n fs -> [TSigDef (qual n) [(f, fmap ty mt) | (f, mt) <- fs]]
+      -- NOTE: structs are expanded to flat globals + a record BEFORE
+      -- module qualification (see loadProgram), so renameTops should not
+      -- see a TStruct. Kept total for safety.
+      TStruct n sigs fs -> [TStruct (qual n) (map (refCon env S.empty) sigs) [(f, expr S.empty e) | (f, e) <- fs]]
       TBind n pats g body ->
         let (pats', bound) = pats1 S.empty pats
          in [TBind (qual n) pats' (fmap (expr bound) g) (expr bound body)]
@@ -247,6 +252,8 @@ renameTops env qh = concatMap top
     ty = \case
       TCon n ts -> TCon (refCon env S.empty n) (map ty ts)
       TTup ts -> TTup (map ty ts)
+      TArrT a b -> TArrT (ty a) (ty b)
+      TVApp n ts -> TVApp n (map ty ts)
       t -> t
 
     pats1 bound = foldl' (\(ps, b) p -> let (p', b') = pat b p in (ps ++ [p'], b')) ([], bound)
@@ -259,6 +266,7 @@ renameTops env qh = concatMap top
       PCon c ps -> let (ps', b') = pats1 bound ps in (PCon (refCon env bound c) ps', b')
       PTup ps -> let (ps', b') = pats1 bound ps in (PTup ps', b')
       PRec fs -> (PRec fs, foldr S.insert bound fs)
+      PSig n sg -> (PSig n sg, S.insert n bound)
 
     expr bound = \case
       SVar n
@@ -353,7 +361,8 @@ loadProgram preludeTops rootPath rootTops = do
                 [ case t of
                     TBind n _ _ _ -> [n]
                     TSig n _ -> [n]
-                    TType n _ cons -> n : map fst cons
+                    TSigDef n _ -> [n]
+                    TType n _ _ cons -> n : map fst cons
                     _ -> []
                   | t <- muTops mu
                 ]

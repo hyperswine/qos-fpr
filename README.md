@@ -33,6 +33,46 @@ boots System.qa, which asks for each app's permissions at launch.
 QEMU exits cleanly on completion and with code 1 on panic (the sifive
 test finisher via `hal_poweroff`), so everything is exit-code driven.
 
+## Types: ML-style modules, row polymorphism, SString
+
+The typed layer (July 2026) sits on top of the original untyped FPRISC
+front-end, ported from the Sol scripting language's type system:
+
+- **Sigs and structures.** `Foo = Sig { ... }.` declares a named row;
+  `Bar = Struct Foo { ... }.` implements it. Generic code takes a
+  `(s : Sig)` parameter; the compiler monomorphizes each call site by
+  the concrete structure passed, so there is no runtime dictionary —
+  `total (s : Add) xs` compiles to `total#Int` / `total#Str` clones.
+- **HM + row polymorphism** (compiler/Infer.hs) infers and checks
+  every program; operators (`+ - * /`) resolve by operand type — Int
+  hits the primitive opcode, `Str.+` concatenates, and at a sig
+  carrier the operator resolves to `s.(+)` internally (never surface
+  syntax) and monomorphizes with the rest of the call.
+- **The typed prelude** (programs/prelude.fpr) groups the HAL/runtime
+  contract into namespaces: `Int`/`Str` (value structures implementing
+  Arith/Eq/Ord/Add), `Actor` (send/recv/spawn/yield — namespace-only,
+  since messages are polymorphic), `Mmio`/`Pin`/`Sys` (namespace-only
+  HAL groupings), and `VList` (the SoA vector — namespace-only because
+  `Vector` is a MONOMORPHIC opaque type with untyped columns, so it
+  cannot satisfy a `t a`-shaped sig like `Functor`; that's a real
+  type-theoretic fact, not an oversight — generic sequence code uses
+  `List`, not `VList`). The flat HAL names (`send`, `strcat`,
+  `Vec.push`) still work; the structures are additions.
+- **SString**: a fixed 128-byte inline string (`SString 1 = Type Int.`,
+  linear), backed by runtime/sstr.c. No heap, no ARC — the buffer lives
+  wherever the caller put it, and linearity licenses in-place
+  put/push/clear the same way it licenses Vector's in-place mutation.
+  The width is hardcoded system-wide for now; `SString n` (an indexed/
+  per-value width, bordering on dependent types) is a deliberate future
+  step, not in this cut.
+- **No JIT, no inline eval.** FPRISC is natively compiled to RISC-V
+  assembly; there is no `> expr.` top-level evaluation (that is Sol's
+  scripting-tier feature) and no JIT tier to keep in sync with types.
+
+tests/typed.fpr exercises all of the above end-to-end on QEMU (operator
+dispatch, structure methods, one generic monomorphized twice, SString,
+VList) and is part of `make test`.
+
 ## Layout
 
     compiler/       fprc: FPRISC.hs (front), Codegen.hs, Modules.hs, Main.hs

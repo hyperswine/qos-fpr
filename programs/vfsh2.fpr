@@ -52,7 +52,7 @@ Res = Type (RFound Int | RMount Int Int | RErr Int).
 
 # ---- tiny console over raw MMIO (registers passed in, never remade) ----
 
-isOdd v = v - (v / 2) * 2 == 1.
+isOdd v = Int.mod v 2 == 1.
 
 putc con c =
   (lsr, dat) = con;

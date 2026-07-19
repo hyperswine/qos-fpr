@@ -52,9 +52,9 @@ build/prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
 	LC_ALL=C.UTF-8 ./fprc --target=$(FPRTGT) $(FPRCFLAGS) --prelude=programs/prelude.fpr $(PROG) build/prog.s
 
-image.elf: build/prog.s runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/mod.c runtime/link.ld
+image.elf: build/prog.s runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/link.ld
 	$(CROSS)gcc $(CFLAGS) -T runtime/link.ld -Iruntime \
-	  runtime/crt0.S runtime/ctx.S build/prog.s $$(cat build/prog.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/mod.c runtime/buddy.c -o $@
+	  runtime/crt0.S runtime/ctx.S build/prog.s $$(cat build/prog.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/buddy.c -o $@
 
 
 # ---- System.qa: the .qa app platform (docs/QA-FORMAT.md) --------------------
@@ -91,10 +91,10 @@ runtime/apps_data.c: $(patsubst %,build/qa0/%.qa,$(QAPPS)) tools/genapps.py
 
 # FORCE: TARGET/HARTS change the flags but not the deps, so always
 # relink (fprc's per-unit cache keeps the compile side cheap)
-system.elf: FORCE fprc programs/system.fpr programs/prelude.fpr runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/mod.c runtime/link.ld
+system.elf: FORCE fprc programs/system.fpr programs/prelude.fpr runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/link.ld
 	./fprc --target=$(FPRTGT) --prelude=programs/prelude.fpr programs/system.fpr build/system.s
 	$(CROSS)gcc $(CFLAGS) -T runtime/link.ld -Iruntime \
-	  runtime/crt0.S runtime/ctx.S build/system.s $$(cat build/system.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/mod.c runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c -o $@
+	  runtime/crt0.S runtime/ctx.S build/system.s $$(cat build/system.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c -o $@
 
 # the DEFAULT setup has a disk: the append-only log carries /apps
 # overrides, app kv streams, and general files (docs/STORAGE.md)

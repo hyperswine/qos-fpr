@@ -43,7 +43,7 @@ LMode = Type (LFix Int | LFlex Int).
 
 # ---- tiny console over raw MMIO (registers made once, threaded) -------------
 
-isOdd v = v - (v / 2) * 2 == 1.
+isOdd v = Int.mod v 2 == 1.
 
 putc con c =
   (lsr, dat) = con;

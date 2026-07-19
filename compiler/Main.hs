@@ -7,6 +7,8 @@ import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import FPRISC
+import Infer (inferTops)
+import Struct (erasePSig, expandStructs, sigTable, specialize, structTable)
 import Modules (LoadResult (..), ModExport (..), hashAST, loadProgram)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs)
@@ -60,31 +62,64 @@ main = do
   lr <- loadProgram preludeTops inp rootTops
   case lr of
     Left e -> putStrLn e >> exitFailure
-    Right (LoadResult tops exports notes units root' rootHash) -> do
+    Right (LoadResult tops0 exports notes units0 root0 rootHash) -> do
       mapM_ putStrLn notes
+      -- ---- ML-style modules: expand sigs/structures, typecheck (HM +
+      -- rows), resolve operators by operand type, monomorphize -----------
+      -- The global sig table spans units (prelude sigs are visible
+      -- everywhere). Structs expand per-unit to flat `Numeric.+` globals
+      -- plus a first-class record; codegen stays per-unit, cached.
+      let sigs = sigTable tops0
+          structs = structTable tops0
+          expandU uts = snd (expandStructs sigs uts)
+          preludeExpErrs = fst (expandStructs sigs preludeTops)
+          preludeE = expandU preludeTops
+          root' = expandU root0
+          units = [(h, expandU uts) | (h, uts) <- units0]
+          tops = expandU tops0
+      unless (null preludeExpErrs) $ do
+        putStrLn "=== SIG/STRUCT: ERRORS ==="
+        mapM_ (putStrLn . ("  * " ++)) preludeExpErrs
+        exitFailure
+      -- typecheck the merged expanded program; rewritten tops carry
+      -- operator sites resolved to prims / Str.+ / s.(+)
+      let (terrs, _notes, topsRW) = inferTops sigs structs tops
+      unless (null terrs) $ do
+        putStrLn "=== TYPE ERRORS ==="
+        mapM_ (putStrLn . ("  * " ++)) terrs
+        exitFailure
+      -- specialize generic calls; clones land in the merged program used
+      -- for whole-program analyses. Per-unit codegen re-expands + rewrites
+      -- its own tops (deterministic), so operator resolution is local.
+      let (specErrs, topsSpec) = specialize sigs structs topsRW
+      unless (null specErrs) $ do
+        putStrLn "=== SIG/STRUCT: ERRORS ==="
+        mapM_ (putStrLn . ("  * " ++)) specErrs
+        exitFailure
+      let finalTops = erasePSig topsSpec
       -- ---- whole-program ANALYSES (cheap; codegen below is per-unit) ----
       let preludeHash = hashAST preludeTops
           -- content-addressed cons: every unit's types under ITS hash;
           -- both sides of a `use` compute the same ids from the same AST.
           consAll =
             M.unions
-              ( collectCons preludeHash preludeTops
+              ( collectCons preludeHash preludeE
                   : collectCons rootHash root'
                   : [collectCons h uts | (h, uts) <- units]
               )
-          shapes = collectShapes tops -- structural fnv ids: globally consistent
+          shapes = collectShapes finalTops -- structural fnv ids: globally consistent
           -- tid collision check (fnv32 is probabilistic; fail LOUDLY)
           tidDecls =
             [ (t, ownerT ++ "." ++ n)
               | (ownerT, ownerH, uts) <-
-                  ("prelude", preludeHash, preludeTops)
+                  ("prelude", preludeHash, preludeE)
                     : ("root", rootHash, root')
                     : [(take 12 h, h, uts) | (h, uts) <- units],
-              TType n _ _ <- uts,
+              TType n _ _ _ <- uts,
               let t = tidFor ownerH n
             ]
-          li = buildLinInfo tops
-          lerrs = lcheck li tops
+          li = buildLinInfo finalTops
+          lerrs = lcheck li finalTops
       -- real tid clash check: same tid, different qualified type name
       let byTid = M.fromListWith (++) [(t, [q]) | (t, q) <- tidDecls]
           bad = [(t, qs) | (t, qs) <- M.toList byTid, length (S.toList (S.fromList qs)) > 1]
@@ -99,8 +134,19 @@ main = do
         mapM_ (putStrLn . ("  * " ++)) lerrs
         exitFailure
       -- ---- per-unit CODEGEN (separate compilation) ----
-      let compileUnit uts = fst (runState (compileTop uts >>= liftFix) (DEnv 0 consAll shapes []))
-          preludeExt = arities preludeTops
+      -- Each unit is expanded already (preludeE/units/root'). For codegen
+      -- we also need operator sites resolved locally (Int prim / Str.+),
+      -- which inferTops does; a unit typechecks standalone WITH the prelude
+      -- in scope. Cross-unit monomorphization clones live in the ROOT
+      -- (specialize ran on the whole program above); finalTops' root
+      -- portion carries them.
+      let resolveUnit uts =
+            let (_, _, rw) = inferTops sigs structs (preludeE ++ uts)
+                bn = S.fromList ([fst3 b | b@(TBind {}) <- uts])
+             in [t | t@(TBind n _ _ _) <- rw, S.member n bn]
+                  ++ [t | t <- rw, not (isTBind t)]
+          compileUnit uts = fst (runState (compileTop uts >>= liftFix) (DEnv 0 consAll shapes []))
+          preludeExt = arities preludeE
           unitExt = M.unions [arities uts | (_, uts) <- units]
           extFor = M.union preludeExt unitExt -- own names win via prog-first lookup
           tgt = oTarget opts
@@ -121,21 +167,34 @@ main = do
                 length asm `seq` writeFile path asm
                 pure (path, show (M.size prog) ++ " supercombinators")
       createDirectoryIfMissing True unitDir
-      -- prelude unit (unqualified names; the always-linked stdlib unit)
+      -- prelude unit (unqualified names; the always-linked stdlib unit).
+      -- The prelude is self-contained, so resolve its own operators.
+      let preludeResolved = let (_, _, rw) = inferTops sigs structs preludeE in rw
       preludeOut <-
         if null preludeTops
           then pure []
           else do
             r <- emitUnit (unitDir </> ("prelude-" ++ take 12 preludeHash ++ "-" ++ tag ++ ".s"))
-                          (bindNames preludeTops) M.empty preludeTops
+                          (bindNames preludeE) M.empty preludeResolved
             pure [r]
       -- dep module units (hash-qualified; filename carries the prelude
       -- hash too -- unit code depends on prelude arities)
       unitOuts <- forM units $ \(h, uts) ->
         emitUnit (unitDir </> ("u-" ++ take 12 h ++ "-p" ++ take 8 preludeHash ++ "-" ++ tag ++ ".s"))
-                 (bindNames uts) extFor uts
-      -- the root: exports its own binds; modtab (all dep exports) lives here
-      let rootProg = compileUnit root'
+                 (bindNames uts) extFor (resolveUnit uts)
+      -- the root: exports its own binds; modtab (all dep exports) lives
+      -- here. Root codegen uses the FULLY specialized+resolved tops
+      -- (finalTops), filtered to root's own names + any monomorphized
+      -- clones (clones have no home unit; they ride with the root).
+      let rootNames = S.fromList ([fst3 b | b@(TBind {}) <- root'])
+          unitNames = S.fromList (concat [[fst3 b | b@(TBind {}) <- uts] | (_, uts) <- units])
+          preludeNames = S.fromList (map fst3 [b | b@(TBind {}) <- preludeE, True])
+          rootProgTops =
+            [ t | t@(TBind n _ _ _) <- finalTops,
+                  S.member n rootNames
+                    || (not (S.member n unitNames) && not (S.member n preludeNames))
+            ]
+          rootProg = compileUnit rootProgTops
       writeFile out (emitProgram tgt rvv exports extFor (bindNames root') rootProg)
       -- the link list: everything the root's image needs beyond out itself
       writeFile (out ++ ".units") (unlines (map fst (preludeOut ++ unitOuts)))
@@ -145,3 +204,11 @@ main = do
         putStrLn ("module table: " ++ show (length [e | e <- exports, meArity e >= 1]) ++ " remote-callable exports")
       putStrLn "assumed external symbols (the fpr_g_ HAL/runtime contract):"
       putStrLn ("  " ++ unwords (externals extFor rootProg))
+
+fst3 :: STop -> String
+fst3 (TBind n _ _ _) = n
+fst3 _ = ""
+
+isTBind :: STop -> Bool
+isTBind TBind {} = True
+isTBind _ = False

@@ -41,4 +41,5 @@ main =
 hello =
   xs = grow 100000 Nil;
   n = lenAcc xs 0;
-  print "hello from a CAPABILITY-GATED loaded process! list len = {n}".
+  _ = print "hello from a CAPABILITY-GATED loaded process! list len = {n}";
+  "wrote greeting".

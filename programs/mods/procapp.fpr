@@ -13,7 +13,7 @@
 
 and2 a b = case a of True -> b | False -> False.
 or2 a b = case a of True -> True | False -> b.
-isOdd v = v - (v / 2) * 2 == 1.
+isOdd v = Int.mod v 2 == 1.
 
 # ---- capability blob: "appid\nurl mode\n..." --------------------------------
 hasGrant s url mode = hgGo s 1 (strlen s) (strcat url (strcat " " mode)).
