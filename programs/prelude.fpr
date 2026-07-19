@@ -1,0 +1,83 @@
+# prelude.fpr -- prepended to every program by the Makefile.
+# Pure FPRISC: the vector "prims" from the original demos, plus the linear
+# Handle. Signatures matter here: they are what tells the linearity
+# checker that a Handle is linear, so `h` must be used exactly once.
+
+Handle 1 = Type Int.
+
+newHandle : Int -> Handle.
+newHandle v = Handle v.
+
+closeHandle : Handle -> Int.
+closeHandle h = case h of Handle v -> v.
+
+# inclusive integer range
+fromTo a b = case a > b of True -> Nil | False -> a :: fromTo (a + 1) b.
+
+mapV f v = case v of Nil -> Nil | x :: rest -> f x :: mapV f rest.
+
+sumV v = case v of Nil -> 0 | x :: rest -> x + sumV rest.
+
+# Vec (a, b) ops -- semantically over lists of pairs here; the real
+# compiler's SoA Repr makes zip/fst/snd free and fuses column maps.
+zipV xs ys = case (xs, ys) of
+    (x :: xr, y :: yr) -> (x, y) :: zipV xr yr
+  | _ -> Nil.
+
+fstV ps = case ps of Nil -> Nil | (a, _) :: rest -> a :: fstV rest.
+sndV ps = case ps of Nil -> Nil | (_, b) :: rest -> b :: sndV rest.
+
+mapFstV f ps = case ps of Nil -> Nil | (a, b) :: rest -> (f a, b) :: mapFstV f rest.
+mapSndV f ps = case ps of Nil -> Nil | (a, b) :: rest -> (a, f b) :: mapSndV f rest.
+
+# ---- the SoA VList vector (vec.c) ------------------------------------
+# LINEAR: single ownership is what licenses in-place column mutation and
+# lending raw column pointers to specialized loops. Vector always LAST,
+# for |> pipelines.
+
+Vector 1 = Type Int.
+
+Vec.new : Unit -> Vector.
+Vec.push : a -> Vector -> Vector.
+Vec.len : Vector -> (Int, Vector).
+Vec.get : Int -> Vector -> (a, Vector).
+Vec.set : Int -> a -> Vector -> Vector.
+Vec.map : (a -> b) -> Vector -> Vector.
+Vec.filter : (a -> Bool) -> Vector -> Vector.
+Vec.fold : (b -> a -> b) -> b -> Vector -> (b, Vector).
+Vec.fromList : List -> Vector.
+Vec.toList : Vector -> List.
+Vec.free : Vector -> Unit.
+Vec.split : Int -> Vector -> (Vector, Vector).
+
+# ---- synchronous actor block groups (SMP) -----------------------------
+# A group is: spawn workers pinned to harts, distribute, JOIN before the
+# spawning code continues -- fork/join with actors, nothing more.  The
+# worker protocol is one round: receive (parent, f, a), reply Ok (f a),
+# die.  receiveRes on the parent side is the join: it waits for the
+# Result and steps over any unrelated traffic.
+
+parWorker self =
+  case receive self of
+    (parent, f, a) -> send parent (Ok (f a)).
+
+# run `f a` on hart h while computing `g b` on the CURRENT hart; block
+# until both are done; return (f a, g b).
+par2 h f a g b =
+  me = myself 0;
+  w = spawnOn h parWorker;
+  _ = send w (me, f, a);
+  rb = g b;
+  case receiveRes me of
+    Ok ra -> (ra, rb).
+
+# ---- dynamic process loading (docs/PROCESS-LOADING.md) ----------------
+# The real LaunchElf seam System.qa's launcher was built around: given
+# the raw bytes of an app's ELF section, run it as a genuinely separate
+# process (its own actor system, its own slab-allocated heap growing
+# from System.qa's buddy allocator on demand) and report what came back.
+Sys.init    : Unit -> Unit.
+Sys.loadElfAt : String -> Int -> Int -> (Int, String).
+Sys.arenaFree : Unit -> Int.
+heapUsed : Unit -> Int.
+

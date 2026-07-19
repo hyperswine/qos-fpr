@@ -1,0 +1,360 @@
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
+
+-- Modules.hs — content-addressed file modules for FPRISC.
+--
+--     MyMod = use "MyMod#4f2a91cc0d9e33b7".
+--
+--     x   = MyMod.x.
+--     res = MyMod.f "hi".
+--     T   = MyMod.T.        # alias the type (constructors + patterns too)
+--
+-- Every .fpr file IS a module.  Its identity is the FNV-1a-64 hash of the
+-- AST it parses to, with each of ITS OWN `use` specs pin-normalized to the
+-- resolved dependency hash first — so the hash is a Merkle root over the
+-- whole dependency tree: pin one hash and you have pinned the exact code
+-- of everything below it.  Whitespace and comments don't change identity;
+-- code does.
+--
+-- Splicing is COMPILE TIME and purely name-based: a module's top-level
+-- names are qualified to `name@hash`, references through the alias
+-- (`MyMod.f`) rewrite to the qualified name, and the qualified tops are
+-- concatenated into the one flat program the rest of the pipeline already
+-- compiles.  Two different hashes of "the same" module therefore coexist
+-- in one image with zero ceremony — immutable versioning falls out of the
+-- naming scheme rather than being a feature.
+--
+-- The alias itself is a first-class value: `MyMod` in expression position
+-- is the module's hash as a String.  Together with the emitted module
+-- table (hash × export name → function object; see Codegen/mod.c) that is
+-- the local half of FPRLive remote calling: `Mod.fn MyMod "f"` resolves
+-- the same (hash, name) pair a remote node would ship over the wire.
+module Modules
+  ( loadProgram,
+    LoadResult (..),
+    ModExport (..),
+    hashAST,
+  )
+where
+
+import Control.Monad (foldM, forM)
+import Data.Bits (xor)
+import Data.Char (isUpper, ord)
+import Data.IORef
+import Data.List (foldl', isPrefixOf, isSuffixOf)
+import qualified Data.Map.Strict as M
+import qualified Data.Set as S
+import Data.Word (Word64)
+import FPRISC
+import Numeric (showHex)
+import System.Directory (canonicalizePath, doesFileExist)
+import System.FilePath (takeDirectory, (</>))
+import Text.Megaparsec (errorBundlePretty, parse)
+
+-- one remote-callable export: hash, surface name, qualified program name
+data ModExport = ModExport
+  { meHash :: String,
+    meName :: String,
+    meQual :: String,
+    meArity :: Int
+  }
+  deriving (Show)
+
+data LoadResult = LoadResult
+  { lrTops :: [STop], -- the merged, qualified, alias-resolved program
+    lrExports :: [ModExport], -- every module top-level bind (0-ary included;
+                              -- Codegen's modtab filters to arity >= 1)
+    lrNotes :: [String], -- unpinned-use resolutions worth printing
+    -- separate compilation: each dep module as its own unit --
+    -- (unit hash, its RENAMED tops), plus the root's renamed tops and
+    -- the root's own Merkle hash (over pin-normalized uses, like any
+    -- module's).  lrTops == prelude ++ concat units ++ root, unchanged.
+    lrUnits :: [(String, [STop])],
+    lrRootTops :: [STop],
+    lrRootHash :: String
+  }
+
+--------------------------------------------------------------------------------
+-- Hashing
+--------------------------------------------------------------------------------
+
+-- FNV-1a 64 over the printed AST: deterministic, dependency-free.
+-- (A real registry would use SHA-256 over a canonical serialization.)
+hashAST :: [STop] -> String
+hashAST tops = pad (showHex h "")
+  where
+    h = foldl' step 0xcbf29ce484222325 (show tops) :: Word64
+    step acc c = (acc `xor` fromIntegral (ord c)) * 0x100000001b3
+    pad s = replicate (16 - length s) '0' ++ s
+
+qualify :: String -> Name -> Name
+qualify h n = n ++ "@" ++ h
+
+--------------------------------------------------------------------------------
+-- Loading (IO): resolve, parse, hash, recurse
+--------------------------------------------------------------------------------
+
+data ModUnit = ModUnit
+  { muHash :: String,
+    muTops :: [STop], -- as parsed (uses pin-normalized, not yet qualified)
+    muAliases :: [(Name, String)] -- import alias -> dep hash
+  }
+
+-- "Name", "Name#hash", "dir/Name", "Name.fpr#hash" — resolved relative
+-- to the importing file's directory.
+specParts :: String -> (String, String)
+specParts spec = let (n, h) = break (== '#') spec in (n, drop 1 h)
+
+specFile :: FilePath -> String -> FilePath
+specFile baseDir name =
+  let f = if ".fpr" `isSuffixOf` name then name else name ++ ".fpr"
+   in if take 1 f == "/" then f else baseDir </> f
+
+-- Load the transitive closure below a root file's tops.  State:
+--   cache  : canonical path -> ModUnit (parse/hash once)
+--   stack  : in-progress canonical paths (cycle detection)
+loadDeps ::
+  IORef (M.Map FilePath ModUnit) ->
+  [FilePath] ->
+  FilePath ->
+  [STop] ->
+  IO (Either String ([(Name, String)], [String]))
+loadDeps cache stack dir tops = do
+  let uses = [(a, s) | TUse a s <- tops]
+  r <- foldM step (Right ([], [])) uses
+  pure (fmap (\(as, ns) -> (reverse as, reverse ns)) r)
+  where
+    step (Left e) _ = pure (Left e)
+    step (Right (as, ns)) (alias, spec) = do
+      let (nm, wantHash) = specParts spec
+          path = specFile dir nm
+      r <- loadModule cache stack path
+      pure $ case r of
+        Left e -> Left e
+        Right mu
+          | not (null wantHash) && muHash mu /= wantHash ->
+              Left
+                ( "use: hash mismatch for " ++ nm
+                    ++ ":\n  pinned  #" ++ wantHash
+                    ++ "\n  on disk #" ++ muHash mu
+                    ++ "\n(the module's AST changed since it was pinned)"
+                )
+          | otherwise ->
+              let note =
+                    [ "use: " ++ alias ++ " resolves to \"" ++ nm ++ "#" ++ muHash mu
+                        ++ "\"  (pin it to freeze this exact code)"
+                      | null wantHash
+                    ]
+               in Right ((alias, muHash mu) : as, note ++ ns)
+
+loadModule ::
+  IORef (M.Map FilePath ModUnit) ->
+  [FilePath] ->
+  FilePath ->
+  IO (Either String ModUnit)
+loadModule cache stack path0 = do
+  ok <- doesFileExist path0
+  if not ok
+    then pure (Left ("use: no such module file: " ++ path0))
+    else do
+      path <- canonicalizePath path0
+      if path `elem` stack
+        then pure (Left ("use: module cycle through " ++ path))
+        else do
+          c <- readIORef cache
+          case M.lookup path c of
+            Just mu -> pure (Right mu)
+            Nothing -> do
+              src <- readFile path
+              case parse program path src of
+                Left e -> pure (Left ("use: module " ++ path ++ " does not parse:\n" ++ errorBundlePretty e))
+                Right tops -> do
+                  r <- loadDeps cache (path : stack) (takeDirectory path) tops
+                  case r of
+                    Left e -> pure (Left e)
+                    Right (aliases, _notes) -> do
+                      -- pin-normalize this module's own uses before hashing:
+                      -- the hash is a Merkle root over the dependency tree
+                      let pinned = [pinUse aliases t | t <- tops]
+                          h = hashAST pinned
+                          mu = ModUnit h tops aliases
+                      modifyIORef' cache (M.insert path mu)
+                      pure (Right mu)
+  where
+    pinUse aliases (TUse a spec) =
+      let (nm, _) = specParts spec
+          hs = maybe "?" id (lookup a aliases)
+       in TUse a (nm ++ "#" ++ hs)
+    pinUse _ t = t
+
+--------------------------------------------------------------------------------
+-- Renaming: qualify a module's namespace, rewrite alias references
+--------------------------------------------------------------------------------
+
+data REnv = REnv
+  { reSelf :: Name -> Maybe Name, -- this unit's top-level names -> qualified
+    reAliases :: M.Map Name String, -- import alias -> dep hash
+    reAliasSubst :: M.Map Name Name -- T = MyMod.T style name aliases
+  }
+
+-- resolve one name occurrence (non-binding position).
+-- conPos: constructor/type position (bare alias does NOT become a hash there).
+refName :: REnv -> Bool -> S.Set Name -> Name -> Either Name String
+refName env conPos bound nm0
+  | S.member nm0 bound = Left nm0
+  | otherwise = go (chase (0 :: Int) nm0)
+  where
+    chase k n
+      | k > 32 = n -- alias cycle: give up, let it fail downstream
+      | Just t <- M.lookup n (reAliasSubst env) = chase (k + 1) t
+      | otherwise = n
+    go nm
+      | not conPos, Just h <- M.lookup nm (reAliases env) = Right h -- bare alias = hash string
+      | (a, '.' : rest) <- break (== '.') nm,
+        Just h <- M.lookup a (reAliases env) =
+          Left (qualify h rest)
+      | Just q <- reSelf env nm = Left q
+      | otherwise = Left nm
+
+refVar :: REnv -> S.Set Name -> Name -> SExpr
+refVar env bound nm = case refName env False bound nm of
+  Left n -> SVar n
+  Right h -> SStrI [SegStr h]
+
+refCon :: REnv -> S.Set Name -> Name -> Name
+refCon env bound nm = case refName env True bound nm of
+  Left n -> n
+  Right h -> h -- unreachable: conPos never yields a hash
+
+--------------------------------------------------------------------------------
+
+renameTops :: REnv -> String -> [STop] -> [STop]
+renameTops env qh = concatMap top
+  where
+    qual n = case qh of "" -> n; h -> qualify h n
+    top = \case
+      TUse {} -> [] -- consumed by the loader
+      TAlias {} -> [] -- folded into reAliasSubst
+      TSkip -> []
+      TShape fs -> [TShape fs] -- structural: never qualified
+      TSig n (as, r) -> [TSig (qual n) (map ty as, ty r)]
+      TType n lin cons ->
+        [TType (qual n) lin [(qual c, map ty ts) | (c, ts) <- cons]]
+      TBind n pats g body ->
+        let (pats', bound) = pats1 S.empty pats
+         in [TBind (qual n) pats' (fmap (expr bound) g) (expr bound body)]
+
+    ty = \case
+      TCon n ts -> TCon (refCon env S.empty n) (map ty ts)
+      TTup ts -> TTup (map ty ts)
+      t -> t
+
+    pats1 bound = foldl' (\(ps, b) p -> let (p', b') = pat b p in (ps ++ [p'], b')) ([], bound)
+
+    pat bound = \case
+      PVar n -> (PVar n, S.insert n bound)
+      PWild -> (PWild, bound)
+      PInt i -> (PInt i, bound)
+      PStr s -> (PStr s, bound)
+      PCon c ps -> let (ps', b') = pats1 bound ps in (PCon (refCon env bound c) ps', b')
+      PTup ps -> let (ps', b') = pats1 bound ps in (PTup ps', b')
+      PRec fs -> (PRec fs, foldr S.insert bound fs)
+
+    expr bound = \case
+      SVar n
+        | isUpper (head' n) -> refVar env bound n
+        | otherwise -> if S.member n bound then SVar n else refVar env bound n
+      SInt i -> SInt i
+      SAtom a -> SAtom a
+      SStrI segs -> SStrI (map seg segs)
+      SApp f a -> SApp (expr bound f) (expr bound a)
+      SLam ps b -> SLam ps (expr (foldr S.insert bound ps) b)
+      SBlock ss e ->
+        let (ss', bound') = stmts bound ss in SBlock ss' (expr bound' e)
+      SCase s arms ->
+        SCase (expr bound s) [let (p', b') = pat bound p in (p', expr b' e) | (p, e) <- arms]
+      SBin o a b -> SBin o (expr bound a) (expr bound b)
+      SProj e fs -> SProj (expr bound e) fs
+      SRec fs -> SRec [(f, expr bound e) | (f, e) <- fs]
+      SUpd m as -> SUpd (expr bound m) [(p, expr bound e) | (p, e) <- as]
+      STup es -> STup (map (expr bound) es)
+      SList es -> SList (map (expr bound) es)
+      where
+        seg (SegExpr e) = SegExpr (expr bound e)
+        seg s = s
+
+    stmts bound [] = ([], bound)
+    stmts bound (SBind n ps e : rest) =
+      let inner = foldr S.insert (S.insert n bound) ps
+          (rest', bound') = stmts (S.insert n bound) rest
+       in (SBind n ps (expr inner e) : rest', bound')
+    stmts bound (SBindPat p e : rest) =
+      let e' = expr bound e
+          (p', bound1) = pat bound p
+          (rest', bound') = stmts bound1 rest
+       in (SBindPat p' e' : rest', bound')
+
+    head' [] = ' '
+    head' (c : _) = c
+
+--------------------------------------------------------------------------------
+-- The whole program
+--------------------------------------------------------------------------------
+
+-- loadProgram preludeTops rootPath rootTops:
+--   * loads the transitive module closure below rootTops,
+--   * qualifies each module's namespace by its hash and splices everything
+--     (prelude + modules + root) into one flat [STop],
+--   * returns module-table exports and unpinned-use notes.
+loadProgram :: [STop] -> FilePath -> [STop] -> IO (Either String LoadResult)
+loadProgram preludeTops rootPath rootTops = do
+  cache <- newIORef M.empty
+  r <- loadDeps cache [] (takeDirectory rootPath) rootTops
+  case r of
+    Left e -> pure (Left e)
+    Right (rootAliases, notes) -> do
+      units <- M.elems <$> readIORef cache -- every loaded module, once per hash
+      -- notes from nested (module-internal) unpinned uses:
+      depNotes <- fmap concat . forM units $ \mu ->
+        pure ["  (inside a module) use of unpinned dep resolves to #" ++ h | (_, h) <- muAliases mu, False] -- deps are pin-normalized silently
+      let unitPairs = [(muHash mu, qualifyUnit mu) | mu <- units]
+          unitTops = map snd unitPairs
+          rootEnv =
+            REnv
+              { reSelf = const Nothing, -- root names stay unqualified
+                reAliases = M.fromList rootAliases,
+                reAliasSubst = M.fromList [(a, b) | TAlias a b <- rootTops]
+              }
+          root' = renameTops rootEnv "" rootTops
+          merged = preludeTops ++ concat unitTops ++ root'
+          rootHash = hashAST [pinRoot rootAliases t | t <- rootTops]
+          exports =
+            [ ModExport (muHash mu) n (qualify (muHash mu) n) (length ps)
+              | mu <- units,
+                TBind n ps _ _ <- muTops mu
+            ]
+      pure (Right (LoadResult merged exports (notes ++ depNotes) unitPairs root' rootHash))
+  where
+    pinRoot aliases (TUse a spec) =
+      let (nm, _) = specParts spec
+          hs = maybe "?" id (lookup a aliases)
+       in TUse a (nm ++ "#" ++ hs)
+    pinRoot _ t = t
+    qualifyUnit mu =
+      let env =
+            REnv
+              { reSelf = \n -> if S.member n selfNames then Just (qualify (muHash mu) n) else Nothing,
+                reAliases = M.fromList (muAliases mu),
+                reAliasSubst = M.fromList [(a, b) | TAlias a b <- muTops mu]
+              }
+          selfNames =
+            S.fromList $
+              concat
+                [ case t of
+                    TBind n _ _ _ -> [n]
+                    TSig n _ -> [n]
+                    TType n _ cons -> n : map fst cons
+                    _ -> []
+                  | t <- muTops mu
+                ]
+       in renameTops env (muHash mu) (muTops mu)

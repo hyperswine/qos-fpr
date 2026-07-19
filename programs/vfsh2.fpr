@@ -1,0 +1,594 @@
+# vfsh2.fpr -- the namespace shell, generation 2: MULTIPLE PROGRAMS.
+#
+#   reader ----Line----> terminal (main, actor 0: the MVU app)
+#   termSrv --Notice---> terminal            mounted at /dev/term
+#                                            (a Write to that path IS a
+#                                             message to actor 0)
+#   vfs: owns the tree. Forwards to mounts NON-BLOCKINGLY, passing the
+#        ORIGINAL replyTo through -- the mount answers the client
+#        directly. The vfs is never in a wait state, so no cycle of
+#        blocked servers can pass through it: the app->vfs->app relay
+#        deadlock of vfsh v1 is structurally gone.
+#   /srv: the registry (Plan 9 flavor). A program sends
+#        (me, Mount name handle) to the vfs and appears at /srv/name.
+#
+# Two PROGRAMS boot alongside the shell, each with its own actor set:
+#
+#   clock  = front actor + a spinner actor that NEVER yields and never
+#            blocks -- pure fuel-based preemption keeps the shell alive.
+#            serves /srv/clock/{ticks,readme}; every few ticks it writes
+#            "clock: tick N" to /dev/term through the namespace.
+#   greet  = front actor + worker actor. `write /srv/greet <name>` makes
+#            the front ACK immediately and hand the job to its worker,
+#            which composes the greeting and writes it to /dev/term --
+#            a message that hops shell -> vfs -> front -> worker -> vfs
+#            -> termSrv -> terminal, every hop a per-sender channel.
+#
+# What the new runtime buys, visibly:
+#   - rpc is now `send; receiveRes` -- the stash-and-replay machinery
+#     that v1 needed to survive the reply/keyboard interleave is DELETED.
+#     Selective receive over per-sender channels made the bug
+#     unrepresentable instead of handled.
+#   - the fronts serve vfs requests and their internal traffic from the
+#     same fair receive; while they wait on an RPC of their own,
+#     receiveRes skips past queued requests without disturbing them.
+#   - the spinner burns CPU forever; type at the prompt anyway.
+
+# ---- protocol ---------------------------------------------------------
+
+Req = Type (Ls Int | Cat Int | Stat Int | Write Int Int | Mount Int Int).
+
+# messages to the terminal: keyboard lines and app notices
+TMsg = Type (Line Int | Notice Int).
+
+# app-internal messages
+CMsg = Type (Tick Int).
+GMsg = Type (Job Int).
+
+# ---- the namespace tree ------------------------------------------------
+
+Node = Type (FNode Int | DNode Int | MNode Int).
+Res = Type (RFound Int | RMount Int Int | RErr Int).
+
+# ---- tiny console over raw MMIO (registers passed in, never remade) ----
+
+isOdd v = v - (v / 2) * 2 == 1.
+
+putc con c =
+  (lsr, dat) = con;
+  putcW lsr dat c.
+putcW lsr dat c = putcV lsr dat c (read lsr).
+putcV lsr dat c v =
+  case isOdd (v / 32) of
+    True -> write dat c
+  | False -> putcW lsr dat c.
+
+puts con s = putsFrom con s 1 (strlen s).
+putsFrom con s i n =
+  case i > n of
+    True -> Unit
+  | False -> putc con (charAt s i) >> putsFrom con s (i + 1) n.
+
+nl con = putc con 13 >> putc con 10.
+putLn con s = puts con s >> nl con.
+
+getc me con =
+  (lsr, dat) = con;
+  getcW me lsr dat.
+getcW me lsr dat = getcV me lsr dat (read lsr).
+getcV me lsr dat v =
+  case isOdd v of
+    True -> read dat
+  | False -> yield me >> getcW me lsr dat.
+
+# ---- string / list utilities -------------------------------------------
+
+revGo xs acc = case xs of Nil -> acc | x :: r -> revGo r (x :: acc).
+revList xs = revGo xs Nil.
+
+strInit s = strTakeGo s 1 (strlen s - 1) "".
+strTakeGo s i n acc =
+  case i > n of
+    True -> acc
+  | False -> strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
+
+split c s = splitGo c s 1 (strlen s) "" Nil.
+splitGo c s i n cur acc =
+  case i > n of
+    True -> revList (pushTok cur acc)
+  | False -> splitCh c s i n cur acc (charAt s i).
+splitCh c s i n cur acc ch =
+  case ch == c of
+    True -> splitGo c s (i + 1) n "" (pushTok cur acc)
+  | False -> splitGo c s (i + 1) n (strcat cur (chr ch)) acc.
+pushTok cur acc = case cur == "" of True -> acc | False -> cur :: acc.
+
+joinSp xs = case xs of Nil -> "" | x :: r -> joinGo x r.
+joinGo acc r = case r of Nil -> acc | x :: rest -> joinGo (strcat acc (strcat " " x)) rest.
+
+# ---- paths ---------------------------------------------------------------
+
+normGo stack segs =
+  case segs of
+    Nil -> revList stack
+  | seg :: rest -> normSeg stack rest seg.
+normSeg stack rest seg =
+  case seg of
+    "." -> normGo stack rest
+  | ".." -> normGo (dropTop stack) rest
+  | _ -> normGo (seg :: stack) rest.
+dropTop st = case st of Nil -> Nil | _ :: r -> r.
+
+absPath cwd s =
+  case strlen s == 0 of
+    True -> cwd
+  | False -> absPath1 cwd s.
+absPath1 cwd s =
+  case charAt s 1 == 47 of
+    True -> normGo Nil (split 47 s)
+  | False -> normGo (revList cwd) (split 47 s).
+
+renderPath p = case p of Nil -> "/" | _ -> renderGo p "".
+renderGo p acc =
+  case p of
+    Nil -> acc
+  | s :: r -> renderGo r (strcat acc (strcat "/" s)).
+
+# ---- VFS resolution ------------------------------------------------------
+
+lookupE name entries =
+  case entries of
+    Nil -> Err "no such entry"
+  | (len, lnode) :: lrest -> lookupHit name lnode lrest (len == name).
+lookupHit name node rest hit =
+  case hit of
+    True -> Ok node
+  | False -> lookupE name rest.
+
+resolve node path =
+  case node of
+    MNode h -> RMount h path
+  | FNode c -> resolveFile c path
+  | DNode es -> resolveDir es path.
+resolveFile c path =
+  case path of
+    Nil -> RFound (FNode c)
+  | _ -> RErr "not a directory".
+resolveDir es path =
+  case path of
+    Nil -> RFound (DNode es)
+  | seg :: rest -> resolveChild seg rest es.
+resolveChild seg rest es =
+  case lookupE seg es of
+    Ok child -> resolve child rest
+  | Err _ -> RErr "no such path".
+
+reqPath r = case r of Ls p -> p | Cat p -> p | Stat p -> p | Write p _ -> p | _ -> Nil.
+reqWith r p = case r of Ls _ -> Ls p | Cat _ -> Cat p | Stat _ -> Stat p | Write _ c -> Write p c | _ -> r.
+
+# local answers (never sees MNode: resolve already peeled those off)
+answer req node =
+  case req of
+    Ls _ -> answerLs node
+  | Cat _ -> answerCat node
+  | Stat _ -> answerStat node
+  | Write _ _ -> Err "read-only (writes only land on live mounts: try /dev/term or /srv/greet)"
+  | _ -> Err "unsupported".
+answerLs node =
+  case node of
+    DNode es -> Ok (decorate es)
+  | _ -> Err "not a directory".
+decorate es =
+  case es of
+    Nil -> Nil
+  | (den, denode) :: derest -> decor1 den denode :: decorate derest.
+decor1 n node =
+  case node of
+    DNode _ -> strcat n "/"
+  | MNode _ -> strcat n "@"
+  | FNode _ -> n.
+answerCat node = case node of FNode c -> Ok c | _ -> Err "is a directory".
+answerStat node = case node of FNode _ -> Ok "file" | _ -> Ok "dir".
+
+# ---- dynamic mounts: /srv ------------------------------------------------
+# Mount name h grafts ("name", MNode h) into the "srv" directory. The
+# tree is immutable data; the vfs loop just tail-recurses on the new one.
+
+mountAt tree name h =
+  case tree of
+    DNode ents -> DNode (graftSrv ents name h)
+  | _ -> tree.
+graftSrv ents name h =
+  case ents of
+    Nil -> Nil
+  | (grn, grnode) :: grrest -> graftHit grn grnode grrest name h (grn == "srv").
+graftHit n node rest name h hit =
+  case hit of
+    True -> (n, srvAdd node name h) :: rest
+  | False -> (n, node) :: graftSrv rest name h.
+srvAdd node name h = case node of DNode es -> DNode ((name, MNode h) :: es) | _ -> node.
+
+# ---- the VFS actor -------------------------------------------------------
+# NON-BLOCKING: a forward passes the ORIGINAL replyTo, so the mounted
+# app answers the client directly and the vfs immediately serves its
+# next request. The vfs holds no conversation state and never waits --
+# which is exactly why programs that are THEMSELVES mounts can safely
+# RPC through it (clock writing to /dev/term while someone cats
+# /srv/clock/ticks: no relay, no cycle, no deadlock).
+
+vfs tree me = vfsLoop me tree.
+vfsLoop me tree =
+  m = receive me;
+  case m of
+    (replyTo, req) -> vfsHandle me tree replyTo req m
+  | _ -> vfsLoop me tree.
+vfsHandle me tree replyTo req m =
+  _ = drop m;
+  case req of
+    Mount name h -> send replyTo (Ok "mounted at /srv/{name}") >> vfsLoop me (mountAt tree name h)
+  | _ -> vfsDispatch replyTo req (resolve tree (reqPath req)) >> vfsLoop me tree.
+vfsDispatch replyTo req res =
+  case res of
+    RFound node -> send replyTo (answer req node)
+  | RErr msg -> send replyTo (Err msg)
+  | RMount h rest -> send h (replyTo, reqWith req rest).
+
+# ---- rpc: send, then selectively receive the reply -------------------------
+# The reply may come from the vfs OR directly from whatever mount the
+# request was forwarded to -- the client doesn't know and doesn't care:
+# receiveRes takes the next Ok/Err from ANY per-sender channel, skipping
+# past (and preserving) everything else. vfsh v1's stash-and-replay
+# emulation of exactly this is gone.
+
+rpc me v req = send v (me, req) >> receiveRes me.
+
+# ---- /dev/term: the terminal as a file -------------------------------------
+# A Write here becomes a Notice message to actor 0. Reply FIRST, notify
+# second: if the writer is main itself (write /dev/term hi), the reply
+# must be at the head of this channel when receiveRes scans it.
+
+termSrv term me = tsLoop term me.
+tsLoop term me =
+  m = receive me;
+  case m of
+    (replyTo, req) -> tsServe term replyTo req >> drop m >> tsLoop term me
+  | _ -> tsLoop term me.
+tsServe term replyTo req =
+  case req of
+    Write p s -> tsWrite term replyTo p s
+  | Ls p -> send replyTo (tsLs p)
+  | Cat p -> send replyTo (tsCat p)
+  | Stat p -> send replyTo (Ok "file")
+  | _ -> send replyTo (Err "unsupported").
+tsWrite term replyTo p s =
+  case p of
+    Nil -> send replyTo (Ok "delivered to actor 0") >> send term (Notice s)
+  | _ -> send replyTo (Err "not a directory").
+tsLs p = Err "not a directory".
+tsCat p =
+  case p of
+    Nil -> Ok "the terminal. write here and the text becomes a Notice message to actor 0"
+  | _ -> Err "not a directory".
+
+# ---- /proc: answers from live hardware and the live runtime ----------------
+
+procApp mt me = procLoop mt me.
+procLoop mt me =
+  m = receive me;
+  case m of
+    (replyTo, req) -> send replyTo (procAnswer mt req) >> drop m >> procLoop mt me
+  | _ -> procLoop mt me.
+procAnswer mt req =
+  case req of
+    Ls p -> procLs p
+  | Cat p -> procCat mt p
+  | Stat p -> procStat p
+  | _ -> Err "read-only".
+procLs p = case p of Nil -> Ok ["uptime", "arc", "heap", "fuel"] | _ -> Err "not a directory".
+procCat mt p =
+  case p of
+    "uptime" :: Nil -> Ok "mtime = {read mt} ticks   (read from the CLINT the moment you ran cat)"
+  | "arc" :: Nil -> Ok "arc live objects: {arcLive 0}"
+  | "heap" :: Nil -> Ok "heap claimed: {heapUsed 0} bytes"
+  | "fuel" :: Nil -> Ok "quantum {fuelQuantum 0} calls/slice; preemptions so far: {fuelPreempts 0}"
+  | Nil -> Err "is a directory"
+  | _ -> Err "no such file".
+procStat p =
+  case p of
+    Nil -> Ok "dir"
+  | _ :: Nil -> Ok "file"
+  | _ -> Err "no such path".
+
+# ---- /apps/counter: unchanged from v1 (reads bump live state) --------------
+
+counterApp me = counterSrv me 0.
+counterSrv me n =
+  m = receive me;
+  case m of
+    (replyTo, req) -> counterStep me n replyTo req m
+  | _ -> counterSrv me n.
+counterStep me n replyTo req m =
+  _ = send replyTo (counterAnswer n req);
+  _ = drop m;
+  counterSrv me (counterNext n req).
+counterNext n req = case req of Cat p -> counterBump n p | _ -> n.
+counterBump n p = case p of "value" :: Nil -> n + 1 | _ -> n.
+counterAnswer n req =
+  case req of
+    Ls p -> counterLs p
+  | Cat p -> counterCat n p
+  | Stat p -> counterStat p
+  | _ -> Err "unsupported".
+counterLs p = case p of Nil -> Ok ["value", "readme"] | _ -> Err "not a directory".
+counterCat n p =
+  case p of
+    "value" :: Nil -> Ok "{n}"
+  | "readme" :: Nil -> Ok "each cat of value bumps a live actor; the number is its state"
+  | Nil -> Err "is a directory"
+  | _ -> Err "no such file".
+counterStat p =
+  case p of
+    Nil -> Ok "dir"
+  | "value" :: Nil -> Ok "file"
+  | "readme" :: Nil -> Ok "file"
+  | _ -> Err "no such path".
+
+# ==== PROGRAM 1: clock =======================================================
+# Registers /srv/clock, then spawns its spinner. The spinner is the
+# fuel demo: a tail loop that never yields, never blocks, never
+# allocates on the countdown path -- under v1's purely cooperative
+# scheduler it would freeze the machine at boot. The compiler-inserted
+# fuel check at every function entry deschedules it ~each 2000 calls.
+
+clockSpinStart front me2 = clockSpin front 1 1500000.
+clockSpin front n k =
+  case k == 0 of
+    True -> send front (Tick n) >> clockSpin front (n + 1) 1500000
+  | False -> clockSpin front n (k - 1).
+
+clockFront v me =
+  r = rpc me v (Mount "clock" me);
+  _ = drop r;
+  _ = spawn (clockSpinStart me);
+  cfLoop me v 0.
+cfLoop me v n =
+  m = receive me;
+  cfDispatch me v n m.
+cfDispatch me v n m =
+  case m of
+    Tick t -> drop m >> cfTick me v t
+  | (replyTo, req) -> cfServe me v n replyTo req m
+  | _ -> cfLoop me v n.
+cfTick me v t =
+  case t - (t / 4) * 4 == 0 of
+    True -> cfNotify me v t
+  | False -> cfLoop me v t.
+cfNotify me v t =
+  r = rpc me v (Write ("dev" :: "term" :: Nil) "clock: tick {t}");
+  drop r >> cfLoop me v t.
+cfServe me v n replyTo req m =
+  _ = drop m;
+  case req of
+    Ls p -> send replyTo (cfLs p) >> cfLoop me v n
+  | Cat p -> send replyTo (cfCat n p) >> cfLoop me v n
+  | Stat p -> send replyTo (cfStat p) >> cfLoop me v n
+  | _ -> send replyTo (Err "read-only") >> cfLoop me v n.
+cfLs p = case p of Nil -> Ok ["ticks", "readme"] | _ -> Err "not a directory".
+cfCat n p =
+  case p of
+    "ticks" :: Nil -> Ok "{n}"
+  | "readme" :: Nil -> Ok "the tick count of a spinner actor that NEVER yields; fuel preemption keeps this shell alive under it"
+  | Nil -> Err "is a directory"
+  | _ -> Err "no such file".
+cfStat p =
+  case p of
+    Nil -> Ok "dir"
+  | _ :: Nil -> Ok "file"
+  | _ -> Err "no such path".
+
+# ==== PROGRAM 2: greet =======================================================
+# Registers /srv/greet, spawns a worker. `write /srv/greet <name>` --
+# the front ACKs the writer immediately and delegates; the worker
+# composes the greeting and writes it back through the NAMESPACE to
+# /dev/term. Count of greetings served at /srv/greet/count.
+
+greetWorker v me = gwLoop v me.
+gwLoop v me =
+  m = receive me;
+  case m of
+    Job s -> gwRun v me s m
+  | _ -> gwLoop v me.
+gwRun v me s m =
+  r = rpc me v (Write ("dev" :: "term" :: Nil) "greet: hello, {s}!");
+  drop r >> drop m >> gwLoop v me.
+
+greetFront v me =
+  r = rpc me v (Mount "greet" me);
+  _ = drop r;
+  w = spawn (greetWorker v);
+  gfLoop me w 0.
+gfLoop me w n =
+  m = receive me;
+  case m of
+    (replyTo, req) -> gfServe me w n replyTo req m
+  | _ -> gfLoop me w n.
+gfServe me w n replyTo req m =
+  _ = drop m;
+  case req of
+    Write p s -> gfWrite me w n replyTo p s
+  | Ls p -> send replyTo (gfLs p) >> gfLoop me w n
+  | Cat p -> send replyTo (gfCat n p) >> gfLoop me w n
+  | Stat p -> send replyTo (gfStat p) >> gfLoop me w n
+  | _ -> send replyTo (Err "unsupported") >> gfLoop me w n.
+gfWrite me w n replyTo p s =
+  case p of
+    Nil -> send replyTo (Ok "accepted -- a worker actor will greet you") >> send w (Job s) >> gfLoop me w (n + 1)
+  | _ -> send replyTo (Err "no such file") >> gfLoop me w n.
+gfLs p = case p of Nil -> Ok ["count", "readme"] | _ -> Err "not a directory".
+gfCat n p =
+  case p of
+    "count" :: Nil -> Ok "{n} greetings delivered"
+  | "readme" :: Nil -> Ok "write /srv/greet <name> -- the front ACKs, its worker greets you via /dev/term"
+  | Nil -> Err "is a directory"
+  | _ -> Err "no such file".
+gfStat p =
+  case p of
+    Nil -> Ok "dir"
+  | _ :: Nil -> Ok "file"
+  | _ -> Err "no such path".
+
+# ---- the reader actor: UART RX + line editing ------------------------------
+
+reader term con me = readLoop term con me "".
+readLoop term con me buf = readCh term con me buf (getc me con).
+readCh term con me buf c =
+  case c of
+    13 -> readEol term con me buf
+  | 10 -> readEol term con me buf
+  | 8 -> readBs term con me buf
+  | 127 -> readBs term con me buf
+  | _ -> readPr term con me buf c.
+readEol term con me buf =
+  _ = nl con;
+  _ = send term (Line buf);
+  readLoop term con me "".
+readBs term con me buf =
+  case strlen buf == 0 of
+    True -> readLoop term con me buf
+  | False -> putc con 8 >> putc con 32 >> putc con 8 >> readLoop term con me (strInit buf).
+readPr term con me buf c =
+  case c < 32 of
+    True -> readLoop term con me buf
+  | False -> putc con c >> readLoop term con me (strcat buf (chr c)).
+
+# ---- the terminal: an MVU app (actor 0) ------------------------------------
+#   Model = cwd    Msg = Line s (reader) | Notice s (termSrv)
+# No pending stash, no rpcWait: per-sender channels + receiveRes replaced
+# ~20 lines of interleave-defense with nothing.
+
+termLoop me v con cwd =
+  _ = puts con "qos:" >> puts con (renderPath cwd) >> puts con "$ ";
+  termMsg me v con cwd (receive me).
+termMsg me v con cwd m =
+  case m of
+    Line s -> termParse me v con cwd m (split 32 s)
+  | Notice s -> termNotice me v con cwd m s
+  | _ -> termLoop me v con cwd.
+termNotice me v con cwd m s =
+  _ = nl con;
+  _ = putLn con "[term] {s}";
+  _ = drop m;
+  termLoop me v con cwd.
+termParse me v con cwd m toks =
+  _ = drop m;
+  termExec me v con cwd toks.
+termExec me v con cwd toks =
+  case toks of
+    Nil -> termLoop me v con cwd
+  | cmd :: args -> termCmd me v con cwd cmd args.
+termCmd me v con cwd cmd args =
+  case cmd of
+    "help" -> doHelp con >> termLoop me v con cwd
+  | "pwd" -> putLn con (renderPath cwd) >> termLoop me v con cwd
+  | "ls" -> doLs me v con cwd args
+  | "cd" -> doCd me v con cwd args
+  | "cat" -> doCat me v con cwd args
+  | "stat" -> doStat me v con cwd args
+  | "write" -> doWrite me v con cwd args
+  | "exit" -> putLn con "halting."
+  | _ -> putLn con "{cmd}: unknown command   (try help)" >> termLoop me v con cwd.
+
+doHelp con =
+  putLn con "ls [p]      cd [p]      cat p      stat p      pwd      exit"
+    >> putLn con "write p text...   write to a url; on a live mount it becomes a message"
+    >> putLn con "programs register at /srv@; the terminal itself is /dev/term"
+    >> putLn con "try: ls /srv ; cat /srv/clock/ticks ; write /srv/greet ada"
+    >> putLn con "     write /dev/term hi ; cat /proc/fuel ; cat /apps/counter/value".
+
+argPath cwd args = case args of Nil -> cwd | a :: _ -> absPath cwd a.
+
+doLs me v con cwd args =
+  r = rpc me v (Ls (argPath cwd args));
+  renderLs con r >> drop r >> termLoop me v con cwd.
+renderLs con r =
+  case r of
+    Ok entries -> lsPrint con entries
+  | Err m -> putLn con "ls: {m}".
+lsPrint con es = case es of Nil -> Unit | e :: rest -> putLn con e >> lsPrint con rest.
+
+doCat me v con cwd args =
+  case args of
+    Nil -> putLn con "cat: missing operand" >> termLoop me v con cwd
+  | a :: _ -> doCat1 me v con cwd a.
+doCat1 me v con cwd a =
+  r = rpc me v (Cat (absPath cwd a));
+  renderCat con r >> drop r >> termLoop me v con cwd.
+renderCat con r = case r of Ok c -> putLn con c | Err m -> putLn con "cat: {m}".
+
+doStat me v con cwd args =
+  case args of
+    Nil -> putLn con "stat: missing operand" >> termLoop me v con cwd
+  | a :: _ -> doStat1 me v con cwd a.
+doStat1 me v con cwd a =
+  r = rpc me v (Stat (absPath cwd a));
+  renderStat con r >> drop r >> termLoop me v con cwd.
+renderStat con r = case r of Ok k -> putLn con k | Err m -> putLn con "stat: {m}".
+
+doWrite me v con cwd args =
+  case args of
+    Nil -> putLn con "write: usage: write <path> <text...>" >> termLoop me v con cwd
+  | p :: rest -> doWrite1 me v con cwd p rest.
+doWrite1 me v con cwd p rest =
+  r = rpc me v (Write (absPath cwd p) (joinSp rest));
+  renderWrite con r >> drop r >> termLoop me v con cwd.
+renderWrite con r = case r of Ok s -> putLn con s | Err m -> putLn con "write: {m}".
+
+doCd me v con cwd args =
+  case args of
+    Nil -> termLoop me v con Nil
+  | a :: _ -> doCd1 me v con cwd (absPath cwd a).
+doCd1 me v con cwd p =
+  r = rpc me v (Stat p);
+  cdFinish me v con cwd p r.
+cdFinish me v con cwd p r =
+  case r of
+    Ok "dir" -> drop r >> termLoop me v con p
+  | Ok _ -> putLn con "cd: not a directory" >> drop r >> termLoop me v con cwd
+  | Err m -> putLn con "cd: {m}" >> drop r >> termLoop me v con cwd.
+
+# ---- boot: build the world, start the programs, become the terminal --------
+
+buildTree proc counter tsrv =
+  DNode
+    [ ("etc", DNode
+        [ ("motd", FNode "the machine is a namespace; the namespace is mostly actors"),
+          ("hostname", FNode "qos-hub"),
+          ("version", FNode "fpriscrv vfsh 0.2 -- per-sender mailboxes, fuel scheduling, /srv programs")
+        ]),
+      ("dev", DNode
+        [ ("uart0", FNode "ns16550a @ 0x10000000  (you are talking through it right now)"),
+          ("clint", FNode "clint @ 0x02000000  (mtime feeds /proc/uptime)"),
+          ("term", MNode tsrv)
+        ]),
+      ("apps", DNode [("counter", MNode counter)]),
+      ("proc", MNode proc),
+      ("srv", DNode Nil)
+    ].
+
+main =
+  me = myself 0;
+  u = device "uart";
+  cl = device "clint";
+  con = (reg8 u 5, reg8 u 0);
+  mt = reg32 cl 49144;
+  tsrv = spawn (termSrv me);
+  proc = spawn (procApp mt);
+  counter = spawn (counterApp);
+  v = spawn (vfs (buildTree proc counter tsrv));
+  _ = spawn (clockFront v);
+  _ = spawn (greetFront v);
+  _ = spawn (reader me con);
+  _ = nl con >> putLn con "qos vfsh2 -- programs in the namespace, per-sender mailboxes, fuel scheduling";
+  _ = putLn con "two programs booted with the shell: ls /srv   (clock never yields; type anyway)";
+  _ = putLn con "type help for commands";
+  termLoop me v con Nil.

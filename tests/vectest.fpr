@@ -1,0 +1,36 @@
+# vectest.fpr -- the SoA VList through the generic tier.
+
+double n = n * 2.
+c3 n = n * 3 + 1.
+keepBig n = n > 6.
+addP a p = case p of (k, v) -> a + k * v.
+sumf a n = a + n.
+
+main =
+  # scalar Int vector: one unboxed column
+  v = Vec.new Unit;
+  v2 = Vec.push 1 v;
+  v3 = Vec.push 2 v2;
+  v4 = Vec.push 3 v3;
+  (n, v5) = Vec.len v4;
+  _ = print "len = {n}";
+  (a, v6) = Vec.get 2 v5;
+  _ = print "get 2 = {a}";
+  v7 = Vec.map c3 v6;
+  _ = print "after map (3n+1): {Vec.toList v7}";
+
+  # a fresh one straight from a list, filter + fold
+  w = Vec.fromList (fromTo 1 10);
+  w2 = Vec.filter keepBig w;
+  (s, w3) = Vec.fold sumf 0 w2;
+  _ = print "sum of [7..10] = {s}";
+  _ = Vec.free w3;
+
+  # SoA: (Int, Int) tuples become two unboxed columns
+  p = Vec.fromList [(1, 10), (2, 20), (3, 30)];
+  (kv, p2) = Vec.get 3 p;
+  _ = print "soa get 3 = {kv}";
+  (dot, p3) = Vec.fold addP 0 p2;
+  _ = print "sum k*v = {dot}";
+  _ = Vec.free p3;
+  print "vec generic tier OK".

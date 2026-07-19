@@ -1,0 +1,65 @@
+# bbspi.fpr -- signal-level verification of the whole pin path:
+# FPRISC drives SPI down through the HAL onto pins; the sim's trace
+# records every edge; this test DECODES THE WAVEFORM back into bytes
+# (sampling mosi at each sck rising edge, exactly as a slave would)
+# and requires the decode to match what was sent.  Also: full-duplex
+# echo through a mosi->miso jumper, and the OLED driver's init
+# sequence verified byte-for-byte off the wire.
+S = use "../programs/mods/bbspi.fpr".
+O = use "../programs/mods/oled.fpr".
+sck = 2. mosi = 3. cs = 4. dc = 5. miso = 6.
+
+main =
+  _ = S.init Pin.mode sck mosi cs miso;
+  _ = Pin.wire mosi miso;                 # loopback jumper
+  _ = Pin.tclear Unit;
+  echo = S.xfer (Pin.write, Pin.read, sck, mosi, miso) "\xA5\x3C\xFF\x00Q";
+  _ = print "echo ok: {strEq echo (strcat (chr 165) (strcat (chr 60) (strcat (chr 255) (strcat (chr 0) (chr 81)))))}";
+  dec = decodeTrace Unit;
+  _ = print "wire decode: [{hexS dec}]";
+  _ = print "wire matches sent: {strEq dec (strcat (chr 165) (strcat (chr 60) (strcat (chr 255) (strcat (chr 0) (chr 81)))))}";
+  _ = Pin.mode dc 1;
+  _ = Pin.tclear Unit;
+  _ = O.cmd Pin.write Pin.read (sck, mosi, cs, dc) miso (O.initSeq Unit);
+  odec = decodeTrace Unit;
+  _ = print "oled init on the wire: [{hexS odec}]";
+  _ = print "oled init correct: {strEq odec (O.initSeq Unit)}";
+  print "bbspi done".
+
+strEq a b = case strlen a == strlen b of False -> False | True -> seGo a b 1.
+seGo a b i =
+  case i > strlen a of
+    True -> True
+  | False -> case charAt a i == charAt b i of
+      True -> seGo a b (i + 1)
+    | False -> False.
+
+# replay the trace: track mosi level; sample it at every sck 0->1 edge
+decodeTrace u = dtGo 1 (Pin.tlen Unit) 0 0 0 0 "".
+dtGo i n mo sl bits acc out =
+  case i > n of
+    True -> out
+  | False -> dtEv i n mo sl bits acc out (Pin.tget i).
+dtEv i n mo sl bits acc out ev =
+  p = ev / 2;
+  v = ev - p * 2;
+  case p == 3 of
+    True -> dtGo (i + 1) n v sl bits acc out
+  | False -> case p == 2 of
+      True -> dtClk i n mo sl v bits acc out
+    | False -> dtGo (i + 1) n mo sl bits acc out.
+dtClk i n mo sl v bits acc out =
+  case and2 (sl == 0) (v == 1) of
+    True -> dtBit i n mo v (bits + 1) (acc * 2 + mo) out
+  | False -> dtGo (i + 1) n mo v bits acc out.
+dtBit i n mo sl bits acc out =
+  case bits == 8 of
+    True -> dtGo (i + 1) n mo sl 0 0 (strcat out (chr acc))
+  | False -> dtGo (i + 1) n mo sl bits acc out.
+and2 a b = case a of True -> b | False -> False.
+hexS s = hxGo s 1 "".
+hxGo s i acc =
+  case i > strlen s of
+    True -> acc
+  | False -> hxGo s (i + 1) (strcat acc (strcat (hx (charAt s i / 16)) (strcat (hx (charAt s i - (charAt s i / 16) * 16)) " "))).
+hx d = case d < 10 of True -> chr (48 + d) | False -> chr (87 + d).

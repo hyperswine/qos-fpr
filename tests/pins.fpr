@@ -1,0 +1,25 @@
+# pins.fpr -- the raw Pin tier + the matrix scan over it, sim-proven:
+# Pin.wire emulates a keypress by jumpering a driven row to a column.
+K = use "../programs/mods/matrixkpd.fpr".
+rows = 4 :: 5 :: 6 :: 7 :: Nil.
+cols = 8 :: 9 :: 10 :: 11 :: Nil.
+main =
+  _ = Pin.mode 0 1;
+  _ = Pin.write 0 1;
+  _ = print "out latch readback = {Pin.read 0}";
+  _ = Pin.mode 1 0;
+  _ = Pin.wire 0 1;
+  _ = print "wired in-pin reads = {Pin.read 1}";
+  _ = Pin.write 0 0;
+  _ = print "after low: in-pin = {Pin.read 1}";
+  _ = K.init Pin.mode rows cols;
+  _ = print "no press: key = {K.scan Pin.write Pin.read rows cols}";
+  _ = print "no press2: key = {K.scan Pin.write Pin.read rows cols}";
+  _ = Pin.wire 5 9;                # row 2 -> col 2: the '5' key held down
+  k = K.scan Pin.write Pin.read rows cols;
+  _ = print "pressed (row2-col2 jumper): key = {chr k}";
+  _ = print "still wired: key = {chr (K.scan Pin.write Pin.read rows cols)}";
+  _ = Pin.wire 99 9;               # release (out-of-range src = unwire)
+  _ = print "released check";
+  _ = print "released: key = {K.scan Pin.write Pin.read rows cols}";
+  print "pins done".

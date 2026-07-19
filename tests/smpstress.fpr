@@ -1,0 +1,36 @@
+# smpstress.fpr -- hammers the cross-hart block/wake protocol: 20000
+# blocking round trips between hart 0 and hart 1.  Every trip is a full
+# block/wake on BOTH sides (no batching), so one lost wakeup anywhere
+# hangs the machine and the deadlock detector names it.
+#
+# ARC discipline: this PoC has no RC-insertion pass, so programs drop
+# received heap messages by hand (same as actors.fpr) -- 20000 trips
+# would otherwise fill the 1024-entry ARC table with one-shot tuples.
+
+echoSrv self =
+  m = receive self;
+  case m of
+    (parent, n) ->
+      case n == 0 of
+        True  -> drop m
+      | False -> (send parent (Ok n)) >> (drop m) >> echoSrv self.
+
+trip me w i =
+  _ = send w (me, i);
+  m = receiveRes me;
+  r = case m of Ok x -> x;
+  _ = drop m;
+  r.
+
+pump me w i =
+  case i == 0 of
+    True  -> 0
+  | False -> (trip me w i) >> pump me w (i - 1).
+
+main =
+  me = myself 0;
+  w = spawnOn 1 echoSrv;
+  _ = pump me w 20000;
+  _ = send w (me, 0);
+  _ = print "20000 cross-hart blocking round trips survived";
+  print "arc live at exit: {arcLive 0}, fuel preempts: {fuelPreempts 0}".

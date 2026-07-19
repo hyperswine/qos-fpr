@@ -1,0 +1,8 @@
+# smpdead.fpr -- intentional cross-hart deadlock: two actors on two
+# harts each waiting for the other to speak first.  The detector must
+# PANIC (loudly), not hang.
+shy self = case receive self of (p, n) -> send p (Ok n).
+main =
+  me = myself 0;
+  w = spawnOn 1 shy;
+  case receiveRes me of Ok r -> print "unreachable {r}".

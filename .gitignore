@@ -1,0 +1,6 @@
+*.elf
+fprc
+dist-newstyle/
+target/
+*.img
+zip-project.sh

@@ -1,0 +1,47 @@
+# smp.fpr -- multi-hart smoke: spawnOn, cross-hart SPSC messages both
+# directions, ARC across harts, selective receive under concurrency,
+# and a par2 block group whose worker PROVABLY ran on the other hart.
+
+# worker: reports its hart to the parent, then serves until :stop
+worker self =
+  case receive self of
+    (parent, n) -> (send parent (parent, hartId 0)) >> serve self.
+
+serve self =
+  case receive self of
+    (parent, n) ->
+      case n == 0 of
+        True  -> 0
+      | False -> (send parent (Ok (n * 2))) >> serve self.
+
+whereRan x = hartId 0.
+
+getHart me = case receive me of (p, h) -> h.
+getRes me = case receiveRes me of Ok r -> r.
+
+main =
+  me = myself 0;
+  _ = print "main on hart {hartId 0} of {harts 0}";
+
+  w = spawnOn 1 worker;
+  _ = send w (me, 0);
+  wh = getHart me;
+  _ = print "worker lives on hart {wh}";
+
+  # ping-pong across harts: two requests, FIFO per sender
+  _ = send w (me, 21);
+  _ = send w (me, 100);
+  a = getRes me;
+  b = getRes me;
+  _ = print "cross-hart doubles: {a} {b}";
+
+  # a third round trip after traffic: channel indices keep working
+  _ = send w (me, 500);
+  c = getRes me;
+  _ = print "still alive: {c}, arc live = {arcLive 0}";
+  _ = send w (me, 0);   # n = 0 means stop
+
+  # par2 sync group: f runs on hart 1 while g runs here
+  r = par2 1 whereRan 0 whereRan 0;
+  _ = case r of (fa, gb) -> print "par2 group: f ran on hart {fa}, g ran on hart {gb}";
+  print "smp smoke done".

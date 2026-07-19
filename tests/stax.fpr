@@ -1,0 +1,289 @@
+# ============================================================================
+# stax.fpr -- a mini stack language ("Stax") implemented IN FPRISC itself.
+#
+#   source text --parser combinators--> Ast --compiler--> bytecode --VM--> stack
+#
+# Grammar (Forth-flavoured):
+#   prog := term*
+#   term := INT
+#         | 'if' prog ('else' prog)? 'then'      # pops flag, 0 = false
+#         | 'begin' prog 'until'                 # pops flag, loops while 0
+#         | '.'                                  # pop & print
+#         | '+' '-' '*' '/' '=' '<' '>'
+#         | 'dup' 'drop' 'swap' 'over'
+#
+# Parsers are plain values: a parser is a function  String -> Int -> PRes
+# (input + 1-based byte position), built from pok/pfail/pbind/palt.
+# Structured control flow is compiled to absolute jump targets in a single
+# pass by threading the next-address through compileSeq (no backpatching).
+# ============================================================================
+
+# ---------------------------------------------------------------- data types
+
+PRes  = Type (POk a Int | PFail String Int).
+Ast   = Type (ANum Int | APrim String | AIf a b | ALoop a).
+Instr = Type (IPush Int | IOp String | IJz Int | IJmp Int | IPrint).
+
+# ------------------------------------------------------------- little prelude
+
+and2 a b = case a of True -> b | False -> False.
+or2 a b = case a of True -> True | False -> b.
+
+append xs ys = case xs of Nil -> ys | h :: t -> h :: append t ys.
+len xs = case xs of Nil -> 0 | _ :: t -> 1 + len t.
+
+boolToInt b = case b of True -> 1 | False -> 0.
+
+# ---------------------------------------------------------- char classifiers
+
+isDigit b = and2 (b >= 48) (b <= 57).
+isLetter2 b = or2 (and2 (b >= 97) (b <= 122)) (and2 (b >= 65) (b <= 90)).
+isSpace2 b = or2 (b == 32) (or2 (b == 10) (or2 (b == 9) (b == 13))).
+isSym b = or2 (b == 43) (or2 (b == 45) (or2 (b == 42) (or2 (b == 47)
+          (or2 (b == 61) (or2 (b == 60) (or2 (b == 62) (b == 46))))))).
+
+# --------------------------------------------------------- parser combinators
+# parser : String -> Int -> PRes
+
+pok v s i = POk v i.
+pfail m s i = PFail m i.
+
+pbind p f s i = case p s i of
+    POk v j -> f v s j
+  | PFail m j -> PFail m j.
+
+palt p q s i = case p s i of
+    POk v j -> POk v j
+  | PFail _ _ -> q s i.
+
+pmapK f v = pok (f v).
+pmap f p s i = pbind p (pmapK f) s i.
+
+# ------------------------------------------------------------ char-level bits
+
+skipWs s i | i > String.len s = i.
+skipWs s i = skipWsB (charAt s i) s i.
+skipWsB b s i | isSpace2 b = skipWs s (i + 1).
+skipWsB b s i = i.
+
+pdigit s i | i > String.len s = PFail "eof: digit" i.
+pdigit s i = pdigitB (charAt s i) i.
+pdigitB b i | isDigit b = POk (b - 48) (i + 1).
+pdigitB b i = PFail "expected digit" i.
+
+pletter s i | i > String.len s = PFail "eof: letter" i.
+pletter s i = pletterB (charAt s i) i.
+pletterB b i | isLetter2 b = POk b (i + 1).
+pletterB b i = PFail "expected letter" i.
+
+psym s i | i > String.len s = PFail "eof: sym" i.
+psym s i = psymB (charAt s i) i.
+psymB b i | isSym b = POk (chr b) (i + 1).
+psymB b i = PFail "expected symbol" i.
+
+# integer literal: one digit, then greedy accumulation
+pintAcc n s i = case pdigit s i of
+    POk d j -> pintAcc (n * 10 + d) s j
+  | PFail _ _ -> POk n i.
+pint s i = pbind pdigit pintAcc s i.
+
+# word: one letter, then greedy accumulation into a String
+plettersK b = plettersAcc (chr b).
+plettersAcc acc s i = case pletter s i of
+    POk b j -> plettersAcc (strcat acc (chr b)) s j
+  | PFail _ _ -> POk acc i.
+pletters s i = pbind pletter plettersK s i.
+
+pword s i = palt pletters psym s i.
+
+# keyword: a word that must equal k (lexeme)
+pkwChk k w = case w == k of True -> pok 1 | False -> pfail "expected {k}".
+pkwRaw k s i = pbind pletters (pkwChk k) s i.
+pkw k s i = pkwRaw k s (skipWs s i).
+
+# ------------------------------------------------------------ grammar parsers
+
+pnumT s i = pmap ANum pint s i.
+
+# word dispatch: keywords open structured forms, anything else is a prim op
+ptermWord w = case w of
+    "if" -> pif
+  | "begin" -> ploop
+  | "else" -> pfail "unexpected else"
+  | "then" -> pfail "unexpected then"
+  | "until" -> pfail "unexpected until"
+  | _ -> pok (APrim w).
+
+pwordT s i = pbind pword ptermWord s i.
+
+ptermRaw s i = palt pnumT pwordT s i.
+pterm s i = ptermRaw s (skipWs s i).
+
+# prog := term*   (never fails; stops at the first non-term)
+pseq s i = case pterm s i of
+    POk t j -> pseqK t s j
+  | PFail _ _ -> POk Nil i.
+pseqK t s j = case pseq s j of
+    POk ts k -> POk (t :: ts) k
+  | PFail m k -> PFail m k.
+
+# if <prog> [else <prog>] then
+pifElse thn s i =
+  pbind (pkw "else") (fn u ->
+    pbind pseq (fn els ->
+      pbind (pkw "then") (fn u2 -> pok (AIf thn els)))) s i.
+pifThen thn s i = pbind (pkw "then") (fn u -> pok (AIf thn Nil)) s i.
+pifK thn = palt (pifElse thn) (pifThen thn).
+pif s i = pbind pseq pifK s i.
+
+# begin <prog> until
+ploop s i = pbind pseq (fn body -> pbind (pkw "until") (fn u -> pok (ALoop body))) s i.
+
+# top level: prog, then require eof (after trailing whitespace)
+parseEof src ts j = case j > String.len src of
+    True -> Ok ts
+  | False -> Err "unexpected input at byte {j}".
+parseFin src r = case r of
+    POk ts j -> parseEof src ts (skipWs src j)
+  | PFail m j -> Err "at byte {j}: {m}".
+parseProg src = parseFin src (pseq src 1).
+
+# ------------------------------------------------- compiler: Ast -> bytecode
+# compileSeq/compileOne thread the next absolute instruction address (1-based)
+# so jump targets are known the moment each instruction is emitted.
+
+compileSeq asts a = case asts of
+    Nil -> (Nil, a)
+  | t :: rest -> compileSeqCons t rest a.
+
+compileSeqCons t rest a =
+  (c1, a1) = compileOne t a;
+  (c2, a2) = compileSeq rest a1;
+  (append c1 c2, a2).
+
+compileOne t a = case t of
+    ANum n -> (IPush n :: Nil, a + 1)
+  | APrim o -> compilePrim o a
+  | AIf thn els -> compileIf thn els a
+  | ALoop b -> compileLoop b a.
+
+compilePrim o a = case o of
+    "." -> (IPrint :: Nil, a + 1)
+  | _ -> (IOp o :: Nil, a + 1).
+
+# layout:  a: jz E | a+1..: thn | at: jmp D | E=at+1..: els | D=ae: ...
+compileIf thn els a =
+  (ct, at) = compileSeq thn (a + 1);
+  (ce, ae) = compileSeq els (at + 1);
+  (append (IJz (at + 1) :: ct) (IJmp ae :: ce), ae).
+
+# layout:  a..: body | ab: jz a  (loop while popped flag is 0)
+compileLoop b a =
+  (cb, ab) = compileSeq b a;
+  (append cb (IJz a :: Nil), ab + 1).
+
+# --------------------------------------------------------- bytecode VM
+# stack is a List Int, head = top of stack
+
+# NB: dispatch on the op string FIRST (one test per arm), then match the
+# stack in a small helper. A single case over (op, stack) tuples makes the
+# match compiler duplicate the fallthrough chain at every sub-test -->
+# exponential Core. Two shallow cases keep it linear.
+addI a b = a + b.
+subI a b = a - b.
+mulI a b = a * b.
+divI a b = a / b.
+eqI a b = boolToInt (a == b).
+ltI a b = boolToInt (a < b).
+gtI a b = boolToInt (a > b).
+
+binOp f st = case st of
+    b :: rest -> binOp2 f b rest
+  | Nil -> error "vm: stack underflow (need 2)".
+binOp2 f b st = case st of
+    a :: r -> f a b :: r
+  | Nil -> error "vm: stack underflow (need 2)".
+
+applyOp o st = case o of
+    "+" -> binOp addI st
+  | "-" -> binOp subI st
+  | "*" -> binOp mulI st
+  | "/" -> binOp divI st
+  | "=" -> binOp eqI st
+  | "<" -> binOp ltI st
+  | ">" -> binOp gtI st
+  | "dup" -> dupOp st
+  | "drop" -> dropOp st
+  | "swap" -> binOp2K swapK st
+  | "over" -> binOp2K overK st
+  | _ -> error "vm: unknown op '{o}'".
+
+dupOp st = case st of x :: r -> x :: x :: r | Nil -> error "vm: stack underflow".
+dropOp st = case st of _ :: r -> r | Nil -> error "vm: stack underflow".
+
+# k receives (top, second, rest)
+swapK t s r = s :: t :: r.
+overK t s r = s :: t :: s :: r.
+binOp2K k st = case st of
+    t :: rest -> binOp2K2 k t rest
+  | Nil -> error "vm: stack underflow (need 2)".
+binOp2K2 k t st = case st of
+    s :: r -> k t s r
+  | Nil -> error "vm: stack underflow (need 2)".
+
+runVM code n pc st = case pc > n of
+    True -> st
+  | False -> step code n pc (code ! pc) st.
+
+step code n pc ins st = case ins of
+    IPush v -> runVM code n (pc + 1) (v :: st)
+  | IOp o -> runVM code n (pc + 1) (applyOp o st)
+  | IJmp t -> runVM code n t st
+  | IJz t -> stepJz code n pc t st
+  | IPrint -> stepPrint code n pc st.
+
+stepJz code n pc t st = case st of
+    0 :: rest -> runVM code n t rest
+  | _ :: rest -> runVM code n (pc + 1) rest
+  | Nil -> error "vm: jz: stack underflow".
+
+stepPrint code n pc st = case st of
+    x :: rest -> print "  output: {x}" >> runVM code n (pc + 1) rest
+  | Nil -> error "vm: print: stack underflow".
+
+# ------------------------------------------------------------- driver / demos
+
+showIns ins = case ins of
+    IPush n -> "push {n}"
+  | IOp o -> "{o}"
+  | IJz t -> "jz {t}"
+  | IJmp t -> "jmp {t}"
+  | IPrint -> "print".
+
+showCode k code = case code of
+    Nil -> ""
+  | ins :: rest -> strcat "{k}:{showIns ins}  " (showCode (k + 1) rest).
+
+execGo code =
+  print "  bytecode: {showCode 1 code}" >>
+  print "  final stack: {runVM code (len code) 1 Nil}".
+
+execC p = case p of (code, _) -> execGo code.
+
+execP r = case r of
+    Err m -> print "  PARSE ERROR: {m}"
+  | Ok ast -> execC (compileSeq ast 1).
+
+exec name src =
+  print "== {name}: \"{src}\"" >>
+  execP (parseProg src).
+
+main =
+  exec "arith" "1 2 + 3 4 + *" >>
+  exec "compare" "10 3 - 6 > if 1 else 0 then ." >>
+  exec "conditional" "7 dup 5 < if 100 + else 1000 + then ." >>
+  exec "nested if" "1 if 2 if 30 then 40 then" >>
+  exec "factorial 5" "1 5 begin swap over * swap 1 - dup 0 = until drop ." >>
+  exec "sum 1..10" "0 10 begin swap over + swap 1 - dup 0 = until drop ." >>
+  exec "parse error" "3 4 if +" >>
+  print :done.

@@ -1,0 +1,30 @@
+# slotclobber.fpr -- the FIXED frame-undercount regression.  Root
+# cause: slotsNeeded's isKnown omitted the cross-unit ext map, so a
+# 3-arg module call's arg spills went uncounted, the frame came up one
+# slot short, a temp spilled BELOW sp, and the timer trap -- which
+# uses the stack below sp asynchronously -- ate it when it fired in
+# the window; the clobbered slot was later read as a list and the
+# Nil/Cons case met garbage.  Hence every symptom: timing-dependent,
+# frame-shape-dependent, and rv32-immune (4-byte slots kept the same
+# count inside the scaled frame).  This file is the shape that caught
+# it; it must run to completion forever.
+K = use "../programs/mods/matrixkpd.fpr".
+rows = 4 :: 5 :: 6 :: 7 :: Nil.
+cols = 8 :: 9 :: 10 :: 11 :: Nil.
+main =
+  _ = Pin.mode 0 1;
+  _ = Pin.write 0 1;
+  _ = print "out latch readback = {Pin.read 0}";
+  _ = Pin.mode 1 0;
+  _ = Pin.wire 0 1;
+  _ = print "wired in-pin reads = {Pin.read 1}";
+  _ = Pin.write 0 0;
+  _ = print "after low: in-pin = {Pin.read 1}";
+  _ = K.init Pin.mode rows cols;
+  _ = print "no press: key = {K.scan Pin.write Pin.read rows cols}";
+  _ = Pin.wire 5 9;
+  k = K.scan Pin.write Pin.read rows cols;
+  _ = print "pressed (row2-col2 jumper): key = {chr k}";
+  _ = Pin.wire (0 - 1) 9;
+  _ = print "released: key = {K.scan Pin.write Pin.read rows cols}";
+  print "pins done".

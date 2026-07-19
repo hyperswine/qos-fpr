@@ -1,0 +1,40 @@
+uart = device "uart" .
+putc c =
+  v = read (reg8 uart 5);
+  case BITTEST v 5 of
+    True -> write (reg8 uart 0) c
+  | False -> putc c . # if the transmit buffer is full, wait until it is not
+puts s = putsFrom s 1 .
+putsFrom s i =
+  n = strlen s;
+  case i > n of True -> Unit | False -> putc (charAt s i) >> putsFrom s (i + 1) .
+nl = putc 13 >> putc 10 .
+
+# a hop first learns its neighbor (first message), then relays tokens.
+hop me =
+  to = receive me;
+  hopLoop to me .
+
+hopLoop to me =
+  m = receive me;
+  case m of
+    (home, n) ->
+      case n == 0 of
+        True -> send home 0 >> drop m >> hopLoop to me
+      | False -> send to (home, n - 1) >> drop m >> hopLoop to me .
+
+main =
+  me = myself 0;
+  _ = puts "token ring: 4 actors in a true cycle, 100000 hops" >> nl;
+  a = spawn hop;
+  b = spawn hop;
+  c = spawn hop;
+  d = spawn hop;
+  _ = send a b;   # tie the knot: neighbors delivered as first messages
+  _ = send b c;
+  _ = send c d;
+  _ = send d a;
+  _ = send a (me, 100000);
+  r = receive me;
+  _ = puts "token expired with value {r} after 100000 hops around the cycle" >> nl;
+  puts "arc live after 100k promote/drop cycles: {arcLive 0} (the 4 neighbor handles)" >> nl .

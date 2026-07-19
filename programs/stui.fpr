@@ -1,0 +1,772 @@
+# ============================================================================
+# stui.fpr -- the TuiPoc cell-buffer TUI, in FPRISC, on bare-metal RISC-V,
+#             with the stax parser/compiler/VM embedded as the REPL.
+#
+#   reader ----Key c----> terminal (main, actor 0: the MVU app)
+#   ticker ----Tick n---> terminal            (CLINT mtime, ~2 s cadence)
+#
+# The TuiPoc layers, ported:
+#   1. Cell buffer : List of rows, row = List of PACKED-INT cells
+#                    (ch*256 + fg*16 + bg). A cell is a tagged immediate --
+#                    zero heap per cell; only the cons spine allocates.
+#   2. Widgets     : Widget = sz -> rows, EXACT-size contract, so
+#                    vbox = row-list append, hbox = row-wise zip, border =
+#                    wrap rows. No blit, no arrays -- the combinators keep
+#                    TuiPoc's Fix/Flex layout algebra (splitSizes ported
+#                    verbatim, last flex soaks the remainder).
+#   3. Diff render : walk old/new rows, dirty runs merged across gaps <= 4
+#                    (a cursor move costs more than overpainting 4 cells),
+#                    ONE cup per run, SGR emitted only on color change,
+#                    SGR state tracked ACROSS frames. This is load-bearing,
+#                    not cosmetic: every byte on the wire is a 2-ary `write`
+#                    (one leaked PAP each, until compiler-inserted RC), so
+#                    the diff bounds the heap bleed per frame.
+#   4. MVU tie-in  : Model = (input, log, ticks, cmds, stats); update on
+#                    Key/Tick; view rebuilds the widget tree; the loop
+#                    diffs against the previous frame's buffer. mStats
+#                    feeds the NEXT frame's sidebar -- TuiPoc's honest
+#                    one-frame lag, unchanged.
+#
+# The REPL is stax: source text --parser combinators--> Ast --compiler-->
+# bytecode --VM--> stack, all in FPRISC, all running on the same heap. Two
+# changes from the standalone demo: the VM is TOTAL (Ok/Err + a gas
+# budget replace `error`, so a typo can't halt the machine) and `.`
+# output is captured into the log instead of hitting the UART raw.
+#
+#   make run PROG=programs/stui.fpr     then type:  1 2 + 3 4 + * .
+# ============================================================================
+
+# ---- message protocol -------------------------------------------------------
+
+Msg = Type (Keys Int | Tick Int).
+LMode = Type (LFix Int | LFlex Int).
+
+# ---- tiny console over raw MMIO (registers made once, threaded) -------------
+
+isOdd v = v - (v / 2) * 2 == 1.
+
+putc con c =
+  (lsr, dat) = con;
+  putcW lsr dat c.
+putcW lsr dat c = putcV lsr dat c (read lsr).
+putcV lsr dat c v =
+  case isOdd (v / 32) of
+    True -> write dat c
+  | False -> putcW lsr dat c.
+
+puts con s = putsFrom con s 1 (strlen s).
+putsFrom con s i n =
+  case i > n of
+    True -> Unit
+  | False -> putc con (charAt s i) >> putsFrom con s (i + 1) n.
+
+nl con = putc con 13 >> putc con 10.
+putLn con s = puts con s >> nl con.
+
+getc me con =
+  (lsr, dat) = con;
+  getcW me lsr dat.
+getcW me lsr dat = getcV me lsr dat (read lsr).
+getcV me lsr dat v =
+  case isOdd v of
+    True -> read dat
+  | False -> yield me >> getcW me lsr dat.
+
+# ---- little prelude (shared by TUI and stax) --------------------------------
+
+and2 a b = case a of True -> b | False -> False.
+or2 a b = case a of True -> True | False -> b.
+boolToInt b = case b of True -> 1 | False -> 0.
+
+append xs ys = case xs of Nil -> ys | h :: t -> h :: append t ys.
+len xs = case xs of Nil -> 0 | _ :: t -> 1 + len t.
+
+revGo xs acc = case xs of Nil -> acc | x :: r -> revGo r (x :: acc).
+revList xs = revGo xs Nil.
+
+takeN n xs = case n <= 0 of True -> Nil | False -> takeGo n xs.
+takeGo n xs = case xs of Nil -> Nil | x :: r -> x :: takeN (n - 1) r.
+
+maxI a b = case a > b of True -> a | False -> b.
+
+strInit s = strTakeGo s 1 (strlen s - 1) "".
+strTakeGo s i n acc =
+  case i > n of
+    True -> acc
+  | False -> strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
+
+# ============================================================================
+# LAYER 1: packed cells and row buffers
+#   cell = ch*256 + fg*16 + bg
+#   colors: 0 Default 1 Black 2 Red 3 Green 4 Yellow 5 Blue 6 Magenta
+#           7 Cyan 8 White        blank = (' ',0,0) = 8192
+#   invalid cell = 1 (ch 0: never produced, so frame 1 paints everything)
+# ============================================================================
+
+mkCell ch f b = ((ch * 256) + (f * 16)) + b.
+cellCh v = v / 256.
+cellFg v = (v / 16) - ((v / 256) * 16).
+cellBg v = v - ((v / 16) * 16).
+
+repCell c n = case n <= 0 of True -> Nil | False -> c :: repCell c (n - 1).
+
+# rows are immutable, so h identical rows are ONE row shared h times
+repRow row h = case h <= 0 of True -> Nil | False -> row :: repRow row (h - 1).
+fillRows c w h = repRow (repCell c w) h.
+blankRows w h = fillRows 8192 w h.
+invalidBuf w h = fillRows 1 w h.
+
+strCells s f b = scGo s f b 1 (strlen s).
+scGo s f b i n =
+  case i > n of
+    True -> Nil
+  | False -> mkCell (charAt s i) f b :: scGo s f b (i + 1) n.
+
+padTo w padc cells = append cells (repCell padc (w - len cells)).
+
+rowFrom f b s w = padTo w 8192 (takeN w (strCells s f b)).
+lineRow f b s w = padTo w (mkCell 32 f b) (takeN w (strCells s f b)).
+
+# ============================================================================
+# LAYER 2: widgets -- Widget = sz -> rows (EXACTLY h rows of w cells)
+# ============================================================================
+
+# splitSizes, ported: fixed rows first, flex shares of the rest by weight,
+# the LAST flex soaks the rounding remainder (TuiPoc's `extra`).
+
+sumFix ms = case ms of Nil -> 0 | LFix n :: r -> n + sumFix r | _ :: r -> sumFix r.
+sumFlex ms = case ms of Nil -> 0 | LFlex k :: r -> k + sumFlex r | _ :: r -> sumFlex r.
+hasFlex ms = case ms of Nil -> False | LFlex _ :: _ -> True | _ :: r -> hasFlex r.
+
+splitSizes avail ms = splitGo ms (maxI 0 (avail - sumFix ms)) (maxI 1 (sumFlex ms)) 0.
+splitGo ms rest ft given =
+  case ms of
+    Nil -> Nil
+  | LFix n :: r -> n :: splitGo r rest ft given
+  | LFlex k :: r -> splitFlex k r rest ft given.
+splitFlex k r rest ft given =
+  case hasFlex r of
+    True -> splitFlex2 ((rest * k) / ft) r rest ft given
+  | False -> (rest - given) :: splitGo r rest ft given.
+splitFlex2 s r rest ft given = s :: splitGo r rest ft (given + s).
+
+modesOf parts = case parts of Nil -> Nil | (m, _) :: r -> m :: modesOf r.
+
+# vbox: children rows concatenated
+vboxW parts sz =
+  (w, h) = sz;
+  vbuild parts (splitSizes h (modesOf parts)) w.
+vbuild parts sizes w =
+  case (parts, sizes) of
+    ((_, wg) :: pr, s :: sr) -> append (wg (w, s)) (vbuild pr sr w)
+  | _ -> Nil.
+
+# hbox: children rendered side by side, rows zipped with append
+hboxW parts sz =
+  (w, h) = sz;
+  hcat (hbufs parts (splitSizes w (modesOf parts)) h).
+hbufs parts sizes h =
+  case (parts, sizes) of
+    ((_, wg) :: pr, s :: sr) -> wg (s, h) :: hbufs pr sr h
+  | _ -> Nil.
+# all children have equal height, so the first buffer running out of rows
+# terminates the zip
+hcat bufs = case bufs of
+    Nil -> Nil
+  | b :: _ -> hcat2 b bufs.
+hcat2 b bufs = case b of
+    Nil -> Nil
+  | _ -> catHeads bufs :: hcat (tailsOf bufs).
+catHeads bufs = case bufs of Nil -> Nil | b :: r -> catHeads2 b r.
+catHeads2 b r = case b of Nil -> Nil | row :: _ -> append row (catHeads r).
+tailsOf bufs = case bufs of Nil -> Nil | b :: r -> tailsOf2 b r.
+tailsOf2 b r = case b of Nil -> Nil :: tailsOf r | _ :: rt -> rt :: tailsOf r.
+
+# leaf widgets
+textW f b s sz =
+  (w, h) = sz;
+  rowFrom f b s w :: blankRows w (h - 1).
+lineW f b s sz =
+  (w, h) = sz;
+  lineRow f b s w :: blankRows w (h - 1).
+fillW c sz =
+  (w, h) = sz;
+  fillRows c w h.
+
+# border: ASCII box (cells are single bytes; UTF-8 box drawing is a
+# multi-byte-glyph upgrade for the same cell type)
+borderW col child sz =
+  (w, h) = sz;
+  bWrap col w (child (w - 2, h - 2)).
+bWrap col w inner =
+  hb = mkCell 45 col 0;
+  vb = mkCell 124 col 0;
+  cn = mkCell 43 col 0;
+  bar = cn :: append (repCell hb (w - 2)) (cn :: Nil);
+  append (bar :: bMid vb inner) (bar :: Nil).
+bMid vb rows =
+  case rows of
+    Nil -> Nil
+  | row :: r -> (vb :: append row (vb :: Nil)) :: bMid vb r.
+
+padW n child sz =
+  (w, h) = sz;
+  padWrap w n (child (w - (2 * n), h - (2 * n))).
+padWrap w n inner = append (blankRows w n) (append (padMid n inner) (blankRows w n)).
+padMid n rows =
+  case rows of
+    Nil -> Nil
+  | row :: r -> append (repCell 8192 n) (append row (repCell 8192 n)) :: padMid n r.
+
+# ---- Dyn patches: the FPRLive static/dyn split, buffer-shaped ---------------
+# A keystroke dirties exactly the input row; a tick dirties exactly the
+# sidebar column. Rebuilding the whole widget tree for those (~370 KB of
+# churn, measured) is the Static path; these splice a freshly rendered
+# region into the CACHED composed buffer and share every untouched row --
+# a keystroke frame drops to a few KB. Geometry falls out of the layout
+# constants (80x24 screen, 30-wide sidebar): input row = composed row 21
+# cols 1..48; sidebar content = composed rows 3..20 cols 52..77.
+
+# single pass: copy the c0-cell prefix once, cons the segment, share the tail
+spliceSeg row c0 seg =
+  case c0 > 0 of
+    True -> spHead row c0 seg
+  | False -> spBody row seg.
+spHead row c0 seg = case row of Nil -> Nil | x :: r -> x :: spliceSeg r (c0 - 1) seg.
+spBody row seg =
+  case seg of
+    Nil -> row
+  | s :: sr -> s :: spTail row sr.
+spTail row sr = case row of Nil -> Nil | _ :: r -> spBody r sr.
+
+spliceRows rows idx i0 c0 segs =
+  case rows of
+    Nil -> Nil
+  | row :: rest -> spliceRow1 row rest idx i0 c0 segs.
+spliceRow1 row rest idx i0 c0 segs =
+  case idx < i0 of
+    True -> row :: spliceRows rest (idx + 1) i0 c0 segs
+  | False -> spliceRow2 row rest idx i0 c0 segs.
+spliceRow2 row rest idx i0 c0 segs =
+  case segs of
+    Nil -> row :: rest
+  | seg :: srest -> spliceSeg row c0 seg :: spliceRows rest (idx + 1) i0 c0 srest.
+
+# ============================================================================
+# LAYER 3: diff renderer -- old rows vs new rows -> escape bytes on the UART
+#   st = (sgrFg, sgrBg, bytesEmitted, cellsPainted); sgr 99 = unknown
+# ============================================================================
+
+esc s = strcat (chr 27) s.
+fgCode c = case c == 0 of True -> "39" | False -> numS (29 + c).
+bgCode c = case c == 0 of True -> "49" | False -> numS (39 + c).
+numS n = "{n}".
+cupS r c = esc "[{r};{c}H".
+sgrS f b = esc "[{fgCode f};{bgCode b}m".
+
+# NB: no tuple-pattern cases anywhere on the per-cell paths -- a
+# `case (o, n) of` scrutinee ALLOCATES the pair per call, which turned a
+# no-op diff into 100 KB of churn (measured). Nested single cases are free.
+dirtyCols o n c =
+  case o of
+    Nil -> Nil
+  | a :: ar -> dirtyCols2 a ar n c.
+dirtyCols2 a ar n c =
+  case n of
+    Nil -> Nil
+  | b :: br -> dirtyHit a b ar br c.
+dirtyHit a b ar br c =
+  case a == b of
+    True -> dirtyCols ar br (c + 1)
+  | False -> c :: dirtyCols ar br (c + 1).
+
+# runs of dirty columns, gaps <= 4 fused: overpainting a few clean cells is
+# cheaper than another 8-byte cursor move (TuiPoc's mergeGap)
+mergeRuns xs = case xs of Nil -> Nil | x :: rest -> mrGo x x rest.
+mrGo s e xs =
+  case xs of
+    Nil -> (s, e) :: Nil
+  | c :: cs -> mrStep s e c cs.
+mrStep s e c cs =
+  case (c - e) <= 5 of
+    True -> mrGo s c cs
+  | False -> (s, e) :: mrGo c c cs.
+
+# SGR state is PACKED (fb = fg*16 + bg, 9999 = unknown) and threaded as a
+# plain int alongside byte/cell counters: the unchanged-color cell path is
+# pure core-prim arithmetic + one `write` -- zero heap per cell. The state
+# tuple (fb, bytes, cells) is built once per run boundary, not per cell.
+diffFrame con st old new = dfRows con st old new 0.
+dfRows con st old new r =
+  case old of
+    Nil -> st
+  | orow :: orest -> dfRows2 con st orow orest new r.
+dfRows2 con st orow orest new r =
+  case new of
+    Nil -> st
+  | nrow :: nrest -> dfRows con (diffRow con st r orow nrow) orest nrest (r + 1).
+diffRow con st r orow nrow = emitRuns con st r nrow (mergeRuns (dirtyCols orow nrow 0)).
+
+emitRuns con st r nrow runs =
+  case runs of
+    Nil -> st
+  | (c0, c1) :: rest -> emitRuns con (emitRun con st r nrow c0 c1) r nrow rest.
+emitRun con st r nrow c0 c1 =
+  s = cupS (r + 1) (c0 + 1);
+  _ = puts con s;
+  emitRun2 con st (strlen s) nrow c0 c1.
+emitRun2 con st k nrow c0 c1 =
+  case st of
+    (fb, by, ce) -> emitCells con fb (by + k) ce nrow c0 c1.
+cellLow v = v - ((v / 256) * 256).
+
+emitCells con fb by ce nrow c c1 =
+  case c > c1 of
+    True -> (fb, by, ce)
+  | False -> emitCell con fb by ce nrow c c1.
+emitCell con fb by ce nrow c c1 = emitCell2 con fb by ce nrow c c1 (nrow ! (c + 1)).
+emitCell2 con fb by ce nrow c c1 v =
+  case cellLow v == fb of
+    True -> putc con (v / 256) >> emitCells con fb (by + 1) (ce + 1) nrow (c + 1) c1
+  | False -> emitCellSgr con by ce nrow c c1 v.
+emitCellSgr con by ce nrow c c1 v =
+  s = sgrS (cellFg v) (cellBg v);
+  _ = puts con s;
+  putc con (v / 256) >> emitCells con (cellLow v) ((by + strlen s) + 1) (ce + 1) nrow (c + 1) c1.
+
+enterScreen con = puts con (esc "[?1049h") >> puts con (esc "[?25l") >> puts con (esc "[2J").
+leaveScreen con =
+  puts con (esc "[0m") >> puts con (esc "[?25h") >> puts con (esc "[?1049l") >>
+  putLn con "left the TUI; machine halting.".
+
+# ============================================================================
+# STAX: the mini stack language -- parser combinators -> Ast -> bytecode -> VM
+# (from stax.fpr; VM made TOTAL: Ok/Err + gas budget instead of `error`,
+#  and `.` output captured into a line list instead of printed)
+# ============================================================================
+
+PRes  = Type (POk a Int | PFail String Int).
+Ast   = Type (ANum Int | APrim String | AIf a b | ALoop a).
+Instr = Type (IPush Int | IOp String | IJz Int | IJmp Int | IPrint).
+
+isDigit b = and2 (b >= 48) (b <= 57).
+isLetter2 b = or2 (and2 (b >= 97) (b <= 122)) (and2 (b >= 65) (b <= 90)).
+isSpace2 b = or2 (b == 32) (or2 (b == 10) (or2 (b == 9) (b == 13))).
+isSym b = or2 (b == 43) (or2 (b == 45) (or2 (b == 42) (or2 (b == 47)
+          (or2 (b == 61) (or2 (b == 60) (or2 (b == 62) (b == 46))))))).
+
+# parser : String -> Int -> PRes
+pok v s i = POk v i.
+pfail m s i = PFail m i.
+pbind p f s i = case p s i of
+    POk v j -> f v s j
+  | PFail m j -> PFail m j.
+palt p q s i = case p s i of
+    POk v j -> POk v j
+  | PFail _ _ -> q s i.
+pmapK f v = pok (f v).
+pmap f p s i = pbind p (pmapK f) s i.
+
+skipWs s i | i > String.len s = i.
+skipWs s i = skipWsB (charAt s i) s i.
+skipWsB b s i | isSpace2 b = skipWs s (i + 1).
+skipWsB b s i = i.
+
+pdigit s i | i > String.len s = PFail "eof: digit" i.
+pdigit s i = pdigitB (charAt s i) i.
+pdigitB b i | isDigit b = POk (b - 48) (i + 1).
+pdigitB b i = PFail "expected digit" i.
+
+pletter s i | i > String.len s = PFail "eof: letter" i.
+pletter s i = pletterB (charAt s i) i.
+pletterB b i | isLetter2 b = POk b (i + 1).
+pletterB b i = PFail "expected letter" i.
+
+psym s i | i > String.len s = PFail "eof: sym" i.
+psym s i = psymB (charAt s i) i.
+psymB b i | isSym b = POk (chr b) (i + 1).
+psymB b i = PFail "expected symbol" i.
+
+pintAcc n s i = case pdigit s i of
+    POk d j -> pintAcc (n * 10 + d) s j
+  | PFail _ _ -> POk n i.
+pint s i = pbind pdigit pintAcc s i.
+
+plettersK b = plettersAcc (chr b).
+plettersAcc acc s i = case pletter s i of
+    POk b j -> plettersAcc (strcat acc (chr b)) s j
+  | PFail _ _ -> POk acc i.
+pletters s i = pbind pletter plettersK s i.
+
+pword s i = palt pletters psym s i.
+
+pkwChk k w = case w == k of True -> pok 1 | False -> pfail "expected {k}".
+pkwRaw k s i = pbind pletters (pkwChk k) s i.
+pkw k s i = pkwRaw k s (skipWs s i).
+
+pnumT s i = pmap ANum pint s i.
+
+ptermWord w = case w of
+    "if" -> pif
+  | "begin" -> ploop
+  | "else" -> pfail "unexpected else"
+  | "then" -> pfail "unexpected then"
+  | "until" -> pfail "unexpected until"
+  | _ -> pok (APrim w).
+pwordT s i = pbind pword ptermWord s i.
+
+ptermRaw s i = palt pnumT pwordT s i.
+pterm s i = ptermRaw s (skipWs s i).
+
+pseq s i = case pterm s i of
+    POk t j -> pseqK t s j
+  | PFail _ _ -> POk Nil i.
+pseqK t s j = case pseq s j of
+    POk ts k -> POk (t :: ts) k
+  | PFail m k -> PFail m k.
+
+pifElse thn s i =
+  pbind (pkw "else") (fn u ->
+    pbind pseq (fn els ->
+      pbind (pkw "then") (fn u2 -> pok (AIf thn els)))) s i.
+pifThen thn s i = pbind (pkw "then") (fn u -> pok (AIf thn Nil)) s i.
+pifK thn = palt (pifElse thn) (pifThen thn).
+pif s i = pbind pseq pifK s i.
+
+ploop s i = pbind pseq (fn body -> pbind (pkw "until") (fn u -> pok (ALoop body))) s i.
+
+parseEof src ts j = case j > String.len src of
+    True -> Ok ts
+  | False -> Err "unexpected input at byte {j}".
+parseFin src r = case r of
+    POk ts j -> parseEof src ts (skipWs src j)
+  | PFail m j -> Err "at byte {j}: {m}".
+parseProg src = parseFin src (pseq src 1).
+
+# ---- compiler: Ast -> bytecode (absolute targets, single pass) --------------
+
+compileSeq asts a = case asts of
+    Nil -> (Nil, a)
+  | t :: rest -> compileSeqCons t rest a.
+compileSeqCons t rest a =
+  (c1, a1) = compileOne t a;
+  (c2, a2) = compileSeq rest a1;
+  (append c1 c2, a2).
+compileOne t a = case t of
+    ANum n -> (IPush n :: Nil, a + 1)
+  | APrim o -> compilePrim o a
+  | AIf thn els -> compileIf thn els a
+  | ALoop b -> compileLoop b a.
+compilePrim o a = case o of
+    "." -> (IPrint :: Nil, a + 1)
+  | _ -> (IOp o :: Nil, a + 1).
+compileIf thn els a =
+  (ct, at) = compileSeq thn (a + 1);
+  (ce, ae) = compileSeq els (at + 1);
+  (append (IJz (at + 1) :: ct) (IJmp ae :: ce), ae).
+compileLoop b a =
+  (cb, ab) = compileSeq b a;
+  (append cb (IJz a :: Nil), ab + 1).
+
+# ---- the VM, made total: Result-valued ops, gas budget, captured output -----
+
+addI a b = a + b.
+subI a b = a - b.
+mulI a b = a * b.
+divI a b = a / b.
+eqI a b = boolToInt (a == b).
+ltI a b = boolToInt (a < b).
+gtI a b = boolToInt (a > b).
+
+binOp f st = case st of
+    b :: rest -> binOp2 f b rest
+  | Nil -> Err "vm: stack underflow (need 2)".
+binOp2 f b st = case st of
+    a :: r -> Ok (f a b :: r)
+  | Nil -> Err "vm: stack underflow (need 2)".
+
+dupOp st = case st of x :: r -> Ok (x :: x :: r) | Nil -> Err "vm: stack underflow".
+dropOp st = case st of _ :: r -> Ok r | Nil -> Err "vm: stack underflow".
+
+swapK t s r = s :: t :: r.
+overK t s r = s :: t :: s :: r.
+binOp2K k st = case st of
+    t :: rest -> binOp2K2 k t rest
+  | Nil -> Err "vm: stack underflow (need 2)".
+binOp2K2 k t st = case st of
+    s :: r -> Ok (k t s r)
+  | Nil -> Err "vm: stack underflow (need 2)".
+
+divChk st = case st of
+    0 :: _ -> Err "vm: division by zero"
+  | _ -> binOp divI st.
+
+applyOp o st = case o of
+    "+" -> binOp addI st
+  | "-" -> binOp subI st
+  | "*" -> binOp mulI st
+  | "/" -> divChk st
+  | "=" -> binOp eqI st
+  | "<" -> binOp ltI st
+  | ">" -> binOp gtI st
+  | "dup" -> dupOp st
+  | "drop" -> dropOp st
+  | "swap" -> binOp2K swapK st
+  | "over" -> binOp2K overK st
+  | _ -> Err "vm: unknown op '{o}'".
+
+runVM code n pc st out gas =
+  case gas <= 0 of
+    True -> Err "vm: out of gas (100000 steps)"
+  | False -> runVM2 code n pc st out gas.
+runVM2 code n pc st out gas =
+  case pc > n of
+    True -> Ok (st, out)
+  | False -> step code n pc (code ! pc) st out gas.
+step code n pc ins st out gas = case ins of
+    IPush v -> runVM code n (pc + 1) (v :: st) out (gas - 1)
+  | IOp o -> stepOp code n pc (applyOp o st) out gas
+  | IJmp t -> runVM code n t st out (gas - 1)
+  | IJz t -> stepJz code n pc t st out gas
+  | IPrint -> stepPrint code n pc st out gas.
+stepOp code n pc r out gas = case r of
+    Ok st2 -> runVM code n (pc + 1) st2 out (gas - 1)
+  | Err m -> Err m.
+stepJz code n pc t st out gas = case st of
+    0 :: rest -> runVM code n t rest out (gas - 1)
+  | _ :: rest -> runVM code n (pc + 1) rest out (gas - 1)
+  | Nil -> Err "vm: jz: stack underflow".
+stepPrint code n pc st out gas = case st of
+    x :: rest -> runVM code n (pc + 1) rest ("output: {x}" :: out) (gas - 1)
+  | Nil -> Err "vm: print: stack underflow".
+
+# ---- REPL driver: source -> (color, text) log lines, oldest first -----------
+
+showStack st = strcat "[" (strcat (joinC st) "]").
+joinC xs = case xs of Nil -> "" | x :: r -> joinCGo "{x}" r.
+joinCGo acc r = case r of Nil -> acc | x :: rest -> joinCGo (strcat acc ", {x}") rest.
+
+runStax src = case parseProg src of
+    Err m -> (2, "parse error: {m}") :: Nil
+  | Ok ast -> runStax2 (compileSeq ast 1).
+runStax2 cp = case cp of (code, _) -> runStax3 code (len code).
+runStax3 code n = runStax4 (runVM code n 1 Nil Nil 100000).
+runStax4 r = case r of
+    Err m -> (2, m) :: Nil
+  | Ok so -> runStax5 so.
+runStax5 so =
+  case so of
+    (st, out) -> append (outLines (revList out)) ((0, "stack: {showStack st}") :: Nil).
+outLines os = case os of Nil -> Nil | s :: r -> (0, s) :: outLines r.
+
+# ============================================================================
+# LAYER 4: MVU -- Model = (input, log, ticks, cmds, stats)
+#   log = List (fg, text), NEWEST first, capped; stats = (bytes, cells)
+#   of the PREVIOUS frame (measured by the diff, shown one frame late)
+# ============================================================================
+
+startLog =
+  (4, "       1 5 begin swap over * swap 1 - dup 0 = until drop .   (factorial)") ::
+  (4, "  try: 1 2 + 3 4 + * .") ::
+  (4, "stax: a parser + compiler + VM written in FPRISC, on bare-metal RISC-V") :: Nil.
+
+helpLines =
+  (4, "grammar: prog := INT | op | if P (else P)? then | begin P until") ::
+  (4, "ops: + - * / = < > dup drop swap over    '.' pops and prints") ::
+  (4, "the screen is a diffed cell buffer: watch bytes/frame in the sidebar") :: Nil.
+
+initModel = ("", startLog, 0, 0, (0, 0)).
+
+modelInput m = case m of (i, _, _, _, _) -> i.
+modelTicks m = case m of (_, _, t, _, _) -> t.
+modelCmds m = case m of (_, _, _, n, _) -> n.
+modelStats m = case m of (_, _, _, _, st) -> st.
+setStats m st = case m of (i, l, t, n, _) -> (i, l, t, n, st).
+bumpTick m t = case m of (i, l, _, n, st) -> (i, l, t, n, st).
+
+editKey m c = case m of (i, l, t, n, st) -> (edit1 i c, l, t, n, st).
+edit1 i c = case c of
+    8 -> strBack i
+  | 127 -> strBack i
+  | _ -> edit2 i c.
+edit2 i c =
+  case and2 (c >= 32) (and2 (c < 127) ((strlen i) < 58)) of
+    True -> strcat i (chr c)
+  | False -> i.
+strBack s = case strlen s == 0 of True -> s | False -> strInit s.
+
+runCmd m =
+  case m of
+    (i, l, t, n, st) -> ("", takeN 30 (pushLines (cmdLines i) ((7, strcat "stax> " i) :: l)), t, n + 1, st).
+pushLines ls log = case ls of Nil -> log | x :: r -> pushLines r (x :: log).
+cmdLines i = case i of
+    "help" -> helpLines
+  | "" -> Nil
+  | _ -> runStax i.
+
+# ---- view: the TuiPoc layout -- title bar / (repl | sidebar) / status bar ---
+
+view m sz =
+  case m of
+    (input, log, ticks, cmds, stats) -> viewGo input log ticks cmds stats sz.
+viewGo input log ticks cmds stats sz =
+  vboxW
+    ( (LFix 1, lineW 1 7 "  QOS TUI -- cell-buffer diff renderer / stax REPL over UART") ::
+      (LFlex 1, hboxW
+        ( (LFlex 1, borderW 7 (replPane log input)) ::
+          (LFix 30, borderW 8 (padW 1 (sidebarWi ticks cmds stats))) :: Nil)) ::
+      (LFix 1, lineW 1 8 "  stax: INT . + - * / = < > dup drop swap over   if..then   begin..until") :: Nil)
+    sz.
+
+replPane log inp sz =
+  (w, h) = sz;
+  append (logRows (revList (takeN (h - 1) log)) w (h - 1)) (inputRow inp w :: Nil).
+logRows es w k = case es of
+    Nil -> blankRows w k
+  | e :: r -> logRow e w :: logRows r w (k - 1).
+logRow e w = case e of (f, s) -> rowFrom f 0 s w.
+inputRow inp w =
+  padTo w 8192 (takeN w (append (strCells "stax> " 3 0) (append (strCells inp 0 0) (mkCell 32 1 8 :: Nil)))).
+
+sidebarWi ticks cmds stats sz =
+  (by, ce) = stats;
+  hk = (heapUsed 0) / 1024;
+  fp = fuelPreempts 0;
+  al = arcLive 0;
+  vboxW (sbParts ticks cmds by ce hk fp al) sz.
+sbParts ticks cmds by ce hk fp al =
+  (LFix 1, textW 4 0 " MVU state") ::
+  (LFix 1, textW 0 0 "  ticks   : {ticks}") ::
+  (LFix 1, textW 0 0 "  cmds    : {cmds}") ::
+  (LFix 1, textW 0 0 "") ::
+  (LFix 1, textW 4 0 " last frame on the wire") ::
+  (LFix 1, textW 0 0 "  bytes   : {by}") ::
+  (LFix 1, textW 0 0 "  cells   : {ce} / 1920") ::
+  (LFix 1, textW 3 0 (savedLine ce)) ::
+  (LFix 1, textW 0 0 "") ::
+  (LFix 1, textW 4 0 " live runtime") ::
+  (LFix 1, textW 0 0 "  heap    : {hk} KiB") ::
+  (LFix 1, textW 0 0 "  preempts: {fp}") ::
+  (LFix 1, textW 0 0 "  arc live: {al}") ::
+  (LFlex 1, fillW 8192) ::
+  (LFix 1, barW ticks) ::
+  (LFix 1, textW 7 0 " enter run   help   exit") :: Nil.
+savedLine ce = case ce == 0 of
+    True -> "  repaint : -"
+  | False -> savedLine2 (100 - ((100 * ce) / 1920)).
+savedLine2 p = "  repaint : saved {p}%".
+
+# the sweeping bar (TuiPoc's mBar), tick-driven: proves the diff repaints
+# exactly one growing green row while everything else stays untouched
+barW ticks sz =
+  (w, h) = sz;
+  barRowOf ticks w :: blankRows w (h - 1).
+barRowOf t w = barRow2 (t - ((t / w) * w)) w.
+barRow2 k w = append (repCell (mkCell 32 0 3) k) (repCell 8192 (w - k)).
+
+# ---- input actors -----------------------------------------------------------
+
+# TuiPoc's drainInput, actor-shaped: block for the first byte, then
+# coalesce everything already in flight (with a short yield-grace so a
+# pasted burst lands as ONE Keys message = ONE frame, not one per char).
+reader term con me = rdLoop term con me.
+rdLoop term con me = rdBatch term con me (chr (getc me con)) 40.
+rdBatch term con me acc grace =
+  case strlen acc >= 64 of
+    True -> send term (Keys acc) >> rdLoop term con me
+  | False -> rdPeek term con me acc grace.
+rdPeek term con me acc grace = rdPeek2 term con me acc grace (rdReady con).
+rdReady con =
+  (lsr, dat) = con;
+  isOdd (read lsr).
+rdTake con =
+  (lsr, dat) = con;
+  read dat.
+rdPeek2 term con me acc grace ready =
+  case ready of
+    True -> rdBatch term con me (strcat acc (chr (rdTake con))) 40
+  | False -> rdGrace term con me acc grace.
+rdGrace term con me acc grace =
+  case grace <= 0 of
+    True -> send term (Keys acc) >> rdLoop term con me
+  | False -> yield me >> rdPeek term con me acc (grace - 1).
+
+# ~2 s cadence off the CLINT (QEMU virt: 10 MHz); yields between polls.
+# `read` is a 1-ary fpr_g_ -- saturated in one apply, so polling is
+# heap-free (the vfsh lesson, kept).
+ticker term mt me = tkLoop term mt me 1 (read mt).
+tkLoop term mt me n last = tkStep term mt me n last (read mt).
+tkStep term mt me n last now =
+  case now < last of
+    True -> tkLoop term mt me n now
+  | False -> tkStep2 term mt me n last now.
+tkStep2 term mt me n last now =
+  case (now - last) >= 30000000 of
+    True -> send term (Tick n) >> tkLoop term mt me (n + 1) now
+  | False -> yield me >> tkLoop term mt me n last.
+
+# ---- the loop: render -> diff -> stats -> block on the mailbox --------------
+
+# full render (Static path): rebuild the widget tree, diff, carry on
+tuiLoop me con m prev fb = tuiDiff me con m prev (view m (80, 24)) fb.
+
+# shared tail: diff old vs new, record wire stats, block on the mailbox
+tuiDiff me con m old new fb =
+  st = diffFrame con (fb, 0, 0) old new;
+  tuiAfter me con m new st.
+tuiAfter me con m buf st =
+  case st of
+    (fb2, by, ce) -> tuiWait me con (setStats m (by, ce)) buf fb2.
+tuiWait me con m buf fb = tuiMsg me con m buf fb (receive me).
+tuiMsg me con m buf fb msg =
+  case msg of
+    Keys s -> tuiKeys me con m buf fb msg s
+  | Tick t -> drop msg >> tuiTick me con (bumpTick m t) buf fb
+  | _ -> tuiLoop me con m buf fb.
+
+# tick: only the sidebar is dirty -- render 18 rows, splice, diff
+tuiTick me con m buf fb =
+  tuiDiff me con m buf (spliceRows buf 0 3 52 (sidebarWi (modelTicks m) (modelCmds m) (modelStats m) (26, 18))) fb.
+
+# keys: fold the batch; a batch with no Enter only dirties the input row
+tuiKeys me con m buf fb msg s =
+  r = applyKeys m s 1 (strlen s) False;
+  _ = drop msg;
+  tuiKeys2 me con buf fb r.
+tuiKeys2 me con buf fb r =
+  case r of
+    Ok mr -> tuiKeys3 me con buf fb mr
+  | Err _ -> leaveScreen con.
+tuiKeys3 me con buf fb mr =
+  case mr of
+    (m2, True) -> tuiLoop me con m2 buf fb
+  | (m2, False) -> tuiDiff me con m2 buf (spliceRows buf 0 21 1 (inputRow (modelInput m2) 48 :: Nil)) fb.
+
+# fold a whole key batch into the model; ran = some command was executed
+# (log + sidebar dirty -> full render); Err = the session typed exit
+applyKeys m s i n ran =
+  case i > n of
+    True -> Ok (m, ran)
+  | False -> applyKey1 m s i n ran (charAt s i).
+applyKey1 m s i n ran c =
+  case or2 (c == 13) (c == 10) of
+    True -> applyEnter m s i n
+  | False -> applyKeys (editKey m c) s (i + 1) n ran.
+applyEnter m s i n =
+  case isExit (modelInput m) of
+    True -> Err 0
+  | False -> applyKeys (runCmd m) s (i + 1) n True.
+isExit s = or2 (s == "exit") (s == "quit").
+
+# ---- boot -------------------------------------------------------------------
+
+main =
+  me = myself 0;
+  u = device "uart";
+  cl = device "clint";
+  con = (reg8 u 5, reg8 u 0);
+  mt = reg32 cl 49144;
+  _ = spawn (reader me con);
+  _ = spawn (ticker me mt);
+  _ = enterScreen con;
+  tuiLoop me con initModel (invalidBuf 80 24) 9999.

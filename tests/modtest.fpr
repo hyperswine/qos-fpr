@@ -1,0 +1,22 @@
+# modtest.fpr -- exercises the use-module system end to end.
+
+MyMod = use "mods/mymod#ddbe5fa48f1a5018".
+V2    = use "mods/mymod2#ae1e13504d5ffa2a".
+
+x   = MyMod.x.
+res = MyMod.f "hi".
+
+T = MyMod.T.            # alias the type
+f : T -> T.
+f t = T (MyMod.unT t + 2).
+
+main =
+  _ = print "x             = {x}";
+  _ = print "res           = {res}";
+  _ = print "f (T 40)      = {MyMod.unT (f (MyMod.mk 40))}";
+  _ = print "old double 21 = {MyMod.double 21}";
+  _ = print "new double 21 = {V2.double 21}   (both versions live in one image)";
+  _ = print "MyMod hash    = {MyMod}";
+  d = Mod.fn MyMod "double";
+  _ = print "Mod.fn MyMod double 5 = {d 5}   (dispatch by hash + name)";
+  print "Mod.has V2    = {Mod.has V2}".
