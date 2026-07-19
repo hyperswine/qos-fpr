@@ -6,3 +6,4 @@ target/
 zip-project.sh
 build/
 NOTES.txt
+*.zip
