@@ -5,3 +5,4 @@ target/
 *.img
 zip-project.sh
 build/
+NOTES.txt
