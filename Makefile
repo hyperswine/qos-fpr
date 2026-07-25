@@ -79,6 +79,20 @@ POSIXCTX = $(RT_POSIX_DIR)/ctx_x64.S
 endif
 RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c \
            $(RT_POSIX_DIR)/net.c $(RT_POSIX_DIR)/heap.S $(POSIXCTX)
+# GFX=1 adds the GPU tier (runtime/posix/gfx.c): EGL + OpenGL ES 3.1
+# via Mesa, keyboard/mouse polling.  The GL stack cannot be statically
+# linked, so a gfx image links dynamic -- the display driver is the one
+# boundary the static philosophy concedes, the same way the kernel is.
+ifeq ($(GFX),1)
+RT_POSIX += $(RT_POSIX_DIR)/gfx.c
+POSIXLIBS = -lEGL -lGLESv2 -lm
+# generated code uses absolute .quad relocations in .rodata (fine when
+# static); a dynamic gfx image must therefore be non-PIE
+POSIXSTATIC = -no-pie
+else
+POSIXLIBS =
+POSIXSTATIC = -static
+endif
 RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c \
                 $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
 
@@ -87,15 +101,15 @@ build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	LC_ALL=C.UTF-8 ./fprc --target=$(POSIXARCH) --prelude=programs/prelude.fpr $(PROG) $@
 
 posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE)
-	$(POSIXCC) -static -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) -I$(RT_CORE_DIR) \
-	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -lpthread -o $@
+	$(POSIXCC) $(POSIXSTATIC) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) -I$(RT_CORE_DIR) \
+	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -lpthread $(POSIXLIBS) -o $@
 
 posix-run: posix.bin
 	$(POSIXRUN) ./posix.bin
 
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs
-	cabal build -v0
-	cp "$$(cabal list-bin fprc)" $@
+	cd compiler && cabal build -v0
+	cp "$$(cd compiler && cabal list-bin fprc)" $@
 
 build/prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build

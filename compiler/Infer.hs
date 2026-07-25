@@ -403,6 +403,11 @@ builtinEnv =
       ("netRead", scheme [0] (TFn tInt (sv 0))),
       ("netWrite", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
       ("netClose", mono (TFn tInt tUnit)),
+      -- GPU tier (runtime/posix/gfx.c: scene-driven render function)
+      ("glInit", mono (TFn tInt (TFn tInt tInt))),
+      ("glRender", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      ("glSavePpm", mono (TFn tStr tInt)),
+      ("inputPoll", scheme [0, 1] (TFn (sv 0) (sv 1))),
       -- Pin / GPIO service (fpr_g_ Pin.*)
       ("Pin.read", scheme [0] (TFn (sv 0) tInt)),
       ("Pin.write", scheme [0] (TFn (sv 0) (TFn tInt tUnit))),

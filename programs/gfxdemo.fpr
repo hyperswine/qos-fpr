@@ -1,0 +1,168 @@
+# ============================================================================
+# gfxdemo.fpr -- the URL-addressed graphics stack on the posix backend.
+#
+#   client                    System (discovery)         service actors
+#   ------                    ------------------         --------------
+#   lookup "/services/graphics"  --> registry match -->  graphics actor
+#   send gfx (me, Render scene)                          |  owns the GL
+#   frame token <-- (draws, bytes) <---------------------+  context: every
+#   lookup "/services/display"                              render in the
+#   send dsp (me, Present path)                             machine goes
+#   done <-- rc <-- glSavePpm --------------------------+   through ITS
+#   lookup "/services/input"                                mailbox, which
+#   send inp (me, Poll) --> inputPoll -> event/0            linearizes the
+#                                                           hard resource.
+# The System actor is the ONLY name that has to be known a priori; every
+# hard resource is reached by URL through it, and each service actor
+# serializes access to its resource by construction -- its mailbox IS
+# the lock.  This is programs/system.fpr's svc* architecture with the
+# services as real actors rather than in-process helpers.
+#
+# The scene ABI (runtime/posix/gfx.c): all numbers Int MILLI-units.
+#   scene  = (statics, dynamics, lights, camera)
+#   entity = (mesh, (x,y,z), yawMilli, (sx,sy,sz), (r,g,b))
+#   light  = ((x,y,z), (r,g,b))     camera = (eye, target, fovMilli)
+#
+#   make posix-run GFX=1 PROG=programs/gfxdemo.fpr
+# ============================================================================
+
+Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
+
+# ---- the System actor: URL -> service actor discovery ----------------------
+
+strEqGo a b i n =
+  case i > n of
+    True -> True
+  | False -> case charAt a i == charAt b i of
+      True -> strEqGo a b (i + 1) n
+    | False -> False.
+strEq a b = case strlen a == strlen b of
+    True -> strEqGo a b 1 (strlen a)
+  | False -> False.
+
+findSvc reg url =
+  case reg of
+    Nil -> 0
+  | p :: r -> case p of (u, a) ->
+      case strEq u url of True -> a | False -> findSvc r url.
+
+systemActor me = sysLoop me Nil.
+sysServe me reg =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Lookup url -> send replyTo (findSvc reg url) >> sysServe me reg.
+# registration phase: main sends the registry once, then serving starts
+sysLoop me reg0 =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
+      | Reg reg -> send replyTo 1 >> sysServe me reg.
+
+# ---- service actors: each one linearizes ONE hard resource -----------------
+
+# graphics: owns the GL context. glInit runs INSIDE the actor, on its
+# hart thread -- EGL contexts are thread-bound, and actors never migrate
+# harts, so the mailbox is exactly the serialization the GPU needs.
+graphicsActor me =
+  _ = glInit 320 240;
+  gfxServe me.
+gfxServe me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Render scene -> send replyTo (glRender scene) >> drop m >> gfxServe me.
+
+# display: presentation of the last-rendered frame.  Headless backend =
+# a PPM on disk; a windowed backend swaps THIS actor's body only.
+displayActor me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Present path -> send replyTo (glSavePpm path) >> drop m >> displayActor me.
+
+# input: keyboard/mouse polling, one reader for the whole machine.
+inputActor me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Poll u -> send replyTo (inputPoll u) >> drop m >> inputActor me.
+
+# ---- client-side URL helpers (what an app links against) -------------------
+
+svcLookup me sys url =
+  _ = send sys (me, Lookup url);
+  receive me.
+
+svcCall me svc q =
+  _ = send svc (me, q);
+  receive me.
+
+# ---- the scene -------------------------------------------------------------
+# A ground plane + a ring of static cubes; two orbiting dynamic spheres.
+# Everything milli-fixed: 1000 = 1.0.
+
+ring n =
+  case n == 0 of
+    True -> Nil
+  | False ->
+      ("cube", (2500 * (n - 3), 400, 0 - 2000), 300 * n, (800, 800, 800), (900, 350 + 100 * n, 250))
+        :: ring (n - 1).
+
+statics =
+  ("plane", (0, 0, 0), 0, (8000, 1000, 8000), (300, 420, 320)) :: ring 5.
+
+dynamics t =
+  ("sphere", (0 - 1500 + 500 * t, 1200, 0 - 500), 0, (1000, 1000, 1000), (950, 800, 250))
+    :: ("sphere", (1500 - 400 * t, 800, 500), 0, (700, 700, 700), (350, 550, 950))
+    :: Nil.
+
+lights = ((4000, 6000, 4000), (1000, 1000, 1000)) :: Nil.
+camera = ((0, 3000, 6000), (0, 500, 0 - 1000), 900).
+
+scene t = (statics, dynamics t, lights, camera).
+
+# ---- main ------------------------------------------------------------------
+
+frameLoop me gfx dsp t =
+  case t > 3 of
+    True -> Unit
+  | False -> frameStep me gfx dsp t.
+frameStep me gfx dsp t =
+  r = svcCall me gfx (Render (scene t));
+  _ = print "frame {t}: rendered {r}";
+  rc = svcCall me dsp (Present "frame{t}.ppm");
+  _ = print "frame {t}: presented -> frame{t}.ppm (rc {rc})";
+  frameLoop me gfx dsp (t + 1).
+
+main =
+  me = myself 0;
+  _ = print "gfxdemo: URL-addressed graphics over service actors";
+
+  sys = spawn systemActor;
+  gfx = spawn graphicsActor;
+  dsp = spawn displayActor;
+  inp = spawn inputActor;
+  reg = ("/services/graphics", gfx) :: ("/services/display", dsp) :: ("/services/input", inp) :: Nil;
+  _ = send sys (me, Reg reg);
+  _ = receive me;
+
+  g = svcLookup me sys "/services/graphics";
+  d = svcLookup me sys "/services/display";
+  i = svcLookup me sys "/services/input";
+  _ = print "discovered: graphics/display/input via /services URLs";
+
+  _ = frameLoop me g d 1;
+
+  ev = svcCall me i (Poll 0);
+  _ = print "input poll -> {ev}   (0 = no event pending)";
+
+  missing = svcLookup me sys "/services/nope";
+  _ = print "lookup /services/nope -> {missing}   (0 = unknown URL, a miss is data)";
+  print "gfxdemo done".

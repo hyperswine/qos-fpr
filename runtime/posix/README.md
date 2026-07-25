@@ -43,6 +43,18 @@ Discovery is the same table-by-name contract as virt hal.c:
   (net.c), byte-compatible with virt's virtio-net surface: one
   connection at a time, actor-side polling.  FPR_PORT picks the port
   (default 8000).  programs/httpd.fpr compiles unchanged.
+- **gpu** (GFX=1) — gfx.c, a C port of the gl_scene ES 3.1 renderer:
+  glInit / glRender / glSavePpm walk an FPRISC Scene VALUE (milli-unit
+  fixed point) into instanced ES draws under surfaceless EGL, with the
+  content-addressed mesh registry and static/dynamic split intact.
+  inputPoll reads keyboard (stdin) and mouse (/dev/input/mice).  The
+  GL context is thread-bound: exactly one graphics service actor owns
+  it, pinned by the no-migration owner-hart model — its mailbox IS the
+  GPU lock.  programs/gfxdemo.fpr is the URL-addressed reference:
+  System discovery actor + graphics/display/input service actors.
+  GFX=1 links dynamic (-no-pie): Mesa is the one boundary the static
+  philosophy concedes, the way the kernel is for syscalls.
+      make posix-run GFX=1 PROG=programs/gfxdemo.fpr
 
 The capability story is build-time, as designed: the image's
 unresolved `fpr_g_` imports ARE its capability manifest.  A program
@@ -66,7 +78,10 @@ step and slot in exactly where the RVV flag does today.
 ## Not yet
 
 - macOS/Mach-O (syntax layer on A64.hs, documented there).
-- A System actor serving /services/net URL discovery over this
-  socket tier (the device-table name lookup is the current contract).
+- A System actor serving /services/net URL discovery over the socket
+  tier (gfxdemo.fpr's registry actor is the shape; net still goes via
+  the device table).
+- Windowed presentation (a swap of displayActor's body + an EGL window
+  surface) and the GBM render-node path for Pi hardware drivers.
 - Blocking service actors parked on real syscalls (today: polling,
   like virt).
