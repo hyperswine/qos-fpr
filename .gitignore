@@ -10,3 +10,4 @@ NOTES.txt
 .DS_Store
 NOTES.md
 apps_data.c
+*.bin

@@ -67,6 +67,7 @@ all: image.elf
 # POSIXCC=gcc POSIXRUN= runs natively.  macOS/Mach-O syntax is the
 # documented next step in compiler/A64.hs, not yet emitted.
 POSIXCC  ?= aarch64-linux-gnu-gcc
+# POSIXRUN ?= qemu-system-aarch64 -M virt # if on macos
 POSIXRUN ?= qemu-aarch64
 RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c $(RT_POSIX_DIR)/heap.S
 RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
