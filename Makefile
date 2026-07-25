@@ -94,8 +94,8 @@ posix-run: posix.bin
 	$(POSIXRUN) ./posix.bin
 
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs
-	cd compiler && cabal build -v0
-	cp "$$(cd compiler && cabal list-bin fprc)" $@
+	cabal build -v0
+	cp "$$(cabal list-bin fprc)" $@
 
 build/prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
