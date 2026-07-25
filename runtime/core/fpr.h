@@ -114,11 +114,18 @@ typedef struct {
 
 extern fpr_hart_t fpr_harts[FPR_NHARTS];
 
+#ifdef FPR_POSIX
+/* hosted: no free per-thread register (tpidr_el0 belongs to libc TLS);
+ * the SAME global that compiler/A64.hs makes generated code load. */
+extern fpr_hart_t *fpr_posix_hart;
+static inline fpr_hart_t *fpr_hart(void) { return fpr_posix_hart; }
+#else
 static inline fpr_hart_t *fpr_hart(void) {
   fpr_hart_t *h;
   __asm__("mv %0, tp" : "=r"(h));
   return h;
 }
+#endif
 
 /* test-and-test-and-set spinlock (AMO acquire/release; A is in imac) */
 typedef struct { volatile uw v; } fpr_lock_t;

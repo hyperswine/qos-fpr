@@ -1,6 +1,7 @@
 module Main where
 
 import Codegen (Target, codegenRev, emitProgram, externals, rv32, rv64, tgtName)
+import A64 (lowerA64)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
 import Data.List (isPrefixOf)
@@ -19,16 +20,18 @@ import Text.Megaparsec (errorBundlePretty, parse)
 
 data Opts = Opts
   { oTarget :: Target,
+    oA64 :: Bool, -- lower the rv64 emission (the shared RISC IR) to AArch64
     oRvv :: Bool,
     oPrelude :: Maybe FilePath,
     oFiles :: [FilePath]
   }
 
 parseArgs :: [String] -> Opts
-parseArgs = foldl step (Opts rv64 False Nothing [])
+parseArgs = foldl step (Opts rv64 False False Nothing [])
   where
     step o "--target=rv32" = o {oTarget = rv32}
     step o "--target=rv64" = o {oTarget = rv64}
+    step o "--target=a64" = o {oTarget = rv64, oA64 = True} -- rv64 emission is the IR
     step o "--rvv" = o {oRvv = True}
     step o a
       | "--prelude=" `isPrefixOf` a = o {oPrelude = Just (drop (length "--prelude=") a)}
@@ -56,7 +59,7 @@ main = do
   opts <- parseArgs <$> getArgs
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
-    _ -> putStrLn "usage: fprc [--target=rv32|rv64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
+    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
   preludeTops <- maybe (pure []) parseFile (oPrelude opts)
   rootTops <- parseFile inp
   lr <- loadProgram preludeTops inp rootTops
@@ -150,8 +153,10 @@ main = do
           unitExt = M.unions [arities uts | (_, uts) <- units]
           extFor = M.union preludeExt unitExt -- own names win via prog-first lookup
           tgt = oTarget opts
-          rvv = oRvv opts
-          tag = "g" ++ show codegenRev ++ "-" ++ tgtName tgt ++ (if rvv then "-rvv" else "")
+          a64 = oA64 opts
+          lower = if a64 then lowerA64 else id
+          rvv = oRvv opts && not a64 -- no RVV lowering in the a64 PoC
+          tag = "g" ++ show codegenRev ++ "-" ++ (if a64 then "a64" else tgtName tgt) ++ (if rvv then "-rvv" else "")
           unitDir = takeDirectory out </> "units"
           emitUnit path exps ext uts = do
             cached <- doesFileExist path
@@ -163,7 +168,7 @@ main = do
                 -- assembly is lazily produced must propagate, never
                 -- leave an empty file the cache then serves as a valid
                 -- compiled unit (the bbspi arity>8 incident)
-                let asm = emitProgram tgt rvv [] ext exps prog
+                let asm = lower (emitProgram tgt rvv [] ext exps prog)
                 length asm `seq` writeFile path asm
                 pure (path, show (M.size prog) ++ " supercombinators")
       createDirectoryIfMissing True unitDir
@@ -195,7 +200,7 @@ main = do
                     || (not (S.member n unitNames) && not (S.member n preludeNames))
             ]
           rootProg = compileUnit rootProgTops
-      writeFile out (emitProgram tgt rvv exports extFor (bindNames root') rootProg)
+      writeFile out (lower (emitProgram tgt rvv exports extFor (bindNames root') rootProg))
       -- the link list: everything the root's image needs beyond out itself
       writeFile (out ++ ".units") (unlines (map fst (preludeOut ++ unitOuts)))
       forM_ (preludeOut ++ unitOuts) $ \(p, note) -> putStrLn ("unit " ++ p ++ " (" ++ note ++ ")")

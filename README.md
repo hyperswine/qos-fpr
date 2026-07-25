@@ -12,6 +12,13 @@ log), a module system with separate compilation and content-addressed
 identity, and a cell-buffer TUI engine — no libc, no OS underneath,
 QEMU virt as the machine.
 
+Runtime layout: `runtime/core` (portable runtime: allocator, actors,
+prims), `runtime/virt` (QEMU-virt bare-metal machine layer: boot, ctx,
+MMIO HAL, linker scripts), `runtime/qos` (app-side runtime for `.qa`
+processes running ON QOS), `runtime/posix` (hosted HAL: libc-backed,
+`--target=a64` lowers the rv64 emission to AArch64 — see
+runtime/posix/README.md).
+
 This file describes the system **as it stands**. The round-by-round
 design log — why each piece got this way, including the essays on
 value representation, the discoverable-symbol contract, tail calls,

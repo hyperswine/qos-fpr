@@ -53,7 +53,11 @@ static void hart_init(int id) {
   h->rpos = 0;
 }
 
+#ifdef FPR_POSIX
+void fpr_set_tp(fpr_hart_t *h) { fpr_posix_hart = h; }
+#else
 void fpr_set_tp(fpr_hart_t *h) { __asm__ volatile("mv tp, %0" ::"r"(h)); }
+#endif
 
 void fpr_rt_init(void) {
   for (int i = 0; i < FPR_NHARTS; i++) hart_init(i);

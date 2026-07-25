@@ -46,7 +46,7 @@ def mangle(sym):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--entries", nargs="*", default=[])  # accepted, ignored (name-dispatch is dead)
-    ap.add_argument("--out", default="runtime/apps_data.c")
+    ap.add_argument("--out", default="runtime/core/apps_data.c")
     ap.add_argument("qa", nargs="+")
     a = ap.parse_args()
 

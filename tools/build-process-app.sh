@@ -37,12 +37,12 @@ echo "target=$TARGET  _proc_arena_start=0x$ARENA_HEX  PROC_SLOT_BASE=$SLOT_BASE"
 BASE=$(basename "$APP_FPR" .fpr)
 ./fprc --target="$TARGET" --prelude=programs/prelude.fpr "$APP_FPR" "build/${BASE}.s"
 
-RT="runtime/proc_entry.c runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/buddy.c runtime/mod.c runtime/vec.c runtime/sstr.c"
+RT="runtime/qos/proc_entry.c runtime/virt/ctx.S runtime/core/runtime.c runtime/virt/hal.c runtime/virt/net.c runtime/virt/blk.c runtime/core/actors.c runtime/core/buddy.c runtime/core/mod.c runtime/core/vec.c runtime/core/sstr.c"
 riscv64-unknown-elf-gcc $ARCHFLAGS -DFPR_NHARTS=1 -ffreestanding -nostdlib -nostartfiles -O2 \
   -Wl,--defsym=PROC_SLOT_BASE=$SLOT_BASE \
   -Wl,--defsym=_heap_start=_proc_image_end \
   -Wl,--defsym=_heap_end=_proc_image_end -Wl,--defsym=_proc_arena_end=0x84000000 \
-  -T runtime/link-app.ld -Iruntime $RT "build/${BASE}.s" $(cat "build/${BASE}.s.units") -o "${BASE}.elf"
+  -T runtime/virt/link-app.ld -Iruntime/core -Iruntime/virt $RT "build/${BASE}.s" $(cat "build/${BASE}.s.units") -o "${BASE}.elf"
 
 python3 tools/mkqa.py "$MANIFEST" "${BASE}.elf" -o "$OUT_QA"
 echo "wrote $OUT_QA (loadMode=process; add it to QAPPS in the Makefile to ship it,"

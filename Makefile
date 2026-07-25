@@ -6,6 +6,19 @@ TARGET ?= rv64
 HARTS  ?= 2
 CROSS  = riscv64-unknown-elf-
 
+# ---- runtime layout ---------------------------------------------------
+# runtime/core  portable runtime (allocator, actors, prims, vec, mod, qa)
+# runtime/virt  QEMU-virt bare-metal machine layer (boot, ctx, MMIO HAL)
+# runtime/qos   app-side runtime for .qa processes running ON QOS
+# runtime/posix hosted-OS HAL (libc-backed; see runtime/posix/README.md)
+RT_CORE_DIR = runtime/core
+RT_VIRT_DIR = runtime/virt
+RT_QOS_DIR  = runtime/qos
+RT_POSIX_DIR = runtime/posix
+RT_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/mod.c $(RT_CORE_DIR)/buddy.c
+RT_VIRT = $(RT_VIRT_DIR)/crt0.S $(RT_VIRT_DIR)/ctx.S $(RT_VIRT_DIR)/hal.c $(RT_VIRT_DIR)/net.c $(RT_VIRT_DIR)/blk.c
+RT_INC  = -I$(RT_CORE_DIR) -I$(RT_VIRT_DIR)
+
 ifeq ($(TARGET),rv32)
 ARCHFLAGS = -march=rv32imac_zicsr -mabi=ilp32
 QEMU      = qemu-system-riscv32
@@ -44,6 +57,31 @@ DISK ?= disk.img
 
 all: image.elf
 
+# ---- posix HAL: hosted images (runtime/posix/README.md) ---------------
+# The a64 fprc target lowers the rv64 emission (the shared low-level
+# RISC IR) to AArch64 ELF assembly; the posix HAL rebinds the virt
+# HAL's contract onto libc.  Static by default: a hosted FPRISC image
+# is ONE self-contained binary, same philosophy as the .qa archive.
+# Cross from x86-64 Linux: make posix-run PROG=tests/orig1.fpr
+# (needs gcc-aarch64-linux-gnu + qemu-user).  On an arm64 Linux host,
+# POSIXCC=gcc POSIXRUN= runs natively.  macOS/Mach-O syntax is the
+# documented next step in compiler/A64.hs, not yet emitted.
+POSIXCC  ?= aarch64-linux-gnu-gcc
+POSIXRUN ?= qemu-aarch64
+RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c $(RT_POSIX_DIR)/heap.S
+RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
+
+build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
+	@mkdir -p build
+	LC_ALL=C.UTF-8 ./fprc --target=a64 --prelude=programs/prelude.fpr $(PROG) $@
+
+posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE)
+	$(POSIXCC) -static -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 -I$(RT_CORE_DIR) \
+	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -o $@
+
+posix-run: posix.bin
+	$(POSIXRUN) ./posix.bin
+
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs
 	cd compiler && cabal build -v0
 	cp "$$(cd compiler && cabal list-bin fprc)" $@
@@ -52,9 +90,9 @@ build/prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
 	LC_ALL=C.UTF-8 ./fprc --target=$(FPRTGT) $(FPRCFLAGS) --prelude=programs/prelude.fpr $(PROG) build/prog.s
 
-image.elf: build/prog.s runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/link.ld
-	$(CROSS)gcc $(CFLAGS) -T runtime/link.ld -Iruntime \
-	  runtime/crt0.S runtime/ctx.S build/prog.s $$(cat build/prog.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/buddy.c -o $@
+image.elf: build/prog.s $(RT_VIRT) $(RT_CORE) $(RT_VIRT_DIR)/link.ld
+	$(CROSS)gcc $(CFLAGS) -T $(RT_VIRT_DIR)/link.ld $(RT_INC) \
+	  $(RT_VIRT) build/prog.s $$(cat build/prog.s.units) $(RT_CORE) -o $@
 
 
 # ---- System.qa: the .qa app platform (docs/QA-FORMAT.md) --------------------
@@ -86,15 +124,15 @@ apps/TUIAppLauncher.qa: apps/TUIAppLauncher.toml tools/mkqa.py
 build/qa0/%.qa: apps/%.toml tools/mkqa.py
 	@mkdir -p build/qa0
 	python3 tools/mkqa.py $< -o $@
-runtime/apps_data.c: $(patsubst %,build/qa0/%.qa,$(QAPPS)) tools/genapps.py
+$(RT_CORE_DIR)/apps_data.c: $(patsubst %,build/qa0/%.qa,$(QAPPS)) tools/genapps.py
 	python3 tools/genapps.py --entries -- $(patsubst %,build/qa0/%.qa,$(QAPPS))
 
 # FORCE: TARGET/HARTS change the flags but not the deps, so always
 # relink (fprc's per-unit cache keeps the compile side cheap)
-system.elf: FORCE fprc programs/system.fpr programs/prelude.fpr runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c runtime/crt0.S runtime/ctx.S runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/link.ld
+system.elf: FORCE fprc programs/system.fpr programs/prelude.fpr $(RT_CORE_DIR)/apps.c $(RT_CORE_DIR)/apps_data.c $(RT_CORE_DIR)/elfload.c $(RT_CORE_DIR)/process.c $(RT_VIRT) $(RT_CORE) $(RT_VIRT_DIR)/link.ld
 	./fprc --target=$(FPRTGT) --prelude=programs/prelude.fpr programs/system.fpr build/system.s
-	$(CROSS)gcc $(CFLAGS) -T runtime/link.ld -Iruntime \
-	  runtime/crt0.S runtime/ctx.S build/system.s $$(cat build/system.s.units) runtime/runtime.c runtime/hal.c runtime/net.c runtime/blk.c runtime/actors.c runtime/vec.c runtime/sstr.c runtime/mod.c runtime/apps.c runtime/apps_data.c runtime/buddy.c runtime/elfload.c runtime/process.c -o $@
+	$(CROSS)gcc $(CFLAGS) -T $(RT_VIRT_DIR)/link.ld $(RT_INC) \
+	  $(RT_VIRT) build/system.s $$(cat build/system.s.units) $(RT_CORE) $(RT_CORE_DIR)/apps.c $(RT_CORE_DIR)/apps_data.c $(RT_CORE_DIR)/elfload.c $(RT_CORE_DIR)/process.c -o $@
 
 # the DEFAULT setup has a disk: the append-only log carries /apps
 # overrides, app kv streams, and general files (docs/STORAGE.md)
@@ -137,7 +175,7 @@ asm: build/prog.s
 
 clean:
 	rm -rf build fprc image.elf system.elf sys*.elf compiler/dist-newstyle
-	rm -f apps/*.qa runtime/apps_data.c
+	rm -f apps/*.qa $(RT_CORE_DIR)/apps_data.c
 
 FORCE:
 
