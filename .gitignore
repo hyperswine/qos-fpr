@@ -9,3 +9,4 @@ NOTES.txt
 *.zip
 .DS_Store
 NOTES.md
+apps_data.c
