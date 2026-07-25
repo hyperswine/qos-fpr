@@ -11,3 +11,5 @@ NOTES.txt
 NOTES.md
 apps_data.c
 *.bin
+*.hi
+*.o

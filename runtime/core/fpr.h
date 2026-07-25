@@ -31,7 +31,7 @@ typedef struct { uint32_t tid, var; } __attribute__((aligned(8))) hdr_t;
 typedef struct { uint32_t tid, var; uw fn, arity, nargs, args[]; } __attribute__((aligned(8))) pap_t;
 typedef struct { uint32_t tid, var; uw fn, arity, nargs; } __attribute__((aligned(8))) pap0_t;
 typedef struct { uint32_t tid, var; uw len; uint8_t bytes[]; } __attribute__((aligned(8))) str_t;
-typedef struct { uint32_t tid, var; uw base; } __attribute__((aligned(8))) dev_t;
+typedef struct { uint32_t tid, var; uw base; } __attribute__((aligned(8))) fpr_dev_t;
 typedef struct { uint32_t tid, var /* = width in bytes */; uw addr; } __attribute__((aligned(8))) reg_t;
 typedef struct { uint32_t tid, var /* = endian: 0 LE, 1 BE */; uw len, val; } __attribute__((aligned(8))) bits_t;
 
@@ -115,9 +115,11 @@ typedef struct {
 extern fpr_hart_t fpr_harts[FPR_NHARTS];
 
 #ifdef FPR_POSIX
-/* hosted: no free per-thread register (tpidr_el0 belongs to libc TLS);
- * the SAME global that compiler/A64.hs makes generated code load. */
-extern fpr_hart_t *fpr_posix_hart;
+/* hosted: no free per-thread register (tpidr_el0/fs belong to libc
+ * TLS); the SAME thread-local that A64.hs/X64.hs make generated code
+ * load.  __thread: each hart pthread carries its own, so actors see
+ * their OWNER hart's block exactly as tp gives them on bare metal. */
+extern __thread fpr_hart_t *fpr_posix_hart;
 static inline fpr_hart_t *fpr_hart(void) { return fpr_posix_hart; }
 #else
 static inline fpr_hart_t *fpr_hart(void) {
@@ -186,7 +188,21 @@ V fpr_prim_fn_str(V v); /* runtime.c: render() a value to a String, same as `str
 extern void fpr_hart_main(int id); /* actors.c: runs hart_loop; returns when fpr_process_done */
 extern void fpr_actors_init(void); /* actors.c: sets up actor 0 on hart 0 */
 void fpr_proc_arena_init(void);
-void fpr_set_tp(fpr_hart_t *h); /* runtime.c */ /* process.c: buddy_init over _proc_arena_start.._end */
+void fpr_set_tp(fpr_hart_t *h); /* runtime.c */
+/* park-forever, portably: rv wfi on metal, a libc pause when hosted
+ * (only reached if hal_poweroff ever returns -- real-HW behavior) */
+#ifdef FPR_POSIX
+void fpr_park(void);
+#define FPR_PARK() fpr_park()
+#else
+#define FPR_PARK() __asm__ volatile("wfi")
+#endif
+/* boot entry points (virt: called from crt0.S; posix: from main.c) */
+void fpr_rt_init(void);          /* runtime.c: buddy, harts, actor 0 */
+void fpr_hart_main(int id);      /* actors.c: hart 0's loop */
+void fpr_hart_secondary(int id); /* actors.c: secondary hart's loop */
+void fpr_ctx_fabricate(uw *ctx, void (*entry)(void), uw stack_top16,
+                       fpr_hart_t *owner); /* ctx layer (virt/posix) */ /* process.c: buddy_init over _proc_arena_start.._end */
 
 V fpr_alloc(V raw_bytes); /* bump + free list; arg is a RAW byte count, not tagged */
 void fpr_free(V obj);     /* returns to the free list (sizes <= 8 KiB) */

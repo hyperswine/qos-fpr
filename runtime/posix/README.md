@@ -1,52 +1,72 @@
-# runtime/posix — the hosted HAL: libc is the board
+# runtime/posix — the hosted HAL: libc as the board
 
-An FPRISC program compiled with `--target=a64` plus this directory is a
-single static hosted binary: same compiler, same portable core
-(`runtime/core`), same discoverable-symbol contract — with the virt
-machine layer's obligations re-satisfied by the host OS's userspace
-instead of MMIO.
+FPRISC programs compile to **self-contained static Linux executables**:
+the full bare-metal runtime — buddy allocator, per-actor slabs, the
+actor scheduler with per-sender SPSC mailboxes, fuel preemption, the
+deadlock detector — linked against a HAL whose "board" is libc.
 
-    make posix-run PROG=tests/orig1.fpr      # cross + qemu-user
-    make posix-run POSIXCC=gcc POSIXRUN=     # native on arm64 Linux
+    make posix-run PROG=tests/actors.fpr                # x86-64, native
+    make posix-run POSIXARCH=a64 PROG=tests/orig1.fpr   # aarch64 via qemu-user
+    make posix.bin PROG=programs/httpd.fpr && ./posix.bin
+    curl localhost:8000/run -d '{"prog":"1 2 + ."}'
 
-## How the pieces line up
+## What is shared and what is per-host
 
-| virt (bare metal)                  | posix (hosted)                       |
-|------------------------------------|--------------------------------------|
-| crt0.S boot, per-hart stacks       | the host did all of it; `main.c`     |
-| link.ld heap/arena regions         | `heap.S` .bss block, same symbols    |
-| tp holds the hart pointer          | `fpr_posix_hart` global (A64.hs makes generated code load it) |
-| hal.c UART MMIO                    | `hal.c` write(1)/exit                |
-| device table / Pin / Mmio          | absent on purpose: reaching for them is a **link error naming the capability** |
-| actors.c scheduler + ctx.S         | not yet: single hart, main on the C stack, actor prims panic by name |
+`runtime/core/actors.c` is the bare-metal scheduler, byte-for-byte:
+it turned out to be portable C11 atomics plus exactly three machine
+obligations, and the posix HAL satisfies those instead of replacing
+the design:
 
-The capability story is the point: a hosted image that only computes
-links against nothing but the core prims; the moment a program touches
-`Pin.read` or `device`, the link fails with `fpr_g_Pin_x2eread` — the
-same "the image's imports ARE its capability manifest" property the
-.qa manifest gives on QOS, enforced by the linker on a host.
+- **fpr_ctx_switch** — ctx_x64.S / ctx_a64.S, the cooperative switch
+  (callee-saved integer state only, same contract as virt/ctx.S).
+- **fpr_ctx_fabricate** — first-activation state (hal.c); x86 fakes
+  post-`call` stack alignment with an 8-byte bias.
+- **hal_wfi / ipi / timer** — the CLINT doorbells become a 200µs
+  nanosleep poll; every wake path re-checks its rings afterwards, so
+  the block/wake CAS protocol is untouched.  A futex per hart is the
+  obvious upgrade; correctness does not depend on it.
 
-## The a64 target (compiler/A64.hs)
+Harts are **pthreads** (POSIXHARTS, default 2), `fpr_posix_hart` is
+`__thread`, and generated code TLS-loads it wherever rv64 code reads
+tp.  This is the P4 bring-up plan's shape — N actors multiplexed onto
+a fixed few kernel threads — prototyped on Linux first.
 
-`--target=a64` does not add a second code generator. Codegen.hs's rv64
-emission only ever uses a ~20-mnemonic, flags-free, 16-byte-aligned,
-direct-control-flow subset of RISC-V — a de-facto portable RISC IR —
-and A64.hs lowers that subset 1:1 to AArch64 under a register map that
-agrees with AAPCS64 everywhere the code touches C (a0-a7 = x0-x7,
-callee/caller-saved partitions line up), so translated FPRISC calls
-the C runtime with no shims. Naive by design: no LDP/STP fusion, no
-CSEL, one cmp per branch. Correct first; the fusion peepholes are
-where performance work would go.
+## Devices
 
-## Known next steps
+Discovery is the same table-by-name contract as virt hal.c:
 
-- **macOS/Mach-O**: same instructions; `:lo12:` becomes `@PAGE/@PAGEOFF`,
-  C-visible symbols grow a leading `_`, section directives change.
-  A syntax layer over A64.hs, not a new translation.
-- **Actors**: ctx switching needs a posix backend (ucontext fibers or
-  N-actors-per-pthread, matching the P4 plan's N-to-2 mapping); until
-  then the fuel check refills and never yields.
-- **The System actor / URL surface**: `/home/...` → `$HOME` resolution,
-  `/dev/keyboard` behind an event loop — the hosted System.qa
-  discussed in the design notes. The HAL boundary here is where those
-  actors' backing implementations (open/read/write, sockets) live.
+- **uart** — a 16550-ish register model over stdio: LSR polling and
+  THR writes work, so console programs run unchanged (stubs.c holds
+  the reg8/read/write tier over pseudo-addresses).
+- **clint** — mtime reads from CLOCK_MONOTONIC at virt's offset.
+- **net** — netPoll/netRead/netWrite/netClose over BSD sockets
+  (net.c), byte-compatible with virt's virtio-net surface: one
+  connection at a time, actor-side polling.  FPR_PORT picks the port
+  (default 8000).  programs/httpd.fpr compiles unchanged.
+
+The capability story is build-time, as designed: the image's
+unresolved `fpr_g_` imports ARE its capability manifest.  A program
+that names a capability this HAL does not export fails at LINK time
+with the capability's name; MMIO reads of unmapped addresses panic
+with an honest message.
+
+## The x86-64 lowering in one breath
+
+compiler/X64.hs lowers the shared rv64 emission; the four mismatches
+(hardware call/ret vs ra, SysV stack alignment, the rax/rdi arg0
+split, two-operand arithmetic) each have a local rule documented in
+its header.  Args 7/8 travel in TLS cells (fpr_x64_a6/a7) rather than
+SysV stack slots so tail calls stay plain jmps — TCO holds at every
+arity; runtime.c's cast table fills the cells at the C boundary.
+Vec-loop specialization is disabled on x64 (six callee-saved
+registers cannot host the s6+ loops); the generic C vec path runs
+instead.  SSE/AVX column loops for SoA VLists are the natural next
+step and slot in exactly where the RVV flag does today.
+
+## Not yet
+
+- macOS/Mach-O (syntax layer on A64.hs, documented there).
+- A System actor serving /services/net URL discovery over this
+  socket tier (the device-table name lookup is the current contract).
+- Blocking service actors parked on real syscalls (today: polling,
+  like virt).

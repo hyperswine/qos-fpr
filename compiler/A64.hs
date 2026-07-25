@@ -15,8 +15,9 @@
 --   ra -> x30  sp -> sp  zero -> xzr
 --   tp -> (no free per-thread register on hosted AArch64: tpidr_el0
 --          belongs to libc TLS)  `mv RD, tp` therefore lowers to a
---          load of the global fpr_posix_hart, which runtime/posix
---          maintains where bare metal maintains tp.  This is the one
+--          local-exec TLS load of fpr_posix_hart (__thread: one per
+--          hart pthread), which runtime/posix maintains where bare
+--          metal maintains tp.  This is the one
 --          place the translation knows it is targeting the posix HAL.
 --
 -- Because both ABIs agree on x0..x7/caller-saved/callee-saved for the
@@ -33,10 +34,15 @@
 -- sym@PAGEOFF,  every C-visible symbol grows a leading underscore, and
 -- .section names change.  That is a syntax layer over this same pass,
 -- not a different translation.
-module A64 (lowerA64) where
+module A64 (lowerA64, a64Rev) where
+
 
 import Data.Char (isDigit, isSpace)
 import Data.List (isPrefixOf, stripPrefix)
+
+-- bump when the lowering changes (unit-cache tag component; see X64.hs)
+a64Rev :: Int
+a64Rev = 3
 
 lowerA64 :: String -> String
 lowerA64 = unlines . concatMap lowerLine . map banner . lines
@@ -162,8 +168,13 @@ instr body = case parts body of
   -- moves / constants / addresses
   ("mv", [rd, "tp"]) ->
     let xd = xreg rd
-     in [ "adrp " ++ xd ++ ", fpr_posix_hart",
-          "ldr " ++ xd ++ ", [" ++ xd ++ ", :lo12:fpr_posix_hart]" ]
+     in [ -- local-exec TLS: fpr_posix_hart is __thread (one per hart
+          -- pthread), matching X64.hs's %fs load; static-link only,
+          -- which is the whole posix philosophy anyway
+          "mrs " ++ xd ++ ", tpidr_el0",
+          "add " ++ xd ++ ", " ++ xd ++ ", :tprel_hi12:fpr_posix_hart",
+          "add " ++ xd ++ ", " ++ xd ++ ", :tprel_lo12_nc:fpr_posix_hart",
+          "ldr " ++ xd ++ ", [" ++ xd ++ "]" ]
   ("mv", [rd, rs]) -> ["mov " ++ xreg rd ++ ", " ++ xreg rs]
   ("li", [rd, n]) -> movImm (xreg rd) (readInt n)
   ("la", [rd, sym]) ->

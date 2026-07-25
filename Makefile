@@ -15,8 +15,8 @@ RT_CORE_DIR = runtime/core
 RT_VIRT_DIR = runtime/virt
 RT_QOS_DIR  = runtime/qos
 RT_POSIX_DIR = runtime/posix
-RT_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/mod.c $(RT_CORE_DIR)/buddy.c
-RT_VIRT = $(RT_VIRT_DIR)/crt0.S $(RT_VIRT_DIR)/ctx.S $(RT_VIRT_DIR)/hal.c $(RT_VIRT_DIR)/net.c $(RT_VIRT_DIR)/blk.c
+RT_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/mod.c $(RT_CORE_DIR)/buddy.c
+RT_VIRT = $(RT_VIRT_DIR)/crt0.S $(RT_VIRT_DIR)/ctx.S $(RT_VIRT_DIR)/ctx_fab.c $(RT_VIRT_DIR)/hal.c $(RT_VIRT_DIR)/net.c $(RT_VIRT_DIR)/blk.c
 RT_INC  = -I$(RT_CORE_DIR) -I$(RT_VIRT_DIR)
 
 ifeq ($(TARGET),rv32)
@@ -62,23 +62,33 @@ all: image.elf
 # RISC IR) to AArch64 ELF assembly; the posix HAL rebinds the virt
 # HAL's contract onto libc.  Static by default: a hosted FPRISC image
 # is ONE self-contained binary, same philosophy as the .qa archive.
-# Cross from x86-64 Linux: make posix-run PROG=tests/orig1.fpr
-# (needs gcc-aarch64-linux-gnu + qemu-user).  On an arm64 Linux host,
-# POSIXCC=gcc POSIXRUN= runs natively.  macOS/Mach-O syntax is the
-# documented next step in compiler/A64.hs, not yet emitted.
+# POSIXARCH=x64 (default): native x86-64 Linux, real actors on
+# pthread harts, sockets.  POSIXARCH=a64: cross aarch64 + qemu-user.
+# POSIXHARTS: pthread "harts" actors are multiplexed onto (the P4
+# plan's N-to-2 shape).  FPR_PORT picks the net actor's port.
+POSIXARCH ?= x64
+POSIXHARTS ?= 2
+ifeq ($(POSIXARCH),a64)
 POSIXCC  ?= aarch64-linux-gnu-gcc
-# POSIXRUN ?= qemu-system-aarch64 -M virt # if on macos
 POSIXRUN ?= qemu-aarch64
-RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c $(RT_POSIX_DIR)/heap.S
-RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
+POSIXCTX = $(RT_POSIX_DIR)/ctx_a64.S
+else
+POSIXCC  ?= gcc
+POSIXRUN ?=
+POSIXCTX = $(RT_POSIX_DIR)/ctx_x64.S
+endif
+RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c \
+           $(RT_POSIX_DIR)/net.c $(RT_POSIX_DIR)/heap.S $(POSIXCTX)
+RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c \
+                $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
 
 build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --target=a64 --prelude=programs/prelude.fpr $(PROG) $@
+	LC_ALL=C.UTF-8 ./fprc --target=$(POSIXARCH) --prelude=programs/prelude.fpr $(PROG) $@
 
 posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE)
-	$(POSIXCC) -static -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 -I$(RT_CORE_DIR) \
-	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -o $@
+	$(POSIXCC) -static -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) -I$(RT_CORE_DIR) \
+	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -lpthread -o $@
 
 posix-run: posix.bin
 	$(POSIXRUN) ./posix.bin

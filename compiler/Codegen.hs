@@ -27,6 +27,10 @@
 -- order matches program order -- nothing is elided or reordered.
 
 module Codegen (emitProgram, externals, Target (..), rv64, rv32, tgtName, codegenRev) where
+-- NOTE: emitProgram's `spec` flag gates Vec.map/filter/fold loop
+-- specialization: x64 lowering runs with it OFF (SysV has too few
+-- callee-saved registers for the s1..s9 spec loops; the generic C
+-- vec path is used instead -- slower, correct).
 
 import Modules (ModExport (..))
 
@@ -99,6 +103,7 @@ data CG = CG
     cgStrs :: M.Map String String,
     cgTgt :: Target,
     cgRvv :: Bool,
+    cgSpec :: Bool, -- vec loop specialization enabled for this target?
     cgSpecs :: M.Map (String, String) (String, SpecPlan), -- (op, fn) -> (label, plan)
     -- separate compilation:
     cgExt :: M.Map String Int, -- extern known globals (other units): name -> arity
@@ -140,8 +145,8 @@ strLabel s = do
       modify (\c -> c {cgStrs = M.insert s l (cgStrs c)})
       pure l
 
-emitProgram :: Target -> Bool -> [ModExport] -> M.Map String Int -> S.Set String -> Prog -> String
-emitProgram tgt rvv exports ext exps prog = unlines (evalState top (CG 0 M.empty tgt rvv M.empty ext exps))
+emitProgram :: Target -> Bool -> Bool -> [ModExport] -> M.Map String Int -> S.Set String -> Prog -> String
+emitProgram tgt rvv spec exports ext exps prog = unlines (evalState top (CG 0 M.empty tgt rvv spec M.empty ext exps))
   where
     top = do
       fns <- concat <$> mapM (uncurry (compileFn prog)) (M.toList prog)
@@ -384,10 +389,11 @@ gen :: Prog -> M.Map String Int -> Int -> Pos -> Core -> G [String]
 gen prog env nxt pos e0 = do
   tgt <- gets cgTgt
   ext <- gets cgExt
-  genT tgt prog ext env nxt pos e0
+  spec <- gets cgSpec
+  genT tgt spec prog ext env nxt pos e0
 
-genT :: Target -> Prog -> M.Map String Int -> M.Map String Int -> Int -> Pos -> Core -> G [String]
-genT tgt prog ext = go
+genT :: Target -> Bool -> Prog -> M.Map String Int -> M.Map String Int -> Int -> Pos -> Core -> G [String]
+genT tgt spec prog ext = go
   where
     w = tgtW tgt
     ld = tgtLd tgt
@@ -410,7 +416,7 @@ genT tgt prog ext = go
     -- (op, fn); see emitSpecs).  The spec symbol behaves exactly like a
     -- supercombinator, so knownCall staging + TCO apply unchanged.
     go env nxt pos e
-      | Just (plan, callArgs) <- vecSpec prog (`M.member` env) e = do
+      | spec, Just (plan, callArgs) <- vecSpec prog (`M.member` env) e = do
           sym <- requestSpec plan
           knownCall env nxt pos sym callArgs
     -- CIf and CLet are the only forms whose "last thing done" is a

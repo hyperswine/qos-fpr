@@ -1,28 +1,37 @@
-/* main.c (posix) — hosted bootstrap: what crt0.S + fpr_rt_init +
- * fpr_actors_init do on virt, minus everything a host OS already did
- * (stacks, clocks, "SMP release").  One hart, no scheduler: main runs
- * on the C stack, straight through, exactly like virt's actor 0 --
- * the actor layer arrives when ctx switching gets a posix backend
- * (ucontext or one-pthread-per-hart; see README).
+/* main.c (posix) — hosted boot: what crt0.S does on virt, done by the
+ * host instead.  fpr_rt_init is the SAME portable init virt runs
+ * (buddy over the heap, hart blocks, actors_init fabricating actor 0
+ * around fpr_fn_main); harts are pthreads; the scheduler, mailboxes,
+ * fuel preemption and deadlock detector are runtime/core/actors.c,
+ * byte-for-byte the bare-metal ones.  This is the P4 plan's shape --
+ * N actors multiplexed onto a fixed few kernel threads -- with Linux
+ * playing the part of the IDF boot.
  */
 #include "fpr.h"
+#include <pthread.h>
 
-/* the hosted stand-in for tp: generated a64 code loads this global
- * where generated rv64 code reads tp (see compiler/A64.hs).  */
-fpr_hart_t *fpr_posix_hart;
+/* the hosted stand-in for tp (one per hart THREAD): generated x64/a64
+ * code TLS-loads this where generated rv64 code reads tp. */
+__thread fpr_hart_t *fpr_posix_hart;
 
-extern char _heap_start[], _heap_end[];
-extern V fpr_fn_main(void);
-void fpr_exit(V result); /* runtime.c: render + hal_poweroff(0) */
+#if defined(__x86_64__)
+/* X64.hs's staging cells for SysV stack args 7/8 (see the a6/a7 rules
+ * in the lowering header): written at arg staging, read by the very
+ * next call's spill -- per hart thread, hence TLS, like tp above. */
+__thread uw fpr_x64_a6, fpr_x64_a7;
+#endif
+
+static void *hart_thread(void *arg) {
+  fpr_hart_secondary((int)(uintptr_t)arg); /* sets tp, joins the loop */
+  return 0;
+}
 
 int main(void) {
-  fpr_hart_t *h = &fpr_harts[0];
-  h->id = 0;
-  h->fuel = 1u << 30; /* refilled by the posix fpr_fuel_exhausted */
-  fpr_posix_hart = h;
-  fpr_set_tp(h); /* posix: same global, keeps runtime.c unchanged */
-  uw minb = 64u * 1024;
-  uw base = ((uw)_heap_start + (minb - 1)) & ~(uw)(minb - 1);
-  buddy_init((void *)base, (uw)_heap_end - base);
-  fpr_exit(fpr_fn_main());
+  fpr_rt_init(); /* runtime/core: buddy, hart blocks, actor 0, smp_go */
+  for (uintptr_t i = 1; i < FPR_NHARTS; i++) {
+    pthread_t t;
+    if (pthread_create(&t, 0, hart_thread, (void *)i))
+      fpr_cpanic("posix: pthread_create");
+  }
+  fpr_hart_main(0); /* never returns: fpr_exit -> hal_poweroff -> exit */
 }

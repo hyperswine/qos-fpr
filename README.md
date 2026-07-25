@@ -15,7 +15,7 @@ QEMU virt as the machine.
 Runtime layout: `runtime/core` (portable runtime: allocator, actors,
 prims), `runtime/virt` (QEMU-virt bare-metal machine layer: boot, ctx,
 MMIO HAL, linker scripts), `runtime/qos` (app-side runtime for `.qa`
-processes running ON QOS), `runtime/posix` (hosted HAL: libc-backed,
+processes running ON QOS), `runtime/posix (hosted HAL: x86-64 native + aarch64, static binaries, pthread-hart actors, sockets)` (hosted HAL: libc-backed,
 `--target=a64` lowers the rv64 emission to AArch64 — see
 runtime/posix/README.md).
 

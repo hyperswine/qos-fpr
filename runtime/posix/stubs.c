@@ -1,51 +1,47 @@
-/* stubs.c (posix) — the not-yet-hosted runtime surface.
+/* stubs.c (posix) — capabilities the hosted HAL does not grant.
  *
- * Two kinds of stub, on purpose:
- *  - fuel: generated code decrements h->fuel unconditionally (that IS
- *    the codegen contract), so hosted single-thread execution just
- *    refills it -- preemption is the scheduler's concern and there is
- *    no scheduler here yet.
- *  - actors/devices: panic with the capability's name.  The prelude
- *    unit links against the full Actor/Mmio contract, so the symbols
- *    must exist; a program that CALLS them on the posix HAL gets an
- *    honest runtime panic instead of a silent wrong answer.
+ * Only the MMIO tier lives here now (the actor surface is the real
+ * runtime/core/actors.c).  Programs that link these and never call
+ * them cost nothing; programs that CALL them get an honest panic
+ * naming the missing capability.  Programs whose own code references
+ * capabilities with no stub at all (Pin.*, bitsLE, ...) fail at LINK
+ * time with the fpr_g_ name -- the image's imports are its capability
+ * manifest, and the posix HAL simply doesn't export the bus tier.
  */
 #include "fpr.h"
 
-void fpr_fuel_exhausted(void) { fpr_hart()->fuel = 1u << 30; }
+/* the register tier, backed by net.c's pseudo-address dispatch: the
+ * SAME reg_t/T_REGISTER values as virt, a different "bus" behind them */
+uw fpr_posix_mmio_read(uw addr, uint32_t width);
+void fpr_posix_mmio_write(uw addr, uw v, uint32_t width);
 
-uw fpr_current_id(void) { return 0; }
-
-/* referenced by fpr_rt_init (linked, not called on posix) */
-void fpr_actors_init(void) {}
-void fpr_hart_main(int id) { (void)id; fpr_cpanic("posix: no hart loop"); }
-void fpr_hart_secondary(int id) { (void)id; fpr_cpanic("posix: no hart loop"); }
-
-#define STUB1(sym, msg) \
-  static V sym##_impl(V a) { (void)a; fpr_cpanic(msg); return 0; } \
-  FPR_FN(sym, sym##_impl, 1)
-#define STUB2(sym, msg) \
-  static V sym##_impl(V a, V b) { (void)a; (void)b; fpr_cpanic(msg); return 0; } \
-  FPR_FN(sym, sym##_impl, 2)
-
-STUB1(fpr_g_spawn, "posix HAL: spawn (actors not hosted yet)");
-STUB2(fpr_g_spawnOn, "posix HAL: spawnOn (actors not hosted yet)");
-STUB2(fpr_g_send, "posix HAL: send (actors not hosted yet)");
-STUB1(fpr_g_receive, "posix HAL: receive (actors not hosted yet)");
-STUB2(fpr_g_receiveFrom, "posix HAL: receiveFrom (actors not hosted yet)");
-STUB1(fpr_g_receiveRes, "posix HAL: receiveRes (actors not hosted yet)");
-STUB1(fpr_g_yield, "posix HAL: yield (actors not hosted yet)");
-STUB1(fpr_g_kill, "posix HAL: kill (actors not hosted yet)");
-STUB1(fpr_g_myself, "posix HAL: myself (actors not hosted yet)");
-STUB1(fpr_g_hartId, "posix HAL: hartId (actors not hosted yet)");
-STUB1(fpr_g_harts, "posix HAL: harts (actors not hosted yet)");
-STUB1(fpr_g_fuelQuantum, "posix HAL: fuelQuantum (actors not hosted yet)");
-STUB1(fpr_g_fuelPreempts, "posix HAL: fuelPreempts (actors not hosted yet)");
-STUB1(fpr_g_read, "posix HAL: read (no MMIO on a hosted image)");
-STUB2(fpr_g_write, "posix HAL: write (no MMIO on a hosted image)");
-
-/* actors.c isn't linked (its slab-refill path is portable but its
- * scheduler isn't yet); satisfy the two symbols runtime.c takes from
- * it.  h->current is always 0 hosted, so fpr_acb_pool is unreachable. */
-volatile int fpr_is_process = 0;
-fpr_pool_t *fpr_acb_pool(struct fpr_acb *a) { (void)a; fpr_cpanic("posix: acb pool"); return 0; }
+static V mkreg(V dev, V off, uint32_t width) {
+  if (ISINT(dev) || TID(dev) != T_DEVICE) fpr_cpanic("reg: not a Device");
+  if (!ISINT(off)) fpr_cpanic("reg: offset not an Int");
+  reg_t *r = (reg_t *)fpr_alloc(sizeof(reg_t));
+  r->tid = T_REGISTER;
+  r->var = width;
+  r->addr = ((fpr_dev_t *)dev)->base + (uw)UNTAG(off);
+  return (V)r;
+}
+static V h_reg8(V d, V o) { return mkreg(d, o, 1); }
+static V h_reg32(V d, V o) { return mkreg(d, o, 4); }
+static V h_read(V rv) {
+  if (ISINT(rv) || TID(rv) != T_REGISTER) fpr_cpanic("read: not a Register");
+  reg_t *r = (reg_t *)rv;
+  return TAG((sw)fpr_posix_mmio_read(r->addr, r->var));
+}
+static V h_write(V rv, V x) {
+  if (ISINT(rv) || TID(rv) != T_REGISTER) fpr_cpanic("write: not a Register");
+  reg_t *r = (reg_t *)rv;
+  uw v;
+  if (ISINT(x)) v = (uw)UNTAG(x);
+  else if (TID(x) == T_BITS) v = ((bits_t *)x)->val;
+  else fpr_cpanic("write: value must be Int or Array Bit");
+  fpr_posix_mmio_write(r->addr, v, r->var);
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_reg8, h_reg8, 2);
+FPR_FN(fpr_g_reg32, h_reg32, 2);
+FPR_FN(fpr_g_read, h_read, 1);
+FPR_FN(fpr_g_write, h_write, 2);

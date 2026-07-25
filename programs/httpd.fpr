@@ -304,7 +304,7 @@ sliceGo s i b acc =
   | False -> sliceGo s (i + 1) b (strcat acc (chr (charAt s i))).
 
 # parse a decimal starting at i, skipping leading spaces
-parseInt s i = piSkip s i (String.len s).
+parseIntAt s i = piSkip s i (String.len s).
 piSkip s i n =
   case i > n of
     True -> 0
@@ -415,7 +415,7 @@ readBody nd acc he =
 reqCLen acc he =
   p = findSub acc "Content-Length:" 1;
   case and2 (p > 0) (p < he) of
-    True -> parseInt acc (p + 15)
+    True -> parseIntAt acc (p + 15)
   | False -> 0.
 
 # ---- request parse + routing ----------------------------------------------------
@@ -444,7 +444,7 @@ dropColors ls = case ls of Nil -> Nil | (_, t) :: r -> t :: dropColors r.
 apiInfo = "\{\"service\":\"stax over QOS net HAL\",\"endpoints\":\{\"GET /status\":\"runtime counters\",\"POST /run\":\"\{\\\"prog\\\":\\\"1 2 + .\\\"\} -> stax log lines\"\}\}".
 
 statusJson n =
-  h = heapUsed 0 / 1024;
+  h = heapUsed Unit / 1024;
   p = fuelPreempts 0;
   a = arcLive 0;
   "\{\"ok\":true,\"heap_kib\":{h},\"preempts\":{p},\"arc_live\":{a},\"cmds\":{n}\}".

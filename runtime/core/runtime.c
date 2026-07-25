@@ -357,7 +357,7 @@ void fpr_cpanic(const char *m) {
   praw(m);
   praw(" ***\n");
   hal_poweroff(1); /* QEMU: exit 1; real HW: no-op, park below */
-  for (;;) __asm__ volatile("wfi");
+  for (;;) FPR_PARK();
 }
 
 void fpr_panic(V s) {
@@ -370,7 +370,7 @@ void fpr_panic(V s) {
   }
   praw(" ***\n");
   hal_poweroff(1); /* QEMU: exit 1; real HW: no-op, park below */
-  for (;;) __asm__ volatile("wfi");
+  for (;;) FPR_PARK();
 }
 
 volatile uint32_t fpr_shutdown; /* hart loops park when set */
@@ -382,7 +382,7 @@ void fpr_exit(V result) {
   fpr_render_to_uart(result);
   praw("\n");
   hal_poweroff(0); /* QEMU: clean exit 0; real HW: no-op, park below */
-  for (;;) __asm__ volatile("wfi");
+  for (;;) FPR_PARK();
 }
 
 /* ---- generic apply --------------------------------------------------- */
@@ -406,8 +406,27 @@ static V callf(uw fn, uw ar, V *a) {
     case 4: return ((F4)fn)(a[0], a[1], a[2], a[3]);
     case 5: return ((F5)fn)(a[0], a[1], a[2], a[3], a[4]);
     case 6: return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
+#if defined(FPR_POSIX) && defined(__x86_64__)
+    /* x64 lowering convention: args 7/8 travel in TLS cells, not SysV
+     * stack slots -- that keeps generated tail calls to arity-7/8
+     * functions plain jmps (TCO intact).  This C boundary fills the
+     * cells and calls through the 6-register cast; the lowered callee
+     * reads the cells in its prologue (see compiler/X64.hs). */
+    case 7: {
+      extern __thread uw fpr_x64_a6;
+      fpr_x64_a6 = (uw)a[6];
+      return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
+    case 8: {
+      extern __thread uw fpr_x64_a6, fpr_x64_a7;
+      fpr_x64_a6 = (uw)a[6];
+      fpr_x64_a7 = (uw)a[7];
+      return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
+    }
+#else
     case 7: return ((F7)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
     case 8: return ((F8)fn)(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+#endif
   }
   fpr_cpanic("apply: arity > 8");
 }

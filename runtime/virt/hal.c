@@ -32,7 +32,7 @@
 
 typedef struct {
   const char *name;
-  dev_t dev;
+  fpr_dev_t dev;
   void (*setup)(void);       /* optional: one-time device init, or NULL */
   V (*ioctl)(V op, V arg);   /* optional: device-specific escape hatch, or NULL */
 } devtable_entry_t;
@@ -192,7 +192,7 @@ static V mkreg(V dev, V off, uint32_t width) {
   reg_t *r = (reg_t *)fpr_alloc(sizeof(reg_t));
   r->tid = T_REGISTER;
   r->var = width;
-  r->addr = ((dev_t *)dev)->base + (uw)UNTAG(off);
+  r->addr = ((fpr_dev_t *)dev)->base + (uw)UNTAG(off);
   return (V)r;
 }
 static V h_reg8(V d, V o) { return mkreg(d, o, 1); }
@@ -226,83 +226,12 @@ static V h_write(V rv, V x) {
 /* ---- Array Bit ------------------------------------------------------- */
 /* Value canonical form is always LSB-0; endianness changes what "bit i"
  * MEANS (LE: i counts from LSB; BE: i counts from MSB within len). */
-static V mkbits(uint32_t endian, uw len, uw val) {
-  if (len == 0 || len > 64) fpr_cpanic("bits: length must be 1..64");
-  bits_t *b = (bits_t *)fpr_alloc(sizeof(bits_t));
-  b->tid = T_BITS;
-  b->var = endian;
-  b->len = len;
-  b->val = (len >= (sw)(sizeof(uw) * 8)) ? val : (val & (((uw)1 << len) - 1));
-  return (V)b;
-}
-static V h_bitsLE(V l, V v) { return mkbits(0, (uw)UNTAG(l), (uw)UNTAG(v)); }
-static V h_bitsBE(V l, V v) { return mkbits(1, (uw)UNTAG(l), (uw)UNTAG(v)); }
-static V h_toInt(V b) {
-  if (ISINT(b)) return b;
-  if (TID(b) != T_BITS) fpr_cpanic("toInt: not Array Bit");
-  return TAG(((bits_t *)b)->val);
-}
-static V h_bitlen(V b) {
-  if (ISINT(b) || TID(b) != T_BITS) fpr_cpanic("bitlen: not Array Bit");
-  return TAG(((bits_t *)b)->len);
-}
-
-static uw bitpos(bits_t *b, sw i) {
-  if (i < 0 || (uw)i >= b->len) fpr_cpanic("bit index out of range");
-  return b->var ? (b->len - 1 - (uw)i) : (uw)i;
-}
-
-static V h_bittest(V b, V i) {
-  sw k = UNTAG(i);
-  if (ISINT(b)) return BOOL((UNTAG(b) >> k) & 1);
-  if (TID(b) != T_BITS) fpr_cpanic("BITTEST: not Int/Array Bit");
-  bits_t *t = (bits_t *)b;
-  return BOOL((t->val >> bitpos(t, k)) & 1);
-}
-static V h_bitset(V b, V i) {
-  sw k = UNTAG(i);
-  if (ISINT(b)) return TAG(UNTAG(b) | (1L << k));
-  if (TID(b) != T_BITS) fpr_cpanic("BITSET: not Int/Array Bit");
-  bits_t *t = (bits_t *)b;
-  return mkbits(t->var, t->len, t->val | ((uw)1 << bitpos(t, k)));
-}
-static V h_bitclear(V b, V i) {
-  sw k = UNTAG(i);
-  if (ISINT(b)) return TAG(UNTAG(b) & ~(1L << k));
-  if (TID(b) != T_BITS) fpr_cpanic("BITCLEAR: not Int/Array Bit");
-  bits_t *t = (bits_t *)b;
-  return mkbits(t->var, t->len, t->val & ~((uw)1 << bitpos(t, k)));
-}
-static V h_bitmask(V w, V o) {
-  sw width = UNTAG(w), off = UNTAG(o);
-  if (width < 0 || width > (sw)(sizeof(uw) * 8 - 1) || off < 0) fpr_cpanic("BITMASK: bad width/offset");
-  return TAG(((width == (sw)(sizeof(uw) * 8 - 1) ? ~(uw)0 >> 1 : ((uw)1 << width) - 1)) << off);
-}
-static V h_shiftl(V v, V k) { return TAG(UNTAG(v) << UNTAG(k)); }
-static V h_shiftr(V v, V k) { return TAG((uw)UNTAG(v) >> UNTAG(k)); }
-static V h_band(V a, V b) { return TAG(UNTAG(a) & UNTAG(b)); }
-static V h_bor(V a, V b) { return TAG(UNTAG(a) | UNTAG(b)); }
-static V h_bxor(V a, V b) { return TAG(UNTAG(a) ^ UNTAG(b)); }
-
 /* ---- the discoverable-symbol table ----------------------------------- */
 FPR_FN(fpr_g_device, h_device, 1);
 FPR_FN(fpr_g_reg8, h_reg8, 2);
 FPR_FN(fpr_g_reg32, h_reg32, 2);
 FPR_FN(fpr_g_read, h_read, 1);
 FPR_FN(fpr_g_write, h_write, 2);
-FPR_FN(fpr_g_bitsLE, h_bitsLE, 2);
-FPR_FN(fpr_g_bitsBE, h_bitsBE, 2);
-FPR_FN(fpr_g_toInt, h_toInt, 1);
-FPR_FN(fpr_g_bitlen, h_bitlen, 1);
-FPR_FN(fpr_g_BITTEST, h_bittest, 2);
-FPR_FN(fpr_g_BITSET, h_bitset, 2);
-FPR_FN(fpr_g_BITCLEAR, h_bitclear, 2);
-FPR_FN(fpr_g_BITMASK, h_bitmask, 2);
-FPR_FN(fpr_g_BITSHIFTL, h_shiftl, 2);
-FPR_FN(fpr_g_BITSHIFTR, h_shiftr, 2);
-FPR_FN(fpr_g_band, h_band, 2);
-FPR_FN(fpr_g_bor, h_bor, 2);
-FPR_FN(fpr_g_bxor, h_bxor, 2);
 
 /* ---- SMP wake machinery: CLINT software interrupts + one timer -------
  * The hart loop sleeps in wfi instead of spin-polling.  Correctness of

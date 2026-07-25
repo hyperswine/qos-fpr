@@ -449,9 +449,8 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   for (int i = 0; i < FPR_NBUCKETS; i++) main_acb.pool.buckets[i] = 0;
   main_acb.stack = stk;
   for (int i = 0; i < 16; i++) main_acb.ctx[i] = 0;
-  main_acb.ctx[0] = (uw)(uintptr_t)trampoline;
-  main_acb.ctx[1] = ((uw)stk + STACK_SZ) & ~(uw)15;
-  main_acb.ctx[3] = (uw)&fpr_harts[0]; /* tp */
+  fpr_ctx_fabricate(main_acb.ctx, (void (*)(void))trampoline,
+                    ((uw)stk + STACK_SZ) & ~(uw)15, &fpr_harts[0]);
   enq(&fpr_harts[0], &main_acb);
 }
 
@@ -487,9 +486,10 @@ static V spawn_on(uw hart, V f) {
   a->id = __atomic_add_fetch(&next_id, 1, __ATOMIC_RELAXED);
   a->hart = hart;
   for (int i = 0; i < 16; i++) a->ctx[i] = 0;
-  a->ctx[0] = (uw)(uintptr_t)trampoline;
-  a->ctx[1] = ((uw)stk + STACK_SZ) & ~(uw)15;
-  a->ctx[3] = (uw)&fpr_harts[hart]; /* tp = the OWNER hart's block */
+  /* first-activation state is machine-specific (x86 needs a stack-
+   * alignment bias; rv needs tp) -- the ctx layer owns fabrication */
+  fpr_ctx_fabricate(a->ctx, (void (*)(void))trampoline,
+                    ((uw)stk + STACK_SZ) & ~(uw)15, &fpr_harts[hart]);
   /* everything above happens-before the ship (ring release / same-hart
    * program order), so the owner hart sees a fully built acb */
   ship(a);
