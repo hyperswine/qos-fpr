@@ -39,6 +39,7 @@ EXCLUDES=(
   "runtime/apps_data.c"
   "disk.img"
   ".git/*"
+  ".vscode/*"
 )
 
 # Convert to -x arguments
