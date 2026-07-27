@@ -114,11 +114,22 @@ typedef struct {
 
 extern fpr_hart_t fpr_harts[FPR_NHARTS];
 
-#ifdef FPR_POSIX
+#if defined(FPR_QOSAPP)
+/* a loaded QOS Portable app image (runtime/qosapp): single-hart per
+ * process AND fixed-slot with no dynamic loader behind it -- nothing
+ * registers a TLS block for the image, and link-time @tpoff constants
+ * would index the HOST's %fs TCB.  One hart = one writer, so the cell
+ * is a PLAIN GLOBAL; fprc's --target=qx64 emits the matching
+ * RIP-relative loads (X64.hs deTlsQosApp). */
+#define FPR_TLS /* plain */
+extern fpr_hart_t *fpr_posix_hart;
+static inline fpr_hart_t *fpr_hart(void) { return fpr_posix_hart; }
+#elif defined(FPR_POSIX)
 /* hosted: no free per-thread register (tpidr_el0/fs belong to libc
  * TLS); the SAME thread-local that A64.hs/X64.hs make generated code
  * load.  __thread: each hart pthread carries its own, so actors see
  * their OWNER hart's block exactly as tp gives them on bare metal. */
+#define FPR_TLS __thread
 extern __thread fpr_hart_t *fpr_posix_hart;
 static inline fpr_hart_t *fpr_hart(void) { return fpr_posix_hart; }
 #else

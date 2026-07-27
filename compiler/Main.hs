@@ -2,7 +2,7 @@ module Main where
 
 import Codegen (Target, codegenRev, emitProgram, externals, rv32, rv64, tgtName)
 import A64 (lowerA64, a64Rev)
-import X64 (lowerX64, x64Rev)
+import X64 (lowerX64, deTlsQosApp, x64Rev)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
 import Data.List (isPrefixOf)
@@ -23,18 +23,20 @@ data Opts = Opts
   { oTarget :: Target,
     oA64 :: Bool, -- lower the rv64 emission (the shared RISC IR) to AArch64
     oX64 :: Bool, -- lower it to x86-64 (SysV) instead
+    oQosApp :: Bool, -- qx64: QOS-x86_64 app image (plain-global cells, no TLS)
     oRvv :: Bool,
     oPrelude :: Maybe FilePath,
     oFiles :: [FilePath]
   }
 
 parseArgs :: [String] -> Opts
-parseArgs = foldl step (Opts rv64 False False False Nothing [])
+parseArgs = foldl step (Opts rv64 False False False False Nothing [])
   where
     step o "--target=rv32" = o {oTarget = rv32}
     step o "--target=rv64" = o {oTarget = rv64}
     step o "--target=a64" = o {oTarget = rv64, oA64 = True} -- rv64 emission is the IR
     step o "--target=x64" = o {oTarget = rv64, oX64 = True} -- likewise
+    step o "--target=qx64" = o {oTarget = rv64, oX64 = True, oQosApp = True} -- QOS-x86_64
     step o "--rvv" = o {oRvv = True}
     step o a
       | "--prelude=" `isPrefixOf` a = o {oPrelude = Just (drop (length "--prelude=") a)}
@@ -62,7 +64,7 @@ main = do
   opts <- parseArgs <$> getArgs
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
-    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|x64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
+    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|x64|qx64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
   preludeTops <- maybe (pure []) parseFile (oPrelude opts)
   rootTops <- parseFile inp
   lr <- loadProgram preludeTops inp rootTops
@@ -158,10 +160,17 @@ main = do
           tgt = oTarget opts
           a64 = oA64 opts
           x64 = oX64 opts
-          lower | a64 = lowerA64 | x64 = lowerX64 | otherwise = id
+          qapp = oQosApp opts
+          lower | a64 = lowerA64
+                | x64 && qapp = deTlsQosApp . lowerX64
+                | x64 = lowerX64
+                | otherwise = id
           rvv = oRvv opts && not a64 && not x64 -- no RVV lowering in the PoCs
           spec = not x64 -- SysV callee-saved registers can't host the s6+ spec loops
-          tname | a64 = "a64r" ++ show a64Rev | x64 = "x64r" ++ show x64Rev | otherwise = tgtName tgt
+          tname | a64 = "a64r" ++ show a64Rev
+                | x64 && qapp = "qx64r" ++ show x64Rev -- distinct cache tag: de-TLS'd units
+                | x64 = "x64r" ++ show x64Rev
+                | otherwise = tgtName tgt
           tag = "g" ++ show codegenRev ++ "-" ++ tname ++ (if rvv then "-rvv" else "")
           unitDir = takeDirectory out </> "units"
           emitUnit path exps ext uts = do

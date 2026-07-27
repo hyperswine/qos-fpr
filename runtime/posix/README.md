@@ -75,6 +75,16 @@ registers cannot host the s6+ loops); the generic C vec path runs
 instead.  SSE/AVX column loops for SoA VLists are the natural next
 step and slot in exactly where the RVV flag does today.
 
+## Relation to QOS Portable
+
+This HAL CO-COMPILES program + runtime into one hosted binary. QOS
+Portable (runtime/portable + runtime/qosapp, docs/QOS-PORTABLE.md) is
+the other discipline over the SAME device tier: the program is a
+separately built QOS-x86_64 `.qa` loaded fixed-slot by the `qosp`
+host, with dispatch through a HAL table instead of link-time binding.
+net.c's raw I/O was factored into net_raw.c so both share one socket +
+pseudo-bus implementation.
+
 ## Not yet
 
 - macOS/Mach-O (syntax layer on A64.hs, documented there).

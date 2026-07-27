@@ -54,7 +54,7 @@
 --   (emitProgram's spec flag); the generic C vec path needs none.
 --   zero -> $0 / a fixup per use.  tp -> initial-exec TLS load of
 --   fpr_posix_hart (multithreaded harts; matches A64.hs).
-module X64 (lowerX64, x64Rev) where
+module X64 (lowerX64, deTlsQosApp, x64Rev) where
 
 
 import Data.Char (isDigit, isSpace)
@@ -65,6 +65,35 @@ import Data.List (isPrefixOf, stripPrefix)
 -- the section-aware fixup fix left stale corrupt prelude units behind)
 x64Rev :: Int
 x64Rev = 3
+
+-- deTlsQosApp: the QOS-x86_64 (--target=qx64) refinement.  A loaded
+-- QOS Portable app image is (a) single-hart in this design pass and
+-- (b) a fixed-slot ELF with no dynamic loader behind it -- nothing
+-- registers a TLS block for it, and its @tpoff constants would index
+-- the HOST's %fs TCB.  So the three thread-local cells the plain x64
+-- lowering uses (fpr_posix_hart, fpr_x64_a6/a7) become PLAIN GLOBALS,
+-- loaded RIP-relative -- correct because one hart means one writer.
+-- Applied as a textual post-pass over the lowered output, same
+-- line-discipline as the lowering itself; runtime/qosapp compiles the
+-- C side with FPR_QOSAPP so its declarations drop __thread to match.
+deTlsQosApp :: String -> String
+deTlsQosApp = unlines . map detls . lines
+  where
+    detls l = case splitTls l of
+      Just (pre, sym, post) -> pre ++ sym ++ "(%rip)" ++ post
+      Nothing -> l
+    -- rewrite every "%fs:SYM@tpoff" occurrence to "SYM(%rip)"
+    splitTls s = case breakOn "%fs:" s of
+      Nothing -> Nothing
+      Just (pre, after) -> case breakOn "@tpoff" after of
+        Nothing -> Nothing
+        Just (sym, post) -> Just (pre, sym, post)
+    breakOn pat s = go2 "" s
+      where
+        go2 _ [] = Nothing
+        go2 acc t@(c : cs)
+          | pat `isPrefixOf` t = Just (reverse acc, drop (length pat) t)
+          | otherwise = go2 (c : acc) cs
 
 lowerX64 :: String -> String
 lowerX64 = unlines . go (True, (False, False)) . map banner . lines

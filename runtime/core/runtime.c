@@ -413,12 +413,12 @@ static V callf(uw fn, uw ar, V *a) {
      * cells and calls through the 6-register cast; the lowered callee
      * reads the cells in its prologue (see compiler/X64.hs). */
     case 7: {
-      extern __thread uw fpr_x64_a6;
+      extern FPR_TLS uw fpr_x64_a6;
       fpr_x64_a6 = (uw)a[6];
       return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     case 8: {
-      extern __thread uw fpr_x64_a6, fpr_x64_a7;
+      extern FPR_TLS uw fpr_x64_a6, fpr_x64_a7;
       fpr_x64_a6 = (uw)a[6];
       fpr_x64_a7 = (uw)a[7];
       return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
