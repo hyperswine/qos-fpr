@@ -1,0 +1,26 @@
+/* gfx_raw.h -- the raw GPU tier (net_raw.h's gfx sibling).  One
+ * implementation (gfx.c: EGL/ES 3.1 context, the scene-value walker,
+ * FBO readback, kbd/mouse polling), two consumers:
+ *
+ *   - runtime/posix/gfx_fpr.c: V-typed FPR_FN wrappers, co-compiled
+ *     into a GFX=1 posix image.
+ *   - runtime/portable/haltab.c: the same functions as qos_hal_t table
+ *     entries in a GFX=1 qosp.
+ *
+ * gfx_render_scene takes the scene VALUE as a uint64_t: the walker
+ * reads it through fpr.h's layout macros, read-only and allocation-
+ * free -- valid across images because host and app share one address
+ * space (docs/QOS-PORTABLE.md).  Faults inside (malformed scene,
+ * missing context) are fpr_cpanic on the co-compiled side and the
+ * host's own loud-exit fpr_cpanic definition inside qosp. */
+#ifndef QOS_GFX_RAW_H
+#define QOS_GFX_RAW_H
+
+#include <stdint.h>
+
+void gfx_init(int w, int h); /* create context + renderer (once) */
+int gfx_render_scene(uint64_t scenev, int64_t *draws, int64_t *dyn_bytes);
+int gfx_save_ppm(const char *path); /* 0 ok, 1 io failure */
+int gfx_input_poll(int64_t *kind, int64_t *a, int64_t *c); /* 1 = event */
+
+#endif

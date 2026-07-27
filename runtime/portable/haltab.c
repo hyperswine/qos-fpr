@@ -12,6 +12,9 @@
  * this table does not carry, and continuing would lie about it. */
 #include "../qosapp/qos_abi.h"
 #include "../posix/net_raw.h"
+#ifdef QOSP_GFX
+#include "../posix/gfx_raw.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +66,12 @@ static const qos_hal_t the_table = {
     .net_read = qos_netraw_read,
     .net_write = qos_netraw_write,
     .net_close = qos_netraw_close,
+#ifdef QOSP_GFX
+    .gfx_init = gfx_init,
+    .gfx_render = gfx_render_scene,
+    .gfx_save_ppm = gfx_save_ppm,
+    .gfx_input_poll = gfx_input_poll,
+#endif /* else: NULL -- the app-side shim reports the missing capability */
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

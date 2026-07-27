@@ -13,3 +13,4 @@ apps_data.c
 *.bin
 *.hi
 *.o
+.vscode/

@@ -82,8 +82,9 @@ Portable (runtime/portable + runtime/qosapp, docs/QOS-PORTABLE.md) is
 the other discipline over the SAME device tier: the program is a
 separately built QOS-x86_64 `.qa` loaded fixed-slot by the `qosp`
 host, with dispatch through a HAL table instead of link-time binding.
-net.c's raw I/O was factored into net_raw.c so both share one socket +
-pseudo-bus implementation.
+net.c's raw I/O was factored into net_raw.c, and gfx.c into a raw
+renderer core (gfx_raw.h) + gfx_fpr.c V-wrappers, so both disciplines
+share one socket/pseudo-bus and one renderer implementation.
 
 ## Not yet
 

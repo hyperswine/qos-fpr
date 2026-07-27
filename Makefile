@@ -84,7 +84,7 @@ RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c 
 # linked, so a gfx image links dynamic -- the display driver is the one
 # boundary the static philosophy concedes, the same way the kernel is.
 ifeq ($(GFX),1)
-RT_POSIX += $(RT_POSIX_DIR)/gfx.c
+RT_POSIX += $(RT_POSIX_DIR)/gfx.c $(RT_POSIX_DIR)/gfx_fpr.c
 POSIXLIBS = -lEGL -lGLESv2 -lm
 # generated code uses absolute .quad relocations in .rodata (fine when
 # static); a dynamic gfx image must therefore be non-PIE
@@ -126,9 +126,26 @@ PORTABLE_DIR = runtime/portable
 QOSP_SRC = $(PORTABLE_DIR)/main.c $(PORTABLE_DIR)/qa.c $(PORTABLE_DIR)/haltab.c \
            $(PORTABLE_DIR)/store.c $(RT_POSIX_DIR)/net_raw.c \
            $(RT_CORE_DIR)/buddy.c $(RT_CORE_DIR)/elfload.c
-qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h
-	gcc -no-pie -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 \
-	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) -I$(RT_POSIX_DIR) $(QOSP_SRC) -o $@
+# GFX=1 compiles the raw renderer core (runtime/posix/gfx.c -- shared
+# with the co-compiled HAL via gfx_raw.h) into the HOST and fills the
+# table's gfx entries; Mesa and its dynamic linking stay concentrated
+# in the host image, the app stays freestanding either way.
+ifeq ($(GFX),1)
+QOSP_SRC += $(RT_POSIX_DIR)/gfx.c
+QOSP_GFXFLAGS = -DQOSP_GFX
+QOSP_LIBS = -lEGL -lGLESv2 -lm
+else
+QOSP_GFXFLAGS =
+QOSP_LIBS =
+endif
+# flag stamp: a GFX=1 and a plain qosp are different binaries -- switching
+# the flag must relink even though no source changed
+QOSP_STAMP = build/.qosp-gfx$(GFX)
+$(QOSP_STAMP):
+	@mkdir -p build && rm -f build/.qosp-gfx* && touch $@
+qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h $(QOSP_STAMP)
+	gcc -no-pie -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 $(QOSP_GFXFLAGS) \
+	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) -I$(RT_POSIX_DIR) $(QOSP_SRC) $(QOSP_LIBS) -o $@
 
 # the app image: generated qx64 code + its OWN copy of the portable
 # runtime (the process model's shape, docs/PROCESS-LOADING.md) + the

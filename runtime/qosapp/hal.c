@@ -127,3 +127,53 @@ FPR_FN(fpr_g_netPoll, h_netPoll, 1);
 FPR_FN(fpr_g_netRead, h_netRead, 1);
 FPR_FN(fpr_g_netWrite, h_netWrite, 2);
 FPR_FN(fpr_g_netClose, h_netClose, 1);
+
+/* ---- gfx: the nullable table tier ----------------------------------
+ * The renderer (and Mesa's dynamic linking) lives in the HOST image --
+ * the one boundary the static philosophy concedes, kept concentrated
+ * there; the app stays freestanding.  A host built without GFX=1
+ * leaves these entries NULL, and calling one is a missing capability,
+ * reported the same honest way stubs.c reports the bus tier. */
+static void need_gfx(void) {
+  if (!qos_hal->gfx_init)
+    fpr_cpanic("gfx: capability not granted by this host (build qosp with GFX=1)");
+}
+static V h_glInit(V wv, V hv) {
+  need_gfx();
+  if (!ISINT(wv) || !ISINT(hv)) fpr_cpanic("glInit: w h must be Ints");
+  qos_hal->gfx_init((int)UNTAG(wv), (int)UNTAG(hv));
+  return TAG(1);
+}
+static V h_glRender(V scene) {
+  need_gfx();
+  int64_t draws, dynBytes;
+  qos_hal->gfx_render((uint64_t)scene, &draws, &dynBytes);
+  V *r = (V *)fpr_alloc(24);
+  ((hdr_t *)r)->tid = 4; ((hdr_t *)r)->var = 0; /* (draws, dynBytes) */
+  r[1] = TAG((sw)draws); r[2] = TAG((sw)dynBytes);
+  return (V)r;
+}
+static V h_glSavePpm(V pathv) {
+  need_gfx();
+  if (ISINT(pathv) || TID(pathv) != T_STR) fpr_cpanic("glSavePpm: path must be a String");
+  str_t *p = (str_t *)pathv;
+  char path[256];
+  uw n = p->len < sizeof path - 1 ? p->len : sizeof path - 1;
+  for (uw i = 0; i < n; i++) path[i] = (char)p->bytes[i];
+  path[n] = 0;
+  return TAG(qos_hal->gfx_save_ppm(path));
+}
+static V h_inputPoll(V u) {
+  (void)u;
+  need_gfx();
+  int64_t kind, a, c;
+  if (!qos_hal->gfx_input_poll(&kind, &a, &c)) return TAG(0);
+  V *t = (V *)fpr_alloc(32);
+  ((hdr_t *)t)->tid = 5; ((hdr_t *)t)->var = 0; /* triple */
+  t[1] = TAG((sw)kind); t[2] = TAG((sw)a); t[3] = TAG((sw)c);
+  return (V)t;
+}
+FPR_FN(fpr_g_glInit, h_glInit, 2);
+FPR_FN(fpr_g_glRender, h_glRender, 1);
+FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);
+FPR_FN(fpr_g_inputPoll, h_inputPoll, 1);

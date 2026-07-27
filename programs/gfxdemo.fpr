@@ -149,7 +149,9 @@ main =
   gfx = spawn graphicsActor;
   dsp = spawn displayActor;
   inp = spawn inputActor;
-  reg = ("/services/graphics", gfx) :: ("/services/display", dsp) :: ("/services/input", inp) :: Nil;
+  reg = ("/services/graphics", gfx)
+     :: ("/services/display", dsp)
+     :: ("/services/input", inp) :: Nil;
   _ = send sys (me, Reg reg);
   _ = receive me;
 

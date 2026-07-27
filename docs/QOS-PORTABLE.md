@@ -98,11 +98,29 @@ consumers with one implementation:
 So `device "uart"`, LSR polling, mtime reads, and
 netPoll/netRead/netWrite/netClose behave identically under both, and
 programs/httpd.fpr serves its REST API unchanged from inside a `.qa`.
+
+**The gfx tier crosses the table the same way** (GFX=1). The ES 3.1
+renderer was split like net: runtime/posix/gfx.c is now the raw core
+(gfx_raw.h -- context setup, the scene-value walker, FBO readback,
+kbd/mouse polling) and gfx_fpr.c the V-typed wrappers for co-compiled
+images; a GFX=1 qosp compiles the raw core into the HOST and fills the
+table's nullable gfx entries. The one deliberate subtlety:
+`gfx_render` receives the app's scene VALUE and the host walks it
+READ-ONLY through the shared fpr.h layout -- valid because the two
+images share one address space -- while all V-result construction
+(the (draws, dynBytes) pair, input triples) happens app-side with the
+app's own allocator, so no allocation ever crosses the boundary.
+Mesa's dynamic linking stays concentrated in the host image (the one
+boundary the static philosophy concedes); the app is freestanding
+either way, and programs/gfxdemo.fpr renders pixel-identical frames
+from inside a `.qa` (verified against the co-compiled path under
+llvmpipe). A host built without GFX=1 leaves the entries NULL and the
+app-side shim reports the missing capability honestly, stubs.c-style.
+
 Missing capabilities stay honest in both directions: an unknown device
-name or unmapped register is an immediate loud failure, and gfx is a
-nullable future table tier (windowed presentation and the Pi
-KMS/DRM+GBM+EGL path slot in as table entries, keeping Mesa and the
-display stack in the HOST image where dynamic linking is tolerable).
+name or unmapped register is an immediate loud failure. Windowed
+presentation and the Pi KMS/DRM+GBM+EGL path slot in as additional
+table entries in the host, exactly this shape.
 
 ## Building and running
 
@@ -117,8 +135,6 @@ narrates the stages, `FPR_PORT` picks the net port (default 8000).
 
 ## Not yet
 
-- gfx table tier (the ES 3.1 renderer stays host-side; entries are
-  reserved conceptually, not in the v1 struct).
 - Multi-hart apps (the entry fabricates one hart; SMP-within-a-process
   is future work on virt too).
 - aarch64 (a `qa64` target is the same one-pass de-TLS over A64.hs's

@@ -45,6 +45,14 @@ void qosp_store_bind(const char *app_id);
 int64_t qosp_store_call(uint64_t, const char *, uint64_t, char *, uint64_t);
 
 static int g_trace;
+
+/* gfx.c (compiled into a GFX=1 qosp) faults through fpr_cpanic; in the
+ * HOST image that is a loud exit, the host idiom for the same honesty
+ * the co-compiled HAL expresses with a panic. */
+__attribute__((noreturn)) void fpr_cpanic(const char *msg) {
+  fprintf(stderr, "qosp: %s\n", msg);
+  exit(1);
+}
 #define TRACE(...) \
   do { if (g_trace) fprintf(stderr, "qosp: " __VA_ARGS__); } while (0)
 

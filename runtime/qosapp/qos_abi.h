@@ -68,6 +68,17 @@ typedef struct {
   int64_t (*net_read)(char *dst, uint64_t cap);
   int64_t (*net_write)(const char *src, uint64_t len);
   int64_t (*net_close)(void);
+
+  /* gfx (NULLABLE: NULL in a host built without GFX=1 -- the app-side
+   * shim panics honestly on use, the missing-capability behavior).
+   * gfx_render takes the scene VALUE as a uint64_t: the host walks it
+   * read-only through the shared fpr.h layout -- valid because the two
+   * images share one address space; results leave via out-params and
+   * the APP builds its own V results with its own allocator. */
+  void (*gfx_init)(int w, int h);
+  int (*gfx_render)(uint64_t scene, int64_t *draws, int64_t *dyn_bytes);
+  int (*gfx_save_ppm)(const char *path);
+  int (*gfx_input_poll)(int64_t *kind, int64_t *a, int64_t *c);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

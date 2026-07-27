@@ -237,7 +237,7 @@ static EGLDisplay egl_display(const char **how) {
   return eglGetDisplay(EGL_DEFAULT_DISPLAY);
 }
 
-static void gfx_init(int w, int h) {
+void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (G.inited) return;
   const char *how = "?";
   G.dpy = egl_display(&how);
@@ -386,14 +386,17 @@ static void stage_clear(void) {
   for (int i = 0; i < G.nmeshes; i++) G.meshes[i].nstage = 0;
 }
 
-/* ==== FPRISC surface ================================================= */
-static V h_glInit(V wv, V hv) {
-  if (!ISINT(wv) || !ISINT(hv)) fpr_cpanic("glInit: w h must be Ints");
-  gfx_init((int)UNTAG(wv), (int)UNTAG(hv));
-  return TAG(1);
-}
-
-static V h_glRender(V scene) {
+/* ==== the raw surface (gfx_raw.h) ====================================
+ * The V-CONSTRUCTING layer was factored out (gfx_fpr.c) the same way
+ * net.c's socket tier was (net_raw.c), and for the same reason: this
+ * core has exactly two consumers -- the co-compiled posix HAL, and
+ * qosp's HAL table.  What stays here is allocation-free with respect
+ * to the FPRISC heap: gfx_render_scene WALKS the scene value read-only
+ * (fine across images: qosp shares the app's address space and fpr.h
+ * layout), and results leave through out-params; whichever side wraps
+ * this builds its V results with ITS OWN allocator. */
+int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out) {
+  V scene = (V)scenev;
   if (!G.inited) fpr_cpanic("glRender: glInit first");
   V *f = fields(scene, 4, "gfx: scene must be (statics, dynamics, lights, camera)");
   int draws = 0; sw dynBytes = 0;
@@ -465,31 +468,22 @@ static V h_glRender(V scene) {
       draws++;
     }
   }
-
-  /* result: (draws, dynBytes) — a pair built the mkbits way */
-  V *r = (V *)fpr_alloc(24);
-  ((hdr_t *)r)->tid = 4; ((hdr_t *)r)->var = 0;
-  r[1] = TAG(draws); r[2] = TAG(dynBytes);
-  return (V)r;
+  *draws_out = draws;
+  *dyn_bytes_out = dynBytes;
+  return 0;
 }
 
-static V h_glSavePpm(V pathv) {
+int gfx_save_ppm(const char *path) {
   if (!G.inited) fpr_cpanic("glSavePpm: glInit first");
-  if (ISINT(pathv) || TID(pathv) != T_STR) fpr_cpanic("glSavePpm: path must be a String");
-  str_t *p = (str_t *)pathv;
-  char path[256];
-  uw n = p->len < sizeof path - 1 ? p->len : sizeof path - 1;
-  memcpy(path, p->bytes, n); path[n] = 0;
-
   int w = G.w, h = G.h;
   unsigned char *pix = malloc((size_t)w * h * 4);
-  if (!pix) return TAG(1);
+  if (!pix) return 1;
   glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
   glFinish();
   glPixelStorei(GL_PACK_ALIGNMENT, 1);
   glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pix);
   FILE *fp = fopen(path, "wb");
-  if (!fp) { free(pix); return TAG(1); }
+  if (!fp) { free(pix); return 1; }
   fprintf(fp, "P6\n%d %d\n255\n", w, h);
   for (int y = h - 1; y >= 0; y--) { /* GL is bottom-up; PPM top-down */
     const unsigned char *src = pix + (size_t)y * w * 4;
@@ -497,13 +491,12 @@ static V h_glSavePpm(V pathv) {
   }
   fclose(fp);
   free(pix);
-  return TAG(0);
+  return 0;
 }
 
 /* ==== input ========================================================== */
 static int mice_fd = -2; /* -2 = untried, -1 = unavailable */
-static V h_inputPoll(V u) {
-  (void)u;
+int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
   /* keyboard: one nonblocking stdin byte */
   int fl = fcntl(0, F_GETFL);
   fcntl(0, F_SETFL, fl | O_NONBLOCK);
@@ -525,14 +518,6 @@ static V h_inputPoll(V u) {
       }
     }
   }
-  if (!kind) return TAG(0);
-  V *t = (V *)fpr_alloc(32);
-  ((hdr_t *)t)->tid = 5; ((hdr_t *)t)->var = 0; /* triple */
-  t[1] = TAG(kind); t[2] = TAG(a); t[3] = TAG(c);
-  return (V)t;
+  *kind_out = kind; *a_out = a; *c_out = c;
+  return kind != 0;
 }
-
-FPR_FN(fpr_g_glInit, h_glInit, 2);
-FPR_FN(fpr_g_glRender, h_glRender, 1);
-FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);
-FPR_FN(fpr_g_inputPoll, h_inputPoll, 1);
