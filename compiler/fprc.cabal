@@ -6,14 +6,13 @@ synopsis:           FPRISC to RISC-V compiler
 
 executable fprc
     main-is:          Main.hs
-    hs-source-dirs:   compiler
     other-modules:    FPRISC
                     , Codegen
                     , Modules
                     , Infer
                     , Struct
-                    , X64
                     , A64
+                    , X64
     hs-source-dirs:   .
     default-language: Haskell2010
     ghc-options:      -Wall

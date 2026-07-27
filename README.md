@@ -203,3 +203,24 @@ port; QLOG reads stream the log index-free; net is the stated
 single-connection PoC stack.
 Each of these is a stated scope line, not an accident — the history
 file records how every previous one of these lines got erased.
+
+## FP-RISC + SOL CABAL
+
+To install:
+
+```
+cabal install exe:fprc --installdir="$HOME/.local/bin" --install-method=copy
+cabal install exe:sol  --installdir="$HOME/.local/bin" --install-method=copy
+
+# IF LLVM 22
+cabal install exe:sol --installdir="$HOME/.local/bin" --install-method=copy -f llvm22
+```
+
+To delete:
+
+```
+rm ~/.local/bin/fprc ~/.local/bin/sol
+rm -rf ~/.cabal/store/ghc-*/fprc-* ~/.cabal/store/ghc-*/sol-*
+```
+
+No need to source anything either if ~/.local/bin is symlinked.
