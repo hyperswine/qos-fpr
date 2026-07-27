@@ -214,6 +214,9 @@ cabal install exe:sol  --installdir="$HOME/.local/bin" --install-method=copy
 
 # IF LLVM 22
 cabal install exe:sol --installdir="$HOME/.local/bin" --install-method=copy -f llvm22
+
+# IF already installed
+cabal install exe:sol --installdir="$HOME/.local/bin" --install-method=copy -f llvm22 --overwrite-policy=always
 ```
 
 To delete:
