@@ -1,0 +1,230 @@
+# ============================================================================
+# mvu3d.fpr -- a small MVU-style 3D program over the URL-addressed
+# graphics stack, driven by an evdev keyboard (real or simulated).
+#
+# The MVU triangle, explicitly:
+#
+#   model  = (yaw, dist, x)            cube heading / camera distance /
+#                                      cube strafe, all milli-units
+#   update = model -> event -> model   PURE: consumes one input event
+#   view   = model -> scene            PURE: builds the scene value
+#
+#   loop:  ev <- /services/input       (one event per tick, evdev kind 4:
+#          m' = update m ev             (4, keycode, value) press/release)
+#          /services/graphics <- Render (view m')
+#          repeat until q or the frame budget
+#
+# Input arrives through the SAME inputPoll capability gfxdemo uses; the
+# evdev tier (runtime/posix/evdev_raw.c) sits behind it when FPR_EVDEV
+# names a device -- a real /dev/input/eventN, a kbdsim FIFO, or a
+# pre-baked event file (deterministic replay: same file, same model
+# trajectory, same pixels).
+#
+# Keys: a/d yaw the cube, w/s dolly the camera, left/right strafe, q quit.
+#
+#   tools/kbdsim.py /tmp/mvu.evd "d*6 w*4 left*3 q"
+#   FPR_EVDEV=/tmp/mvu.evd make posix-run GFX=1 PROG=programs/mvu3d.fpr
+#   FPR_EVDEV=/tmp/mvu.evd ./qosp --yes app.qa      # same program as a .qa
+# ============================================================================
+
+Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
+
+# ---- discovery + services (gfxdemo.fpr's architecture, unchanged) ----------
+
+strEqGo a b i n =
+  case i > n of
+    True -> True
+  | False -> case charAt a i == charAt b i of
+      True -> strEqGo a b (i + 1) n
+    | False -> False.
+strEq a b = case strlen a == strlen b of
+    True -> strEqGo a b 1 (strlen a)
+  | False -> False.
+
+findSvc reg url =
+  case reg of
+    Nil -> 0
+  | p :: r -> case p of (u, a) ->
+      case strEq u url of True -> a | False -> findSvc r url.
+
+systemActor me = sysLoop me Nil.
+sysServe me reg =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Lookup url -> send replyTo (findSvc reg url) >> sysServe me reg.
+sysLoop me reg0 =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
+      | Reg reg -> send replyTo 1 >> sysServe me reg.
+
+graphicsActor me =
+  _ = glInit 320 240;
+  gfxServe me.
+gfxServe me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Render scene -> send replyTo (glRender scene) >> drop m >> gfxServe me.
+
+displayActor me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Present path -> send replyTo (glSavePpm path) >> drop m >> displayActor me.
+
+inputActor me =
+  m = receive me;
+  case m of
+    (replyTo, q) ->
+      case q of
+        Poll u -> send replyTo (inputPoll u) >> drop m >> inputActor me.
+
+svcLookup me sys url =
+  _ = send sys (me, Lookup url);
+  receive me.
+svcCall me svc q =
+  _ = send svc (me, q);
+  receive me.
+
+# ---- MODEL -----------------------------------------------------------------
+# (yaw, dist, x): cube heading (milli-rad for the renderer's m4rotY),
+# camera dolly distance, cube strafe.  All plain Ints: MVU state is data.
+
+model0 = (0, 6000, 0).
+
+# ---- UPDATE ----------------------------------------------------------------
+# One pure step per input event.  Presses (value 1) act; releases
+# (value 0) and autorepeat (2) fall through unchanged -- press/release
+# as DISTINCT events is exactly what the evdev tier buys over stdin.
+# Keycodes are Linux input-event-codes: w=17 a=30 s=31 d=32 q=16
+# left=105 right=106.  Returns (model, quit).
+
+applyKey m code =
+  case m of (yaw, dist, x) ->
+    case code == 30 of True -> (yaw - 200, dist, x)          # a
+  | False -> case code == 32 of True -> (yaw + 200, dist, x)  # d
+  | False -> case code == 17 of True -> (yaw, dist - 400, x)  # w
+  | False -> case code == 31 of True -> (yaw, dist + 400, x)  # s
+  | False -> case code == 105 of True -> (yaw, dist, x - 300) # left
+  | False -> case code == 106 of True -> (yaw, dist, x + 300) # right
+  | False -> m.                                               # q / unbound key
+
+update m ev =
+  case ev of
+    (kind, code, val) ->
+      case and2 (kind == 4) (val == 1) of
+        True -> applyKey m code
+      | False -> m.                   # kind 0 (none) / release / repeat: no-op
+
+# quit is DERIVED from the event, not threaded through update: keeps
+# update's type model -> event -> model, and -- the operational reason --
+# an idle poll loop allocating a (model, quit) pair per spin would churn
+# the heap for nothing.  q press = keycode 16, value 1.
+quitOf ev = case ev of (kind, code, val) ->
+  case and2 (kind == 4) (and2 (code == 16) (val == 1)) of True -> 1 | False -> 0.
+and2 a b = case a of True -> b | False -> False.
+
+# ---- VIEW ------------------------------------------------------------------
+# Pure model -> scene.  The hero cube carries the model's yaw and x;
+# the camera eye carries dist.  Statics never change (compiled to GPU
+# buffers once); only the dynamic tier re-uploads -- the MVU render
+# discipline and the renderer's static/dynamic split are the same idea.
+
+statics =
+  ("plane", (0, 0, 0), 0, (8000, 1000, 8000), (300, 420, 320))
+    :: ("cube", (0 - 2500, 400, 0 - 2000), 300, (800, 800, 800), (900, 450, 250))
+    :: ("cube", (2500, 400, 0 - 2000), 600, (800, 800, 800), (250, 450, 900))
+    :: Nil.
+lights = ((4000, 6000, 4000), (1000, 1000, 1000)) :: Nil.
+
+view m =
+  case m of (yaw, dist, x) ->
+    (statics,
+     ("cube", (x, 900, 0), yaw, (1400, 1400, 1400), (950, 800, 250)) :: Nil,
+     lights,
+     ((0, 3000, dist), (0, 500, 0 - 1000), 900)).
+
+# ---- the MVU loop ----------------------------------------------------------
+# EVENT-DRIVEN with a wall-clock session budget: render only when the
+# model changed (the MVU discipline -- no event, no new frame), and run
+# until q or ~3 seconds of mtime (the clint device through the register
+# tier: 10MHz ticks, virt's offset -- the same read works co-compiled,
+# through qosp's table, and on virt).  This is what lets a LIVE feeder
+# (kbdsim --fifo, or a real keyboard) drive it: idle polls just spin
+# the input service until an event or the deadline arrives.
+
+mtimeOf clint = read (reg32 clint 49144).
+
+mvuLoop me g i clint t0 m =
+  case (mtimeOf clint - t0) > 30000000 of
+    True -> mvuDone me m "time budget"
+  | False -> mvuTick me g i clint t0 m.
+mvuTick me g i clint t0 m =
+  ev = svcCall me i (Poll 0);
+  m2 = update m ev;
+  q = quitOf ev;
+  mvuStep me g i clint t0 ev m2 q.
+mvuStep me g i clint t0 ev m2 q =
+  _ = renderIf me g (evKind ev) m2;
+  _ = logStep ev m2;
+  _ = drop ev;                     # the poll reply escaped from the input
+                                   # actor; an idle spin makes millions --
+                                   # undropped they fill the ARC table
+  case q == 1 of
+    True -> mvuDone me m2 "q pressed"
+  | False -> mvuLoop me g i clint t0 m2.
+evKind ev = case ev of (kind, code, val) -> kind.
+renderIf me g kind m =
+  case kind == 0 of
+    True -> 0                              # no event: no new frame
+  | False -> renderNow me g m.
+renderNow me g m =
+  r = svcCall me g (Render (view m));
+  drop r >> 1.                             # the (draws, bytes) pair, same rule
+
+# print only when an event landed (presses AND releases show)
+logStep ev mNew =
+  case ev of
+    (kind, code, val) ->
+      case kind == 0 of
+        True -> Unit
+      | False -> print "event ({kind}, {code}, {val}) -> model {mNew}".
+
+mvuDone me m why =
+  _ = print "mvu3d done ({why}), final model {m}";
+  Unit.
+
+# ---- main ------------------------------------------------------------------
+
+main =
+  me = myself 0;
+  _ = print "mvu3d: MVU over URL-addressed graphics, evdev input";
+  sys = spawn systemActor;
+  gfx = spawn graphicsActor;
+  dsp = spawn displayActor;
+  inp = spawn inputActor;
+  reg = ("/services/graphics", gfx)
+     :: ("/services/display", dsp)
+     :: ("/services/input", inp) :: Nil;
+  _ = send sys (me, Reg reg);
+  _ = receive me;
+  g = svcLookup me sys "/services/graphics";
+  d = svcLookup me sys "/services/display";
+  i = svcLookup me sys "/services/input";
+
+  clint = device "clint";
+  _ = svcCall me g (Render (view model0));
+  _ = svcCall me d (Present "mvu-first.ppm");
+  _ = print "frame 0 (model {model0}) -> mvu-first.ppm";
+
+  _ = mvuLoop me g i clint (mtimeOf clint) model0;
+
+  rc = svcCall me d (Present "mvu-final.ppm");
+  print "final frame -> mvu-final.ppm (rc {rc})".

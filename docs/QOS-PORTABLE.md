@@ -117,6 +117,26 @@ from inside a `.qa` (verified against the co-compiled path under
 llvmpipe). A host built without GFX=1 leaves the entries NULL and the
 app-side shim reports the missing capability honestly, stubs.c-style.
 
+**Input is evdev** (runtime/posix/evdev_raw.c, behind the same
+inputPoll capability). The reader consumes `struct input_event`
+records -- the evdev wire format, what libevdev parses -- from the fd
+FPR_EVDEV names, so ONE reader serves a real /dev/input/eventN (the Pi
+console target), a live simulated keyboard (tools/kbdsim.py feeding a
+FIFO), or a pre-baked event file for deterministic replay; kbdsim's
+--uinput mode creates a genuine kernel virtual keyboard where
+/dev/uinput exists. Raw evdev rather than libevdev-the-library, per
+the input-stack decision: control input needs no layout translation
+and static images want no extra dynamic dependency. EV_KEY events
+surface as input kind 4, (4, keycode, value) with press/release/repeat
+distinct -- which stdin can't say -- and inputPoll now always returns
+a uniform (kind, a, b) triple, kind 0 = none (the Mod.resolve
+"a miss is data" convention, so the typed layer can case on it).
+programs/mvu3d.fpr is the reference: an explicitly MVU-structured 3D
+program (model = data, pure update per event, pure view -> scene,
+render only on model change, session bounded by clint mtime through
+the register tier) that replays a kbdsim script to pixel-identical
+frames, co-compiled and as a `.qa`.
+
 Missing capabilities stay honest in both directions: an unknown device
 name or unmapped register is an immediate loud failure. Windowed
 presentation and the Pi KMS/DRM+GBM+EGL path slot in as additional

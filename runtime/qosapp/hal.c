@@ -166,8 +166,9 @@ static V h_glSavePpm(V pathv) {
 static V h_inputPoll(V u) {
   (void)u;
   need_gfx();
-  int64_t kind, a, c;
-  if (!qos_hal->gfx_input_poll(&kind, &a, &c)) return TAG(0);
+  /* uniform shape (Mod.resolve convention): (0, 0, 0) = no event */
+  int64_t kind = 0, a = 0, c = 0;
+  qos_hal->gfx_input_poll(&kind, &a, &c);
   V *t = (V *)fpr_alloc(32);
   ((hdr_t *)t)->tid = 5; ((hdr_t *)t)->var = 0; /* triple */
   t[1] = TAG((sw)kind); t[2] = TAG((sw)a); t[3] = TAG((sw)c);

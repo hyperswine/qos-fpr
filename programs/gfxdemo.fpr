@@ -163,7 +163,7 @@ main =
   _ = frameLoop me g d 1;
 
   ev = svcCall me i (Poll 0);
-  _ = print "input poll -> {ev}   (0 = no event pending)";
+  _ = print "input poll -> {ev}   (kind 0 = no event pending)";
 
   missing = svcLookup me sys "/services/nope";
   _ = print "lookup /services/nope -> {missing}   (0 = unknown URL, a miss is data)";

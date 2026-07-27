@@ -43,6 +43,13 @@ Discovery is the same table-by-name contract as virt hal.c:
   (net.c), byte-compatible with virt's virtio-net surface: one
   connection at a time, actor-side polling.  FPR_PORT picks the port
   (default 8000).  programs/httpd.fpr compiles unchanged.
+- **evdev keyboard** (with GFX=1's input tier) — evdev_raw.c reads
+  `struct input_event` records from the fd FPR_EVDEV names: a real
+  /dev/input/eventN, a tools/kbdsim.py FIFO (simulated keyboard), or a
+  pre-baked event file (deterministic replay).  EV_KEY surfaces as
+  input kind 4 with press/release distinct; inputPoll returns a
+  uniform (kind, a, b) triple, kind 0 = none.  programs/mvu3d.fpr is
+  the MVU-structured reference client.
 - **gpu** (GFX=1) — gfx.c, a C port of the gl_scene ES 3.1 renderer:
   glInit / glRender / glSavePpm walk an FPRISC Scene VALUE (milli-unit
   fixed point) into instanced ES draws under surfaceless EGL, with the

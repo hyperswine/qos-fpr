@@ -84,7 +84,7 @@ RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c 
 # linked, so a gfx image links dynamic -- the display driver is the one
 # boundary the static philosophy concedes, the same way the kernel is.
 ifeq ($(GFX),1)
-RT_POSIX += $(RT_POSIX_DIR)/gfx.c $(RT_POSIX_DIR)/gfx_fpr.c
+RT_POSIX += $(RT_POSIX_DIR)/gfx.c $(RT_POSIX_DIR)/gfx_fpr.c $(RT_POSIX_DIR)/evdev_raw.c
 POSIXLIBS = -lEGL -lGLESv2 -lm
 # generated code uses absolute .quad relocations in .rodata (fine when
 # static); a dynamic gfx image must therefore be non-PIE
@@ -131,7 +131,7 @@ QOSP_SRC = $(PORTABLE_DIR)/main.c $(PORTABLE_DIR)/qa.c $(PORTABLE_DIR)/haltab.c 
 # table's gfx entries; Mesa and its dynamic linking stay concentrated
 # in the host image, the app stays freestanding either way.
 ifeq ($(GFX),1)
-QOSP_SRC += $(RT_POSIX_DIR)/gfx.c
+QOSP_SRC += $(RT_POSIX_DIR)/gfx.c $(RT_POSIX_DIR)/evdev_raw.c
 QOSP_GFXFLAGS = -DQOSP_GFX
 QOSP_LIBS = -lEGL -lGLESv2 -lm
 else

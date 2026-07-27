@@ -17,7 +17,7 @@
  *   glInit w h        -> Int 1      create context + renderer (once)
  *   glRender scene    -> (draws, dynBytes)   walk + draw one frame
  *   glSavePpm path    -> Int 0/1    read back the FBO, write a PPM
- *   inputPoll u       -> 0 | (kind, a, b)    kbd/mouse event or none
+ *   inputPoll u       -> (kind, a, b)   kind 0 = none (uniform shape)
  *
  * The Scene VALUE, in FPRISC terms (all numbers Int MILLI-units —
  * FPRISC has no floats; the walker divides by 1000):
@@ -36,6 +36,7 @@
  *   (1, byte, 0)  key    (2, dx, dy)  mouse move    (3, buttons, 0)
  */
 #include "fpr.h"
+#include "evdev_raw.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
@@ -497,6 +498,11 @@ int gfx_save_ppm(const char *path) {
 /* ==== input ========================================================== */
 static int mice_fd = -2; /* -2 = untried, -1 = unavailable */
 int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
+  /* evdev keyboard first (FPR_EVDEV -- a real event node, a simulated
+   * device FIFO, or a pre-baked event file; evdev_raw.h): press AND
+   * release arrive as distinct (4, keycode, value) events, which is
+   * what a control-input consumer actually wants and stdin can't say */
+  if (qos_evdev_poll(kind_out, a_out, c_out)) return 1;
   /* keyboard: one nonblocking stdin byte */
   int fl = fcntl(0, F_GETFL);
   fcntl(0, F_SETFL, fl | O_NONBLOCK);
