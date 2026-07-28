@@ -93,12 +93,52 @@ net.c's raw I/O was factored into net_raw.c, and gfx.c into a raw
 renderer core (gfx_raw.h) + gfx_fpr.c V-wrappers, so both disciplines
 share one socket/pseudo-bus and one renderer implementation.
 
+## macOS (Apple Silicon)
+
+`make posix-run POSIXARCH=a64` on a Darwin host builds and runs
+NATIVELY: the Makefile detects Darwin and switches fprc to
+`--target=a64mac` — the promised syntax layer over the same a64
+lowering.  Four differences, all in A64.hs:
+
+- every C-visible symbol grows the Mach-O underscore (definitions,
+  .globl, call/la/.quad references); `.L` locals become `L`, the
+  assembler-private prefix; `.section .rodata` becomes `__TEXT,__const`.
+- `adrp/:lo12:` becomes `adrp _sym@PAGE` / `add _sym@PAGEOFF`.
+- big immediates are movz/movk chains on BOTH syntaxes now (the old
+  `ldr =imm` literal pool was gas-ELF-only; the Linux a64 suite
+  regression-tests the shared encoding).
+- `mv rd, tp` (the per-entry fuel-cell read) cannot be a local-exec
+  `:tprel:` load — Darwin TLS is TLV descriptors.  The lowering emits
+  the standard Darwin sequence (adrp/ldr the descriptor, blr its
+  thunk), safe mid-function because dyld's `_tlv_get_addr` preserves
+  every register except x0/x16/x17; x0 (arg0) and x30 (ra) are saved
+  around it.  The C side's `__thread` hart cell uses the same TLV
+  machinery, so both sides agree by construction.
+
+The runtime side: heap.S grows a Mach-O branch (an ordered `.zerofill`
+group standing in for the .bss label sequence — `nm -n` shows
+`__heap_end` at exactly start + 64 MiB), ctx_a64.S spells its one
+symbol through a `SYM()` cpp guard, and evdev_raw.c defines the
+`input_event` wire struct locally off-Linux so the FPR_EVDEV
+simulated-keyboard/replay tier stays portable.  Linking is dynamic —
+Mach-O has no `-static`; libSystem is the concession, the way Mesa is
+for GFX.  GFX=1 stays Linux-only (EGL/evdev hardware tier).
+
+First boot on a Mac: `sh tools/mac-smoke.sh` (verifies the heap symbol
+layout with nm, then runs the actor, typed-layer, svc-funnel, and
+slab-churn tests).  Status: the full emission surface — every test
+program plus the 207-supercombinator System.qa and httpd, with all
+their units — assembles clean under `clang --target=arm64-apple-macos11`
+(validated in CI-like fashion off-Mac); the runtime C is POSIX-clean by
+inspection.  End-to-end link + run wants a real arm64 Mac, which is
+what the smoke script is for.
+
 ## Not yet
 
-- macOS/Mach-O (syntax layer on A64.hs, documented there).
 - A System actor serving /services/net URL discovery over the socket
   tier (gfxdemo.fpr's registry actor is the shape; net still goes via
-  the device table).
+  the device table).  The `mods/svc.fpr` URL funnel is the front half
+  of this: net joins as one more route behind `Svc.read`/`Svc.write`.
 - Windowed presentation (a swap of displayActor's body + an EGL window
   surface) and the GBM render-node path for Pi hardware drivers.
 - Blocking service actors parked on real syscalls (today: polling,

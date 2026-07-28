@@ -45,3 +45,17 @@ FPR_FN(fpr_g_reg8, h_reg8, 2);
 FPR_FN(fpr_g_reg32, h_reg32, 2);
 FPR_FN(fpr_g_read, h_read, 1);
 FPR_FN(fpr_g_write, h_write, 2);
+
+/* the pin bus: absent hardware, present SYMBOLS.  The svc URL router
+ * (mods/svc.fpr) references every route it can dispatch, so a hosted
+ * image that merely LINKS the funnel must not fail on the pin tier --
+ * the capability gate still refuses ungranted /pins first, and a
+ * GRANTED /pins on a host with no pin bus gets the honest panic. */
+static V h_pin_mode(V n, V m) { (void)n; (void)m; fpr_cpanic("Pin.mode: no pin bus on the posix HAL"); return (V)&fpr_unit; }
+static V h_pin_write(V n, V v) { (void)n; (void)v; fpr_cpanic("Pin.write: no pin bus on the posix HAL"); return (V)&fpr_unit; }
+static V h_pin_read(V n) { (void)n; fpr_cpanic("Pin.read: no pin bus on the posix HAL"); return (V)&fpr_unit; }
+FPR_FN(fpr_g_Pin_x2emode, h_pin_mode, 2);
+FPR_FN(fpr_g_Pin_x2ewrite, h_pin_write, 2);
+FPR_FN(fpr_g_Pin_x2eread, h_pin_read, 1);
+static V h_pin_wire(V n, V f) { (void)n; (void)f; fpr_cpanic("Pin.wire: no pin bus on the posix HAL"); return (V)&fpr_unit; }
+FPR_FN(fpr_g_Pin_x2ewire, h_pin_wire, 2);

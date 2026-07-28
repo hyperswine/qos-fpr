@@ -4,10 +4,15 @@
  * callee-saved d8-d15 in 16 extra bytes? -- NO: ctx[] is 16 words, so
  * d8-d15 are deliberately NOT saved; the runtime's switch paths do no
  * FP, which matches virt ctx.S's integer-only contract. */
+#ifdef __APPLE__
+#define SYM(x) _##x
+#else
+#define SYM(x) x
+#endif
     .text
     .balign 16
-    .globl fpr_ctx_switch
-fpr_ctx_switch:
+    .globl SYM(fpr_ctx_switch)
+SYM(fpr_ctx_switch):
     mov x9, sp
     str x30, [x0, #0]          // resume pc: our return address
     str x9,  [x0, #8]

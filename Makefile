@@ -66,15 +66,32 @@ all: image.elf
 # pthread harts, sockets.  POSIXARCH=a64: cross aarch64 + qemu-user.
 # POSIXHARTS: pthread "harts" actors are multiplexed onto (the P4
 # plan's N-to-2 shape).  FPR_PORT picks the net actor's port.
+# POSIXARCH=a64 on a Darwin host targets macOS natively: fprc emits
+# Mach-O syntax (--target=a64mac: _sym, @PAGE/@PAGEOFF, Darwin TLV for
+# the hart cell), cc/clang assembles and links (dynamic -- Mach-O has
+# no -static; the philosophy concedes libSystem the way GFX concedes
+# Mesa), and the binary runs natively on Apple Silicon.  Everything
+# else (runtime C, actors, sockets, the uart/clint pseudo-bus) is the
+# same portable code.  GFX=1 stays Linux-only (EGL/evdev), but the
+# FPR_EVDEV simulated-keyboard tier is portable (see evdev_raw.c).
+UNAME_S := $(shell uname -s)
 POSIXARCH ?= x64
 POSIXHARTS ?= 2
 ifeq ($(POSIXARCH),a64)
+POSIXCTX = $(RT_POSIX_DIR)/ctx_a64.S
+ifeq ($(UNAME_S),Darwin)
+POSIXCC  ?= cc
+POSIXRUN ?=
+POSIXFPRTGT = a64mac
+else
 POSIXCC  ?= aarch64-linux-gnu-gcc
 POSIXRUN ?= qemu-aarch64
-POSIXCTX = $(RT_POSIX_DIR)/ctx_a64.S
+POSIXFPRTGT = a64
+endif
 else
 POSIXCC  ?= gcc
 POSIXRUN ?=
+POSIXFPRTGT = x64
 POSIXCTX = $(RT_POSIX_DIR)/ctx_x64.S
 endif
 RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c \
@@ -93,12 +110,18 @@ else
 POSIXLIBS =
 POSIXSTATIC = -static
 endif
-RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c \
+ifeq ($(UNAME_S),Darwin)
+POSIXSTATIC =
+ifeq ($(GFX),1)
+$(error GFX=1 is Linux-only (EGL/evdev); the FPR_EVDEV keyboard sim works without it)
+endif
+endif
+RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/mod.c \
                 $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
 
 build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --target=$(POSIXARCH) --prelude=programs/prelude.fpr $(PROG) $@
+	LC_ALL=C.UTF-8 ./fprc --target=$(POSIXFPRTGT) --prelude=programs/prelude.fpr $(PROG) $@
 
 posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE)
 	$(POSIXCC) $(POSIXSTATIC) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) -I$(RT_CORE_DIR) \

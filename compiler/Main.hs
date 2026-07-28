@@ -22,6 +22,7 @@ import Text.Megaparsec (errorBundlePretty, parse)
 data Opts = Opts
   { oTarget :: Target,
     oA64 :: Bool, -- lower the rv64 emission (the shared RISC IR) to AArch64
+    oA64Mac :: Bool, -- AArch64 with Mach-O syntax (macOS): _sym, @PAGE, TLV
     oX64 :: Bool, -- lower it to x86-64 (SysV) instead
     oQosApp :: Bool, -- qx64: QOS-x86_64 app image (plain-global cells, no TLS)
     oRvv :: Bool,
@@ -30,11 +31,12 @@ data Opts = Opts
   }
 
 parseArgs :: [String] -> Opts
-parseArgs = foldl step (Opts rv64 False False False False Nothing [])
+parseArgs = foldl step (Opts rv64 False False False False False Nothing [])
   where
     step o "--target=rv32" = o {oTarget = rv32}
     step o "--target=rv64" = o {oTarget = rv64}
     step o "--target=a64" = o {oTarget = rv64, oA64 = True} -- rv64 emission is the IR
+    step o "--target=a64mac" = o {oTarget = rv64, oA64 = True, oA64Mac = True} -- same lowering, Mach-O syntax
     step o "--target=x64" = o {oTarget = rv64, oX64 = True} -- likewise
     step o "--target=qx64" = o {oTarget = rv64, oX64 = True, oQosApp = True} -- QOS-x86_64
     step o "--rvv" = o {oRvv = True}
@@ -64,7 +66,7 @@ main = do
   opts <- parseArgs <$> getArgs
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
-    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|x64|qx64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
+    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|a64mac|x64|qx64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
   preludeTops <- maybe (pure []) parseFile (oPrelude opts)
   rootTops <- parseFile inp
   lr <- loadProgram preludeTops inp rootTops
@@ -159,15 +161,17 @@ main = do
           extFor = M.union preludeExt unitExt -- own names win via prog-first lookup
           tgt = oTarget opts
           a64 = oA64 opts
+          a64mac = oA64Mac opts
           x64 = oX64 opts
           qapp = oQosApp opts
-          lower | a64 = lowerA64
+          lower | a64 = lowerA64 a64mac
                 | x64 && qapp = deTlsQosApp . lowerX64
                 | x64 = lowerX64
                 | otherwise = id
           rvv = oRvv opts && not a64 && not x64 -- no RVV lowering in the PoCs
           spec = not x64 -- SysV callee-saved registers can't host the s6+ spec loops
-          tname | a64 = "a64r" ++ show a64Rev
+          tname | a64mac = "a64macr" ++ show a64Rev
+                | a64 = "a64r" ++ show a64Rev
                 | x64 && qapp = "qx64r" ++ show x64Rev -- distinct cache tag: de-TLS'd units
                 | x64 = "x64r" ++ show x64Rev
                 | otherwise = tgtName tgt

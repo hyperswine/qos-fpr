@@ -194,7 +194,14 @@ loadModule cache stack path0 = do
 data REnv = REnv
   { reSelf :: Name -> Maybe Name, -- this unit's top-level names -> qualified
     reAliases :: M.Map Name String, -- import alias -> dep hash
-    reAliasSubst :: M.Map Name Name -- T = MyMod.T style name aliases
+    reAliasSubst :: M.Map Name Name, -- T = MyMod.T style name aliases
+    -- struct names, for dotted-field resolution: a struct qualifies as
+    -- `Rand@hash` and expands to `Rand@hash.next`, so a reference
+    -- `Rand.next` (self) / `M.Rand.next` (through an alias) / `R.next`
+    -- (through `R = M.Rand.`) must qualify the HEAD only -- unlike plain
+    -- module members, where the whole name qualifies.
+    reSelfStructs :: S.Set Name, -- this unit's own struct tops
+    reDepStructs :: M.Map Name (S.Set Name) -- import alias -> dep's struct tops
   }
 
 -- resolve one name occurrence (non-binding position).
@@ -207,13 +214,31 @@ refName env conPos bound nm0
     chase k n
       | k > 32 = n -- alias cycle: give up, let it fail downstream
       | Just t <- M.lookup n (reAliasSubst env) = chase (k + 1) t
+      -- `R = M.Rand.` then `R.next`: substitute the HEAD of a dotted
+      -- name through the alias, then resolve the result normally
+      | (h, '.' : rest) <- break (== '.') n,
+        Just t <- M.lookup h (reAliasSubst env) =
+          chase (k + 1) (t ++ "." ++ rest)
       | otherwise = n
     go nm
       | not conPos, Just h <- M.lookup nm (reAliases env) = Right h -- bare alias = hash string
       | (a, '.' : rest) <- break (== '.') nm,
         Just h <- M.lookup a (reAliases env) =
-          Left (qualify h rest)
+          case break (== '.') rest of
+            -- `M.Rand.next` where Rand is a struct in M: the struct name
+            -- qualifies, the field stays -- `Rand@hash.next` is the flat
+            -- global expandStructs creates
+            (s, '.' : fld)
+              | S.member s (M.findWithDefault S.empty a (reDepStructs env)) ->
+                  Left (qualify h s ++ "." ++ fld)
+            _ -> Left (qualify h rest)
       | Just q <- reSelf env nm = Left q
+      -- `Rand.next` inside the module that declares struct Rand: the
+      -- head qualifies to this unit's hash, the field stays
+      | (s, '.' : fld) <- break (== '.') nm,
+        S.member s (reSelfStructs env),
+        Just qs <- reSelf env s =
+          Left (qs ++ "." ++ fld)
       | otherwise = Left nm
 
 refVar :: REnv -> S.Set Name -> Name -> SExpr
@@ -325,13 +350,26 @@ loadProgram preludeTops rootPath rootTops = do
       -- notes from nested (module-internal) unpinned uses:
       depNotes <- fmap concat . forM units $ \mu ->
         pure ["  (inside a module) use of unpinned dep resolves to #" ++ h | (_, h) <- muAliases mu, False] -- deps are pin-normalized silently
-      let unitPairs = [(muHash mu, qualifyUnit mu) | mu <- units]
+      let unitPairs = [(muHash mu, qualifyUnit unitStructs' mu) | mu <- units]
+          unitStructs' =
+            M.fromList
+              [(muHash mu, S.fromList [n | TStruct n _ _ <- muTops mu]) | mu <- units]
           unitTops = map snd unitPairs
+          unitStructs =
+            M.fromList
+              [(muHash mu, S.fromList [n | TStruct n _ _ <- muTops mu]) | mu <- units]
+          depStructsFor aliases =
+            M.fromList
+              [ (a, M.findWithDefault S.empty h unitStructs)
+                | (a, h) <- aliases
+              ]
           rootEnv =
             REnv
               { reSelf = const Nothing, -- root names stay unqualified
                 reAliases = M.fromList rootAliases,
-                reAliasSubst = M.fromList [(a, b) | TAlias a b <- rootTops]
+                reAliasSubst = M.fromList [(a, b) | TAlias a b <- rootTops],
+                reSelfStructs = S.empty, -- root structs keep their names; refs already match
+                reDepStructs = depStructsFor rootAliases
               }
           root' = renameTops rootEnv "" rootTops
           merged = preludeTops ++ concat unitTops ++ root'
@@ -348,12 +386,18 @@ loadProgram preludeTops rootPath rootTops = do
           hs = maybe "?" id (lookup a aliases)
        in TUse a (nm ++ "#" ++ hs)
     pinRoot _ t = t
-    qualifyUnit mu =
+    qualifyUnit unitStructs mu =
       let env =
             REnv
               { reSelf = \n -> if S.member n selfNames then Just (qualify (muHash mu) n) else Nothing,
                 reAliases = M.fromList (muAliases mu),
-                reAliasSubst = M.fromList [(a, b) | TAlias a b <- muTops mu]
+                reAliasSubst = M.fromList [(a, b) | TAlias a b <- muTops mu],
+                reSelfStructs = S.fromList [n | TStruct n _ _ <- muTops mu],
+                reDepStructs =
+                  M.fromList
+                    [ (a, M.findWithDefault S.empty h unitStructs)
+                      | (a, h) <- muAliases mu
+                    ]
               }
           selfNames =
             S.fromList $
@@ -362,6 +406,7 @@ loadProgram preludeTops rootPath rootTops = do
                     TBind n _ _ _ -> [n]
                     TSig n _ -> [n]
                     TSigDef n _ -> [n]
+                    TStruct n _ _ -> [n]
                     TType n _ _ cons -> n : map fst cons
                     _ -> []
                   | t <- muTops mu

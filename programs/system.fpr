@@ -63,6 +63,14 @@ getcV me lsr dat v =
 # mod-service URL; the app that asks for it never links the module's
 # name, only the (hash, fn) identity -- the FPRLive wire shape.
 TimeFmt = use "mods/timefmt#48c8226ba0480e57".
+SVCM    = use "mods/svc".
+Svc  = SVCM.Svc.
+IoV  = SVCM.IoV.
+IUnit = SVCM.IUnit.
+IInt = SVCM.IInt.
+IStr = SVCM.IStr.
+IFn  = SVCM.IFn.
+IErr = SVCM.IErr.
 QLog    = use "mods/qlog#9c8b89e0dd258d0e".
 MK      = use "mods/matrixkpd".
 TUI     = use "mods/tui#dd2f2f35bad3f6bb".
@@ -416,36 +424,27 @@ anyPerm g url mode =
   | p :: r -> case p of (u, m) ->
       case and2 (strEq u url) (strEq m mode) of True -> True | False -> anyPerm r url mode.
 
-# ---- the URL-addressed services (the ONLY api an app uses) -----------------
+# ---- the URL-addressed services: ONE funnel (mods/svc.fpr) -----------------
+# Every service call below is `Svc.read caps url` / `Svc.write caps url v`
+# -- the Sol read/write collapse, upstreamed.  The svc* names survive as
+# wrappers so app code is untouched, but the capability check and the
+# dispatch now live in exactly one place (the router), keyed by the URL
+# itself.  A service that forgets its own gate can no longer exist.
 
-svcWrite caps s =
-  case hasCap caps "/services/display" "write" of
-    True -> puts (capCon caps) s
-  | False -> capBug "/services/display".
-svcWriteLn caps s = svcWrite caps s >> nl (capCon caps).
+expectU r = case r of IUnit -> Unit | IErr e -> error e | _ -> Unit.
+expectI r = case r of IInt v -> v | IErr e -> error e | _ -> 0 - 1.
 
-svcReadKey caps =
-  case hasCap caps "/services/keyboard" "read" of
-    True -> getc (capMe caps) (capCon caps)
-  | False -> capBug "/services/keyboard".
+svcWrite caps s = expectU (Svc.write caps "/services/display" (IStr s)).
+svcWriteLn caps s = expectU (Svc.write caps "/services/display/line" (IStr s)).
+
+svcReadKey caps = expectI (Svc.read caps "/services/keyboard").
 
 # nonblocking key poll (0 = none waiting): what makes an app DYNAMIC --
 # it can tick a clock or animate between keystrokes instead of parking
 # in getc.  Same capability as svcReadKey.
-svcPollKey caps =
-  case hasCap caps "/services/keyboard" "read" of
-    True -> pollKey (capCon caps)
-  | False -> capBug "/services/keyboard".
-pollKey con =
-  (lsr, dat) = con;
-  case isOdd (read lsr) of
-    True -> read dat
-  | False -> 0.
+svcPollKey caps = expectI (Svc.read caps "/services/keyboard/poll").
 
-svcClock caps =
-  case hasCap caps "/services/clock" "read" of
-    True -> read (capClk caps)
-  | False -> capBug "/services/clock".
+svcClock caps = expectI (Svc.read caps "/services/clock").
 
 # /services/modules: URL-addressed module resolution (the URL method).
 # url is "<hash>/<fn>"; the answer is (1, fn) or (0, 0) -- a miss is
@@ -453,10 +452,13 @@ svcClock caps =
 # module store or an FPRLive remote peer, where misses are routine.
 # Today's backend is the link-time module table (Mod.resolve); swapping
 # in .qa module archives or a remote node changes THIS function only.
+# through the funnel for the gate; the resolved value rides IFn.  (No
+# in-tree caller applies the fn today -- dynamic application goes through
+# Mod.fn PAPs -- so the opaque carrier is honest.)
 svcModFn caps url =
-  case hasCap caps "/services/modules" "read" of
-    True -> Mod.resolve (urlHead url) (urlTail url)
-  | False -> capBug "/services/modules".
+  case Svc.read caps (strcat "/services/modules/" url) of
+    IFn f -> (1, f)
+  | _ -> (0, 0).
 
 # split "<head>/<tail>" at the first '/' (charAt is 1-indexed; '/' = 47)
 findSlash s i n = case i > n of True -> 0 | False -> case charAt s i == 47 of True -> i | False -> findSlash s (i + 1) n.
@@ -472,14 +474,9 @@ urlTail s = k = findSlash s 1 (strlen s); case k == 0 of True -> "" | False -> s
 # as the runner.  Diskless boots answer Err: absence is data.
 kvUrl caps = strcat "apps/" (strcat (capId caps) (strcat "/" (strcat (capId caps) ".kv"))).
 
-svcKvAppend caps line =
-  case hasCap caps "/services/storage" "write" of
-    True -> storeRpc caps 2 (kvUrl caps) (strcat line (chr 10))
-  | False -> capBug "/services/storage".
-svcKvReplay caps =
-  case hasCap caps "/services/storage" "write" of
-    True -> storeRpc caps 3 (kvUrl caps) ""
-  | False -> capBug "/services/storage".
+svcKvAppend caps line = kvRes (Svc.write caps "/services/storage/kv" (IStr line)).
+svcKvReplay caps = kvRes (Svc.read caps "/services/storage/kv").
+kvRes r = case r of IStr s -> Ok s | IErr e -> Err e | _ -> Err "storage: bad shape".
 
 storeRpc caps tag url pay = storeRpc1 (capMe caps) (capSt caps) tag url pay.
 storeRpc1 me st tag url pay =
@@ -495,18 +492,10 @@ storeRpc1 me st tag url pay =
 # /services/keypad, built from mods/matrixkpd over svcPin*, with its
 # pin map read from the "sys/pinmap.keypad" storage url -- remapping a
 # soldered-differently board is one storage write, no rebuild.
-svcPinMode caps n m =
-  case hasCap caps "/pins" "rw" of
-    True -> Pin.mode n m
-  | False -> capBug "/pins".
-svcPinWrite caps n v =
-  case hasCap caps "/pins" "rw" of
-    True -> Pin.write n v
-  | False -> capBug "/pins".
-svcPinRead caps n =
-  case hasCap caps "/pins" "rw" of
-    True -> Pin.read n
-  | False -> capBug "/pins".
+svcPinMode caps n m = expectU (Svc.write caps (pinUrl n "/mode") (IInt m)).
+svcPinWrite caps n v = expectU (Svc.write caps (pinUrl n "") (IInt v)).
+svcPinRead caps n = expectI (Svc.read caps (pinUrl n "")).
+pinUrl n suf = strcat "/pins/" (strcat (showInt n) suf).
 
 kpdDefaultMap = "4 5 6 7 8 9 10 11".
 kpdMap caps =

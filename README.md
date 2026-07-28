@@ -15,9 +15,9 @@ QEMU virt as the machine.
 Runtime layout: `runtime/core` (portable runtime: allocator, actors,
 prims), `runtime/virt` (QEMU-virt bare-metal machine layer: boot, ctx,
 MMIO HAL, linker scripts), `runtime/qos` (app-side runtime for `.qa`
-processes running ON QOS), `runtime/posix (hosted HAL: x86-64 native + aarch64, static binaries, pthread-hart actors, sockets)` (hosted HAL: libc-backed,
-`--target=a64` lowers the rv64 emission to AArch64 — see
-runtime/posix/README.md).
+processes running ON QOS), `runtime/posix` (hosted HAL: libc-backed; x86-64 and aarch64 Linux as
+static binaries, and macOS/Apple Silicon natively via `--target=a64mac`
+— pthread-hart actors, sockets; see runtime/posix/README.md).
 
 This file describes the system **as it stands**. The round-by-round
 design log — why each piece got this way, including the essays on
@@ -111,6 +111,14 @@ record-shape ids are **content-addressed** (fnv32 of unit-hash + type
 name / of the sorted field set), so separately compiled units agree
 on them with no shared counter; fprc aborts loudly on collision.
 
+Structs travel through modules like everything else (July 2026, ported
+back from Sol): a module can expose its surface as one structure —
+`Rand = Struct { next, ... }` — and a consumer writes `M = use "rmod".
+Rand = M.Rand.` then `Rand.next s`; dotted references whose head is a
+struct qualify the head only (`Rand@hash.next`), both for the module's
+own self-references and through aliases, so the flat expanded globals
+and the monomorphizer see the same names.
+
 Two module tiers, per the design decision:
 - **Local**: `use "localmod.fpr"` — unpinned, relative, extension
   optional — just works, Sol-style. Pin with `#<hash>` to freeze.
@@ -150,8 +158,20 @@ from disk on demand**: `tools/mkdisk.py` seeds `disk.img` with each
 built `.qa` as its own log record plus an `apps/index` record;
 System.qa discovers from the index and reads each `.qa` off the log
 at launch (rodata is the diskless fallback). Every launch goes
-through the permission gate; a capability is a granted `(url, mode)`
-exercised through `svc*` helpers — apps never see a device register.
+through the permission gate; a capability is a granted `(url, mode)`.
+ALL of app IO is two functions — `Svc.read caps url` and `Svc.write
+caps url v` (programs/mods/svc.fpr, the Sol read/write collapse
+upstreamed): one router derives the needed capability from the URL
+itself ('/'-boundary prefix against the granted set), checks it ONCE,
+and dispatches — display, keyboard(+/poll), clock, /services/modules
+(miss is data), /services/storage/kv (the storage-actor RPC, with the
+app-scoped kv URL built from the capability so cross-app addressing
+stays structurally impossible), /pins/<n>(+/mode).  The historical
+`svc*` names survive as wrappers over the funnel, so app code is
+untouched; a service that forgets its own gate can no longer exist,
+because services are not functions any more — they are routes.
+tests/svcurl.fpr runs the router on the hosted HAL.  Apps never see a
+device register.
 
 Two load modes today:
 - **process** (`docs/PROCESS-LOADING.md`): a real ELF, linked at the
