@@ -119,7 +119,7 @@ extern V fpr_fn_main(void);
 extern void fpr_exit(V result);
 extern void fpr_set_tp(fpr_hart_t *h);
 extern volatile uint32_t fpr_shutdown;
-void fpr_rvv_enable(void) __attribute__((weak)); /* mstatus.VS is per-hart */
+extern void fpr_rvv_enable(void); /* mstatus.VS is per-hart; weak default defined in runtime.c */
 
 /* hal.c: CLINT-based sleep/wake (see the wfi essay there) */
 void hal_ipi_send(uw hart);
@@ -460,7 +460,7 @@ void fpr_hart_main(int id) { /* boot stack becomes the hart loop */
 
 void fpr_hart_secondary(int id) {
   fpr_set_tp(&fpr_harts[id]);
-  if (fpr_rvv_enable) fpr_rvv_enable(); /* mstatus.VS is per-hart */
+  fpr_rvv_enable(); /* mstatus.VS is per-hart */
   hart_loop(&fpr_harts[id]);
 }
 

@@ -36,7 +36,12 @@
 --     C-visible symbol (definitions, .globl, call/la/.quad references)
 --     grows the leading underscore; .L local labels become L (the
 --     Mach-O assembler-private prefix)
---   * .section .rodata becomes __TEXT,__const
+--   * .section .rodata becomes __DATA,__const -- NOT __TEXT,__const: the
+--     rodata section holds .quad relocations to code symbols (e.g. the
+--     per-shape dispatch tables), and a PIE binary's dyld fixes those
+--     up at load time. ld64 refuses to emit such a fixup into __TEXT
+--     ("illegal text-relocation"; W^X/hardened-runtime pages can't be
+--     patched post-link), so the data has to live in __DATA instead.
 --   * big immediates are movz/movk chains on BOTH syntaxes now (the
 --     ldr =imm literal pool + .ltorg pseudo was ELF-gas-only; the chain
 --     is portable and the ELF suite regression-tests the encoding)
@@ -59,7 +64,7 @@ import Data.Word (Word64)
 
 -- bump when the lowering changes (unit-cache tag component; see X64.hs)
 a64Rev :: Int
-a64Rev = 4
+a64Rev = 6
 
 lowerA64 :: Bool -> String -> String
 lowerA64 mach =
@@ -139,7 +144,7 @@ macLine l
     not (isDigit c),
     c /= '-' =
       "    .quad " ++ gsym True (trim rest)
-  | "    .section .rodata" `isPrefixOf` l = "    .section __TEXT,__const"
+  | "    .section .rodata" `isPrefixOf` l = "    .section __DATA,__const"
   | (name, ':' : rest) <- break (== ':') l,
     not (null name),
     all (not . isSpace) name,
@@ -309,7 +314,11 @@ instr mach body = case parts body of
   ("bltu", [r1, r2, l]) -> cmpBr r1 r2 "b.lo" l
   -- control transfer
   ("call", [sym]) -> ["bl " ++ gsym mach sym]
-  ("j", [l]) -> ["b " ++ l]
+  -- `j` is used both for intra-function local branches (.L-prefixed
+  -- labels) and for tail calls to global function symbols (see
+  -- Codegen.hs's knownCall): gsym only adds the underscore in the
+  -- latter case, so this must go through it exactly like `call` does.
+  ("j", [l]) -> ["b " ++ gsym mach l]
   ("ret", []) -> ["ret"] -- no literal pools since the movz/movk change
   (op, _) -> error ("A64: cannot lower `" ++ body ++ "` (op " ++ op ++ ")")
   where

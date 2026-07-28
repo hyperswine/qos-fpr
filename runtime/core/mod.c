@@ -16,9 +16,14 @@
  */
 #include "fpr.h"
 
-/* weak: only the root unit of a build with modules emits the table;
- * module-free images simply have none. */
-extern const uw fpr_modtab[] __attribute__((weak));
+/* weak empty-table default: only the root unit of a build with modules
+ * emits a real fpr_modtab (strong .globl data from Codegen); a
+ * module-free image overrides nothing and just sees this empty table.
+ * (A plain `extern ... weak` declaration with no definition anywhere
+ * is what Apple's ld refuses to leave unresolved in a main executable
+ * -- an actual weak definition is required, coalesced the same way on
+ * both ELF and Mach-O.) */
+__attribute__((weak)) const uw fpr_modtab[1] = {0};
 
 static int str_eq(const str_t *a, const str_t *b) {
   if (a->len != b->len) return 0;

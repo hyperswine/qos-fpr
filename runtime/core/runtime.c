@@ -29,16 +29,24 @@ fpr_grant_t (*fpr_grow_memory)(uw want_bytes) = 0;
  * section + volatile) so it is 0 straight from the ELF image -- a
  * secondary that reaches its spin loop before hart 0 clears bss reads
  * a real 0, not garbage. */
+#ifdef __APPLE__
+__attribute__((section("__DATA,__data"))) volatile uint32_t fpr_smp_go = 0;
+#else
 __attribute__((section(".data"))) volatile uint32_t fpr_smp_go = 0;
+#endif
 
 void fpr_actors_init(void);       /* actors.c: global (hart 0, pre-release) */
 void fpr_hart_main(int id);       /* actors.c: the hart loop */
 void fpr_hart_secondary(int id);  /* actors.c: tp setup + hart loop */
 
-/* emitted by fprc only under --rvv (sets mstatus.VS); weak so images
- * built without it link and never touch the CSR.  mstatus is PER-HART:
- * every hart's init calls it. */
-void fpr_rvv_enable(void) __attribute__((weak));
+/* emitted by fprc only under --rvv (sets mstatus.VS).  Weak no-op
+ * default here so images built without --rvv link and never touch the
+ * CSR: a --rvv unit's own (strong) definition from the generated
+ * assembly overrides this one via ordinary weak/strong symbol
+ * coalescing (true on both ELF and Mach-O; plain `extern ... weak`
+ * with NO definition anywhere is what Apple's ld refuses to leave
+ * unresolved). mstatus is PER-HART: every hart's init calls it. */
+__attribute__((weak)) void fpr_rvv_enable(void) {}
 
 static void hart_init(int id) {
   fpr_hart_t *h = &fpr_harts[id];
@@ -80,7 +88,7 @@ void fpr_rt_init(void) {
     buddy_init((void *)base, (uw)_heap_end - base);
   }
   fpr_set_tp(&fpr_harts[0]);
-  if (fpr_rvv_enable) fpr_rvv_enable();
+  fpr_rvv_enable();
   fpr_actors_init();
   /* everything above happens-before any secondary's first instruction */
   __atomic_store_n(&fpr_smp_go, 1, __ATOMIC_RELEASE);
