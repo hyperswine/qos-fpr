@@ -492,6 +492,7 @@ V fpr_applyN(V f, uw n, V *rargs) {
     if (n == need) return r;
     /* over-saturated: the result must itself be applicable */
     n -= need;
+    // could (void) to silence
     rargs = rargs; /* remaining logical args are 0..n-1: same base */
     f = r;
   }
