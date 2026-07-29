@@ -469,7 +469,7 @@ consEnv aliases tops = M.fromList . concat <$> mapM one [t | t@TType {} <- tops]
 
 -- `n : τ1 -> .. -> τr.` prelude/user annotations become declared schemes
 sigAnnEnv :: ShapeAliases -> [STop] -> I TEnv
-sigAnnEnv aliases tops = M.fromList <$> mapM one [(n, ps, r) | TSig n (ps, r) <- tops]
+sigAnnEnv aliases tops = M.fromList <$> mapM one [(n, ps, r) | TSig n (ps, r) _ <- tops]
   where
     one (n, ps, r) = do
       (t, _) <- tyToTypeA aliases M.empty (foldr TArrT r ps)

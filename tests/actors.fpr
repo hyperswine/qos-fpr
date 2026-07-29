@@ -12,17 +12,12 @@ lsrReady =
   v = read (reg8 uart 5);
   BITTEST v 5 .
 
-putc c =
-  case lsrReady of
-    True -> write (reg8 uart 0) c
-  | False -> putc c .
+putc c | lsrReady = write (reg8 uart 0) c.
+putc c = putc c .
 
 puts s = putsFrom s 1 .
-putsFrom s i =
-  n = strlen s;
-  case i > n of
-    True -> Unit
-  | False -> putc (charAt s i) >> putsFrom s (i + 1) .
+putsFrom s i | i > strlen s = Unit.
+putsFrom s i = putc (charAt s i) >> putsFrom s (i + 1) .
 
 nl = putc 13 >> putc 10 .
 

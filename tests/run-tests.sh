@@ -46,6 +46,8 @@ orig3|||main => 585
 orig4|||main => 60
 orig5|||ok 100;:done
 typed|||ops: 42 fprisc;generic: total Int=10 total Str=abc;sstring: len=2 at1=104 str=hi;vlist: fold=60
+precond|||amount: 80 100 75 75 0 7;avg: 30 0  precond done
+!precondviol|||precondition violated: double requires (n > 0), got n=-3 (in poke)
 '
 
 echo "$TESTS" | while IFS='|' read -r name vars stdin expects; do

@@ -1,0 +1,18 @@
+# precondviol.fpr — the dynamic tier of preconditions.
+#
+# `poke` proves nothing about k, so the call to `double` compiles to a
+# boundary check; violating it crashes the actor with blame — callee,
+# predicate, offending value, and the caller it came through:
+#
+#     precondition violated: double requires (n > 0), got n=-3 (in poke)
+
+double : (n : Int | n > 0) -> Int.
+double n = n * 2.
+
+poke : Int -> Int.
+poke k = double k.
+
+main =
+  a = poke 4;
+  _ = print "ok {a}";
+  poke (0 - 3).

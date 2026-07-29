@@ -31,60 +31,44 @@ Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
 
 # ---- discovery + services (gfxdemo.fpr's architecture, unchanged) ----------
 
-strEqGo a b i n =
-  case i > n of
-    True -> True
-  | False -> case charAt a i == charAt b i of
-      True -> strEqGo a b (i + 1) n
-    | False -> False.
-strEq a b = case strlen a == strlen b of
-    True -> strEqGo a b 1 (strlen a)
-  | False -> False.
+strEqGo a b i n | i > n = True.
+strEqGo a b i n | charAt a i == charAt b i = strEqGo a b (i + 1) n.
+strEqGo a b i n = False.
 
-findSvc reg url =
-  case reg of
-    Nil -> 0
-  | p :: r -> case p of (u, a) ->
-      case strEq u url of True -> a | False -> findSvc r url.
+strEq a b | strlen a == strlen b = strEqGo a b 1 (strlen a).
+strEq a b = False.
+
+findSvc Nil url = 0.
+findSvc ((u, a) :: r) url | strEq u url = a.
+findSvc ((u, a) :: r) url = findSvc r url.
 
 systemActor me = sysLoop me Nil.
 sysServe me reg =
-  m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Lookup url -> send replyTo (findSvc reg url) >> sysServe me reg.
+  (replyTo, Lookup url) = receive me;
+  send replyTo (findSvc reg url) >> sysServe me reg.
 sysLoop me reg0 =
-  m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
-      | Reg reg -> send replyTo 1 >> sysServe me reg.
+  (replyTo, q) = receive me;
+  case q of
+    Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
+  | Reg reg -> send replyTo 1 >> sysServe me reg.
 
 graphicsActor me =
   _ = glInit 320 240;
   gfxServe me.
 gfxServe me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Render scene -> send replyTo (glRender scene) >> drop m >> gfxServe me.
+  (replyTo, Render scene) = m;
+  send replyTo (glRender scene) >> drop m >> gfxServe me.
 
 displayActor me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Present path -> send replyTo (glSavePpm path) >> drop m >> displayActor me.
+  (replyTo, Present path) = m;
+  send replyTo (glSavePpm path) >> drop m >> displayActor me.
 
 inputActor me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Poll u -> send replyTo (inputPoll u) >> drop m >> inputActor me.
+  (replyTo, Poll u) = m;
+  send replyTo (inputPoll u) >> drop m >> inputActor me.
 
 svcLookup me sys url =
   _ = send sys (me, Lookup url);
@@ -106,30 +90,27 @@ model0 = (0, 6000, 0).
 # Keycodes are Linux input-event-codes: w=17 a=30 s=31 d=32 q=16
 # left=105 right=106.  Returns (model, quit).
 
-applyKey m code =
-  case m of (yaw, dist, x) ->
-    case code == 30 of True -> (yaw - 200, dist, x)          # a
-  | False -> case code == 32 of True -> (yaw + 200, dist, x)  # d
-  | False -> case code == 17 of True -> (yaw, dist - 400, x)  # w
-  | False -> case code == 31 of True -> (yaw, dist + 400, x)  # s
-  | False -> case code == 105 of True -> (yaw, dist, x - 300) # left
-  | False -> case code == 106 of True -> (yaw, dist, x + 300) # right
-  | False -> m.                                               # q / unbound key
+applyKey (yaw, dist, x) 30 = (yaw - 200, dist, x).            # a
+applyKey (yaw, dist, x) 32 = (yaw + 200, dist, x).            # d
+applyKey (yaw, dist, x) 17 = (yaw, dist - 400, x).            # w
+applyKey (yaw, dist, x) 31 = (yaw, dist + 400, x).            # s
+applyKey (yaw, dist, x) 105 = (yaw, dist, x - 300).           # left
+applyKey (yaw, dist, x) 106 = (yaw, dist, x + 300).           # right
+applyKey m code = m.                                          # q / unbound key
 
-update m ev =
-  case ev of
-    (kind, code, val) ->
-      case and2 (kind == 4) (val == 1) of
-        True -> applyKey m code
-      | False -> m.                   # kind 0 (none) / release / repeat: no-op
+update m (kind, code, val) | and2 (kind == 4) (val == 1) = applyKey m code.
+update m ev = m.                    # kind 0 (none) / release / repeat: no-op
 
 # quit is DERIVED from the event, not threaded through update: keeps
 # update's type model -> event -> model, and -- the operational reason --
 # an idle poll loop allocating a (model, quit) pair per spin would churn
-# the heap for nothing.  q press = keycode 16, value 1.
-quitOf ev = case ev of (kind, code, val) ->
-  case and2 (kind == 4) (and2 (code == 16) (val == 1)) of True -> 1 | False -> 0.
-and2 a b = case a of True -> b | False -> False.
+# the heap for nothing.  q press = keycode 16, value 1 -- one literal
+# tuple clause.
+quitOf (4, 16, 1) = 1.
+quitOf ev = 0.
+
+and2 True b = b.
+and2 False b = False.
 
 # ---- VIEW ------------------------------------------------------------------
 # Pure model -> scene.  The hero cube carries the model's yaw and x;
@@ -144,12 +125,11 @@ statics =
     :: Nil.
 lights = ((4000, 6000, 4000), (1000, 1000, 1000)) :: Nil.
 
-view m =
-  case m of (yaw, dist, x) ->
-    (statics,
-     ("cube", (x, 900, 0), yaw, (1400, 1400, 1400), (950, 800, 250)) :: Nil,
-     lights,
-     ((0, 3000, dist), (0, 500, 0 - 1000), 900)).
+view (yaw, dist, x) =
+  (statics,
+   ("cube", (x, 900, 0), yaw, (1400, 1400, 1400), (950, 800, 250)) :: Nil,
+   lights,
+   ((0, 3000, dist), (0, 500, 0 - 1000), 900)).
 
 # ---- the MVU loop ----------------------------------------------------------
 # EVENT-DRIVEN with a wall-clock session budget: render only when the
@@ -162,10 +142,8 @@ view m =
 
 mtimeOf clint = read (reg32 clint 49144).
 
-mvuLoop me g i clint t0 m =
-  case (mtimeOf clint - t0) > 30000000 of
-    True -> mvuDone me m "time budget"
-  | False -> mvuTick me g i clint t0 m.
+mvuLoop me g i clint t0 m | (mtimeOf clint - t0) > 30000000 = mvuDone me m "time budget".
+mvuLoop me g i clint t0 m = mvuTick me g i clint t0 m.
 mvuTick me g i clint t0 m =
   ev = svcCall me i (Poll 0);
   m2 = update m ev;
@@ -177,25 +155,21 @@ mvuStep me g i clint t0 ev m2 q =
   _ = drop ev;                     # the poll reply escaped from the input
                                    # actor; an idle spin makes millions --
                                    # undropped they fill the ARC table
-  case q == 1 of
-    True -> mvuDone me m2 "q pressed"
-  | False -> mvuLoop me g i clint t0 m2.
-evKind ev = case ev of (kind, code, val) -> kind.
-renderIf me g kind m =
-  case kind == 0 of
-    True -> 0                              # no event: no new frame
-  | False -> renderNow me g m.
+  mvuNext me g i clint t0 m2 q.
+mvuNext me g i clint t0 m2 1 = mvuDone me m2 "q pressed".
+mvuNext me g i clint t0 m2 q = mvuLoop me g i clint t0 m2.
+
+evKind (kind, code, val) = kind.
+
+renderIf me g 0 m = 0.                     # no event: no new frame
+renderIf me g kind m = renderNow me g m.
 renderNow me g m =
   r = svcCall me g (Render (view m));
   drop r >> 1.                             # the (draws, bytes) pair, same rule
 
 # print only when an event landed (presses AND releases show)
-logStep ev mNew =
-  case ev of
-    (kind, code, val) ->
-      case kind == 0 of
-        True -> Unit
-      | False -> print "event ({kind}, {code}, {val}) -> model {mNew}".
+logStep (0, code, val) mNew = Unit.
+logStep (kind, code, val) mNew = print "event ({kind}, {code}, {val}) -> model {mNew}".
 
 mvuDone me m why =
   _ = print "mvu3d done ({why}), final model {m}";

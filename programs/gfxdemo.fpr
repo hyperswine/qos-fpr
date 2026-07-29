@@ -30,37 +30,27 @@ Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
 
 # ---- the System actor: URL -> service actor discovery ----------------------
 
-strEqGo a b i n =
-  case i > n of
-    True -> True
-  | False -> case charAt a i == charAt b i of
-      True -> strEqGo a b (i + 1) n
-    | False -> False.
-strEq a b = case strlen a == strlen b of
-    True -> strEqGo a b 1 (strlen a)
-  | False -> False.
+strEqGo a b i n | i > n = True.
+strEqGo a b i n | charAt a i == charAt b i = strEqGo a b (i + 1) n.
+strEqGo a b i n = False.
 
-findSvc reg url =
-  case reg of
-    Nil -> 0
-  | p :: r -> case p of (u, a) ->
-      case strEq u url of True -> a | False -> findSvc r url.
+strEq a b | strlen a == strlen b = strEqGo a b 1 (strlen a).
+strEq a b = False.
+
+findSvc Nil url = 0.
+findSvc ((u, a) :: r) url | strEq u url = a.
+findSvc ((u, a) :: r) url = findSvc r url.
 
 systemActor me = sysLoop me Nil.
 sysServe me reg =
-  m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Lookup url -> send replyTo (findSvc reg url) >> sysServe me reg.
+  (replyTo, Lookup url) = receive me;
+  send replyTo (findSvc reg url) >> sysServe me reg.
 # registration phase: main sends the registry once, then serving starts
 sysLoop me reg0 =
-  m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
-      | Reg reg -> send replyTo 1 >> sysServe me reg.
+  (replyTo, q) = receive me;
+  case q of
+    Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
+  | Reg reg -> send replyTo 1 >> sysServe me reg.
 
 # ---- service actors: each one linearizes ONE hard resource -----------------
 
@@ -72,27 +62,21 @@ graphicsActor me =
   gfxServe me.
 gfxServe me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Render scene -> send replyTo (glRender scene) >> drop m >> gfxServe me.
+  (replyTo, Render scene) = m;
+  send replyTo (glRender scene) >> drop m >> gfxServe me.
 
 # display: presentation of the last-rendered frame.  Headless backend =
 # a PPM on disk; a windowed backend swaps THIS actor's body only.
 displayActor me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Present path -> send replyTo (glSavePpm path) >> drop m >> displayActor me.
+  (replyTo, Present path) = m;
+  send replyTo (glSavePpm path) >> drop m >> displayActor me.
 
 # input: keyboard/mouse polling, one reader for the whole machine.
 inputActor me =
   m = receive me;
-  case m of
-    (replyTo, q) ->
-      case q of
-        Poll u -> send replyTo (inputPoll u) >> drop m >> inputActor me.
+  (replyTo, Poll u) = m;
+  send replyTo (inputPoll u) >> drop m >> inputActor me.
 
 # ---- client-side URL helpers (what an app links against) -------------------
 
@@ -108,12 +92,10 @@ svcCall me svc q =
 # A ground plane + a ring of static cubes; two orbiting dynamic spheres.
 # Everything milli-fixed: 1000 = 1.0.
 
+ring 0 = Nil.
 ring n =
-  case n == 0 of
-    True -> Nil
-  | False ->
-      ("cube", (2500 * (n - 3), 400, 0 - 2000), 300 * n, (800, 800, 800), (900, 350 + 100 * n, 250))
-        :: ring (n - 1).
+  ("cube", (2500 * (n - 3), 400, 0 - 2000), 300 * n, (800, 800, 800), (900, 350 + 100 * n, 250))
+    :: ring (n - 1).
 
 statics =
   ("plane", (0, 0, 0), 0, (8000, 1000, 8000), (300, 420, 320)) :: ring 5.
@@ -130,11 +112,8 @@ scene t = (statics, dynamics t, lights, camera).
 
 # ---- main ------------------------------------------------------------------
 
+frameLoop me gfx dsp t | t > 3 = Unit.
 frameLoop me gfx dsp t =
-  case t > 3 of
-    True -> Unit
-  | False -> frameStep me gfx dsp t.
-frameStep me gfx dsp t =
   r = svcCall me gfx (Render (scene t));
   _ = print "frame {t}: rendered {r}";
   rc = svcCall me dsp (Present "frame{t}.ppm");

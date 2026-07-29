@@ -41,7 +41,8 @@ import Control.Monad (foldM, forM)
 import Data.Bits (xor)
 import Data.Char (isUpper, ord)
 import Data.IORef
-import Data.List (foldl', isPrefixOf, isSuffixOf)
+import Data.List (foldl', intercalate, isPrefixOf, isSuffixOf)
+import Data.Maybe (isNothing)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Word (Word64)
@@ -83,7 +84,12 @@ data LoadResult = LoadResult
 hashAST :: [STop] -> String
 hashAST tops = pad (showHex h "")
   where
-    h = foldl' step 0xcbf29ce484222325 (show tops) :: Word64
+    -- precondition-free sigs print in the pre-contract shape so
+    -- existing pinned module hashes stay valid (the AST is the same
+    -- module; only the constructor grew a field)
+    stable (TSig n tys pres) | all isNothing pres = "TSig " ++ show n ++ " " ++ show tys
+    stable t = show t
+    h = foldl' step 0xcbf29ce484222325 ("[" ++ intercalate "," (map stable tops) ++ "]") :: Word64
     step acc c = (acc `xor` fromIntegral (ord c)) * 0x100000001b3
     pad s = replicate (16 - length s) '0' ++ s
 
@@ -262,7 +268,7 @@ renameTops env qh = concatMap top
       TAlias {} -> [] -- folded into reAliasSubst
       TSkip -> []
       TShape n fs -> [TShape n [(f, ty t) | (f, t) <- fs]] -- structural: never qualified
-      TSig n (as, r) -> [TSig (qual n) (map ty as, ty r)]
+      TSig n (as, r) pres -> [TSig (qual n) (map ty as, ty r) pres]
       TType n lin ps cons ->
         [TType (qual n) lin ps [(qual c, map ty ts) | (c, ts) <- cons]]
       TSigDef n fs -> [TSigDef (qual n) [(f, fmap ty mt) | (f, mt) <- fs]]
@@ -404,7 +410,7 @@ loadProgram preludeTops rootPath rootTops = do
               concat
                 [ case t of
                     TBind n _ _ _ -> [n]
-                    TSig n _ -> [n]
+                    TSig n _ _ -> [n]
                     TSigDef n _ -> [n]
                     TStruct n _ _ -> [n]
                     TType n _ _ cons -> n : map fst cons

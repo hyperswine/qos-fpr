@@ -226,7 +226,7 @@ portable-qa: build/qosapp.elf tools/mkqa.py
 portable-run: qosp portable-qa
 	./qosp --yes app.qa
 
-fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs compiler/A64.hs compiler/X64.hs compiler/Infer.hs compiler/Struct.hs
+fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs compiler/A64.hs compiler/X64.hs compiler/Infer.hs compiler/Struct.hs compiler/Precond.hs
 	cd compiler && cabal build -v0
 	cp "$$(cd compiler && cabal list-bin fprc)" $@
 

@@ -7,50 +7,51 @@ now = read (reg32 clint 49144) .
 
 imod a b = a - (a / b) * b.
 
-# Lehmer LCG mod 65537: values stay well inside rv32's tagged range
-fillV i n x v =
-  case i > n of
-    True  -> v
-  | False -> fillV (i + 1) n (imod (x * 75) 65537) (Vec.push x v).
+# Lehmer LCG mod 65537: values stay well inside rv32's tagged range.
+# Clause + guard: the termination condition reads as a fact, not a branch.
+fillV i n x v | i > n = v.
+fillV i n x v = fillV (i + 1) n (imod (x * 75) 65537) (Vec.push x v).
 
 # ---- tail-recursive list merge sort (O(1) stack for merge) -----------
-rev2 acc rest = case acc of Nil -> rest | Cons a at -> rev2 at (Cons a rest).
+# One clause per list shape; the base cases ARE the equations.
+rev2 Nil rest = rest.
+rev2 (Cons a at) rest = rev2 at (Cons a rest).
 
+mergeGo acc Nil ys = rev2 acc ys.
+mergeGo acc xs Nil = rev2 acc xs.
 mergeGo acc xs ys =
-  case xs of
-    Nil -> rev2 acc ys
-  | Cons x xt ->
-      case ys of
-        Nil -> rev2 acc xs
-      | Cons y yt ->
-          case x <= y of
-            True  -> mergeGo (Cons x acc) xt ys
-          | False -> mergeGo (Cons y acc) xs yt.
+  Cons x xt = xs;                 # destructure by pattern-bind so the
+  Cons y yt = ys;                 # un-consumed side is passed on WHOLE
+  case x <= y of
+    True  -> mergeGo (Cons x acc) xt ys
+  | False -> mergeGo (Cons y acc) xs yt.
 
 merge xs ys = mergeGo Nil xs ys.
 
-halveGo a b xs = case xs of Nil -> (a, b) | Cons x xt -> halveGo b (Cons x a) xt.
+halveGo a b Nil = (a, b).
+halveGo a b (Cons x xt) = halveGo b (Cons x a) xt.
 
+msort Nil = Nil.
+msort (Cons x Nil) = Cons x Nil.
 msort xs =
-  case xs of
-    Nil -> xs
-  | Cons x xt ->
-      case xt of
-        Nil -> xs
-      | Cons y yt ->
-          case halveGo Nil Nil xs of
-            (a, b) -> merge (msort a) (msort b).
+  (a, b) = halveGo Nil Nil xs;
+  merge (msort a) (msort b).
 
-sortVec v = Vec.fromList (msort (Vec.toList v)).
+sortVec v = v |> Vec.toList |> msort |> Vec.fromList.
 
 # ---- checks ------------------------------------------------------------
-sortedGo prev xs =
-  case xs of
-    Nil -> True
-  | Cons x xt -> case prev <= x of True -> sortedGo x xt | False -> False.
-isSorted xs = case xs of Nil -> True | Cons x xt -> sortedGo x xt.
-lenGo n xs = case xs of Nil -> n | Cons x xt -> lenGo (n + 1) xt.
-sumGo s xs = case xs of Nil -> s | Cons x xt -> sumGo (s + x) xt.
+sortedGo prev Nil = True.
+sortedGo prev (Cons x xt) | prev <= x = sortedGo x xt.
+sortedGo prev xs = False.
+
+isSorted Nil = True.
+isSorted (Cons x xt) = sortedGo x xt.
+
+lenGo n Nil = n.
+lenGo n (Cons x xt) = lenGo (n + 1) xt.
+
+sumGo s Nil = s.
+sumGo s (Cons x xt) = sumGo (s + x) xt.
 
 mkData n = fillV 1 n 12345 (Vec.new Unit).
 

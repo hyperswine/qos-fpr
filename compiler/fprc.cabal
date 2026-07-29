@@ -10,6 +10,7 @@ executable fprc
                     , Codegen
                     , Modules
                     , Infer
+                    , Precond
                     , Struct
                     , A64
                     , X64

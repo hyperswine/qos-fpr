@@ -38,7 +38,7 @@
 
 # ---- message protocol -------------------------------------------------------
 
-Msg = Type (Keys Int | Tick Int).
+Msg = Type (Keys String | Tick Int).
 LMode = Type (LFix Int | LFlex Int).
 
 # ---- tiny console over raw MMIO (registers made once, threaded) -------------
@@ -49,16 +49,12 @@ putc con c =
   (lsr, dat) = con;
   putcW lsr dat c.
 putcW lsr dat c = putcV lsr dat c (read lsr).
-putcV lsr dat c v =
-  case isOdd (v / 32) of
-    True -> write dat c
-  | False -> putcW lsr dat c.
+putcV lsr dat c v | isOdd (v / 32) = write dat c.
+putcV lsr dat c v = putcW lsr dat c.
 
 puts con s = putsFrom con s 1 (strlen s).
-putsFrom con s i n =
-  case i > n of
-    True -> Unit
-  | False -> putc con (charAt s i) >> putsFrom con s (i + 1) n.
+putsFrom con s i n | i > n = Unit.
+putsFrom con s i n = putc con (charAt s i) >> putsFrom con s (i + 1) n.
 
 nl con = putc con 13 >> putc con 10.
 putLn con s = puts con s >> nl con.
@@ -67,33 +63,40 @@ getc me con =
   (lsr, dat) = con;
   getcW me lsr dat.
 getcW me lsr dat = getcV me lsr dat (read lsr).
-getcV me lsr dat v =
-  case isOdd v of
-    True -> read dat
-  | False -> yield me >> getcW me lsr dat.
+getcV me lsr dat v | isOdd v = read dat.
+getcV me lsr dat v = yield me >> getcW me lsr dat.
 
 # ---- little prelude (shared by TUI and stax) --------------------------------
 
-and2 a b = case a of True -> b | False -> False.
-or2 a b = case a of True -> True | False -> b.
-boolToInt b = case b of True -> 1 | False -> 0.
+and2 True b = b.
+and2 False b = False.
 
-append xs ys = case xs of Nil -> ys | h :: t -> h :: append t ys.
-len xs = case xs of Nil -> 0 | _ :: t -> 1 + len t.
+or2 True b = True.
+or2 False b = b.
 
-revGo xs acc = case xs of Nil -> acc | x :: r -> revGo r (x :: acc).
+boolToInt True = 1.
+boolToInt False = 0.
+
+append Nil ys = ys.
+append (h :: t) ys = h :: append t ys.
+
+len Nil = 0.
+len (_ :: t) = 1 + len t.
+
+revGo Nil acc = acc.
+revGo (x :: r) acc = revGo r (x :: acc).
 revList xs = revGo xs Nil.
 
-takeN n xs = case n <= 0 of True -> Nil | False -> takeGo n xs.
-takeGo n xs = case xs of Nil -> Nil | x :: r -> x :: takeN (n - 1) r.
+takeN n xs | n <= 0 = Nil.
+takeN n Nil = Nil.
+takeN n (x :: r) = x :: takeN (n - 1) r.
 
-maxI a b = case a > b of True -> a | False -> b.
+maxI a b | a > b = a.
+maxI a b = b.
 
 strInit s = strTakeGo s 1 (strlen s - 1) "".
-strTakeGo s i n acc =
-  case i > n of
-    True -> acc
-  | False -> strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
+strTakeGo s i n acc | i > n = acc.
+strTakeGo s i n acc = strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
 
 # ============================================================================
 # LAYER 1: packed cells and row buffers
@@ -108,19 +111,19 @@ cellCh v = v / 256.
 cellFg v = (v / 16) - ((v / 256) * 16).
 cellBg v = v - ((v / 16) * 16).
 
-repCell c n = case n <= 0 of True -> Nil | False -> c :: repCell c (n - 1).
+repCell c n | n <= 0 = Nil.
+repCell c n = c :: repCell c (n - 1).
 
 # rows are immutable, so h identical rows are ONE row shared h times
-repRow row h = case h <= 0 of True -> Nil | False -> row :: repRow row (h - 1).
+repRow row h | h <= 0 = Nil.
+repRow row h = row :: repRow row (h - 1).
 fillRows c w h = repRow (repCell c w) h.
 blankRows w h = fillRows 8192 w h.
 invalidBuf w h = fillRows 1 w h.
 
 strCells s f b = scGo s f b 1 (strlen s).
-scGo s f b i n =
-  case i > n of
-    True -> Nil
-  | False -> mkCell (charAt s i) f b :: scGo s f b (i + 1) n.
+scGo s f b i n | i > n = Nil.
+scGo s f b i n = mkCell (charAt s i) f b :: scGo s f b (i + 1) n.
 
 padTo w padc cells = append cells (repCell padc (w - len cells)).
 
@@ -134,53 +137,55 @@ lineRow f b s w = padTo w (mkCell 32 f b) (takeN w (strCells s f b)).
 # splitSizes, ported: fixed rows first, flex shares of the rest by weight,
 # the LAST flex soaks the rounding remainder (TuiPoc's `extra`).
 
-sumFix ms = case ms of Nil -> 0 | LFix n :: r -> n + sumFix r | _ :: r -> sumFix r.
-sumFlex ms = case ms of Nil -> 0 | LFlex k :: r -> k + sumFlex r | _ :: r -> sumFlex r.
-hasFlex ms = case ms of Nil -> False | LFlex _ :: _ -> True | _ :: r -> hasFlex r.
+sumFix Nil = 0.
+sumFix (LFix n :: r) = n + sumFix r.
+sumFix (_ :: r) = sumFix r.
+
+sumFlex Nil = 0.
+sumFlex (LFlex k :: r) = k + sumFlex r.
+sumFlex (_ :: r) = sumFlex r.
+
+hasFlex Nil = False.
+hasFlex (LFlex _ :: _) = True.
+hasFlex (_ :: r) = hasFlex r.
 
 splitSizes avail ms = splitGo ms (maxI 0 (avail - sumFix ms)) (maxI 1 (sumFlex ms)) 0.
-splitGo ms rest ft given =
-  case ms of
-    Nil -> Nil
-  | LFix n :: r -> n :: splitGo r rest ft given
-  | LFlex k :: r -> splitFlex k r rest ft given.
-splitFlex k r rest ft given =
-  case hasFlex r of
-    True -> splitFlex2 ((rest * k) / ft) r rest ft given
-  | False -> (rest - given) :: splitGo r rest ft given.
+splitGo Nil rest ft given = Nil.
+splitGo (LFix n :: r) rest ft given = n :: splitGo r rest ft given.
+splitGo (LFlex k :: r) rest ft given = splitFlex k r rest ft given.
+splitFlex k r rest ft given | hasFlex r = splitFlex2 ((rest * k) / ft) r rest ft given.
+splitFlex k r rest ft given = (rest - given) :: splitGo r rest ft given.
 splitFlex2 s r rest ft given = s :: splitGo r rest ft (given + s).
 
-modesOf parts = case parts of Nil -> Nil | (m, _) :: r -> m :: modesOf r.
+modesOf Nil = Nil.
+modesOf ((m, _) :: r) = m :: modesOf r.
 
 # vbox: children rows concatenated
 vboxW parts sz =
   (w, h) = sz;
   vbuild parts (splitSizes h (modesOf parts)) w.
-vbuild parts sizes w =
-  case (parts, sizes) of
-    ((_, wg) :: pr, s :: sr) -> append (wg (w, s)) (vbuild pr sr w)
-  | _ -> Nil.
+vbuild ((_, wg) :: pr) (s :: sr) w = append (wg (w, s)) (vbuild pr sr w).
+vbuild parts sizes w = Nil.
 
 # hbox: children rendered side by side, rows zipped with append
 hboxW parts sz =
   (w, h) = sz;
   hcat (hbufs parts (splitSizes w (modesOf parts)) h).
-hbufs parts sizes h =
-  case (parts, sizes) of
-    ((_, wg) :: pr, s :: sr) -> wg (s, h) :: hbufs pr sr h
-  | _ -> Nil.
+hbufs ((_, wg) :: pr) (s :: sr) h = wg (s, h) :: hbufs pr sr h.
+hbufs parts sizes h = Nil.
 # all children have equal height, so the first buffer running out of rows
 # terminates the zip
-hcat bufs = case bufs of
-    Nil -> Nil
-  | b :: _ -> hcat2 b bufs.
-hcat2 b bufs = case b of
-    Nil -> Nil
-  | _ -> catHeads bufs :: hcat (tailsOf bufs).
-catHeads bufs = case bufs of Nil -> Nil | b :: r -> catHeads2 b r.
-catHeads2 b r = case b of Nil -> Nil | row :: _ -> append row (catHeads r).
-tailsOf bufs = case bufs of Nil -> Nil | b :: r -> tailsOf2 b r.
-tailsOf2 b r = case b of Nil -> Nil :: tailsOf r | _ :: rt -> rt :: tailsOf r.
+hcat Nil = Nil.
+hcat (Nil :: _) = Nil.
+hcat bufs = catHeads bufs :: hcat (tailsOf bufs).
+
+catHeads Nil = Nil.
+catHeads (Nil :: r) = Nil.
+catHeads ((row :: _) :: r) = append row (catHeads r).
+
+tailsOf Nil = Nil.
+tailsOf (Nil :: r) = Nil :: tailsOf r.
+tailsOf ((_ :: rt) :: r) = rt :: tailsOf r.
 
 # leaf widgets
 textW f b s sz =
@@ -204,19 +209,15 @@ bWrap col w inner =
   cn = mkCell 43 col 0;
   bar = cn :: append (repCell hb (w - 2)) (cn :: Nil);
   append (bar :: bMid vb inner) (bar :: Nil).
-bMid vb rows =
-  case rows of
-    Nil -> Nil
-  | row :: r -> (vb :: append row (vb :: Nil)) :: bMid vb r.
+bMid vb Nil = Nil.
+bMid vb (row :: r) = (vb :: append row (vb :: Nil)) :: bMid vb r.
 
 padW n child sz =
   (w, h) = sz;
   padWrap w n (child (w - (2 * n), h - (2 * n))).
 padWrap w n inner = append (blankRows w n) (append (padMid n inner) (blankRows w n)).
-padMid n rows =
-  case rows of
-    Nil -> Nil
-  | row :: r -> append (repCell 8192 n) (append row (repCell 8192 n)) :: padMid n r.
+padMid n Nil = Nil.
+padMid n (row :: r) = append (repCell 8192 n) (append row (repCell 8192 n)) :: padMid n r.
 
 # ---- Dyn patches: the FPRLive static/dyn split, buffer-shaped ---------------
 # A keystroke dirties exactly the input row; a tick dirties exactly the
@@ -228,29 +229,19 @@ padMid n rows =
 # cols 1..48; sidebar content = composed rows 3..20 cols 52..77.
 
 # single pass: copy the c0-cell prefix once, cons the segment, share the tail
-spliceSeg row c0 seg =
-  case c0 > 0 of
-    True -> spHead row c0 seg
-  | False -> spBody row seg.
-spHead row c0 seg = case row of Nil -> Nil | x :: r -> x :: spliceSeg r (c0 - 1) seg.
-spBody row seg =
-  case seg of
-    Nil -> row
-  | s :: sr -> s :: spTail row sr.
-spTail row sr = case row of Nil -> Nil | _ :: r -> spBody r sr.
+spliceSeg row c0 seg | c0 > 0 = spHead row c0 seg.
+spliceSeg row c0 seg = spBody row seg.
+spHead Nil c0 seg = Nil.
+spHead (x :: r) c0 seg = x :: spliceSeg r (c0 - 1) seg.
+spBody row Nil = row.
+spBody row (s :: sr) = s :: spTail row sr.
+spTail Nil sr = Nil.
+spTail (_ :: r) sr = spBody r sr.
 
-spliceRows rows idx i0 c0 segs =
-  case rows of
-    Nil -> Nil
-  | row :: rest -> spliceRow1 row rest idx i0 c0 segs.
-spliceRow1 row rest idx i0 c0 segs =
-  case idx < i0 of
-    True -> row :: spliceRows rest (idx + 1) i0 c0 segs
-  | False -> spliceRow2 row rest idx i0 c0 segs.
-spliceRow2 row rest idx i0 c0 segs =
-  case segs of
-    Nil -> row :: rest
-  | seg :: srest -> spliceSeg row c0 seg :: spliceRows rest (idx + 1) i0 c0 srest.
+spliceRows Nil idx i0 c0 segs = Nil.
+spliceRows (row :: rest) idx i0 c0 segs | idx < i0 = row :: spliceRows rest (idx + 1) i0 c0 segs.
+spliceRows (row :: rest) idx i0 c0 Nil = row :: rest.
+spliceRows (row :: rest) idx i0 c0 (seg :: srest) = spliceSeg row c0 seg :: spliceRows rest (idx + 1) i0 c0 srest.
 
 # ============================================================================
 # LAYER 3: diff renderer -- old rows vs new rows -> escape bytes on the UART
@@ -258,77 +249,56 @@ spliceRow2 row rest idx i0 c0 segs =
 # ============================================================================
 
 esc s = strcat (chr 27) s.
-fgCode c = case c == 0 of True -> "39" | False -> numS (29 + c).
-bgCode c = case c == 0 of True -> "49" | False -> numS (39 + c).
+fgCode 0 = "39".
+fgCode c = numS (29 + c).
+bgCode 0 = "49".
+bgCode c = numS (39 + c).
 numS n = "{n}".
 cupS r c = esc "[{r};{c}H".
 sgrS f b = esc "[{fgCode f};{bgCode b}m".
 
-# NB: no tuple-pattern cases anywhere on the per-cell paths -- a
-# `case (o, n) of` scrutinee ALLOCATES the pair per call, which turned a
-# no-op diff into 100 KB of churn (measured). Nested single cases are free.
-dirtyCols o n c =
-  case o of
-    Nil -> Nil
-  | a :: ar -> dirtyCols2 a ar n c.
-dirtyCols2 a ar n c =
-  case n of
-    Nil -> Nil
-  | b :: br -> dirtyHit a b ar br c.
-dirtyHit a b ar br c =
-  case a == b of
-    True -> dirtyCols ar br (c + 1)
-  | False -> c :: dirtyCols ar br (c + 1).
+# NB: no tuple-pattern SCRUTINEES anywhere on the per-cell paths -- a
+# `case (o, n) of` ALLOCATES the pair per call, which turned a no-op
+# diff into 100 KB of churn (measured). Clause patterns on separate
+# params destructure each argument independently -- as free as the
+# nested single cases they replace.
+dirtyCols Nil n c = Nil.
+dirtyCols (a :: ar) Nil c = Nil.
+dirtyCols (a :: ar) (b :: br) c | a == b = dirtyCols ar br (c + 1).
+dirtyCols (a :: ar) (b :: br) c = c :: dirtyCols ar br (c + 1).
 
 # runs of dirty columns, gaps <= 4 fused: overpainting a few clean cells is
 # cheaper than another 8-byte cursor move (TuiPoc's mergeGap)
-mergeRuns xs = case xs of Nil -> Nil | x :: rest -> mrGo x x rest.
-mrGo s e xs =
-  case xs of
-    Nil -> (s, e) :: Nil
-  | c :: cs -> mrStep s e c cs.
-mrStep s e c cs =
-  case (c - e) <= 5 of
-    True -> mrGo s c cs
-  | False -> (s, e) :: mrGo c c cs.
+mergeRuns Nil = Nil.
+mergeRuns (x :: rest) = mrGo x x rest.
+mrGo s e Nil = (s, e) :: Nil.
+mrGo s e (c :: cs) | (c - e) <= 5 = mrGo s c cs.
+mrGo s e (c :: cs) = (s, e) :: mrGo c c cs.
 
 # SGR state is PACKED (fb = fg*16 + bg, 9999 = unknown) and threaded as a
 # plain int alongside byte/cell counters: the unchanged-color cell path is
 # pure core-prim arithmetic + one `write` -- zero heap per cell. The state
 # tuple (fb, bytes, cells) is built once per run boundary, not per cell.
 diffFrame con st old new = dfRows con st old new 0.
-dfRows con st old new r =
-  case old of
-    Nil -> st
-  | orow :: orest -> dfRows2 con st orow orest new r.
-dfRows2 con st orow orest new r =
-  case new of
-    Nil -> st
-  | nrow :: nrest -> dfRows con (diffRow con st r orow nrow) orest nrest (r + 1).
+dfRows con st Nil new r = st.
+dfRows con st (orow :: orest) Nil r = st.
+dfRows con st (orow :: orest) (nrow :: nrest) r = dfRows con (diffRow con st r orow nrow) orest nrest (r + 1).
 diffRow con st r orow nrow = emitRuns con st r nrow (mergeRuns (dirtyCols orow nrow 0)).
 
-emitRuns con st r nrow runs =
-  case runs of
-    Nil -> st
-  | (c0, c1) :: rest -> emitRuns con (emitRun con st r nrow c0 c1) r nrow rest.
+emitRuns con st r nrow Nil = st.
+emitRuns con st r nrow ((c0, c1) :: rest) = emitRuns con (emitRun con st r nrow c0 c1) r nrow rest.
 emitRun con st r nrow c0 c1 =
   s = cupS (r + 1) (c0 + 1);
   _ = puts con s;
   emitRun2 con st (strlen s) nrow c0 c1.
-emitRun2 con st k nrow c0 c1 =
-  case st of
-    (fb, by, ce) -> emitCells con fb (by + k) ce nrow c0 c1.
+emitRun2 con (fb, by, ce) k nrow c0 c1 = emitCells con fb (by + k) ce nrow c0 c1.
 cellLow v = v - ((v / 256) * 256).
 
-emitCells con fb by ce nrow c c1 =
-  case c > c1 of
-    True -> (fb, by, ce)
-  | False -> emitCell con fb by ce nrow c c1.
+emitCells con fb by ce nrow c c1 | c > c1 = (fb, by, ce).
+emitCells con fb by ce nrow c c1 = emitCell con fb by ce nrow c c1.
 emitCell con fb by ce nrow c c1 = emitCell2 con fb by ce nrow c c1 (nrow ! (c + 1)).
-emitCell2 con fb by ce nrow c c1 v =
-  case cellLow v == fb of
-    True -> putc con (v / 256) >> emitCells con fb (by + 1) (ce + 1) nrow (c + 1) c1
-  | False -> emitCellSgr con by ce nrow c c1 v.
+emitCell2 con fb by ce nrow c c1 v | cellLow v == fb = putc con (v / 256) >> emitCells con fb (by + 1) (ce + 1) nrow (c + 1) c1.
+emitCell2 con fb by ce nrow c c1 v = emitCellSgr con by ce nrow c c1 v.
 emitCellSgr con by ce nrow c c1 v =
   s = sgrS (cellFg v) (cellBg v);
   _ = puts con s;
@@ -400,19 +370,19 @@ pletters s i = pbind pletter plettersK s i.
 
 pword s i = palt pletters psym s i.
 
-pkwChk k w = case w == k of True -> pok 1 | False -> pfail "expected {k}".
+pkwChk k w | w == k = pok 1.
+pkwChk k w = pfail "expected {k}".
 pkwRaw k s i = pbind pletters (pkwChk k) s i.
 pkw k s i = pkwRaw k s (skipWs s i).
 
 pnumT s i = pmap ANum pint s i.
 
-ptermWord w = case w of
-    "if" -> pif
-  | "begin" -> ploop
-  | "else" -> pfail "unexpected else"
-  | "then" -> pfail "unexpected then"
-  | "until" -> pfail "unexpected until"
-  | _ -> pok (APrim w).
+ptermWord "if" = pif.
+ptermWord "begin" = ploop.
+ptermWord "else" = pfail "unexpected else".
+ptermWord "then" = pfail "unexpected then".
+ptermWord "until" = pfail "unexpected until".
+ptermWord w = pok (APrim w).
 pwordT s i = pbind pword ptermWord s i.
 
 ptermRaw s i = palt pnumT pwordT s i.
@@ -445,21 +415,19 @@ parseProg src = parseFin src (pseq src 1).
 
 # ---- compiler: Ast -> bytecode (absolute targets, single pass) --------------
 
-compileSeq asts a = case asts of
-    Nil -> (Nil, a)
-  | t :: rest -> compileSeqCons t rest a.
+compileSeq Nil a = (Nil, a).
+compileSeq (t :: rest) a = compileSeqCons t rest a.
 compileSeqCons t rest a =
   (c1, a1) = compileOne t a;
   (c2, a2) = compileSeq rest a1;
   (append c1 c2, a2).
-compileOne t a = case t of
-    ANum n -> (IPush n :: Nil, a + 1)
-  | APrim o -> compilePrim o a
-  | AIf thn els -> compileIf thn els a
-  | ALoop b -> compileLoop b a.
-compilePrim o a = case o of
-    "." -> (IPrint :: Nil, a + 1)
-  | _ -> (IOp o :: Nil, a + 1).
+compileOne (ANum n) a = (IPush n :: Nil, a + 1).
+compileOne (APrim o) a = compilePrim o a.
+compileOne (AIf thn els) a = compileIf thn els a.
+compileOne (ALoop b) a = compileLoop b a.
+
+compilePrim "." a = (IPrint :: Nil, a + 1).
+compilePrim o a = (IOp o :: Nil, a + 1).
 compileIf thn els a =
   (ct, at) = compileSeq thn (a + 1);
   (ce, ae) = compileSeq els (at + 1);
@@ -478,86 +446,78 @@ eqI a b = boolToInt (a == b).
 ltI a b = boolToInt (a < b).
 gtI a b = boolToInt (a > b).
 
-binOp f st = case st of
-    b :: rest -> binOp2 f b rest
-  | Nil -> Err "vm: stack underflow (need 2)".
-binOp2 f b st = case st of
-    a :: r -> Ok (f a b :: r)
-  | Nil -> Err "vm: stack underflow (need 2)".
+binOp f (b :: (a :: r)) = Ok (f a b :: r).
+binOp f st = Err "vm: stack underflow (need 2)".
 
-dupOp st = case st of x :: r -> Ok (x :: x :: r) | Nil -> Err "vm: stack underflow".
-dropOp st = case st of _ :: r -> Ok r | Nil -> Err "vm: stack underflow".
+dupOp (x :: r) = Ok (x :: x :: r).
+dupOp Nil = Err "vm: stack underflow".
+
+dropOp (_ :: r) = Ok r.
+dropOp Nil = Err "vm: stack underflow".
 
 swapK t s r = s :: t :: r.
 overK t s r = s :: t :: s :: r.
-binOp2K k st = case st of
-    t :: rest -> binOp2K2 k t rest
-  | Nil -> Err "vm: stack underflow (need 2)".
-binOp2K2 k t st = case st of
-    s :: r -> Ok (k t s r)
-  | Nil -> Err "vm: stack underflow (need 2)".
+binOp2K k (t :: (s :: r)) = Ok (k t s r).
+binOp2K k st = Err "vm: stack underflow (need 2)".
 
-divChk st = case st of
-    0 :: _ -> Err "vm: division by zero"
-  | _ -> binOp divI st.
+divChk (0 :: _) = Err "vm: division by zero".
+divChk st = binOp divI st.
 
-applyOp o st = case o of
-    "+" -> binOp addI st
-  | "-" -> binOp subI st
-  | "*" -> binOp mulI st
-  | "/" -> divChk st
-  | "=" -> binOp eqI st
-  | "<" -> binOp ltI st
-  | ">" -> binOp gtI st
-  | "dup" -> dupOp st
-  | "drop" -> dropOp st
-  | "swap" -> binOp2K swapK st
-  | "over" -> binOp2K overK st
-  | _ -> Err "vm: unknown op '{o}'".
+applyOp "+" st = binOp addI st.
+applyOp "-" st = binOp subI st.
+applyOp "*" st = binOp mulI st.
+applyOp "/" st = divChk st.
+applyOp "=" st = binOp eqI st.
+applyOp "<" st = binOp ltI st.
+applyOp ">" st = binOp gtI st.
+applyOp "dup" st = dupOp st.
+applyOp "drop" st = dropOp st.
+applyOp "swap" st = binOp2K swapK st.
+applyOp "over" st = binOp2K overK st.
+applyOp o st = Err "vm: unknown op '{o}'".
 
-runVM code n pc st out gas =
-  case gas <= 0 of
-    True -> Err "vm: out of gas (100000 steps)"
-  | False -> runVM2 code n pc st out gas.
-runVM2 code n pc st out gas =
-  case pc > n of
-    True -> Ok (st, out)
-  | False -> step code n pc (code ! pc) st out gas.
-step code n pc ins st out gas = case ins of
-    IPush v -> runVM code n (pc + 1) (v :: st) out (gas - 1)
-  | IOp o -> stepOp code n pc (applyOp o st) out gas
-  | IJmp t -> runVM code n t st out (gas - 1)
-  | IJz t -> stepJz code n pc t st out gas
-  | IPrint -> stepPrint code n pc st out gas.
-stepOp code n pc r out gas = case r of
-    Ok st2 -> runVM code n (pc + 1) st2 out (gas - 1)
-  | Err m -> Err m.
-stepJz code n pc t st out gas = case st of
-    0 :: rest -> runVM code n t rest out (gas - 1)
-  | _ :: rest -> runVM code n (pc + 1) rest out (gas - 1)
-  | Nil -> Err "vm: jz: stack underflow".
-stepPrint code n pc st out gas = case st of
-    x :: rest -> runVM code n (pc + 1) rest ("output: {x}" :: out) (gas - 1)
-  | Nil -> Err "vm: print: stack underflow".
+runVM code n pc st out gas | gas <= 0 = Err "vm: out of gas (100000 steps)".
+runVM code n pc st out gas | pc > n = Ok (st, out).
+runVM code n pc st out gas = step code n pc (code ! pc) st out gas.
+
+step code n pc (IPush v) st out gas = runVM code n (pc + 1) (v :: st) out (gas - 1).
+step code n pc (IOp o) st out gas = stepOp code n pc (applyOp o st) out gas.
+step code n pc (IJmp t) st out gas = runVM code n t st out (gas - 1).
+step code n pc (IJz t) st out gas = stepJz code n pc t st out gas.
+step code n pc IPrint st out gas = stepPrint code n pc st out gas.
+
+stepOp code n pc (Ok st2) out gas = runVM code n (pc + 1) st2 out (gas - 1).
+stepOp code n pc (Err m) out gas = Err m.
+
+stepJz code n pc t (0 :: rest) out gas = runVM code n t rest out (gas - 1).
+stepJz code n pc t (_ :: rest) out gas = runVM code n (pc + 1) rest out (gas - 1).
+stepJz code n pc t Nil out gas = Err "vm: jz: stack underflow".
+
+stepPrint code n pc (x :: rest) out gas = runVM code n (pc + 1) rest ("output: {x}" :: out) (gas - 1).
+stepPrint code n pc Nil out gas = Err "vm: print: stack underflow".
 
 # ---- REPL driver: source -> (color, text) log lines, oldest first -----------
 
 showStack st = strcat "[" (strcat (joinC st) "]").
-joinC xs = case xs of Nil -> "" | x :: r -> joinCGo "{x}" r.
-joinCGo acc r = case r of Nil -> acc | x :: rest -> joinCGo (strcat acc ", {x}") rest.
+joinC Nil = "".
+joinC (x :: r) = joinCGo "{x}" r.
+joinCGo acc Nil = acc.
+joinCGo acc (x :: rest) = joinCGo (strcat acc ", {x}") rest.
 
-runStax src = case parseProg src of
-    Err m -> (2, "parse error: {m}") :: Nil
-  | Ok ast -> runStax2 (compileSeq ast 1).
-runStax2 cp = case cp of (code, _) -> runStax3 code (len code).
-runStax3 code n = runStax4 (runVM code n 1 Nil Nil 100000).
-runStax4 r = case r of
-    Err m -> (2, m) :: Nil
-  | Ok so -> runStax5 so.
-runStax5 so =
-  case so of
-    (st, out) -> append (outLines (revList out)) ((0, "stack: {showStack st}") :: Nil).
-outLines os = case os of Nil -> Nil | s :: r -> (0, s) :: outLines r.
+runStax src = runParsed (parseProg src).
+runParsed (Err m) = (2, "parse error: {m}") :: Nil.
+runParsed (Ok ast) =
+  (code, _) = compileSeq ast 1;
+  runOutcome (runVM code (len code) 1 Nil Nil 100000).
+runOutcome (Err m) = (2, m) :: Nil.
+runOutcome (Ok (st, out)) =
+  out
+  |> revList
+  |> outLines
+  |> fn ls -> append ls ((0, "stack: {showStack st}") :: Nil).
+
+outLines Nil = Nil.
+outLines (s :: r) = (0, s) :: outLines r.
 
 # ============================================================================
 # LAYER 4: MVU -- Model = (input, log, ticks, cmds, stats)
@@ -577,38 +537,32 @@ helpLines =
 
 initModel = ("", startLog, 0, 0, (0, 0)).
 
-modelInput m = case m of (i, _, _, _, _) -> i.
-modelTicks m = case m of (_, _, t, _, _) -> t.
-modelCmds m = case m of (_, _, _, n, _) -> n.
-modelStats m = case m of (_, _, _, _, st) -> st.
-setStats m st = case m of (i, l, t, n, _) -> (i, l, t, n, st).
-bumpTick m t = case m of (i, l, _, n, st) -> (i, l, t, n, st).
+modelInput (i, _, _, _, _) = i.
+modelTicks (_, _, t, _, _) = t.
+modelCmds (_, _, _, n, _) = n.
+modelStats (_, _, _, _, st) = st.
+setStats (i, l, t, n, _) st = (i, l, t, n, st).
+bumpTick (i, l, _, n, st) t = (i, l, t, n, st).
 
-editKey m c = case m of (i, l, t, n, st) -> (edit1 i c, l, t, n, st).
-edit1 i c = case c of
-    8 -> strBack i
-  | 127 -> strBack i
-  | _ -> edit2 i c.
-edit2 i c =
-  case and2 (c >= 32) (and2 (c < 127) ((strlen i) < 58)) of
-    True -> strcat i (chr c)
-  | False -> i.
-strBack s = case strlen s == 0 of True -> s | False -> strInit s.
+editKey (i, l, t, n, st) c = (edit1 i c, l, t, n, st).
+edit1 i 8 = strBack i.
+edit1 i 127 = strBack i.
+edit1 i c | and2 (c >= 32) (and2 (c < 127) ((strlen i) < 58)) = strcat i (chr c).
+edit1 i c = i.
+strBack s | strlen s == 0 = s.
+strBack s = strInit s.
 
-runCmd m =
-  case m of
-    (i, l, t, n, st) -> ("", takeN 30 (pushLines (cmdLines i) ((7, strcat "stax> " i) :: l)), t, n + 1, st).
-pushLines ls log = case ls of Nil -> log | x :: r -> pushLines r (x :: log).
-cmdLines i = case i of
-    "help" -> helpLines
-  | "" -> Nil
-  | _ -> runStax i.
+runCmd (i, l, t, n, st) =
+  ("", takeN 30 (pushLines (cmdLines i) ((7, strcat "stax> " i) :: l)), t, n + 1, st).
+pushLines Nil log = log.
+pushLines (x :: r) log = pushLines r (x :: log).
+cmdLines "help" = helpLines.
+cmdLines "" = Nil.
+cmdLines i = runStax i.
 
 # ---- view: the TuiPoc layout -- title bar / (repl | sidebar) / status bar ---
 
-view m sz =
-  case m of
-    (input, log, ticks, cmds, stats) -> viewGo input log ticks cmds stats sz.
+view (input, log, ticks, cmds, stats) sz = viewGo input log ticks cmds stats sz.
 viewGo input log ticks cmds stats sz =
   vboxW
     ( (LFix 1, lineW 1 7 "  QOS TUI -- cell-buffer diff renderer / stax REPL over UART") ::
@@ -621,16 +575,15 @@ viewGo input log ticks cmds stats sz =
 replPane log inp sz =
   (w, h) = sz;
   append (logRows (revList (takeN (h - 1) log)) w (h - 1)) (inputRow inp w :: Nil).
-logRows es w k = case es of
-    Nil -> blankRows w k
-  | e :: r -> logRow e w :: logRows r w (k - 1).
-logRow e w = case e of (f, s) -> rowFrom f 0 s w.
+logRows Nil w k = blankRows w k.
+logRows (e :: r) w k = logRow e w :: logRows r w (k - 1).
+logRow (f, s) w = rowFrom f 0 s w.
 inputRow inp w =
   padTo w 8192 (takeN w (append (strCells "stax> " 3 0) (append (strCells inp 0 0) (mkCell 32 1 8 :: Nil)))).
 
 sidebarWi ticks cmds stats sz =
   (by, ce) = stats;
-  hk = (heapUsed 0) / 1024;
+  hk = heapUsed Unit / 1024;
   fp = fuelPreempts 0;
   al = arcLive 0;
   vboxW (sbParts ticks cmds by ce hk fp al) sz.
@@ -651,9 +604,8 @@ sbParts ticks cmds by ce hk fp al =
   (LFlex 1, fillW 8192) ::
   (LFix 1, barW ticks) ::
   (LFix 1, textW 7 0 " enter run   help   exit") :: Nil.
-savedLine ce = case ce == 0 of
-    True -> "  repaint : -"
-  | False -> savedLine2 (100 - ((100 * ce) / 1920)).
+savedLine 0 = "  repaint : -".
+savedLine ce = savedLine2 (100 - ((100 * ce) / 1920)).
 savedLine2 p = "  repaint : saved {p}%".
 
 # the sweeping bar (TuiPoc's mBar), tick-driven: proves the diff repaints
@@ -671,10 +623,8 @@ barRow2 k w = append (repCell (mkCell 32 0 3) k) (repCell 8192 (w - k)).
 # pasted burst lands as ONE Keys message = ONE frame, not one per char).
 reader term con me = rdLoop term con me.
 rdLoop term con me = rdBatch term con me (chr (getc me con)) 40.
-rdBatch term con me acc grace =
-  case strlen acc >= 64 of
-    True -> send term (Keys acc) >> rdLoop term con me
-  | False -> rdPeek term con me acc grace.
+rdBatch term con me acc grace | strlen acc >= 64 = send term (Keys acc) >> rdLoop term con me.
+rdBatch term con me acc grace = rdPeek term con me acc grace.
 rdPeek term con me acc grace = rdPeek2 term con me acc grace (rdReady con).
 rdReady con =
   (lsr, dat) = con;
@@ -682,28 +632,19 @@ rdReady con =
 rdTake con =
   (lsr, dat) = con;
   read dat.
-rdPeek2 term con me acc grace ready =
-  case ready of
-    True -> rdBatch term con me (strcat acc (chr (rdTake con))) 40
-  | False -> rdGrace term con me acc grace.
-rdGrace term con me acc grace =
-  case grace <= 0 of
-    True -> send term (Keys acc) >> rdLoop term con me
-  | False -> yield me >> rdPeek term con me acc (grace - 1).
+rdPeek2 term con me acc grace True = rdBatch term con me (strcat acc (chr (rdTake con))) 40.
+rdPeek2 term con me acc grace False = rdGrace term con me acc grace.
+rdGrace term con me acc grace | grace <= 0 = send term (Keys acc) >> rdLoop term con me.
+rdGrace term con me acc grace = yield me >> rdPeek term con me acc (grace - 1).
 
 # ~2 s cadence off the CLINT (QEMU virt: 10 MHz); yields between polls.
 # `read` is a 1-ary fpr_g_ -- saturated in one apply, so polling is
 # heap-free (the vfsh lesson, kept).
 ticker term mt me = tkLoop term mt me 1 (read mt).
 tkLoop term mt me n last = tkStep term mt me n last (read mt).
-tkStep term mt me n last now =
-  case now < last of
-    True -> tkLoop term mt me n now
-  | False -> tkStep2 term mt me n last now.
-tkStep2 term mt me n last now =
-  case (now - last) >= 30000000 of
-    True -> send term (Tick n) >> tkLoop term mt me (n + 1) now
-  | False -> yield me >> tkLoop term mt me n last.
+tkStep term mt me n last now | now < last = tkLoop term mt me n now.
+tkStep term mt me n last now | (now - last) >= 30000000 = send term (Tick n) >> tkLoop term mt me (n + 1) now.
+tkStep term mt me n last now = yield me >> tkLoop term mt me n last.
 
 # ---- the loop: render -> diff -> stats -> block on the mailbox --------------
 
@@ -714,9 +655,7 @@ tuiLoop me con m prev fb = tuiDiff me con m prev (view m (80, 24)) fb.
 tuiDiff me con m old new fb =
   st = diffFrame con (fb, 0, 0) old new;
   tuiAfter me con m new st.
-tuiAfter me con m buf st =
-  case st of
-    (fb2, by, ce) -> tuiWait me con (setStats m (by, ce)) buf fb2.
+tuiAfter me con m buf (fb2, by, ce) = tuiWait me con (setStats m (by, ce)) buf fb2.
 tuiWait me con m buf fb = tuiMsg me con m buf fb (receive me).
 tuiMsg me con m buf fb msg =
   case msg of
@@ -733,29 +672,18 @@ tuiKeys me con m buf fb msg s =
   r = applyKeys m s 1 (strlen s) False;
   _ = drop msg;
   tuiKeys2 me con buf fb r.
-tuiKeys2 me con buf fb r =
-  case r of
-    Ok mr -> tuiKeys3 me con buf fb mr
-  | Err _ -> leaveScreen con.
-tuiKeys3 me con buf fb mr =
-  case mr of
-    (m2, True) -> tuiLoop me con m2 buf fb
-  | (m2, False) -> tuiDiff me con m2 buf (spliceRows buf 0 21 1 (inputRow (modelInput m2) 48 :: Nil)) fb.
+tuiKeys2 me con buf fb (Err e) = leaveScreen con.
+tuiKeys2 me con buf fb (Ok (m2, True)) = tuiLoop me con m2 buf fb.
+tuiKeys2 me con buf fb (Ok (m2, False)) = tuiDiff me con m2 buf (spliceRows buf 0 21 1 (inputRow (modelInput m2) 48 :: Nil)) fb.
 
 # fold a whole key batch into the model; ran = some command was executed
 # (log + sidebar dirty -> full render); Err = the session typed exit
-applyKeys m s i n ran =
-  case i > n of
-    True -> Ok (m, ran)
-  | False -> applyKey1 m s i n ran (charAt s i).
-applyKey1 m s i n ran c =
-  case or2 (c == 13) (c == 10) of
-    True -> applyEnter m s i n
-  | False -> applyKeys (editKey m c) s (i + 1) n ran.
-applyEnter m s i n =
-  case isExit (modelInput m) of
-    True -> Err 0
-  | False -> applyKeys (runCmd m) s (i + 1) n True.
+applyKeys m s i n ran | i > n = Ok (m, ran).
+applyKeys m s i n ran = applyKey1 m s i n ran (charAt s i).
+applyKey1 m s i n ran c | or2 (c == 13) (c == 10) = applyEnter m s i n.
+applyKey1 m s i n ran c = applyKeys (editKey m c) s (i + 1) n ran.
+applyEnter m s i n | isExit (modelInput m) = Err 0.
+applyEnter m s i n = applyKeys (runCmd m) s (i + 1) n True.
 isExit s = or2 (s == "exit") (s == "quit").
 
 # ---- boot -------------------------------------------------------------------

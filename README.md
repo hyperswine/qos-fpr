@@ -247,3 +247,9 @@ rm -rf ~/.cabal/store/ghc-*/fprc-* ~/.cabal/store/ghc-*/sol-*
 ```
 
 No need to source anything either if ~/.local/bin is symlinked.
+
+On Mac:
+
+```
+make posix-run POSIXARCH=a64 PROG=tests/actors.fpr
+```

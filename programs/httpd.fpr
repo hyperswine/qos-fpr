@@ -16,26 +16,35 @@
 
 # ---- little prelude (shared by TUI and stax) --------------------------------
 
-and2 a b = case a of True -> b | False -> False.
-or2 a b = case a of True -> True | False -> b.
-boolToInt b = case b of True -> 1 | False -> 0.
+and2 True b = b.
+and2 False b = False.
 
-append xs ys = case xs of Nil -> ys | h :: t -> h :: append t ys.
-len xs = case xs of Nil -> 0 | _ :: t -> 1 + len t.
+or2 True b = True.
+or2 False b = b.
 
-revGo xs acc = case xs of Nil -> acc | x :: r -> revGo r (x :: acc).
+boolToInt True = 1.
+boolToInt False = 0.
+
+append Nil ys = ys.
+append (h :: t) ys = h :: append t ys.
+
+len Nil = 0.
+len (_ :: t) = 1 + len t.
+
+revGo Nil acc = acc.
+revGo (x :: r) acc = revGo r (x :: acc).
 revList xs = revGo xs Nil.
 
-takeN n xs = case n <= 0 of True -> Nil | False -> takeGo n xs.
-takeGo n xs = case xs of Nil -> Nil | x :: r -> x :: takeN (n - 1) r.
+takeN n xs | n <= 0 = Nil.
+takeN n Nil = Nil.
+takeN n (x :: r) = x :: takeN (n - 1) r.
 
-maxI a b = case a > b of True -> a | False -> b.
+maxI a b | a > b = a.
+maxI a b = b.
 
 strInit s = strTakeGo s 1 (strlen s - 1) "".
-strTakeGo s i n acc =
-  case i > n of
-    True -> acc
-  | False -> strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
+strTakeGo s i n acc | i > n = acc.
+strTakeGo s i n acc = strTakeGo s (i + 1) n (strcat acc (chr (charAt s i))).
 
 
 # ============================================================================
@@ -99,19 +108,19 @@ pletters s i = pbind pletter plettersK s i.
 
 pword s i = palt pletters psym s i.
 
-pkwChk k w = case w == k of True -> pok 1 | False -> pfail "expected {k}".
+pkwChk k w | w == k = pok 1.
+pkwChk k w = pfail "expected {k}".
 pkwRaw k s i = pbind pletters (pkwChk k) s i.
 pkw k s i = pkwRaw k s (skipWs s i).
 
 pnumT s i = pmap ANum pint s i.
 
-ptermWord w = case w of
-    "if" -> pif
-  | "begin" -> ploop
-  | "else" -> pfail "unexpected else"
-  | "then" -> pfail "unexpected then"
-  | "until" -> pfail "unexpected until"
-  | _ -> pok (APrim w).
+ptermWord "if" = pif.
+ptermWord "begin" = ploop.
+ptermWord "else" = pfail "unexpected else".
+ptermWord "then" = pfail "unexpected then".
+ptermWord "until" = pfail "unexpected until".
+ptermWord w = pok (APrim w).
 pwordT s i = pbind pword ptermWord s i.
 
 ptermRaw s i = palt pnumT pwordT s i.
@@ -134,31 +143,27 @@ pif s i = pbind pseq pifK s i.
 
 ploop s i = pbind pseq (fn body -> pbind (pkw "until") (fn u -> pok (ALoop body))) s i.
 
-parseEof src ts j = case j > String.len src of
-    True -> Ok ts
-  | False -> Err "unexpected input at byte {j}".
-parseFin src r = case r of
-    POk ts j -> parseEof src ts (skipWs src j)
-  | PFail m j -> Err "at byte {j}: {m}".
+parseEof src ts j | j > String.len src = Ok ts.
+parseEof src ts j = Err "unexpected input at byte {j}".
+parseFin src (POk ts j) = parseEof src ts (skipWs src j).
+parseFin src (PFail m j) = Err "at byte {j}: {m}".
 parseProg src = parseFin src (pseq src 1).
 
 # ---- compiler: Ast -> bytecode (absolute targets, single pass) --------------
 
-compileSeq asts a = case asts of
-    Nil -> (Nil, a)
-  | t :: rest -> compileSeqCons t rest a.
+compileSeq Nil a = (Nil, a).
+compileSeq (t :: rest) a = compileSeqCons t rest a.
 compileSeqCons t rest a =
   (c1, a1) = compileOne t a;
   (c2, a2) = compileSeq rest a1;
   (append c1 c2, a2).
-compileOne t a = case t of
-    ANum n -> (IPush n :: Nil, a + 1)
-  | APrim o -> compilePrim o a
-  | AIf thn els -> compileIf thn els a
-  | ALoop b -> compileLoop b a.
-compilePrim o a = case o of
-    "." -> (IPrint :: Nil, a + 1)
-  | _ -> (IOp o :: Nil, a + 1).
+compileOne (ANum n) a = (IPush n :: Nil, a + 1).
+compileOne (APrim o) a = compilePrim o a.
+compileOne (AIf thn els) a = compileIf thn els a.
+compileOne (ALoop b) a = compileLoop b a.
+
+compilePrim "." a = (IPrint :: Nil, a + 1).
+compilePrim o a = (IOp o :: Nil, a + 1).
 compileIf thn els a =
   (ct, at) = compileSeq thn (a + 1);
   (ce, ae) = compileSeq els (at + 1);
@@ -177,86 +182,78 @@ eqI a b = boolToInt (a == b).
 ltI a b = boolToInt (a < b).
 gtI a b = boolToInt (a > b).
 
-binOp f st = case st of
-    b :: rest -> binOp2 f b rest
-  | Nil -> Err "vm: stack underflow (need 2)".
-binOp2 f b st = case st of
-    a :: r -> Ok (f a b :: r)
-  | Nil -> Err "vm: stack underflow (need 2)".
+binOp f (b :: (a :: r)) = Ok (f a b :: r).
+binOp f st = Err "vm: stack underflow (need 2)".
 
-dupOp st = case st of x :: r -> Ok (x :: x :: r) | Nil -> Err "vm: stack underflow".
-dropOp st = case st of _ :: r -> Ok r | Nil -> Err "vm: stack underflow".
+dupOp (x :: r) = Ok (x :: x :: r).
+dupOp Nil = Err "vm: stack underflow".
+
+dropOp (_ :: r) = Ok r.
+dropOp Nil = Err "vm: stack underflow".
 
 swapK t s r = s :: t :: r.
 overK t s r = s :: t :: s :: r.
-binOp2K k st = case st of
-    t :: rest -> binOp2K2 k t rest
-  | Nil -> Err "vm: stack underflow (need 2)".
-binOp2K2 k t st = case st of
-    s :: r -> Ok (k t s r)
-  | Nil -> Err "vm: stack underflow (need 2)".
+binOp2K k (t :: (s :: r)) = Ok (k t s r).
+binOp2K k st = Err "vm: stack underflow (need 2)".
 
-divChk st = case st of
-    0 :: _ -> Err "vm: division by zero"
-  | _ -> binOp divI st.
+divChk (0 :: _) = Err "vm: division by zero".
+divChk st = binOp divI st.
 
-applyOp o st = case o of
-    "+" -> binOp addI st
-  | "-" -> binOp subI st
-  | "*" -> binOp mulI st
-  | "/" -> divChk st
-  | "=" -> binOp eqI st
-  | "<" -> binOp ltI st
-  | ">" -> binOp gtI st
-  | "dup" -> dupOp st
-  | "drop" -> dropOp st
-  | "swap" -> binOp2K swapK st
-  | "over" -> binOp2K overK st
-  | _ -> Err "vm: unknown op '{o}'".
+applyOp "+" st = binOp addI st.
+applyOp "-" st = binOp subI st.
+applyOp "*" st = binOp mulI st.
+applyOp "/" st = divChk st.
+applyOp "=" st = binOp eqI st.
+applyOp "<" st = binOp ltI st.
+applyOp ">" st = binOp gtI st.
+applyOp "dup" st = dupOp st.
+applyOp "drop" st = dropOp st.
+applyOp "swap" st = binOp2K swapK st.
+applyOp "over" st = binOp2K overK st.
+applyOp o st = Err "vm: unknown op '{o}'".
 
-runVM code n pc st out gas =
-  case gas <= 0 of
-    True -> Err "vm: out of gas (100000 steps)"
-  | False -> runVM2 code n pc st out gas.
-runVM2 code n pc st out gas =
-  case pc > n of
-    True -> Ok (st, out)
-  | False -> step code n pc (code ! pc) st out gas.
-step code n pc ins st out gas = case ins of
-    IPush v -> runVM code n (pc + 1) (v :: st) out (gas - 1)
-  | IOp o -> stepOp code n pc (applyOp o st) out gas
-  | IJmp t -> runVM code n t st out (gas - 1)
-  | IJz t -> stepJz code n pc t st out gas
-  | IPrint -> stepPrint code n pc st out gas.
-stepOp code n pc r out gas = case r of
-    Ok st2 -> runVM code n (pc + 1) st2 out (gas - 1)
-  | Err m -> Err m.
-stepJz code n pc t st out gas = case st of
-    0 :: rest -> runVM code n t rest out (gas - 1)
-  | _ :: rest -> runVM code n (pc + 1) rest out (gas - 1)
-  | Nil -> Err "vm: jz: stack underflow".
-stepPrint code n pc st out gas = case st of
-    x :: rest -> runVM code n (pc + 1) rest ("output: {x}" :: out) (gas - 1)
-  | Nil -> Err "vm: print: stack underflow".
+runVM code n pc st out gas | gas <= 0 = Err "vm: out of gas (100000 steps)".
+runVM code n pc st out gas | pc > n = Ok (st, out).
+runVM code n pc st out gas = step code n pc (code ! pc) st out gas.
+
+step code n pc (IPush v) st out gas = runVM code n (pc + 1) (v :: st) out (gas - 1).
+step code n pc (IOp o) st out gas = stepOp code n pc (applyOp o st) out gas.
+step code n pc (IJmp t) st out gas = runVM code n t st out (gas - 1).
+step code n pc (IJz t) st out gas = stepJz code n pc t st out gas.
+step code n pc IPrint st out gas = stepPrint code n pc st out gas.
+
+stepOp code n pc (Ok st2) out gas = runVM code n (pc + 1) st2 out (gas - 1).
+stepOp code n pc (Err m) out gas = Err m.
+
+stepJz code n pc t (0 :: rest) out gas = runVM code n t rest out (gas - 1).
+stepJz code n pc t (_ :: rest) out gas = runVM code n (pc + 1) rest out (gas - 1).
+stepJz code n pc t Nil out gas = Err "vm: jz: stack underflow".
+
+stepPrint code n pc (x :: rest) out gas = runVM code n (pc + 1) rest ("output: {x}" :: out) (gas - 1).
+stepPrint code n pc Nil out gas = Err "vm: print: stack underflow".
 
 # ---- REPL driver: source -> (color, text) log lines, oldest first -----------
 
 showStack st = strcat "[" (strcat (joinC st) "]").
-joinC xs = case xs of Nil -> "" | x :: r -> joinCGo "{x}" r.
-joinCGo acc r = case r of Nil -> acc | x :: rest -> joinCGo (strcat acc ", {x}") rest.
+joinC Nil = "".
+joinC (x :: r) = joinCGo "{x}" r.
+joinCGo acc Nil = acc.
+joinCGo acc (x :: rest) = joinCGo (strcat acc ", {x}") rest.
 
-runStax src = case parseProg src of
-    Err m -> (2, "parse error: {m}") :: Nil
-  | Ok ast -> runStax2 (compileSeq ast 1).
-runStax2 cp = case cp of (code, _) -> runStax3 code (len code).
-runStax3 code n = runStax4 (runVM code n 1 Nil Nil 100000).
-runStax4 r = case r of
-    Err m -> (2, m) :: Nil
-  | Ok so -> runStax5 so.
-runStax5 so =
-  case so of
-    (st, out) -> append (outLines (revList out)) ((0, "stack: {showStack st}") :: Nil).
-outLines os = case os of Nil -> Nil | s :: r -> (0, s) :: outLines r.
+runStax src = runParsed (parseProg src).
+runParsed (Err m) = (2, "parse error: {m}") :: Nil.
+runParsed (Ok ast) =
+  (code, _) = compileSeq ast 1;
+  runOutcome (runVM code (len code) 1 Nil Nil 100000).
+runOutcome (Err m) = (2, m) :: Nil.
+runOutcome (Ok (st, out)) =
+  out
+  |> revList
+  |> outLines
+  |> fn ls -> append ls ((0, "stack: {showStack st}") :: Nil).
+
+outLines Nil = Nil.
+outLines (s :: r) = (0, s) :: outLines r.
 
 
 # ---- HTTP wire bits ----------------------------------------------------------
@@ -279,144 +276,93 @@ findSub s sub from =
   n = String.len s;
   m = String.len sub;
   findGo s sub from n m.
-findGo s sub i n m =
-  case i + m - 1 > n of
-    True -> 0
-  | False -> findAt s sub i n m.
-findAt s sub i n m =
-  case matchAt s sub i 1 m of
-    True -> i
-  | False -> findGo s sub (i + 1) n m.
-matchAt s sub i j m =
-  case j > m of
-    True -> True
-  | False -> matchAt2 s sub i j m.
-matchAt2 s sub i j m =
-  case charAt s (i + j - 1) == charAt sub j of
-    True -> matchAt s sub i (j + 1) m
-  | False -> False.
+findGo s sub i n m | i + m - 1 > n = 0.
+findGo s sub i n m | matchAt s sub i 1 m = i.
+findGo s sub i n m = findGo s sub (i + 1) n m.
+
+matchAt s sub i j m | j > m = True.
+matchAt s sub i j m | charAt s (i + j - 1) == charAt sub j = matchAt s sub i (j + 1) m.
+matchAt s sub i j m = False.
 
 # substring [a..b] inclusive
 strSlice s a b = sliceGo s a b "".
-sliceGo s i b acc =
-  case i > b of
-    True -> acc
-  | False -> sliceGo s (i + 1) b (strcat acc (chr (charAt s i))).
+sliceGo s i b acc | i > b = acc.
+sliceGo s i b acc = sliceGo s (i + 1) b (strcat acc (chr (charAt s i))).
 
 # parse a decimal starting at i, skipping leading spaces
 parseIntAt s i = piSkip s i (String.len s).
-piSkip s i n =
-  case i > n of
-    True -> 0
-  | False -> piSkip2 s i n (charAt s i).
-piSkip2 s i n c =
-  case c == 32 of
-    True -> piSkip s (i + 1) n
-  | False -> piGo s i n 0.
-piGo s i n acc =
-  case i > n of
-    True -> acc
-  | False -> piGo2 s i n acc (charAt s i).
-piGo2 s i n acc c =
-  case and2 (c >= 48) (c <= 57) of
-    True -> piGo s (i + 1) n (acc * 10 + (c - 48))
-  | False -> acc.
+piSkip s i n | i > n = 0.
+piSkip s i n = piSkip2 s i n (charAt s i).
+piSkip2 s i n 32 = piSkip s (i + 1) n.
+piSkip2 s i n c = piGo s i n 0.
+piGo s i n acc | i > n = acc.
+piGo s i n acc = piGo2 s i n acc (charAt s i).
+piGo2 s i n acc c | and2 (c >= 48) (c <= 57) = piGo s (i + 1) n (acc * 10 + (c - 48)).
+piGo2 s i n acc c = acc.
 
 # ---- JSON out ------------------------------------------------------------------
 
 jesc s = jescGo s 1 (String.len s) "".
-jescGo s i n acc =
-  case i > n of
-    True -> acc
-  | False -> jescGo s (i + 1) n (strcat acc (jescCh (charAt s i))).
-jescCh c =
-  case c of
-    34 -> "\\\""
-  | 92 -> "\\\\"
-  | 10 -> "\\n"
-  | 13 -> ""
-  | 9  -> "\\t"
-  | _  -> jescPr c.
-jescPr c = case c < 32 of True -> " " | False -> chr c.
+jescGo s i n acc | i > n = acc.
+jescGo s i n acc = jescGo s (i + 1) n (strcat acc (jescCh (charAt s i))).
+jescCh 34 = "\\\"".
+jescCh 92 = "\\\\".
+jescCh 10 = "\\n".
+jescCh 13 = "".
+jescCh 9 = "\\t".
+jescCh c | c < 32 = " ".
+jescCh c = chr c.
 
 jstr s = strcat "\"" (strcat (jesc s) "\"").
 
 # ["a","b",...] from a list of raw strings
 jarr xs = strcat "[" (strcat (jarrGo xs "") "]").
-jarrGo xs acc =
-  case xs of
-    Nil -> acc
-  | s :: r -> jarrGo2 s r acc.
-jarrGo2 s r acc =
-  case acc == "" of
-    True -> jarrGo r (jstr s)
-  | False -> jarrGo r (strcat acc (strcat "," (jstr s))).
+jarrGo Nil acc = acc.
+jarrGo (s :: r) acc | acc == "" = jarrGo r (jstr s).
+jarrGo (s :: r) acc = jarrGo r (strcat acc (strcat "," (jstr s))).
 
 # ---- JSON in: extract a string field (ascii, \" \\ \n \t \/ escapes) ----------
 
 jsonStr body key =
   k = strcat "\"" (strcat key "\"");
-  p = findSub body k 1;
-  case p of
-    0 -> Err "missing field"
-  | _ -> jsonStr2 body (jsAfterColon body (p + String.len k)).
+  jsonAt body (findSub body k 1) (String.len k).
+jsonAt body 0 kn = Err "missing field".
+jsonAt body p kn = jsonStr2 body (jsAfterColon body (p + kn)).
 jsAfterColon s i = jsSkip s i (String.len s).
-jsSkip s i n =
-  case i > n of
-    True -> 0
-  | False -> jsSkip2 s i n (charAt s i).
-jsSkip2 s i n c =
-  case or2 (c == 58) (or2 (c == 32) (or2 (c == 9) (or2 (c == 13) (c == 10)))) of
-    True -> jsSkip s (i + 1) n
-  | False -> jsOpen s i c.
-jsOpen s i c = case c == 34 of True -> i + 1 | False -> 0.
-jsonStr2 body i =
-  case i of
-    0 -> Err "field is not a string"
-  | _ -> jsRead body i (String.len body) "".
-jsRead s i n acc =
-  case i > n of
-    True -> Err "unterminated string"
-  | False -> jsRead2 s i n acc (charAt s i).
-jsRead2 s i n acc c =
-  case c of
-    34 -> Ok acc
-  | 92 -> jsEsc s (i + 1) n acc
-  | _  -> jsRead s (i + 1) n (strcat acc (chr c)).
-jsEsc s i n acc =
-  case i > n of
-    True -> Err "dangling escape"
-  | False -> jsEsc2 s i n acc (charAt s i).
-jsEsc2 s i n acc c =
-  case c of
-    110 -> jsRead s (i + 1) n (strcat acc (chr 10))
-  | 116 -> jsRead s (i + 1) n (strcat acc (chr 9))
-  | _   -> jsRead s (i + 1) n (strcat acc (chr c)).
+jsSkip s i n | i > n = 0.
+jsSkip s i n = jsSkip2 s i n (charAt s i).
+jsSkip2 s i n c | or2 (c == 58) (or2 (c == 32) (or2 (c == 9) (or2 (c == 13) (c == 10)))) = jsSkip s (i + 1) n.
+jsSkip2 s i n 34 = i + 1.
+jsSkip2 s i n c = 0.
+jsonStr2 body 0 = Err "field is not a string".
+jsonStr2 body i = jsRead body i (String.len body) "".
+jsRead s i n acc | i > n = Err "unterminated string".
+jsRead s i n acc = jsRead2 s i n acc (charAt s i).
+jsRead2 s i n acc 34 = Ok acc.
+jsRead2 s i n acc 92 = jsEsc s (i + 1) n acc.
+jsRead2 s i n acc c = jsRead s (i + 1) n (strcat acc (chr c)).
+jsEsc s i n acc | i > n = Err "dangling escape".
+jsEsc s i n acc = jsEsc2 s i n acc (charAt s i).
+jsEsc2 s i n acc 110 = jsRead s (i + 1) n (strcat acc (chr 10)).
+jsEsc2 s i n acc 116 = jsRead s (i + 1) n (strcat acc (chr 9)).
+jsEsc2 s i n acc c = jsRead s (i + 1) n (strcat acc (chr c)).
 
 # ---- request accumulation ------------------------------------------------------
 
 # read until headers + declared body are in; Err on connection loss
-readReq nd acc =
-  case netPoll nd of
-    0 -> Err "connection lost"
-  | 2 -> readMore nd acc
-  | _ -> readTest nd acc.
-readMore nd acc = readTest nd (strcat acc (netRead nd)).
-readTest nd acc =
-  he = findSub acc (strcat crlf crlf) 1;
-  case he of
-    0 -> readReq nd acc
-  | _ -> readBody nd acc he.
-readBody nd acc he =
-  need = he + 3 + reqCLen acc he;
-  case String.len acc >= need of
-    True -> Ok acc
-  | False -> readReq nd acc.
+readReq nd acc = readPolled (netPoll nd) nd acc.
+readPolled 0 nd acc = Err "connection lost".
+readPolled 2 nd acc = readTest nd (strcat acc (netRead nd)).
+readPolled r nd acc = readTest nd acc.
+readTest nd acc = readHdr nd acc (findSub acc (strcat crlf crlf) 1).
+readHdr nd acc 0 = readReq nd acc.
+readHdr nd acc he | String.len acc >= he + 3 + reqCLen acc he = Ok acc.
+readHdr nd acc he = readReq nd acc.
 reqCLen acc he =
   p = findSub acc "Content-Length:" 1;
-  case and2 (p > 0) (p < he) of
-    True -> parseIntAt acc (p + 15)
-  | False -> 0.
+  reqCLenAt acc p he.
+reqCLenAt acc p he | and2 (p > 0) (p < he) = parseIntAt acc (p + 15).
+reqCLenAt acc p he = 0.
 
 # ---- request parse + routing ----------------------------------------------------
 
@@ -428,18 +374,21 @@ reqBody s =
   he = findSub s (strcat crlf crlf) 1;
   strSlice s (he + 4) (String.len s).
 
-route m p req n =
-  case (m, p) of
-    ("GET", "/") -> httpResp "200 OK" apiInfo
-  | ("GET", "/status") -> httpResp "200 OK" (statusJson n)
-  | ("POST", "/run") -> routeRun (jsonStr (reqBody req) "prog")
-  | _ -> httpResp "404 Not Found" "\{\"ok\":false,\"error\":\"not found\"\}".
-routeRun r =
-  case r of
-    Err m -> httpResp "400 Bad Request" (strcat "\{\"ok\":false,\"error\":" (strcat (jstr m) "\}"))
-  | Ok prog -> httpResp "200 OK" (runJson (runStax prog)).
+route "GET" "/" req n = httpResp "200 OK" apiInfo.
+route "GET" "/status" req n = httpResp "200 OK" (statusJson n).
+route "POST" "/run" req n = routeRun (jsonStr (reqBody req) "prog").
+route m p req n = httpResp "404 Not Found" "\{\"ok\":false,\"error\":\"not found\"\}".
+
+routeRun (Err m) = httpResp "400 Bad Request" (strcat "\{\"ok\":false,\"error\":" (strcat (jstr m) "\}")).
+routeRun (Ok prog) =
+  prog
+  |> runStax
+  |> runJson
+  |> httpResp "200 OK".
+
 runJson lines = strcat "\{\"ok\":true,\"lines\":" (strcat (jarr (dropColors lines)) "\}").
-dropColors ls = case ls of Nil -> Nil | (_, t) :: r -> t :: dropColors r.
+dropColors Nil = Nil.
+dropColors ((_, t) :: r) = t :: dropColors r.
 
 apiInfo = "\{\"service\":\"stax over QOS net HAL\",\"endpoints\":\{\"GET /status\":\"runtime counters\",\"POST /run\":\"\{\\\"prog\\\":\\\"1 2 + .\\\"\} -> stax log lines\"\}\}".
 
@@ -451,18 +400,11 @@ statusJson n =
 
 # ---- the server loop -------------------------------------------------------------
 
-srv nd n =
-  case netPoll nd of
-    2 -> serve nd n
-  | _ -> srv nd n.
-serve nd n =
-  r = readReq nd "";
-  serve2 nd n r.
-serve2 nd n r =
-  case r of
-    Err e -> logDrop nd n e
-  | Ok req -> serve3 nd n req.
-logDrop nd n e = print "[http] dropped: {e}" >> srv nd n.
+srv nd n = srvPolled (netPoll nd) nd n.
+srvPolled 2 nd n = serve2 nd n (readReq nd "").
+srvPolled r nd n = srv nd n.
+serve2 nd n (Err e) = print "[http] dropped: {e}" >> srv nd n.
+serve2 nd n (Ok req) = serve3 nd n req.
 serve3 nd n req =
   m = reqMethod req;
   p = reqPath req;

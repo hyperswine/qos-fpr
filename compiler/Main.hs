@@ -12,6 +12,7 @@ import FPRISC
 import Infer (inferTops)
 import Struct (erasePSig, expandStructs, sigTable, specialize, structTable)
 import Modules (LoadResult (..), ModExport (..), hashAST, loadProgram)
+import Precond (PreNote (..), PreStatus (..), applyPreconds, preTable, renderNote, validatePre)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
@@ -92,9 +93,36 @@ main = do
         putStrLn "=== SIG/STRUCT: ERRORS ==="
         mapM_ (putStrLn . ("  * " ++)) preludeExpErrs
         exitFailure
+      -- ---- preconditions (contracts): signatures may constrain params,
+      -- (n : Int | n > 0).  Discharge obligations statically from local
+      -- facts (clause guards, case discrimination, own preconditions),
+      -- insert blame-carrying runtime checks otherwise.  Runs BEFORE
+      -- inference so inserted checks are typechecked + operator-resolved
+      -- like any user code; the merged table spans units, and the pass
+      -- is deterministic per-bind so unit and root rewrites agree.
+      let preTab = preTable tops
+          preFragErrs = validatePre preTab
+      unless (null preFragErrs) $ do
+        putStrLn "=== PRECONDITION: ERRORS ==="
+        mapM_ (putStrLn . ("  * " ++)) preFragErrs
+        exitFailure
+      let (pnAll, tops') = applyPreconds preTab tops
+          preludeE' = snd (applyPreconds preTab preludeE)
+          root'' = snd (applyPreconds preTab root')
+          units' = [(h, snd (applyPreconds preTab uts)) | (h, uts) <- units]
+          rootBinds = S.fromList [fst3 b | b@TBind {} <- root']
+          pnRoot = [n | n <- pnAll, S.member (pnCaller n) rootBinds]
+          nDis = length [() | n <- pnAll, pnStatus n == Discharged]
+          nRt = length [() | n <- pnAll, pnStatus n == RuntimeCheck]
+          nTrap = length [() | n <- pnAll, pnStatus n == BuiltinTrap]
+      mapM_ (putStrLn . renderNote) pnRoot
+      unless (null pnAll) $
+        putStrLn ("precond: " ++ show (length pnAll) ++ " obligations: "
+                  ++ show nDis ++ " discharged, " ++ show nRt
+                  ++ " runtime-checked, " ++ show nTrap ++ " builtin traps")
       -- typecheck the merged expanded program; rewritten tops carry
       -- operator sites resolved to prims / Str.+ / s.(+)
-      let (terrs, _notes, topsRW) = inferTops sigs structs tops
+      let (terrs, _notes, topsRW) = inferTops sigs structs tops'
       unless (null terrs) $ do
         putStrLn "=== TYPE ERRORS ==="
         mapM_ (putStrLn . ("  * " ++)) terrs
@@ -152,13 +180,13 @@ main = do
       -- (specialize ran on the whole program above); finalTops' root
       -- portion carries them.
       let resolveUnit uts =
-            let (_, _, rw) = inferTops sigs structs (preludeE ++ uts)
+            let (_, _, rw) = inferTops sigs structs (preludeE' ++ uts)
                 bn = S.fromList ([fst3 b | b@(TBind {}) <- uts])
              in [t | t@(TBind n _ _ _) <- rw, S.member n bn]
                   ++ [t | t <- rw, not (isTBind t)]
           compileUnit uts = fst (runState (compileTop uts >>= liftFix) (DEnv 0 consAll shapes []))
-          preludeExt = arities preludeE
-          unitExt = M.unions [arities uts | (_, uts) <- units]
+          preludeExt = arities preludeE'
+          unitExt = M.unions [arities uts | (_, uts) <- units']
           extFor = M.union preludeExt unitExt -- own names win via prog-first lookup
           tgt = oTarget opts
           a64 = oA64 opts
@@ -178,7 +206,7 @@ main = do
                 | x64 && qapp = "qx64r" ++ show x64Rev -- distinct cache tag: de-TLS'd units
                 | x64 = "x64r" ++ show x64Rev
                 | otherwise = tgtName tgt
-          tag = "g" ++ show codegenRev ++ "-" ++ tname ++ (if rvv then "-rvv" else "")
+          tag = "g" ++ show codegenRev ++ "pc1-" ++ tname ++ (if rvv then "-rvv" else "")
           unitDir = takeDirectory out </> "units"
           emitUnit path exps ext uts = do
             cached <- doesFileExist path
@@ -196,17 +224,17 @@ main = do
       createDirectoryIfMissing True unitDir
       -- prelude unit (unqualified names; the always-linked stdlib unit).
       -- The prelude is self-contained, so resolve its own operators.
-      let preludeResolved = let (_, _, rw) = inferTops sigs structs preludeE in rw
+      let preludeResolved = let (_, _, rw) = inferTops sigs structs preludeE' in rw
       preludeOut <-
         if null preludeTops
           then pure []
           else do
             r <- emitUnit (unitDir </> ("prelude-" ++ take 12 preludeHash ++ "-" ++ tag ++ ".s"))
-                          (bindNames preludeE) M.empty preludeResolved
+                          (bindNames preludeE') M.empty preludeResolved
             pure [r]
       -- dep module units (hash-qualified; filename carries the prelude
       -- hash too -- unit code depends on prelude arities)
-      unitOuts <- forM units $ \(h, uts) ->
+      unitOuts <- forM units' $ \(h, uts) ->
         emitUnit (unitDir </> ("u-" ++ take 12 h ++ "-p" ++ take 8 preludeHash ++ "-" ++ tag ++ ".s"))
                  (bindNames uts) extFor (resolveUnit uts)
       -- the root: exports its own binds; modtab (all dep exports) lives

@@ -70,7 +70,7 @@ data STop
   = TBind Name [SPat] (Maybe SExpr) SExpr
   | TType Name Bool [Name] [(Name, [Ty])]
   | TShape Name [(Name, Ty)]
-  | TSig Name ([Ty], Ty)
+  | TSig Name ([Ty], Ty) [Maybe (Name, SExpr)] -- per-PARAM precondition: (n : Int | n > 0)
   | TSigDef Name [(Name, Maybe Ty)] -- `Functor = Sig { map : ... }.`
   | TStruct Name [Name] [(Name, SExpr)] -- `Numeric = Struct Arith { ... }.`
   | TUse Name String -- MyMod = use "MyMod#hash".  (compile-time module import)
@@ -472,11 +472,22 @@ signature = do
   try (fullSig n) <|> (skipTillDot >> pure TSkip)
   where
     fullSig n = do
-      parts <- tyApp `sepBy1` symbol "->"
+      parts <- sigPart `sepBy1` symbol "->"
       dotTerm
       case parts of
         [] -> fail "empty signature"
-        ps -> pure (TSig n (init ps, last ps))
+        ps -> pure (TSig n (map fst (init ps), fst (last ps)) (map snd (init ps)))
+    -- a signature part is a type, optionally precondition-annotated:
+    --   (b : Int | b != 0)   -- name the param, constrain its value
+    sigPart =
+      try preParam <|> ((,Nothing) <$> tyApp)
+    preParam = parens $ do
+      v <- lowerName
+      _ <- lexeme (char ':' <* notFollowedBy (char ':'))
+      t <- tyApp
+      pipeSep
+      p <- expr
+      pure (t, Just (v, p))
 
 tyApp :: P Ty
 tyApp = do
@@ -1141,7 +1152,7 @@ buildLinInfo :: [STop] -> LinInfo
 buildLinInfo tops = LinInfo lin sigs conSh conAr
   where
     lin = [n | TType n True _ _ <- tops]
-    sigs = M.fromList [(n, (map sh ps, sh r)) | TSig n (ps, r) <- tops]
+    sigs = M.fromList [(n, (map sh ps, sh r)) | TSig n (ps, r) _ <- tops]
     conSh = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
     conAr = M.fromList [(c, length tys) | TType _ _ _ cs <- tops, (c, tys) <- cs]
     sh = shapeOfTy lin
