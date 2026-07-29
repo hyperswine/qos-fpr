@@ -27,15 +27,20 @@ void hal_ipi_clear(uw hart) { (void)hart; }
 void hal_timer_park(uw hart) { (void)hart; }
 void hal_timer_arm(uw hart, uw ticks) { (void)hart; (void)ticks; }
 
-/* ---- first-activation contexts for ctx_x64.S ------------------------
- * (posix hal.c's rule, verbatim: jmp-entry must look like post-call
- * state -- entry %rsp == 8 mod 16 -- or gcc's 16-byte spills inside
- * the trampoline are misaligned.) */
+/* ---- first-activation contexts for ctx_*.S ------------------------
+ * Same rule as posix/hal.c: on x86-64 the fabricated entry state must
+ * look like post-call (entry %rsp == 8 mod 16) so that gcc's 16-byte
+ * spills inside the trampoline are aligned.  AArch64 and RISC-V do not
+ * need the bias. */
 void fpr_ctx_fabricate(uw *ctx, void (*entry)(void), uw stack_top16,
                        fpr_hart_t *owner) {
   (void)owner; /* the hart pointer is the plain global, not a ctx slot */
   ctx[0] = (uw)(uintptr_t)entry;
+#if defined(__x86_64__)
   ctx[1] = stack_top16 - 8;
+#else
+  ctx[1] = stack_top16;
+#endif
 }
 
 /* ---- the register tier (stubs.c's mkreg handlers, table-backed) ----- */

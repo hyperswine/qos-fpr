@@ -1,7 +1,7 @@
 module Main where
 
 import Codegen (Target, codegenRev, emitProgram, externals, rv32, rv64, tgtName)
-import A64 (lowerA64, a64Rev)
+import A64 (deTlsQosAppA64, lowerA64, a64Rev)
 import X64 (lowerX64, deTlsQosApp, x64Rev)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
@@ -39,6 +39,7 @@ parseArgs = foldl step (Opts rv64 False False False False False Nothing [])
     step o "--target=a64mac" = o {oTarget = rv64, oA64 = True, oA64Mac = True} -- same lowering, Mach-O syntax
     step o "--target=x64" = o {oTarget = rv64, oX64 = True} -- likewise
     step o "--target=qx64" = o {oTarget = rv64, oX64 = True, oQosApp = True} -- QOS-x86_64
+    step o "--target=qa64" = o {oTarget = rv64, oA64 = True, oQosApp = True} -- QOS-aarch64
     step o "--rvv" = o {oRvv = True}
     step o a
       | "--prelude=" `isPrefixOf` a = o {oPrelude = Just (drop (length "--prelude=") a)}
@@ -66,7 +67,7 @@ main = do
   opts <- parseArgs <$> getArgs
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
-    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|a64mac|x64|qx64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
+    _ -> putStrLn "usage: fprc [--target=rv32|rv64|a64|a64mac|x64|qx64|qa64] [--rvv] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
   preludeTops <- maybe (pure []) parseFile (oPrelude opts)
   rootTops <- parseFile inp
   lr <- loadProgram preludeTops inp rootTops
@@ -164,13 +165,15 @@ main = do
           a64mac = oA64Mac opts
           x64 = oX64 opts
           qapp = oQosApp opts
-          lower | a64 = lowerA64 a64mac
+          lower | a64 && qapp = deTlsQosAppA64 . lowerA64 False
+                | a64 = lowerA64 a64mac
                 | x64 && qapp = deTlsQosApp . lowerX64
                 | x64 = lowerX64
                 | otherwise = id
           rvv = oRvv opts && not a64 && not x64 -- no RVV lowering in the PoCs
           spec = not x64 -- SysV callee-saved registers can't host the s6+ spec loops
           tname | a64mac = "a64macr" ++ show a64Rev
+                | a64 && qapp = "qa64r" ++ show a64Rev -- distinct cache tag: de-TLS'd units
                 | a64 = "a64r" ++ show a64Rev
                 | x64 && qapp = "qx64r" ++ show x64Rev -- distinct cache tag: de-TLS'd units
                 | x64 = "x64r" ++ show x64Rev

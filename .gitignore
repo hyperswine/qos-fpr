@@ -13,3 +13,7 @@ apps_data.c
 *.hi
 *.o
 .vscode/
+*.ppm
+*.qa
+qosp
+

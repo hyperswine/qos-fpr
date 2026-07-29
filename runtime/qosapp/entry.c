@@ -19,8 +19,9 @@
 #include "fpr.h"
 #include "qos_abi.h"
 
-/* the cells --target=qx64 code loads RIP-relative (X64.hs deTlsQosApp),
- * and runtime.c's arity-7/8 cast cases write (FPR_TLS = plain here) */
+/* the cells that --target=qx64/qa64 code loads RIP-relative via the
+ * deTlsQosApp* passes.  runtime.c writes to a6/a7 only on the x64 path
+ * (SysV stack args); they are unused (but harmless) on qa64. */
 fpr_hart_t *fpr_posix_hart;
 uw fpr_x64_a6, fpr_x64_a7;
 

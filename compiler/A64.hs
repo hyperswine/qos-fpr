@@ -54,7 +54,7 @@
 --     saved around it; x17 stashes the loaded hart pointer across the
 --     restore.  The C side's __thread cell uses the same TLV machinery,
 --     so both sides agree by construction.
-module A64 (lowerA64, a64Rev) where
+module A64 (lowerA64, deTlsQosAppA64, a64Rev) where
 
 
 import Data.Bits (shiftR, (.&.))
@@ -330,3 +330,59 @@ instr mach body = case parts body of
     -- entirely by materializing (the IR only uses small masks anyway)
     logImm op rd rs n =
       movImm "x16" (readInt n) ++ [op ++ " " ++ xreg rd ++ ", " ++ xreg rs ++ ", x16"]
+
+-- deTlsQosAppA64: the QOS-aarch64 (--target=qa64) refinement.
+-- Same purpose as X64.hs deTlsQosApp: a loaded QOS Portable app is
+-- single-hart and fixed-slot with no TLS block registered by a dynamic
+-- loader.  The A64 lowering emits a 4-instruction local-exec TLS load
+-- using tpidr_el0 + :tprel_* on fpr_posix_hart.  Rewrite the whole
+-- sequence to a plain adrp+ldr of the global (RIP-relative in the
+-- image), and update the banner.  Applied as a post-pass like the x64
+-- version.
+deTlsQosAppA64 :: String -> String
+deTlsQosAppA64 = unlines . go . lines
+  where
+    go [] = []
+    go (l:ls)
+      | Just (pre, xd) <- matchTls4 (l:ls) =
+          let rest = drop 4 ls
+              adrp = pre ++ "adrp " ++ xd ++ ", fpr_posix_hart"
+              ldr  = pre ++ "ldr  " ++ xd ++ ", [" ++ xd ++ ", #:lo12:fpr_posix_hart]"
+          in adrp : ldr : go rest
+      | otherwise = fixBanner l : go ls
+
+    -- Detect the exact 4-line tpidr sequence emitted by lowerA64 (non-mach)
+    -- for "mv rd, tp".  Returns (indent, reg) if matched.
+    matchTls4 (l1:l2:l3:l4:_)
+      | Just (pre, xd) <- isMrsTpidr l1,
+        isAddTprel xd l2 "hi12",
+        isAddTprel xd l3 "lo12_nc",
+        isLdrSelf xd l4 =
+          Just (pre, xd)
+    matchTls4 _ = Nothing
+
+    -- token helpers: the emitted asm has "xN," (with comma attached to reg)
+    stripComma t = takeWhile (/= ',') t
+    isMrsTpidr s =
+      let (pre, r) = break (not . isSpace) s
+          ws = words r
+      in case ws of
+           ["mrs", xd, "tpidr_el0"] -> Just (pre, stripComma xd)
+           _ -> Nothing
+    isAddTprel xd s kind =
+      let ws = words (dropWhile isSpace s)
+      in case ws of
+           ["add", d, base, off] | stripComma d == xd && stripComma base == xd && (":tprel_" ++ kind ++ ":fpr_posix_hart") `isSuffixOf` off -> True
+           _ -> False
+    isLdrSelf xd s =
+      let ws = words (dropWhile isSpace s)
+      in case ws of
+           ["ldr", d, mem] | stripComma d == xd && mem == "[" ++ xd ++ "]" -> True
+           _ -> False
+
+    isSuffixOf suf s = reverse suf `isPrefixOf` reverse s
+
+    fixBanner "# target: rv64" = "# target: qa64 (lowered from the rv64 emission; QOS Portable single-hart globals)"
+    fixBanner "# target: a64 (lowered from the rv64 emission -- the shared RISC IR)" =
+      "# target: qa64 (lowered from the rv64 emission; QOS Portable single-hart globals)"
+    fixBanner l = l
