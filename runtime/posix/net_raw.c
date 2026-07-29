@@ -35,6 +35,8 @@ void qos_netraw_setup(void) {
   a.sin_family = AF_INET;
   a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   a.sin_port = htons((uint16_t)port);
+  /* restarting a server across TIME_WAIT is normal, not an error */
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
   if (bind(lfd, (struct sockaddr *)&a, sizeof a)) {
     fprintf(stderr, "net: bind (port busy?)\n");
     exit(2);

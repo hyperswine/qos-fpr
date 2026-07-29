@@ -180,7 +180,7 @@ expr :: P SExpr
 expr = lamE <|> opExpr
   where
     lamE = do
-      _ <- symbol "fn"
+      keyword "fn" -- word-boundary: `fnv1a ...` is an application, not a lambda
       ps <- some lowerName
       _ <- symbol "->"
       SLam ps <$> expr
@@ -195,7 +195,7 @@ opExpr = dollarChain
     pipeChain = chainl1' pipeOperand pipeOp
     pipeOperand =
       ( do
-          _ <- symbol "fn"
+          keyword "fn"
           ps <- some lowerName
           _ <- symbol "->"
           SLam ps <$> expr
