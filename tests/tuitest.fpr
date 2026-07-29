@@ -2,9 +2,15 @@
 # LMode constructors across the separate-compilation boundary, the full
 # widget tree (border/vbox/hbox/fill/glyph rows), and the diff renderer
 # emitting through a passed-in writer.
+
 TUI = use "../programs/mods/tui".
+
 pad2 n = case n < 10 of True -> strcat "0" "{n}" | False -> "{n}".
+
 w s = print "[emit {strlen s}b]".
+
+# IDEALLY SHOULD BE PURE and MVU BASED
+
 main =
   _ = print "cells: {TUI.mkCell 65 2 0}";
   _ = print "repCell len: {lenL (TUI.repCell 8192 5)}";
@@ -16,22 +22,30 @@ main =
   _ = print "clockrows: {lenL (bigClockW 754 (80, 24))}";
   _ = TUI.diffFrame w 9999 (TUI.invalidBuf 80 24) (bigClockW 754 (80, 24));
   print "tuitest done".
+
 lenL xs = case xs of Nil -> 0 | _ :: r -> 1 + lenL r.
+
 digCells d r col = blockCells (substr (fontD d) (r * 3 + 1) 3) col.
+
 blockCells s col = bcGo s col 1.
+
 bcGo s col i =
   case i > strlen s of
     True -> Nil
   | False -> bcCell s col i :: bcGo s col (i + 1).
+
 bcCell s col i =
   case charAt s i == 35 of
     True -> TUI.mkCell 32 0 col
   | False -> 8192.
+
 colonCells r col =
   case or2 (r == 1) (r == 3) of
     True -> TUI.mkCell 32 0 col :: Nil
   | False -> 8192 :: Nil.
+
 or2 a b = case a of True -> True | False -> b.
+
 fontD d =
   case d of
     0 -> "#### ## ## ####"
@@ -44,7 +58,9 @@ fontD d =
   | 7 -> "###  #  #  #  #"
   | 8 -> "#### ##### ####"
   | _ -> "#### ####  ####".
+
 gap n = TUI.repCell 8192 n.
+
 glyphRow mm ss col r =
   catAll (TUI.repCell 8192 30
     :: digCells (mm / 10) r col :: gap 1
@@ -52,14 +68,18 @@ glyphRow mm ss col r =
     :: colonCells r col :: gap 1
     :: digCells (ss / 10) r col :: gap 1
     :: digCells (ss - (ss / 10) * 10) r col :: Nil).
+
 catAll xs = case xs of Nil -> Nil | x :: r -> TUI.append x (catAll r).
+
 glyphRows mm ss col w r =
   case r >= 5 of
     True -> Nil
   | False -> TUI.padTo w 8192 (glyphRow mm ss col r) :: glyphRows mm ss col w (r + 1).
+
 glyphLineW mm ss col sz =
   (w, h) = sz;
   glyphRows mm ss col w 0.
+
 bigClockW sec sz =
   mm = sec / 60;
   ss = sec - mm * 60;

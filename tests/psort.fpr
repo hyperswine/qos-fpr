@@ -76,7 +76,7 @@ main =
   d2 = mkData n;
   t2 = now;
   (lo2, hi2) = Vec.split h d2;
-  (pl, ph) = par2 1 sortVec lo2 sortVec hi2;
+  (pl, ph) = par2 1 sortVec lo2 sortVec hi2; # par2 is the synchronous actor block group primitive
   m2 = merge (Vec.toList pl) (Vec.toList ph);
   t3 = now;
   _ = print "parallel  : {t3 - t2} ticks   (speedup x100 = {(t1 - t0) * 100 / (t3 - t2)})";

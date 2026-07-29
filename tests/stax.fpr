@@ -285,5 +285,18 @@ main =
   exec "nested if" "1 if 2 if 30 then 40 then" >>
   exec "factorial 5" "1 5 begin swap over * swap 1 - dup 0 = until drop ." >>
   exec "sum 1..10" "0 10 begin swap over + swap 1 - dup 0 = until drop ." >>
+  exec "dup" "5 dup + ." >>
+  exec "drop" "1 2 drop ." >>
+  exec "swap" "1 2 swap . ." >>
+  exec "over" "1 2 over . . ." >>
+  exec "sub" "10 3 - ." >>
+  exec "div" "20 4 / ." >>
+  exec "compound" "2 3 + 4 * 5 - ." >>
+  exec "eq true" "5 5 = if 1 else 0 then ." >>
+  exec "eq false" "5 6 = if 1 else 0 then ." >>
+  exec "lt" "2 10 < if 77 else 0 then ." >>
+  exec "gt" "10 2 > if 88 else 0 then ." >>
+  exec "countdown" "3 begin dup . 1 - dup 0 = until drop" >>
+  exec "multi ." "10 . 20 ." >>
   exec "parse error" "3 4 if +" >>
   print :done.
