@@ -1,11 +1,9 @@
 uart = device "uart" .
-
 putc c | BITTEST (read (reg8 uart 5)) 5 = write (reg8 uart 0) c.
 putc c = putc c . # if the transmit buffer is full, wait until it is not
 puts s = putsFrom s 1 .
 putsFrom s i | i > Str.len s = Unit.
 putsFrom s i = putc (Str.at s i) >> putsFrom s (i + 1) .
-
 nl = putc 13 >> putc 10 .
 
 # a hop first learns its neighbor (first message), then relays tokens.

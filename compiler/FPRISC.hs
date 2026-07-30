@@ -745,7 +745,10 @@ dExpr = \case
     body <- updateRecord (CVar v) assigns
     pure (CLet v m' body)
   STup es -> do
-    let con = if length es == 3 then "Tup3" else "Tup2"
+    -- Tup2/Tup3 are the only tuple constructors this ABI has; a wider
+    -- tuple used to be packed into a Tup2 header and silently corrupt
+    -- its own payload, so it is a hard error now.  Use a constructor.
+    con <- tupCon (length es)
     (tid, var, _) <- conInfo con
     CMk tid var <$> mapM dExpr es
   SList es -> dExpr (foldr (\x acc -> SApp (SApp (SVar "Cons") x) acc) (SVar "Nil") es)
@@ -757,6 +760,18 @@ dExpr = \case
     where
       segCore (SegStr s) = pure (CStr s)
       segCore (SegExpr e) = CApp (CVar "str") <$> dExpr e
+
+-- the ABI has Tup2 and Tup3 and nothing wider
+tupCon :: Int -> D String
+tupCon 2 = pure "Tup2"
+tupCon 3 = pure "Tup3"
+tupCon n =
+  error
+    ( "tuple of "
+        ++ show n
+        ++ " elements: this ABI has Tup2 and Tup3 only -- "
+        ++ "declare a constructor for it instead"
+    )
 
 conInfo :: Name -> D (Int, Int, Int)
 conInfo c = do
@@ -838,7 +853,7 @@ matchPat scrut p ok fail' = case p of
     inner <- matchFields scrut ps ok fail'
     pure (CIf (CTagEq tid var scrut) inner fail')
   PTup ps -> do
-    let con = if length ps == 3 then "Tup3" else "Tup2"
+    con <- tupCon (length ps)
     (tid, var, _) <- conInfo con
     inner <- matchFields scrut ps ok fail'
     pure (CIf (CTagEq tid var scrut) inner fail')

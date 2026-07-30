@@ -18,8 +18,7 @@ WORK=$(mktemp -d)
 trap 'kill $SRV 2>/dev/null; rm -rf "$WORK"' EXIT
 
 echo "== build server (FP-RISC -> posix)"
-# change POSIXARCH=a64 to x86 for testing on x86
-make -s posix.bin PROG=programs/livenotes.fpr POSIXARCH=a64 >/dev/null || exit 1
+make -s posix.bin PROG=programs/livenotes.fpr >/dev/null || exit 1
 echo "== build client (C)"
 cc -O2 -o "$WORK/client" tools/fprlive_client.c || exit 1
 

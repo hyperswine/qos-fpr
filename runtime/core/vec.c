@@ -336,3 +336,231 @@ FPR_FN(fpr_g_Vec_x2efromList, h_fromList, 1);
 FPR_FN(fpr_g_Vec_x2etoList, h_toList, 1);
 FPR_FN(fpr_g_Vec_x2efree, h_free, 1);
 FPR_FN(fpr_g_Vec_x2esplit, h_split, 2);
+
+/* ==== the numeric SIMD tier ============================================
+ * Element-wise ops over ONE unboxed Int column, striding the raw block
+ * words contiguously -- the loops below are exactly the shapes RVV/NEON
+ * name (vadd.vx, vmul.vv, vmerge.vvm, vluxei, vmslt), written so the C
+ * compiler's autovectorizer takes them on hosted targets.  Two vectors
+ * of equal length share an IDENTICAL block partition (the directory is
+ * index-structured), so zips pair blocks and stay contiguous.
+ *
+ * Linearity discipline: unary ops mutate in place and return the same
+ * vector; zips mutate dst in place and CONSUME src (freed) -- dup first
+ * if you need it again; gather/slice thread the read-only operand back
+ * in a tuple; blend consumes mask and src.  Int column only: anything
+ * else panics (this is the numeric tier, not the generic one).      */
+
+/* the whole tier compiles under the full vectorizer regardless of the
+ * build's baseline -O level: these loops ARE the SIMD, so the pragma is
+ * part of the contract, not an optimization hint.
+ *
+ * What actually vectorizes today: adds, min/max, compares, ges, blend
+ * and burst take SSE2/NEON lanes (paddq / cmgt / vmerge shapes).  The
+ * 64-bit MULTIPLIES (axpb, zipMul) stay scalar on hosted baselines --
+ * SSE has no 64-lane multiply below AVX-512, NEON none at all -- and
+ * become vmul.vx/.vv at SEW=64 on the RVV target this tier is shaped
+ * for.  Element width is the machine word by design (16.16 products
+ * need the headroom); narrowing lanes to buy host multipliers would
+ * trade away correctness for a benchmark. */
+#pragma GCC push_options
+#pragma GCC optimize("O3,tree-vectorize")
+
+static vec_t *vnum(V v, const char *who) {
+  vec_t *x = vchk(v, who);
+  if (x->len && x->var != VR_INT) fpr_cpanic("SIMD tier: not an Int vector");
+  return x;
+}
+
+/* iterate one column's blocks: sw *p over contiguous runs of n words,
+ * block index in j (VL_B0<<j words at base vl_cap(j)) */
+#define VS_BLOCKS(x, BODY)                                           \
+  do {                                                               \
+    uw _rem = (x)->len;                                              \
+    for (uw j = 0; _rem; j++) {                                      \
+      uw n = ((uw)VL_B0 << j) < _rem ? ((uw)VL_B0 << j) : _rem;      \
+      sw *p = (sw *)(x)->cols[0]->blk[j];                            \
+      (void)p;                                                       \
+      BODY;                                                          \
+      _rem -= n;                                                     \
+    }                                                                \
+  } while (0)
+
+static V h_iota(V nv) {
+  if (!ISINT(nv)) fpr_cpanic("Vec.iota: not an Int");
+  sw n = UNTAG(nv);
+  V v = h_new((V)&fpr_unit);
+  for (sw i = 0; i < n; i++) v = h_push(TAG(i), v);
+  return v;
+}
+
+static V h_dup(V vec) {
+  vec_t *x = vnum(vec, "Vec.dup: not a Vector");
+  V c = h_new((V)&fpr_unit);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) c = h_push(TAG(p[i]), c); });
+  return mktup2(c, (V)x);
+}
+
+static V h_axpb(V av, V bv, V vec) {
+  vec_t *x = vnum(vec, "Vec.axpb: not a Vector");
+  sw a = UNTAG(av), b = UNTAG(bv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = a * p[i] + b; });
+  return (V)x;
+}
+
+static V h_sar(V kv, V vec) {
+  vec_t *x = vnum(vec, "Vec.sar: not a Vector");
+  sw k = UNTAG(kv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] >>= k; });
+  return (V)x;
+}
+
+static V h_minS(V kv, V vec) {
+  vec_t *x = vnum(vec, "Vec.minS: not a Vector");
+  sw k = UNTAG(kv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < k ? p[i] : k; });
+  return (V)x;
+}
+
+static V h_maxS(V kv, V vec) {
+  vec_t *x = vnum(vec, "Vec.maxS: not a Vector");
+  sw k = UNTAG(kv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] > k ? p[i] : k; });
+  return (V)x;
+}
+
+static V h_ges(V kv, V vec) {
+  vec_t *x = vnum(vec, "Vec.ges: not a Vector");
+  sw k = UNTAG(kv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] >= k; });
+  return (V)x;
+}
+
+/* zips: dst op= src, contiguously over the shared block partition */
+static vec_t *vzip2(V dv, V sv, const char *who) {
+  vec_t *d = vnum(dv, who), *s = vnum(sv, who);
+  if (d->len != s->len) fpr_cpanic("SIMD tier: zip length mismatch");
+  return s; /* caller pairs blocks itself */
+}
+#define VS_ZIP(dv, sv, WHO, EXPR)                                            \
+  do {                                                                       \
+    vec_t *_d = vnum(dv, WHO), *_s = vzip2(dv, sv, WHO);                     \
+    uw _r = _d->len;                                                         \
+    for (uw _j = 0; _r; _j++) {                                              \
+      uw _n = ((uw)VL_B0 << _j) < _r ? ((uw)VL_B0 << _j) : _r;               \
+      sw *p = (sw *)_d->cols[0]->blk[_j], *q = (sw *)_s->cols[0]->blk[_j];   \
+      for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
+      _r -= _n;                                                              \
+    }                                                                        \
+    vfree(_s);                                                               \
+    return (V)_d;                                                            \
+  } while (0)
+
+static V h_zipAdd(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipAdd", A + B); }
+static V h_zipMul(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipMul", A * B); }
+static V h_zipMin(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipMin", A < B ? A : B); }
+static V h_zipLt(V dv, V sv)  { VS_ZIP(dv, sv, "Vec.zipLt", A < B); }
+static V h_zipDiv(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipDiv", B == 0 ? 0 : A / B); }
+
+/* gather: idx[i] := src[idx[i]] (out of range -> 0); src threads back */
+static V h_gather(V iv, V sv) {
+  vec_t *x = vnum(iv, "Vec.gather: not a Vector");
+  vec_t *s = vnum(sv, "Vec.gather: not a Vector");
+  VS_BLOCKS(x, {
+    for (uw i = 0; i < n; i++) {
+      sw ix = p[i];
+      p[i] = (ix >= 0 && (uw)ix < s->len) ? *(sw *)vl_slot(s->cols[0], (uw)ix) : 0;
+    }
+  });
+  return mktup2((V)x, (V)s);
+}
+
+/* blend: dst[i] := mask[i] ? src[i] : dst[i]; mask and src consumed */
+static V h_blend(V mv, V sv, V dv) {
+  vec_t *m = vnum(mv, "Vec.blend: not a Vector");
+  vec_t *s = vnum(sv, "Vec.blend: not a Vector");
+  vec_t *d = vnum(dv, "Vec.blend: not a Vector");
+  if (m->len != d->len || s->len != d->len) fpr_cpanic("Vec.blend: length mismatch");
+  uw r = d->len;
+  for (uw j = 0; r; j++) {
+    uw n = ((uw)VL_B0 << j) < r ? ((uw)VL_B0 << j) : r;
+    sw *pd = (sw *)d->cols[0]->blk[j], *pm = (sw *)m->cols[0]->blk[j],
+       *ps = (sw *)s->cols[0]->blk[j];
+    for (uw i = 0; i < n; i++) pd[i] = pm[i] ? ps[i] : pd[i];
+    r -= n;
+  }
+  vfree(m); vfree(s);
+  return (V)d;
+}
+
+/* slice: fresh copy of [off, off+n) (0-based); original threads back */
+static V h_slice(V ov, V nv, V vec) {
+  vec_t *x = vnum(vec, "Vec.slice: not a Vector");
+  if (!ISINT(ov) || !ISINT(nv)) fpr_cpanic("Vec.slice: bounds not Ints");
+  sw off = UNTAG(ov), n = UNTAG(nv);
+  if (off < 0 || n < 0 || (uw)(off + n) > x->len) fpr_cpanic("Vec.slice: out of range");
+  V c = h_new((V)&fpr_unit);
+  for (sw i = 0; i < n; i++) c = h_push(TAG(*(sw *)vl_slot(x->cols[0], (uw)(off + i))), c);
+  return mktup2(c, (V)x);
+}
+
+/* burst: dst[off..] := src, contiguously; src consumed */
+static V h_burst(V ov, V sv, V dv) {
+  vec_t *s = vnum(sv, "Vec.burst: not a Vector");
+  vec_t *d = vnum(dv, "Vec.burst: not a Vector");
+  if (!ISINT(ov)) fpr_cpanic("Vec.burst: offset not an Int");
+  sw off = UNTAG(ov);
+  if (off < 0 || (uw)off + s->len > d->len) fpr_cpanic("Vec.burst: out of range");
+  VS_BLOCKS(s, {
+    uw base = vl_cap(j); /* first index of block j */
+    for (uw i = 0; i < n; i++) *(sw *)vl_slot(d->cols[0], (uw)off + base + i) = p[i];
+  });
+  vfree(s);
+  return (V)d;
+}
+
+/* ---- the DDA lanes: subtract, compare-equal, max, abs, scalar-eq ----
+ * Voxel traversal needs per-lane axis selection (which tMax is smallest),
+ * per-lane sign handling, and per-lane block-id tests; these are the
+ * remaining shapes for that (vsub.vv, vmseq.vv/.vx, vmax.vv). */
+
+static V h_zipSub(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipSub", A - B); }
+static V h_zipEq(V dv, V sv)  { VS_ZIP(dv, sv, "Vec.zipEq", A == B); }
+static V h_zipMax(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipMax", A > B ? A : B); }
+
+static V h_absv(V vec) {
+  vec_t *x = vnum(vec, "Vec.absv: not a Vector");
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < 0 ? -p[i] : p[i]; });
+  return (V)x;
+}
+
+static V h_eqS(V kv, V vec) {
+  vec_t *x = vnum(vec, "Vec.eqS: not a Vector");
+  sw k = UNTAG(kv);
+  VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] == k; });
+  return (V)x;
+}
+
+#pragma GCC pop_options
+
+FPR_FN(fpr_g_Vec_x2eiota, h_iota, 1);
+FPR_FN(fpr_g_Vec_x2edup, h_dup, 1);
+FPR_FN(fpr_g_Vec_x2eaxpb, h_axpb, 3);
+FPR_FN(fpr_g_Vec_x2esar, h_sar, 2);
+FPR_FN(fpr_g_Vec_x2eminS, h_minS, 2);
+FPR_FN(fpr_g_Vec_x2emaxS, h_maxS, 2);
+FPR_FN(fpr_g_Vec_x2eges, h_ges, 2);
+FPR_FN(fpr_g_Vec_x2ezipAdd, h_zipAdd, 2);
+FPR_FN(fpr_g_Vec_x2ezipMul, h_zipMul, 2);
+FPR_FN(fpr_g_Vec_x2ezipMin, h_zipMin, 2);
+FPR_FN(fpr_g_Vec_x2ezipLt, h_zipLt, 2);
+FPR_FN(fpr_g_Vec_x2ezipDiv, h_zipDiv, 2);
+FPR_FN(fpr_g_Vec_x2egather, h_gather, 2);
+FPR_FN(fpr_g_Vec_x2eblend, h_blend, 3);
+FPR_FN(fpr_g_Vec_x2eslice, h_slice, 3);
+FPR_FN(fpr_g_Vec_x2eburst, h_burst, 3);
+FPR_FN(fpr_g_Vec_x2ezipSub, h_zipSub, 2);
+FPR_FN(fpr_g_Vec_x2ezipEq, h_zipEq, 2);
+FPR_FN(fpr_g_Vec_x2ezipMax, h_zipMax, 2);
+FPR_FN(fpr_g_Vec_x2eabsv, h_absv, 1);
+FPR_FN(fpr_g_Vec_x2eeqS, h_eqS, 2);
