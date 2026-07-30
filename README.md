@@ -257,7 +257,7 @@ make posix-run POSIXARCH=a64 PROG=tests/actors.fpr
 When using build.sol, do e.g.
 
 ```
-# first, change the input of the thing first, then the output will be built e.g. sched and out is the binary file sched-a64
+# first, change the input of the thing first, then the output will be built e.g. sched and out is the binary file build/sched-a64
 sol tools/build.sol
 ./sched-a64
 ```

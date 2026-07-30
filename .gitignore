@@ -16,5 +16,4 @@ apps_data.c
 *.ppm
 *.qa
 qosp
-sched-a64
 *.s.units

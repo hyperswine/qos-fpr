@@ -1,4 +1,4 @@
-prog=tests/sched.fpr
+prog=programs/raster.fpr
 target=a64-mac
-out=sched-a64
+out=build/raster-a64
 harts=2
