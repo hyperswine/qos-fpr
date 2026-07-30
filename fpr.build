@@ -1,4 +1,4 @@
 prog=tests/sched.fpr
-target=a64
+target=a64-mac
 out=sched-a64
 harts=2
