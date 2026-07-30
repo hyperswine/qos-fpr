@@ -1,0 +1,4 @@
+prog=tests/sched.fpr
+target=a64
+out=sched-a64
+harts=2
