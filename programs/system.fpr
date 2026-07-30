@@ -62,8 +62,10 @@ getcV me lsr dat v =
 # evaluates to the hash string, so "{TimeFmt}/pad2" is a complete
 # mod-service URL; the app that asks for it never links the module's
 # name, only the (hash, fn) identity -- the FPRLive wire shape.
-TimeFmt = use "mods/timefmt#48c8226ba0480e57".
+TimeFmt = use "mods/timefmt#1b3d7ee34360f46f".
 SVCM    = use "mods/svc".
+Caps    = SVCM.Caps.
+Rpc     = SVCM.Rpc.
 Svc  = SVCM.Svc.
 IoV  = SVCM.IoV.
 IUnit = SVCM.IUnit.
@@ -71,9 +73,9 @@ IInt = SVCM.IInt.
 IStr = SVCM.IStr.
 IFn  = SVCM.IFn.
 IErr = SVCM.IErr.
-QLog    = use "mods/qlog#9c8b89e0dd258d0e".
+QLog    = use "mods/qlog#c8cada6d0773d4ca".
 MK      = use "mods/matrixkpd".
-TUI     = use "mods/tui#dd2f2f35bad3f6bb".
+TUI     = use "mods/tui#048dbec3cf39021e".
 
 # ---- small prelude ----------------------------------------------------------
 
@@ -262,7 +264,11 @@ pickEntry cur k v = case strEq k "entry" of True -> v | False -> cur.
 pickMode cur k v = case strEq k "loadMode" of True -> v | False -> cur.
 
 # a friendlier constructor name used above
-mkManifest id entry req opt mode = (id, entry, req, opt, mode).
+# declared constructors, NOT wide tuples: the ABI has Tup2/Tup3 only
+Man = Type (Man id entry req opt mode).
+Io4 = Type (Io4 con me clk st).
+
+mkManifest id entry req opt mode = Man id entry req opt mode.
 
 # parse a .qa string all the way to (id, entry, req, opt) | Err
 parseQa qa =
@@ -278,7 +284,7 @@ parseQa qa =
 # reader actor needed for IO; the app-facing capability set is separate.
 # Returns True (grant) / False (deny).
 askPerm io url mode =
-  (con, me, clk, st0) = io;
+  Io4 con me clk st0 = io;
   _ = puts con "  grant ";
   _ = puts con url;
   _ = puts con " (";
@@ -406,14 +412,14 @@ persistPerms1 io aid req reqG opt optG =
 #   caps = (con, me, clk, granted)
 # where granted is the list of (url,mode) the user allowed.
 
-mkCaps con me clk granted aid st = (con, me, clk, granted, aid, st).
+mkCaps con me clk granted aid st = Caps con me clk granted aid st.
 
-capCon caps = case caps of (c, _, _, _, _, _) -> c.
-capMe  caps = case caps of (_, m, _, _, _, _) -> m.
-capClk caps = case caps of (_, _, k, _, _, _) -> k.
-capGranted caps = case caps of (_, _, _, g, _, _) -> g.
-capId  caps = case caps of (_, _, _, _, a, _) -> a.
-capSt  caps = case caps of (_, _, _, _, _, s) -> s.
+capCon (Caps c _ _ _ _ _) = c.
+capMe  (Caps _ m _ _ _ _) = m.
+capClk (Caps _ _ k _ _ _) = k.
+capGranted (Caps _ _ _ g _ _) = g.
+capId  (Caps _ _ _ _ a _) = a.
+capSt  (Caps _ _ _ _ _ s) = s.
 
 # is (url,mode) in the granted set?  services check this so a bug that
 # calls an ungranted service faults loudly instead of silently working.
@@ -481,7 +487,7 @@ kvRes r = case r of IStr s -> Ok s | IErr e -> Err e | _ -> Err "storage: bad sh
 storeRpc caps tag url pay = storeRpc1 (capMe caps) (capSt caps) tag url pay.
 storeRpc1 me st tag url pay =
   case stHas st of
-    True -> send (stAct st) (me, tag, url, pay) >> receiveRes me
+    True -> send (stAct st) (Rpc me tag url pay) >> receiveRes me
   | False -> Err "no disk".
 
 # /pins/<n>: the raw GPIO tier as capability-gated URLs.  Direction,
@@ -568,7 +574,7 @@ launch io id =
     True -> putLn con (strcat "No such app: " id)
   | False -> launchParsed io id qa (parseQa qa).
 
-ioCon io = case io of (c, _, _, _) -> c.
+ioCon (Io4 c _ _ _) = c.
 
 launchParsed io id qa pr =
   con = ioCon io;
@@ -602,14 +608,14 @@ launchGranted io qa m stored reqG =
   caps = mkCaps con (ioMe io) (ioClk io) granted (manId m) (ioSt io);
   runEntry con qa m caps.
 
-manId m = case m of (a, _, _, _, _) -> a.
-manEntry m = case m of (_, e, _, _, _) -> e.
-manReq m = case m of (_, _, r, _, _) -> r.
-manOpt m = case m of (_, _, _, o, _) -> o.
-manMode m = case m of (_, _, _, _, md) -> md.
-ioMe io = case io of (_, me, _, _) -> me.
-ioClk io = case io of (_, _, k, _) -> k.
-ioSt  io = case io of (_, _, _, st) -> st.
+manId (Man a _ _ _ _) = a.
+manEntry (Man _ e _ _ _) = e.
+manReq (Man _ _ r _ _) = r.
+manOpt (Man _ _ _ o _) = o.
+manMode (Man _ _ _ _ md) = md.
+ioMe (Io4 _ me _ _) = me.
+ioClk (Io4 _ _ k _) = k.
+ioSt  (Io4 _ _ _ st) = st.
 stHas st = case st of (h, _) -> h.
 stAct st = case st of (_, a) -> a.
 
@@ -827,7 +833,7 @@ lQuit caps =
 # re-enter the permission flow. This is the recursive heart -- the launcher
 # is an app that uses System.qa's launch service on /services/apps.
 launchFromApp caps id =
-  io = (capCon caps, capMe caps, capClk caps, capSt caps);
+  io = Io4 (capCon caps) (capMe caps) (capClk caps) (capSt caps);
   launch io id.
 
 # ---- the launcher widget tree ----------------------------------------------
@@ -912,7 +918,7 @@ main =
   st = case blkPages dsk == 0 of
          True  -> (False, 0)
        | False -> (True, spawnStore dsk);
-  io = (con, me, clk, st);
+  io = Io4 con me clk st;
   _ = bootBeat io con;
   startup = configGet systemConfig "startup";
   _ = putLn con (strcat "config: startup = " startup);
@@ -934,7 +940,8 @@ spawnStore dsk =
   a = case Sys.harts Unit > 1 of
         True -> spawnOn 1 (QLog.actor dsk)
       | False -> spawn (QLog.actor dsk);
-  _ = Sys.bindStore a;
+  # the Rpc tid is content-addressed; hand C a prototype to read it from
+  _ = Sys.bindStore a (Rpc a 0 "" "");
   a.
 
 bootBeat io con =

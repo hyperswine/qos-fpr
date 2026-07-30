@@ -72,6 +72,142 @@ intFits t n = n >= -b && n < b where b = 2 ^ (tgtW t * 8 - 2)
 corePrims :: [String]
 corePrims = ["+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "strcat", "str", "error", "print", "String.len", "!"]
 
+
+--------------------------------------------------------------------------------
+-- G1: max IR instructions between fuel safepoints (docs/FUEL-RC-ABI.md)
+--------------------------------------------------------------------------------
+-- The fuel model bounds GENERATED-code time between safepoints, but a
+-- fuel unit is "one safepoint passed", not a duration — G1 in
+-- FUEL-RC-ABI.md. This closes it at the compiler: for every emitted
+-- function, walk the assembly as a CFG (a DAG — all loops are tail
+-- calls, so intra-function branches are forward) and compute the
+-- maximum number of instructions on any path between two consecutive
+-- safepoint events. Events: the entry fuel check, any later
+-- `call fpr_fuel_exhausted` (vector-kernel checks), and any call/jump
+-- into an fpr_fn_* (the callee's entry check fires next).
+--
+-- Counts are pre-lowering IR instructions: the per-target lowering
+-- multiplies by a small bounded factor (x64 fixups etc.), which
+-- belongs to the hw/target column of the WCET triple, not here.
+-- Calls to C (anything not fpr_fn_*/fpr_fuel_exhausted) do NOT reset
+-- and contribute their own per-(qos,hw) bound (G2); we count them.
+-- Cross-function chaining caveat: the tail of a caller after its last
+-- fpr call extends the callee's final segment; the per-function
+-- segmax composes with that via the printed exit-tail term.
+--
+-- Output: one `# wcet:` comment per function; FPRC_WCET=1 makes Main
+-- print the table and the program maximum.
+
+data WBlock = WBlock
+  { wRuns :: [Int], -- instruction runs split by reset events (n runs = n-1 resets inside)
+    wCCalls :: Int,
+    wSuccs :: [String], -- label successors (branch targets + fallthrough)
+    wExit :: Bool -- ends in ret (or falls off the end / tail-jumps out)
+  }
+
+wcetAnnotate :: String -> [String] -> [String]
+wcetAnnotate fname lns =
+  lns ++ ["# wcet: " ++ fname ++ " segmax=" ++ segS ++ " exittail=" ++ tailS ++ " ccalls=" ++ show ccTotal]
+  where
+    segS = maybe "UNBOUNDED" show segMax'
+    tailS = maybe "UNBOUNDED" show exitTail'
+    -- ---- tokenize into (label | instruction) stream ----
+    toks = concatMap tok lns
+    tok l =
+      let t = dropWhile (== ' ') l
+       in if null t || head t == '#'
+            then []
+            else
+              if last t == ':' && ' ' `notElem` t
+                then [Left (init t)]
+                else
+                  if head t == '.'
+                    then [] -- directive
+                    else [Right (words t)]
+    -- ---- split into blocks at labels ----
+    blocks :: [(String, [[String]])]
+    blocks = go "%entry" [] toks
+      where
+        go cur acc [] = [(cur, reverse acc)]
+        go cur acc (Left lbl : rest) = (cur, reverse acc) : go lbl [] rest
+        go cur acc (Right i : rest) = go cur (i : acc) rest
+    labels = [l | (l, _) <- blocks]
+    nextOf l = case dropWhile ((/= l) . fst) blocks of
+      (_ : (n, _) : _) -> Just (fst' n)
+      _ -> Nothing
+      where fst' = id
+    -- ---- classify one instruction ----
+    isReset ws = case ws of
+      ("call" : t : _) -> t == "fpr_fuel_exhausted" || isFprFn t
+      ("j" : t : _) -> isFprFn t
+      ("jmp" : t : _) -> isFprFn t
+      _ -> False
+    isFprFn t = take 7 t == "fpr_fn_"
+    isCCall ws = case ws of
+      ("call" : t : _) -> not (t == "fpr_fuel_exhausted" || isFprFn t)
+      _ -> False
+    isRet ws = ws == ["ret"]
+    isUncond ws = case ws of ("j" : t : _) -> not (isFprFn t); _ -> False
+    isCond ws = case ws of
+      (op : _) -> take 1 op == "b" && op /= "call"
+      _ -> False
+    target ws = last ws
+    -- ---- per-block summary ----
+    summarize :: String -> [[String]] -> WBlock
+    summarize lbl is = WBlock runs cc succs exits
+      where
+        cc = length (filter isCCall is)
+        runs = splitRuns 0 is
+        splitRuns n [] = [n]
+        splitRuns n (w : rest)
+          | isReset w = n : splitRuns 0 rest
+          | otherwise = splitRuns (n + 1) rest
+        condTargets = [target w | w <- is, isCond w]
+        lastI = if null is then [] else last is
+        fallsOff = null is || not (isUncond lastI || isRet lastI || endsInFprJump lastI)
+        endsInFprJump w = case w of ("j" : t : _) -> isFprFn t; ("jmp" : t : _) -> isFprFn t; _ -> False
+        uncondT = [target lastI | not (null is), isUncond lastI]
+        succs = filter (`elem` labels) (condTargets ++ uncondT ++ [n | fallsOff, Just n <- [nextOf lbl]])
+        exits = (not (null is) && (isRet lastI || endsInFprJump lastI)) || (fallsOff && nextOf lbl == Nothing)
+    bmap = [(l, summarize l is) | (l, is) <- blocks]
+    look l = lookup l bmap
+    -- ---- maxFrom: max insns from block start to first reset/exit ----
+    -- DAG walk with a visited path guard: a back-edge (shouldn't exist —
+    -- all loops are tail calls) yields Nothing = UNBOUNDED, loudly.
+    maxFrom :: [String] -> String -> Maybe Int
+    maxFrom path l
+      | l `elem` path = Nothing
+      | otherwise = case look l of
+          Nothing -> Just 0
+          Just b ->
+            let r1 = head (wRuns b)
+             in if length (wRuns b) > 1
+                  then Just r1 -- reset inside this block ends the segment
+                  else fmap (r1 +) (succMax (l : path) b)
+    succMax path b
+      | null (wSuccs b) = Just 0
+      | otherwise = maximumM [maxFrom path s | s <- wSuccs b]
+    maximumM ms = if any (== Nothing) ms then Nothing else Just (maximum [m | Just m <- ms])
+    -- segments STARTING at a reset inside a block: trailing run + onward
+    afterResets :: Maybe [Int]
+    afterResets = sequence
+      [ seg
+        | (l, b) <- bmap,
+          length (wRuns b) > 1,
+          let lastRun = last (wRuns b),
+          let inner = init (drop 1 (wRuns b)), -- complete segments inside the block
+          seg <-
+            map Just inner
+              ++ [fmap (lastRun +) (succMax [l] b)]
+      ]
+    segMax' = do
+      entry <- maxFrom [] (fst (head bmap))
+      rest <- afterResets
+      pure (maximum (entry : rest ++ [0]))
+    -- exit-tail: max insns from the LAST reset to a ret (for chaining)
+    exitTail' = segMax' -- conservative: the true tail <= segmax; refine later
+    ccTotal = sum [wCCalls b | (_, b) <- bmap]
+
 mangle :: String -> String
 mangle = concatMap enc
   where
@@ -326,7 +462,7 @@ compileFn prog name (params, body) = do
           "    call fpr_fuel_exhausted",
           fuelOk ++ ":"
         ]
-  pure $
+  pure $ wcetAnnotate name $
     [ "# " ++ name ++ " (arity " ++ show (length params) ++ ")" ]
       ++ [ "    .globl fpr_fn_" ++ m | S.member name exps ]
       ++ [ "fpr_fn_" ++ m ++ ":",

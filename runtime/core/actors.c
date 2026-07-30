@@ -84,6 +84,9 @@ typedef struct fpr_acb {
   uint32_t scan; /* round-robin cursor for fair receive (owner-only) */
   V entry;       /* PAP to run: body = entry(self); 0 for main */
   struct fpr_acb *next; /* run-queue link (owner hart only) */
+  struct fpr_acb *bl_next; /* backlog link (owner hart only) */
+  uw ready_at; /* g_adm stamp when it entered a backlog (aging tier) */
+  uw weight;   /* selection weight for the randomized default tier (>=1) */
   char *stack;
   uw id;
   uw hart;         /* pinned owner hart */
@@ -150,19 +153,151 @@ static void xpush(uw src, uw dst, acb_t *a) {
   __atomic_store_n(&x->rt, x->rt + 1, __ATOMIC_RELEASE);
 }
 
-/* ---- per-hart run queue (owner-only, no atomics) ---------------------- */
-static void enq(fpr_hart_t *h, acb_t *a) {
-  a->next = 0;
-  if (h->rq_tail) h->rq_tail->next = a;
-  else h->rq_head = a;
-  h->rq_tail = a;
+/* ---- the two-tier bounded-latency scheduler (docs/SCHED-MODEL.md) -----
+ *
+ * READY actors land in the per-hart BACKLOG (owner-only list) stamped
+ * with the machine-wide admission counter g_adm. Admission into the
+ * (bounded, FIFO) run queue picks per slot:
+ *
+ *   AGED TIER (deterministic): if any backlog actor has waited more
+ *   than FPR_TAU admissions, the OLDEST such actor is admitted — no
+ *   randomness, oldest-first. This tier alone carries the WCET bound:
+ *   Wait(a) <= tau + (#earlier-stamped actors) * T_slot.
+ *
+ *   DEFAULT TIER (weighted random): otherwise a weighted reservoir
+ *   pick over acb->weight, driven by a per-hart deterministic LCG.
+ *   Randomness here decides only WHO runs among the un-aged — it
+ *   shapes expected fairness and touches no worst case.
+ *
+ * Work stealing is DETERMINISTIC: a backlog past DONATE_HI donates its
+ * oldest entries (stamps preserved) into a global FIFO under one lock
+ * (same discipline as arc_lock); an idle hart pops the head — oldest
+ * donated first, no victim scanning, no randomness. */
+
+#ifndef FPR_TAU
+#define FPR_TAU 64 /* aging threshold, in machine-wide admissions */
+#endif
+#ifndef RQ_CAP
+#define RQ_CAP 4 /* run-queue admissions per refill batch */
+#endif
+#define DONATE_HI 4 /* backlog length that triggers donation */
+#define SCAP 64     /* global steal FIFO capacity */
+
+static uw g_tau = FPR_TAU;
+static volatile uw g_adm;      /* machine-wide admission counter (the clock) */
+static volatile uw g_max_wait; /* max observed backlog wait, in admissions */
+static volatile uw g_steals;
+
+static fpr_lock_t steal_lock;
+static acb_t *steal_ring[SCAP];
+static uw steal_h, steal_t;
+
+static void backlog_add(fpr_hart_t *h, acb_t *a);
+
+static void donate(fpr_hart_t *h) {
+  /* pop our OLDEST (head) and publish it; full ring = keep it local */
+  acb_t *a = h->bl_head;
+  if (!a) return;
+  fpr_lock(&steal_lock);
+  if (steal_t - steal_h < SCAP) {
+    h->bl_head = a->bl_next;
+    if (!h->bl_head) h->bl_tail = 0;
+    h->bl_len--;
+    steal_ring[steal_t % SCAP] = a;
+    steal_t++;
+  }
+  fpr_unlock(&steal_lock);
 }
 
+static acb_t *steal(fpr_hart_t *h) {
+  acb_t *a = 0;
+  fpr_lock(&steal_lock);
+  if (steal_h != steal_t) {
+    a = steal_ring[steal_h % SCAP];
+    steal_h++;
+  }
+  fpr_unlock(&steal_lock);
+  if (a) {
+    a->hart = h->id; /* migrates; stamp is preserved (global clock) */
+    g_steals++;
+  }
+  return a;
+}
+
+static void backlog_add(fpr_hart_t *h, acb_t *a) {
+  a->bl_next = 0;
+  a->ready_at = g_adm; /* stamped in admission time */
+  if (!a->weight) a->weight = 1;
+  if (h->bl_tail) h->bl_tail->bl_next = a;
+  else h->bl_head = a;
+  h->bl_tail = a;
+  h->bl_len++;
+  if (h->bl_len > DONATE_HI) donate(h);
+}
+
+/* one O(backlog) scan: unlink DEAD/BLOCKED, find the oldest aged actor,
+ * and run the weighted reservoir over the rest in the same pass */
+static acb_t *select_backlog(fpr_hart_t *h) {
+  acb_t *prev = 0, *a = h->bl_head;
+  acb_t *aged = 0, *aged_prev = 0;
+  acb_t *pick = 0, *pick_prev = 0;
+  uw total = 0;
+  while (a) {
+    acb_t *nx = a->bl_next;
+    uint32_t st = __atomic_load_n(&a->var, __ATOMIC_ACQUIRE);
+    if (st != ST_READY) {
+      /* unlink; DEAD reaps, BLOCKED re-ships on its real wake */
+      if (prev) prev->bl_next = nx; else h->bl_head = nx;
+      if (h->bl_tail == a) h->bl_tail = prev;
+      h->bl_len--;
+      if (st == ST_DEAD) reap(a);
+      a = nx;
+      continue;
+    }
+    if (g_adm - a->ready_at > g_tau) {
+      if (!aged || a->ready_at < aged->ready_at) { aged = a; aged_prev = prev; }
+    }
+    total += a->weight;
+    h->lcg = h->lcg * 1103515245u + 12345u;
+    if ((h->lcg >> 16) % total < a->weight) { pick = a; pick_prev = prev; }
+    prev = a;
+    a = nx;
+  }
+  acb_t *sel = aged ? aged : pick;
+  acb_t *sp = aged ? aged_prev : pick_prev;
+  if (sel) {
+    if (sp) sp->bl_next = sel->bl_next; else h->bl_head = sel->bl_next;
+    if (h->bl_tail == sel) h->bl_tail = sp;
+    h->bl_len--;
+  }
+  return sel;
+}
+
+/* admit up to RQ_CAP backlog actors into the FIFO run queue */
+static void refill(fpr_hart_t *h) {
+  while (h->rq_len < RQ_CAP) {
+    acb_t *a = select_backlog(h);
+    if (!a) return;
+    uw adm = __atomic_add_fetch(&g_adm, 1, __ATOMIC_RELAXED);
+    uw wait = adm - a->ready_at;
+    if (wait > g_max_wait) g_max_wait = wait;
+    a->next = 0;
+    if (h->rq_tail) h->rq_tail->next = a;
+    else h->rq_head = a;
+    h->rq_tail = a;
+    h->rq_len++;
+  }
+}
+
+static void enq(fpr_hart_t *h, acb_t *a) { backlog_add(h, a); }
+
 static acb_t *deq(fpr_hart_t *h) {
+  refill(h);
   while (h->rq_head) {
     acb_t *a = h->rq_head;
     h->rq_head = a->next;
     if (!h->rq_head) h->rq_tail = 0;
+    h->rq_len--;
     uint32_t st = __atomic_load_n(&a->var, __ATOMIC_ACQUIRE);
     /* skip stale entries: DEAD forever; BLOCKED re-ships on real wake */
     if (st == ST_DEAD) reap(a); /* slab refactor: reclaim off its stack */
@@ -222,6 +357,7 @@ static V fpr_process_result;
 
 static void hart_loop(fpr_hart_t *h) {
   uw last_act = 0, stable = 0;
+  h->lcg = h->id * 2654435761u + 12345u; /* decorrelated, deterministic */
   hal_wfi_enable(); /* mie on, mstatus.MIE off: wfi wakes, never traps */
   for (;;) {
     if (fpr_process_done) return; /* process mode: clean C return to the loader */
@@ -250,6 +386,11 @@ static void hart_loop(fpr_hart_t *h) {
        * on the hart-loop stack now, so ITS stack is safe to reclaim */
       if (__atomic_load_n(&n->var, __ATOMIC_ACQUIRE) == ST_DEAD) reap(n);
       continue;
+    }
+    /* nothing local: deterministic steal — oldest donated work first */
+    {
+      acb_t *s = steal(h);
+      if (s) { backlog_add(h, s); continue; }
     }
     h->idle = 1;
     if (h->id == 0) {
@@ -643,6 +784,16 @@ static V a_myself(V dummy) {
 static V g_hart_id(V d) { (void)d; return TAG((sw)fpr_hart()->id); }
 static V g_harts(V d) { (void)d; return TAG(FPR_NHARTS); }
 
+/* scheduler introspection + tuning (docs/SCHED-MODEL.md) */
+static V g_sched_tau(V d) { (void)d; return TAG((sw)g_tau); }
+static V g_sched_set_tau(V n) { g_tau = (uw)UNTAG(n); return (V)&fpr_unit; }
+static V g_sched_max_wait(V d) { (void)d; return TAG((sw)g_max_wait); }
+static V g_sched_steals(V d) { (void)d; return TAG((sw)g_steals); }
+static V g_sched_set_weight(V av, V w) {
+  ((acb_t *)av)->weight = (uw)UNTAG(w) ? (uw)UNTAG(w) : 1;
+  return (V)&fpr_unit;
+}
+
 /* fuel introspection, for /proc */
 static V g_fuel_quantum(V d) { (void)d; return TAG(FUEL_QUANTUM); }
 static V g_fuel_preempts(V d) {
@@ -663,6 +814,11 @@ FPR_FN(fpr_g_yield, a_yield, 1);
 FPR_FN(fpr_g_kill, a_kill, 1);
 FPR_FN(fpr_g_myself, a_myself, 1);
 FPR_FN(fpr_g_hartId, g_hart_id, 1);
+FPR_FN(fpr_g_schedTau, g_sched_tau, 1);
+FPR_FN(fpr_g_schedSetTau, g_sched_set_tau, 1);
+FPR_FN(fpr_g_schedMaxWait, g_sched_max_wait, 1);
+FPR_FN(fpr_g_schedSteals, g_sched_steals, 1);
+FPR_FN(fpr_g_schedSetWeight, g_sched_set_weight, 2);
 FPR_FN(fpr_g_harts, g_harts, 1);
 FPR_FN(fpr_g_fuelQuantum, g_fuel_quantum, 1);
 FPR_FN(fpr_g_fuelPreempts, g_fuel_preempts, 1);

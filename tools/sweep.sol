@@ -24,6 +24,7 @@ Case = Type (Case name expects wantFail).
 
 cases =
   [ Case "actors" ["actor demo done"] False,
+    Case "patguard" ["ok 200000 guarded fallthroughs, O(1) stack", "patguard done"] False,
     Case "ring" ["arc live after 100k promote/drop cycles: 4"] False,
     Case "smp" ["smp smoke done"] False,
     Case "smpstress" ["20000 cross-hart blocking round trips survived"] False,

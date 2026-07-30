@@ -87,14 +87,24 @@ pnGo s i n acc = case i > n of
     True -> acc
   | False -> pnGo s (i + 1) n (acc * 10 + (charAt s i - 48)).
 
-# ---- the caps tuple (System.qa's ABI: (con, me, clk, granted, aid, st)) -----
+# ---- the caps value (System.qa's ABI) ---------------------------------------
+# A declared constructor, NOT a tuple: the ABI has Tup2/Tup3 only (a wider
+# tuple used to pack into a Tup2 header and silently truncate under any
+# header-arity-driven copy). Tids are content-addressed by (declaring
+# unit, type name), so every importer of THIS module — System.qa and apps
+# compiled separately — agrees on the tag.
 
-capCon caps = case caps of (c, _, _, _, _, _) -> c.
-capMe  caps = case caps of (_, m, _, _, _, _) -> m.
-capClk caps = case caps of (_, _, k, _, _, _) -> k.
-capGranted caps = case caps of (_, _, _, g, _, _) -> g.
-capId  caps = case caps of (_, _, _, _, a, _) -> a.
-capSt  caps = case caps of (_, _, _, _, _, s) -> s.
+Caps = Type (Caps con me clk granted aid st).
+
+# the RPC envelope every service actor speaks: (replyTo, tag, url, payload)
+Rpc = Type (Rpc me tag url pay).
+
+capCon (Caps c _ _ _ _ _) = c.
+capMe  (Caps _ m _ _ _ _) = m.
+capClk (Caps _ _ k _ _ _) = k.
+capGranted (Caps _ _ _ g _ _) = g.
+capId  (Caps _ _ _ _ a _) = a.
+capSt  (Caps _ _ _ _ _ s) = s.
 stHas st = case st of (h, _) -> h.
 stAct st = case st of (_, a) -> a.
 
@@ -198,7 +208,7 @@ kvUrl caps = strcat "apps/" (strcat (capId caps) (strcat "/" (strcat (capId caps
 storeRpc caps tag url pay =
   st = capSt caps;
   case stHas st of
-    True -> send (stAct st) (capMe caps, tag, url, pay) >> receiveRes (capMe caps)
+    True -> send (stAct st) (Rpc (capMe caps) tag url pay) >> receiveRes (capMe caps)
   | False -> Err "no disk".
 
 # "/pins/<n>" and "/pins/<n>/mode"

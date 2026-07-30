@@ -110,6 +110,11 @@ typedef struct {
   uw fuel_preempts;
   char rbuf[FPR_RBUF_SZ];         /* per-hart render buffer (str/print) */
   int rpos;
+  /* two-tier bounded-latency scheduler (docs/SCHED-MODEL.md) */
+  struct fpr_acb *bl_head, *bl_tail; /* ready backlog (owner-only) */
+  uw bl_len;
+  uw rq_len;
+  uw lcg; /* per-hart deterministic PRNG state (weighted default tier) */
 } fpr_hart_t;
 
 extern fpr_hart_t fpr_harts[FPR_NHARTS];

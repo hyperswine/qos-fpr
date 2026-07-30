@@ -66,8 +66,21 @@ data SPat
   | PSig Name Name -- (s : Functor) — a param constrained by a named sig
   deriving (Show)
 
+-- one component of a clause guard: `| e1, p <- e2, e3 = body`
+data SGuard
+  = GBool SExpr -- boolean condition
+  | GPat SPat SExpr -- pattern-match binding `pat <- expr`
+  deriving (Show)
+
+guardBools :: [SGuard] -> [SExpr]
+guardBools gs = [e | GBool e <- gs]
+
+mapGuardE :: (SExpr -> SExpr) -> SGuard -> SGuard
+mapGuardE f' (GBool e) = GBool (f' e)
+mapGuardE f' (GPat p e) = GPat p (f' e)
+
 data STop
-  = TBind Name [SPat] (Maybe SExpr) SExpr
+  = TBind Name [SPat] [SGuard] SExpr
   | TType Name Bool [Name] [(Name, [Ty])]
   | TShape Name [(Name, Ty)]
   | TSig Name ([Ty], Ty) [Maybe (Name, SExpr)] -- per-PARAM precondition: (n : Int | n > 0)
@@ -566,11 +579,17 @@ binding :: P STop
 binding = do
   n <- pName
   pats <- many patAtom
-  g <- optional (pipeSep *> expr)
+  g <- option [] (pipeSep *> guardItem `sepBy1` symbol ",")
   eqSign
   body <- block
   dotTerm
   pure (TBind n pats g body)
+
+-- `pat <- expr` (pattern-match binding) or a boolean condition
+guardItem :: P SGuard
+guardItem =
+  try (GPat <$> pattern' <* symbol "<-" <*> expr)
+    <|> (GBool <$> expr)
 
 block :: P SExpr
 block = do
@@ -661,8 +680,11 @@ collectShapes tops = M.fromList [(fs, shapeIdFor fs) | fs <- allShapes]
     topShapes (TShape _ fs) = [sort (map fst fs)]
     topShapes (TBind _ ps g b) =
       concatMap patShapes ps
-        ++ maybe [] exprShapes g
+        ++ concatMap gShapes g
         ++ exprShapes b
+      where
+        gShapes (GBool e) = exprShapes e
+        gShapes (GPat p e) = patShapes p ++ exprShapes e
     topShapes _ = []
     patShapes = \case
       PCon _ ps -> concatMap patShapes ps
@@ -885,7 +907,7 @@ compileTop tops = do
        in (n, (ps, g, b) : [(ps', g', b') | TBind _ ps' g' b' <- same]) : groupClauses others
     groupClauses (_ : rest) = groupClauses rest
 
-compileGroup :: (Name, [([SPat], Maybe SExpr, SExpr)]) -> D (Name, ([Name], Core))
+compileGroup :: (Name, [([SPat], [SGuard], SExpr)]) -> D (Name, ([Name], Core))
 compileGroup (n, clauses@((ps0, _, _) : _)) = do
   let arity = length ps0
   args <- mapM (\i -> fresh ("a" ++ show i)) [1 .. arity]
@@ -894,12 +916,46 @@ compileGroup (n, clauses@((ps0, _, _) : _)) = do
   where
     goClauses _ [] = pure (CErr ("no matching clause for " ++ n))
     goClauses args ((ps, g, b) : rest) = do
-      nxt <- goClauses args rest
+      nxt0 <- goClauses args rest
+      -- JOIN POINT: matchPat inlines the fail continuation at EVERY
+      -- test site, so a clause with t tests duplicates the whole
+      -- remaining-clauses tree t times — exponential in the worst
+      -- case. When a clause can fail from more than one place, bind
+      -- the rest ONCE as a lifted top-level function and fail into a
+      -- saturated call to it: in tail position that is a TCO'd jump
+      -- (zero stack), it passes the function-entry fuel safepoint
+      -- (uniform accounting: one unit per clause fallen through), and
+      -- code size goes linear in the number of clauses.
+      nxt <- case failSites ps + length g of
+        t | t > 1, not (trivial nxt0) -> do
+          jn <- fresh (n ++ "_fb")
+          modify (\s -> s {dLifted = (jn, args, nxt0) : dLifted s})
+          pure (foldl' CApp (CVar jn) (map CVar args))
+        _ -> pure nxt0
       b' <- dExpr b
-      inner <- case g of
-        Nothing -> pure b'
-        Just ge -> do ge' <- dExpr ge; pure (CIf ge' b' nxt)
+      inner <- foldGuards g b' nxt
       matchMany (zip (map CVar args) ps) inner nxt
+    -- guards run left to right; a pattern guard binds its pattern for
+    -- the guards to its right and for the body, and falls through to
+    -- the next clause on a non-match, exactly like a pattern test
+    foldGuards [] ok _ = pure ok
+    foldGuards (gd : rest) ok nxt = do
+      inner <- foldGuards rest ok nxt
+      case gd of
+        GBool ge -> do ge' <- dExpr ge; pure (CIf ge' inner nxt)
+        GPat p ge -> do
+          ge' <- dExpr ge
+          sv <- fresh "gp"
+          m <- matchPat (CVar sv) p inner nxt
+          pure (CLet sv ge' m)
+    failSites = sum . map tests
+    tests = \case
+      PWild -> 0; PVar _ -> 0; PRec _ -> 0; PSig _ _ -> 0
+      PInt _ -> 1; PStr _ -> 1
+      PCon _ ps -> 1 + sum (map tests ps)
+      PTup ps -> 1 + sum (map tests ps)
+    trivial (CErr _) = True
+    trivial _ = False
     matchMany [] ok _ = pure ok
     matchMany ((s, p) : rest) ok fail' = do
       inner <- matchMany rest ok fail'
@@ -912,9 +968,14 @@ compileGroup (n, []) = error ("empty clause group: " ++ n)
 
 liftProg :: Prog -> D Prog
 liftProg prog = do
-  let globalNames = M.keysSet prog
+  -- clause-fallthrough JOIN functions were registered in dLifted during
+  -- compileTop; they are globals-to-be, so lifting must not treat a
+  -- reference to one as a lambda capture
+  joins0 <- gets (map (\(jn, _, _) -> jn) . dLifted)
+  let globalNames = M.keysSet prog `S.union` S.fromList joins0
   lifted <- M.traverseWithKey (\_ (ps, b) -> (ps,) <$> liftC globalNames ps b) prog
   extra <- gets dLifted
+  modify (\s -> s {dLifted = []})
   extra' <-
     mapM
       ( \(n, ps, b) -> do
@@ -931,7 +992,7 @@ liftProg prog = do
             body' <- go (ps ++ env) body
             let fvs =
                   nub
-                    [ v | v <- freeVars body', v `notElem` ps, not (v `M.member` prog), v `notElem` primNames
+                    [ v | v <- freeVars body', v `notElem` ps, not (S.member v globals), v `notElem` primNames
                     ]
                 capture = filter (`elem` (env :: [Name])) fvs
             nm <- fresh "lifted"
@@ -959,7 +1020,12 @@ freeVars = \case
 
 liftFix :: Prog -> D Prog
 liftFix p = do
-  modify (\s -> s {dLifted = []})
+  -- NOTE dLifted is NOT cleared here: compileTop registers clause-
+  -- fallthrough join functions in it, and clearing before the first
+  -- liftProg round would silently drop them (their call sites then
+  -- resolve as fpr_g_ closure loads of a symbol that never exists).
+  -- liftProg consumes-and-clears instead, which keeps the fixpoint
+  -- rounds from re-adding old entries.
   p' <- liftProg p
   if any (hasLam . snd . snd) (M.toList p') then liftFix p' else pure p'
   where
@@ -1193,10 +1259,20 @@ lcheck li tops = concatMap checkGroup groups
           binds = concat (zipWith (bindPat li) pats paramShapes)
           env = M.fromList binds
           linear = [v | (v, s) <- binds, isLin s]
-          (ge, gc) = case g of
-            Nothing -> ([], M.empty)
-            Just gx -> let (e', c', _) = lin' env gx in (e', fromMaybe M.empty c')
-          (be, bc, _) = lin' env body
+          (genv, ge, gc) =
+            foldl'
+              ( \(en, errs, cnt) gd -> case gd of
+                  GBool gx ->
+                    let (e', c', _) = lin' en gx
+                     in (en, errs ++ e', M.unionWith (+) cnt (fromMaybe M.empty c'))
+                  GPat p gx ->
+                    let (e', c', _) = lin' en gx
+                        en' = M.union (M.fromList (bindPat li p LU)) en
+                     in (en', errs ++ e', M.unionWith (+) cnt (fromMaybe M.empty c'))
+              )
+              (env, [], M.empty)
+              g
+          (be, bc, _) = lin' genv body
           guardErr = ["in " ++ n ++ ": guard uses linear variable(s) " ++ show (M.keys (M.filter (> 0) gc)) ++ " (guards may re-evaluate on fallthrough)" | not (M.null (M.filter (> 0) gc))]
           useErrs = case bc of
             Nothing -> []

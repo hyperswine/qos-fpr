@@ -413,6 +413,10 @@ builtinEnv =
       ("drop", scheme [0] (TFn (sv 0) tUnit)),
       ("kill", mono (TFn tInt tUnit)),
       ("hartId", mono (TFn tInt tInt)),
+      ("schedTau", mono (TFn tInt tInt)),
+      ("schedSetTau", mono (TFn tInt tUnit)),
+      ("schedMaxWait", mono (TFn tInt tInt)),
+      ("schedSteals", mono (TFn tInt tInt)),
       ("harts", mono (TFn tInt tInt)),
       ("fuelPreempts", mono (TFn tInt tInt)),
       ("fuelQuantum", mono (TFn tInt tInt)),
@@ -831,7 +835,11 @@ inferTops sigs structs tops =
             ]
           refs (ps, g, b) =
             let bound = S.fromList (concatMap patVars ps)
-             in topRefs2 topSet bound b ++ maybe [] (topRefs2 topSet bound) g
+                gbound = S.union bound (S.fromList (concatMap gPatVars g))
+                gPatVars (GPat p _) = patVars p
+                gPatVars (GBool _) = []
+                gExprs = [e | gd <- g, e <- case gd of GBool e' -> [e']; GPat _ e' -> [e']]
+             in topRefs2 topSet gbound b ++ concatMap (topRefs2 topSet bound) gExprs
           sccs = stronglyConnComp nodes
       (env, rwBinds) <-
         foldM
@@ -854,7 +862,7 @@ inferTops sigs structs tops =
       let rebuild bnds t = case t of
             TBind n _ _ _ -> case M.lookup n bnds of
               Just ((ps, g, b) : more) ->
-                (M.insert n more bnds, TBind n ps (fmap apE g) (apE b))
+                (M.insert n more bnds, TBind n ps (map (mapGuardE apE) g) (apE b))
               _ -> (bnds, t)
             _ -> (bnds, t)
           (_, tops') = foldl' (\(st', acc) t -> let (st2, t') = rebuild st' t in (st2, acc ++ [t'])) (fmap reverse rwMap, []) tops
@@ -862,7 +870,7 @@ inferTops sigs structs tops =
     flat (AcyclicSCC n) = [n]
     flat (CyclicSCC ns) = ns
 
-    inferSCC :: TEnv -> TEnv -> [Name] -> I (TEnv, [(Name, [SPat], Maybe SExpr, SExpr)])
+    inferSCC :: TEnv -> TEnv -> [Name] -> I (TEnv, [(Name, [SPat], [SGuard], SExpr)])
     inferSCC cons env ns = do
       -- monomorphic recursion within the SCC
       mvs <- mapM (const freshT) ns
@@ -873,11 +881,24 @@ inferTops sigs structs tops =
           -- params: PSig gets its sig's record type; others infer
           (ptys, penvs) <- unzip <$> mapM (inferParam cons) ps
           let ctx = ICtx (M.union (M.unions penvs) recEnv) cons sigs
-          g' <- forM g $ \ge -> do
-            (tg, ge') <- inferE ctx ge
-            unify ("guard of " ++ n) tg tBool
-            pure ge'
-          (tb, b') <- inferE ctx b
+          -- guards run left to right; a pattern guard's binds are in
+          -- scope for the guards to its right and for the body
+          (ctx2, g') <-
+            foldM
+              ( \(cx, acc) gd -> case gd of
+                  GBool ge -> do
+                    (tg, ge') <- inferE cx ge
+                    unify ("guard of " ++ n) tg tBool
+                    pure (cx, acc ++ [GBool ge'])
+                  GPat p ge -> do
+                    (tg, ge') <- inferE cx ge
+                    (tp, benv) <- inferPat cons p
+                    unify ("pattern guard of " ++ n) tg tp
+                    pure (extend benv cx, acc ++ [GPat p ge'])
+              )
+              (ctx, [])
+              g
+          (tb, b') <- inferE ctx2 b
           declaredOrRec n mv (foldr TFn tb ptys)
           -- prefix errors this clause produced with the bind name
           modify $ \st ->

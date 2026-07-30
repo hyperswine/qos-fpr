@@ -27,7 +27,7 @@ main =
          :: ("/services/storage", "write")
          :: ("/nope", "read")
          :: Nil;
-  caps = (con, me, clk, granted, "svctest", (False, 0));
+  caps = SVCM.Caps con me clk granted "svctest" (False, 0);
 
   # display: the write verb (and the /line sub-route)
   _ = Svc.write caps "/services/display" (IStr "svc: display route ");

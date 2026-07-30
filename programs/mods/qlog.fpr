@@ -29,6 +29,13 @@
 # ============================================================================
 
 # ---- small self-contained helpers (module units see only the prelude) ------
+SVC = use "svc".
+Rpc = SVC.Rpc.
+
+# the parsed record header (tag, npages, paylen, url) — a declared
+# constructor: the ABI has Tup2/Tup3 only
+Rec = Type (Rec tag np pl url).
+
 minI a b = case a < b of True -> a | False -> b.
 ceilDiv a b = (a + b - 1) / b.
 
@@ -67,7 +74,7 @@ parseHdr2 s n i1 tag =
   (npw, i2) = takeWord s i1 n;
   (plw, i3) = takeWord s i2 n;
   (url, i4) = takeWord s i3 n;
-  Ok (tag, parseNum npw, parseNum plw, url).
+  Ok (Rec tag (parseNum npw) (parseNum plw) url).
 strEq a b = case strlen a == strlen b of True -> seGo a b 1 (strlen a) | False -> False.
 seGo a b i n = case i > n of True -> True | False -> seCh a b i n.
 seCh a b i n = case charAt a i == charAt b i of True -> seGo a b (i + 1) n | False -> False.
@@ -133,7 +140,7 @@ rlStep dev head url p best h =
     Err _ -> best
   | Ok rec -> rlHit dev head url p best rec.
 rlHit dev head url p best rec =
-  (tag, np, pl, u) = rec;
+  Rec tag np pl u = rec;
   case strEq u url of
     True -> rlTake dev head url p pl (strEq tag "QDEL") np
   | False -> rlGo dev head url (p + 1 + np) best.
@@ -154,7 +161,7 @@ raStep dev head url p acc h =
     Err _ -> acc
   | Ok rec -> raHit dev head url p acc rec.
 raHit dev head url p acc rec =
-  (tag, np, pl, u) = rec;
+  Rec tag np pl u = rec;
   case strEq u url of
     True -> raTake dev head url (p + 1 + np) acc (strEq tag "QDEL") (readPayload dev p pl)
   | False -> raGo dev head url (p + 1 + np) acc.
@@ -174,7 +181,7 @@ crStep dev head url p n h =
     Err _ -> n
   | Ok rec -> crHit dev head url p n rec.
 crHit dev head url p n rec =
-  (tag, np, pl, u) = rec;
+  Rec tag np pl u = rec;
   case strEq u url of
     True -> crTake dev head url p n (strEq tag "QDEL") np
   | False -> crGo dev head url (p + 1 + np) n.
@@ -199,7 +206,7 @@ siStep dev head p idx h =
     Err _ -> idx
   | Ok rec -> siHit dev head p idx rec.
 siHit dev head p idx rec =
-  (tag, np, pl, u) = rec;
+  Rec tag np pl u = rec;
   case strEq tag "QDEL" of
     True -> siGo dev head (p + 1 + np) (dropUrl idx u)
   | False -> siGo dev head (p + 1 + np) (append idx ((u, p, pl) :: Nil)).
@@ -246,7 +253,7 @@ actor dev me =
   aLoop dev me head (scanIdx dev head).
 aLoop dev me head idx =
   m = receive me;
-  case m of (replyTo, tag, url, pay) -> aServe dev me head idx replyTo tag url pay.
+  case m of Rpc replyTo tag url pay -> aServe dev me head idx replyTo tag url pay.
 aServe dev me head idx replyTo tag url pay =
   case tag of
     1 -> send replyTo (idxLatest dev idx url)          >> aLoop dev me head idx

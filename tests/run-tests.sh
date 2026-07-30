@@ -48,6 +48,8 @@ orig5|||ok 100;:done
 typed|||ops: 42 fprisc;generic: total Int=10 total Str=abc;sstring: len=2 at1=104 str=hi;vlist: fold=60
 precond|||amount: 80 100 75 75 0 7;avg: 30 0  precond done
 vsimd|||axpb/sar: [2, 3, 5, 6, 8, 9];gather:   [40, 10, 20, 0];blit:     [7, 7, 50, 7, 52, 7, 7, 7];vsimd done
+patguard|||patguard done
+sched|||sched done
 !precondviol|||precondition violated: double requires (n > 0), got n=-3 (in poke)
 '
 

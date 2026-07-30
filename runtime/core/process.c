@@ -38,22 +38,38 @@ void fpr_proc_arena_init(void) {
 static V g_store_actor;   /* Sys.bindStore, at boot (0 = diskless) */
 static str_t *g_app_id;   /* Sys.bindApp, per launch */
 
-static V g_sys_bind_store(V a) { g_store_actor = a; return (V)&fpr_unit; }
+/* The RPC envelope is a DECLARED FPR constructor now (svc.fpr's Rpc),
+ * and constructor tids are content-addressed by (unit hash, type name) —
+ * C cannot know the tag statically. So bindStore takes a PROTOTYPE Rpc
+ * value alongside the actor: we read tid/var off its header once at
+ * boot and mint real Rpc values from then on. The tid crosses the ABI
+ * as data, which is the only place it can honestly live. */
+static uw g_rpc_tid; /* from the bind-time prototype */
+static uw g_rpc_var;
+static V g_sys_bind_store(V a, V rpc_proto) {
+  g_store_actor = a;
+  hdr_t *p = (hdr_t *)rpc_proto;
+  g_rpc_tid = p->tid;
+  g_rpc_var = p->var;
+  return (V)&fpr_unit;
+}
 static V g_sys_bind_app(V idv) {
   if (ISINT(idv) || ((hdr_t *)idv)->tid != T_STR) fpr_cpanic("Sys.bindApp: id must be a String");
   g_app_id = (str_t *)idv;
   return (V)&fpr_unit;
 }
-FPR_FN(fpr_g_Sys_x2ebindStore, g_sys_bind_store, 1);
+FPR_FN(fpr_g_Sys_x2ebindStore, g_sys_bind_store, 2);
 FPR_FN(fpr_g_Sys_x2ebindApp, g_sys_bind_app, 1);
 
-/* N-tuples (N >= 4) are tid 4 (Tup2's tid) with N fields -- the
- * positional-pattern convention the whole system uses (caps is a
- * 6-tuple the same way). */
-static V mktup4v(V a, V b, V c, V d) {
+/* mint an Rpc constructor value (4 fields) with the bind-time tag.
+ * The old scheme here — a Tup2 header carrying 4 slots — was exactly
+ * the silent-corruption ABI the compiler now rejects at compile time;
+ * this was its last C-side survivor. */
+static V mkrpc(V a, V b, V c, V d) {
+  if (!g_rpc_tid) fpr_cpanic("store call before bindStore prototype");
   hdr_t *t = (hdr_t *)fpr_alloc(8 + 4 * sizeof(uw));
-  t->tid = T_TUP2;
-  t->var = 0;
+  t->tid = g_rpc_tid;
+  t->var = g_rpc_var;
   V *f = (V *)((char *)t + 8);
   f[0] = a; f[1] = b; f[2] = c; f[3] = d;
   return (V)t;
@@ -76,7 +92,7 @@ sw qos_store_call(uw tag, const char *pay, uw plen, char *out, uw outcap) {
   V urlv = (V)fpr_mkstr((const uint8_t *)url, n);
   V payv = (V)fpr_mkstr((const uint8_t *)pay, plen);
   V mb = (V)fpr_syscall_mailbox();
-  V msg = mktup4v(mb, TAG((sw)tag), urlv, payv);
+  V msg = mkrpc(mb, TAG((sw)tag), urlv, payv);
   fpr_send_as((uw)mb, g_store_actor, msg);
   V r = fpr_syscall_wait_result();
   /* r = Ok s | Err s (builtin Result, variant 0/1), field at +8 */

@@ -278,7 +278,18 @@ renameTops env qh = concatMap top
       TStruct n sigs fs -> [TStruct (qual n) (map (refCon env S.empty) sigs) [(f, expr S.empty e) | (f, e) <- fs]]
       TBind n pats g body ->
         let (pats', bound) = pats1 S.empty pats
-         in [TBind (qual n) pats' (fmap (expr bound) g) (expr bound body)]
+            (g', bound') =
+              foldl'
+                ( \(acc, b) gd -> case gd of
+                    GBool e -> (acc ++ [GBool (expr b e)], b)
+                    GPat p e ->
+                      let e' = expr b e
+                          (p', b2) = pat b p
+                       in (acc ++ [GPat p' e'], b2)
+                )
+                ([], bound)
+                g
+         in [TBind (qual n) pats' g' (expr bound' body)]
 
     ty = \case
       TCon n ts -> TCon (refCon env S.empty n) (map ty ts)

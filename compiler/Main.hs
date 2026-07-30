@@ -1,5 +1,8 @@
 module Main where
 
+import Data.List (sortBy)
+import System.Environment (lookupEnv)
+import System.IO (hPutStrLn, stderr)
 import Codegen (Target, codegenRev, emitProgram, externals, rv32, rv64, tgtName)
 import A64 (deTlsQosAppA64, lowerA64, a64Rev)
 import X64 (lowerX64, deTlsQosApp, x64Rev)
@@ -16,7 +19,7 @@ import Precond (PreNote (..), PreStatus (..), applyPreconds, preTable, renderNot
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs)
 import System.Exit (exitFailure)
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (takeDirectory, takeFileName, (</>))
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import Text.Megaparsec (errorBundlePretty, parse)
 
@@ -220,6 +223,7 @@ main = do
                 -- compiled unit (the bbspi arity>8 incident)
                 let asm = lower (emitProgram tgt rvv spec [] ext exps prog)
                 length asm `seq` writeFile path asm
+                wcetSummary ("unit " ++ takeFileName path) asm
                 pure (path, show (M.size prog) ++ " supercombinators")
       createDirectoryIfMissing True unitDir
       -- prelude unit (unqualified names; the always-linked stdlib unit).
@@ -250,7 +254,9 @@ main = do
                     || (not (S.member n unitNames) && not (S.member n preludeNames))
             ]
           rootProg = compileUnit rootProgTops
-      writeFile out (lower (emitProgram tgt rvv spec exports extFor (bindNames root') rootProg))
+      let rootAsm = lower (emitProgram tgt rvv spec exports extFor (bindNames root') rootProg)
+      writeFile out rootAsm
+      wcetSummary "root" rootAsm
       -- the link list: everything the root's image needs beyond out itself
       writeFile (out ++ ".units") (unlines (map fst (preludeOut ++ unitOuts)))
       forM_ (preludeOut ++ unitOuts) $ \(p, note) -> putStrLn ("unit " ++ p ++ " (" ++ note ++ ")")
@@ -267,3 +273,23 @@ fst3 _ = ""
 isTBind :: STop -> Bool
 isTBind TBind {} = True
 isTBind _ = False
+
+-- G1 (docs/FUEL-RC-ABI.md): with FPRC_WCET=1, print the per-emission
+-- safepoint-distance table. The program bound is the max over ALL
+-- emissions linked together (root + units), plus the C-entry bounds
+-- (G2) for each counted ccall.
+wcetSummary :: String -> String -> IO ()
+wcetSummary what asm = do
+  w <- lookupEnv "FPRC_WCET"
+  case w of
+    Just "1" -> do
+      let rows = [drop 8 l | l <- lines asm, take 8 l == "# wcet: "]
+          parse r = case words r of
+            (fn : kvs) -> (fn, [(takeWhile (/= '=') kv, drop 1 (dropWhile (/= '=') kv)) | kv <- kvs])
+            _ -> ("?", [])
+          segOf (_, kvs) = maybe (0 :: Int) (\v -> if v == "UNBOUNDED" then maxBound else read v) (lookup "segmax" kvs)
+          parsed = map parse rows
+          top = take 12 (sortBy (\a b -> compare (segOf b) (segOf a)) parsed)
+      hPutStrLn stderr ("[wcet] " ++ what ++ ": " ++ show (length parsed) ++ " function(s), max segment " ++ (case parsed of [] -> "0"; _ -> show (maximum (map segOf parsed))) ++ " IR insns between safepoints")
+      mapM_ (\(fn, kvs) -> hPutStrLn stderr ("[wcet]   " ++ fn ++ "  segmax=" ++ maybe "?" id (lookup "segmax" kvs) ++ "  ccalls=" ++ maybe "?" id (lookup "ccalls" kvs))) top
+    _ -> pure ()

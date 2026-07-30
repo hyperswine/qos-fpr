@@ -260,7 +260,7 @@ applyPreconds tab tops = (concat notes, tops')
   where
     (tops', notes) = unzip (map top tops)
     top (TBind n pats g body) =
-      let facts = ownFacts n pats ++ maybe [] conjuncts g
+      let facts = ownFacts n pats ++ concatMap conjuncts (guardBools g)
           shadow = S.empty
           (body', PEnv _ ns) = runState (goE tab n shadow facts body) (PEnv 0 [])
        in (TBind n pats g body', reverse ns)
