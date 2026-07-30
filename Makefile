@@ -16,7 +16,7 @@ RT_VIRT_DIR = runtime/virt
 RT_QOS_DIR  = runtime/qos
 RT_POSIX_DIR = runtime/posix
 RT_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/mod.c $(RT_CORE_DIR)/buddy.c
-RT_VIRT = $(RT_VIRT_DIR)/crt0.S $(RT_VIRT_DIR)/ctx.S $(RT_VIRT_DIR)/ctx_fab.c $(RT_VIRT_DIR)/hal.c $(RT_VIRT_DIR)/net.c $(RT_VIRT_DIR)/blk.c
+RT_VIRT = $(RT_VIRT_DIR)/crt0.S $(RT_VIRT_DIR)/ctx.S $(RT_VIRT_DIR)/ctx_fab.c $(RT_VIRT_DIR)/hal.c $(RT_VIRT_DIR)/net.c $(RT_VIRT_DIR)/blk.c $(RT_VIRT_DIR)/memshim.c
 RT_INC  = -I$(RT_CORE_DIR) -I$(RT_VIRT_DIR)
 
 ifeq ($(TARGET),rv32)
@@ -179,6 +179,11 @@ qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h $(QOSP_STAMP)
 # (e.g. aarch64-linux-gnu-gcc on an x86 build host).
 QOSARCH ?= x64
 ifeq ($(QOSARCH),a64)
+QOSATOMICS = -mno-outline-atomics
+else
+QOSATOMICS =
+endif
+ifeq ($(QOSARCH),a64)
 QOSFPRTGT = qa64
 QOSCTX    = $(RT_POSIX_DIR)/ctx_a64.S
 QOSLD     = $(QOSAPP_DIR)/link-qosapp-a64.ld
@@ -205,7 +210,7 @@ build/qosapp-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOSLD)
 	$(QOSCC) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic \
-	  -mno-outline-atomics \
+	  $(QOSATOMICS) \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=1 \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) \
 	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
