@@ -36,6 +36,7 @@ import Modules (ModExport (..))
 
 import Control.Monad (when)
 import Control.Monad.State.Strict
+import Data.Bits (shiftR, (.&.))
 import Data.Char (isAlphaNum, ord)
 import Data.List (intercalate, nub, sort)
 import qualified Data.Map.Strict as M
@@ -47,7 +48,7 @@ import FPRISC (Core (..), Prog)
 -- bump on ANY change to emitted code: it keys the build/units cache
 -- (a unit's content hash names its SOURCE, not its compilation)
 codegenRev :: Int
-codegenRev = 3
+codegenRev = 4
 
 -- Target word parameterization: everything the emitted assembly does
 -- that depends on XLEN funnels through these five fields.  The value
@@ -376,18 +377,33 @@ emitProgram tgt rvv spec exports ext exps prog = unlines (evalState top (CG 0 M.
         ""
       ]
     strFor (content, label) =
-      [ "    .balign 8",
-        label ++ ":",
-        "    .long 9000",
-        "    .long 0",
-        "    " ++ tgtDir tgt ++ " " ++ show (length content)
-      ]
-        ++ byteLines content
-        ++ [""]
+      -- string payloads are UTF-8 BYTES: a codepoint above 0x7F must be
+      -- encoded, not truncated to its low byte by the assembler (which
+      -- is what `.byte 8212` silently does -- em-dashes became 0x14).
+      -- The length field is the BYTE length for the same reason.
+      let bs = concatMap utf8 content
+       in [ "    .balign 8",
+            label ++ ":",
+            "    .long 9000",
+            "    .long 0",
+            "    " ++ tgtDir tgt ++ " " ++ show (length bs)
+          ]
+            ++ byteLines bs
+            ++ [""]
+    utf8 c
+      -- 0x00-0xFF pass through as RAW single bytes: \xNN escapes are
+      -- wire data (SPI/OLED byte strings) and must stay bytes.
+      -- Codepoints >= 0x100 are text and encode as UTF-8 (em-dashes
+      -- etc. were being truncated to their low byte before this).
+      | v < 0x100 = [v]
+      | v < 0x800 = [0xC0 + shiftR v 6, 0x80 + (v .&. 0x3F)]
+      | v < 0x10000 = [0xE0 + shiftR v 12, 0x80 + (shiftR v 6 .&. 0x3F), 0x80 + (v .&. 0x3F)]
+      | otherwise = [0xF0 + shiftR v 18, 0x80 + (shiftR v 12 .&. 0x3F), 0x80 + (shiftR v 6 .&. 0x3F), 0x80 + (v .&. 0x3F)]
+      where v = ord c
     byteLines [] = []
     byteLines s =
       let (a, b) = splitAt 16 s
-       in ("    .byte " ++ intercalate ", " (map (show . ord) a)) : byteLines b
+       in ("    .byte " ++ intercalate ", " (map show a)) : byteLines b
 
 -- True high-water mark of frame slots `gen` will use for a body,
 -- mirroring go's slot discipline exactly:

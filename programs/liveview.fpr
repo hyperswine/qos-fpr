@@ -1,0 +1,243 @@
+# liveview.fpr -- a gen_view PoC: Elm-shaped app, LiveView-shaped wire.
+#
+#   make posix.bin PROG=programs/liveview.fpr && ./posix.bin   ->  :8000
+#
+# The app is the three Elm functions and nothing else:
+#
+#   init  : Model
+#   update: Msg -> Arg -> Model -> Model      (server, single writer)
+#   view  : Model -> Node                     (a tree, not a string)
+#
+# The server owns the MODEL. The tree also declares LOCALS -- client-only
+# state (@tab, @press) that never touches the server until an event
+# names it: onClick = Msg.pressed @press ships that local's value into
+# `update`. Tab switching is pure client work and provably costs zero
+# round trips; the counter is server work and costs one changed slot.
+#
+# mods/genview does the split, the CSS, and the delta; this file is the
+# application.
+
+GV = use "mods/genview".
+JS = use "mods/livejs".
+Cls = GV.Cls. Att = GV.Att. Local = GV.Local. OnClick = GV.OnClick.
+OnSet = GV.OnSet. ShowIf = GV.ShowIf. OnBoth = GV.OnBoth.
+El = GV.El. Txt = GV.Txt. Dyn = GV.Dyn. LTxt = GV.LTxt.
+
+Model = Type (Model count last log).
+
+init = Model 0 "0" Nil.
+
+# ---- update ----------------------------------------------------------------
+
+update "inc" arg (Model c last log) = Model (c + 1) last (note log "count -> {c + 1}").
+update "dec" arg (Model c last log) = Model (c - 1) last (note log "count -> {c - 1}").
+update "reset" arg (Model c last log) = Model 0 "0" (note log "reset by client").
+# the bridge: a CLIENT local arrives in the server's update function
+update "pressed" arg (Model c last log) = Model c arg (note log "@press = {arg} (from client)").
+update m arg model = model.
+
+note log s = take5 (s :: log).
+take5 Nil = Nil.
+take5 (x :: r) = x :: take4 r.
+take4 Nil = Nil.
+take4 (x :: r) = x :: take3 r.
+take3 Nil = Nil.
+take3 (x :: r) = x :: take2 r.
+take2 Nil = Nil.
+take2 (x :: r) = x :: Nil.
+
+# ---- view ------------------------------------------------------------------
+
+view (Model c last log) =
+  El "div" [Cls "col gap-4 p-6", Local "tab" "1", Local "press" "0"]
+    [ header0 Unit
+    , El "div" [Cls "row gap-4 wrap"]
+        [ counterCard c
+        , localCard Unit ]
+    , tabs Unit
+    , El "div" [Cls "panel round p-4", ShowIf "tab:1"]
+        [ El "div" [Cls "upper text-xs dim mb-2"] [Txt "Server model"]
+        , El "div" [Cls "mono text-sm dim"] [Txt "count = ", Dyn "{c}", Txt "   last @press seen = ", Dyn last]
+        , El "div" [Cls "col gap-1 mt-4"] (logRows log) ]
+    , El "div" [Cls "panel round p-4", ShowIf "tab:2"]
+        [ El "div" [Cls "upper text-xs dim mb-2"] [Txt "Client locals"]
+        , El "div" [Cls "text-sm dim"]
+            [ Txt "@tab and @press are declared on the root element and live only in the browser. Switching these tabs sends nothing at all — watch the wire line stay quiet." ]
+        , El "div" [Cls "row gap-4 center mt-4"]
+            [ El "div" [Cls "big mono acc"] [LTxt "press"]
+            , El "div" [Cls "col gap-2"]
+                [ El "button" [Cls "btn pill px-3 py-2 text-sm", OnSet "press" "+1"] [Txt "@press + 1  (client only)"]
+                , El "button" [Cls "btn pill px-3 py-2 text-sm", OnSet "press" "0"] [Txt "@press = 0  (client only)"]
+                , El "button" [Cls "btn pill px-3 py-2 text-sm glow", OnBoth "pressed" "press" "press" "+1"]
+                    [Txt "onClick = Msg.pressed @press  (server)"] ] ] ]
+    , El "div" [Cls "panel round p-4", ShowIf "tab:3"]
+        [ El "div" [Cls "upper text-xs dim mb-2"] [Txt "The wire"]
+        , El "div" [Cls "text-sm dim"]
+            [ Txt "Statics are fixed by the shape of the tree; only dynamics move. A click that changes one value ships one string. When the shape itself changes — the log growing a row — the server sends new statics and the client re-renders." ]
+        , El "div" [Cls "mono text-sm acc mt-4", Att "id" "lv-wire"] [Txt "idle"]
+        , El "div" [Cls "mono text-xs dim mt-2"] [Txt "slots in this page: ", Dyn "{c}", Txt " server value(s) tracked"] ]
+    , El "div" [Cls "rule"] []
+    , El "div" [Cls "row between dim text-xs mono"]
+        [ El "span" [] [Txt "gen_view PoC · FP-RISC actor + generated CSS + delta client"]
+        , El "span" [] [Txt "heap ", Dyn "{heapUsed Unit / 1024}", Txt " KiB · preempts ", Dyn "{fuelPreempts 0}"] ] ].
+
+header0 u =
+  El "div" [Cls "col gap-1"]
+    [ El "div" [Cls "upper text-xs dim"] [Txt "gen_view"]
+    , El "div" [Cls "text-4xl ink"] [Txt "Two kinds of state, one tree."]
+    , El "div" [Cls "text-sm dim"]
+        [Txt "The server owns the model. The browser owns the locals. The tree says which is which."] ].
+
+counterCard c =
+  El "div" [Cls "panel round p-4 col gap-3 grow"]
+    [ El "div" [Cls "upper text-xs dim"] [Txt "Server state · round trip"]
+    , El "div" [Cls "big mono tabular ink"] [Dyn "{c}"]
+    , El "div" [Cls "row gap-2 wrap"]
+        [ El "button" [Cls "btn pill px-3 py-2 text-sm", OnClick "inc" ""] [Txt "count + 1"]
+        , El "button" [Cls "btn pill px-3 py-2 text-sm", OnClick "dec" ""] [Txt "count − 1"]
+        , El "button" [Cls "btn pill px-3 py-2 text-sm", OnClick "reset" ""] [Txt "reset"] ] ].
+
+localCard u =
+  El "div" [Cls "card round p-4 col gap-3 grow"]
+    [ El "div" [Cls "upper text-xs dim"] [Txt "Client state · no round trip"]
+    , El "div" [Cls "big mono tabular acc"] [LTxt "press"]
+    , El "div" [Cls "row gap-2 wrap"]
+        [ El "button" [Cls "btn pill px-3 py-2 text-sm", OnSet "press" "+1"] [Txt "@press + 1"]
+        , El "button" [Cls "btn pill px-3 py-2 text-sm", OnSet "press" "-1"] [Txt "@press − 1"] ] ].
+
+tabs u =
+  El "div" [Cls "row gap-2"]
+    [ tabBtn "1" "Server model"
+    , tabBtn "2" "Client locals"
+    , tabBtn "3" "The wire" ].
+tabBtn n label =
+  El "button" [Cls "btn pill px-3 py-2 text-sm", OnSet "tab" n, Att "data-on" "tab:{n}"] [Txt label].
+
+logRows Nil = El "div" [Cls "mono text-xs dim"] [Txt "no events yet"] :: Nil.
+logRows (l :: r) = El "div" [Cls "mono text-xs dim"] [Txt "· ", Dyn l] :: logRows r.
+
+# ---- the model actor: single writer, holds the last render ------------------
+
+St = Type (St model ss ds).
+Req = Type (Ev me msg arg | Page me).
+
+spawnApp u = spawn (fn me -> appLoop me (mkSt init)).
+mkSt m = st2 m (GV.render (view m)).
+st2 m (ss, ds) = St m ss ds.
+
+appLoop me s = appServe me s (receive me).
+appServe me (St m ss ds) (Page who) =
+  u = send who (Ok (page ss ds));
+  appLoop me (St m ss ds).
+appServe me (St m ss ds) (Ev who msg arg) =
+  m2 = update msg arg m;
+  (ss2, ds2) = GV.render (view m2);
+  u = send who (Ok (reply ss ds ss2 ds2));
+  appLoop me (St m2 ss2 ds2).
+
+# a delta if the shape held, a full re-render if it did not
+reply ss ds ss2 ds2 | GV.sameStatics ss ss2 = "\{\"d\":{GV.deltaJson ds ds2}}".
+reply ss ds ss2 ds2 = "\{\"s\":{GV.jarr ss2},\"d\":{GV.jarr ds2}}".
+
+# ---- the page --------------------------------------------------------------
+
+page ss ds =
+  "<!doctype html><html><head><meta charset=\"utf-8\">
+<title>gen_view — FP-RISC</title>
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>
+<link href=\"https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;700&display=swap\" rel=\"stylesheet\">
+<style>{GV.cssFor (view init)}</style></head>
+<body><div id=\"lv-root\"></div>
+<script>window.__LV__=\{\"s\":{GV.jarr ss},\"d\":{GV.jarr ds}}</script>
+<script>{JS.src Unit}</script></body></html>".
+
+# ---- HTTP ------------------------------------------------------------------
+
+crlf = strcat (chr 13) (chr 10).
+hline s = strcat s crlf.
+resp ct status body =
+  n = strlen body;
+  strcat (hline "HTTP/1.0 {status}")
+  (strcat (hline "Content-Type: {ct}")
+  (strcat (hline "Content-Length: {n}")
+  (strcat (hline "Connection: close")
+  (strcat crlf body)))).
+
+matchAt s sub i j m | j > m = True.
+matchAt s sub i j m | charAt s (i + j - 1) == charAt sub j = matchAt s sub i (j + 1) m.
+matchAt s sub i j m = False.
+findSub s sub from = fsGo s sub from (strlen s) (strlen sub).
+fsGo s sub i n m | i + m - 1 > n = 0.
+fsGo s sub i n m | matchAt s sub i 1 m = i.
+fsGo s sub i n m = fsGo s sub (i + 1) n m.
+
+takeTok s i n = ttGo s i n "".
+ttGo s i n acc | i > n = acc.
+ttGo s i n acc | charAt s i == 32 = acc.
+ttGo s i n acc | charAt s i == 13 = acc.
+ttGo s i n acc = ttGo s (i + 1) n (strcat acc (chr (charAt s i))).
+findCh s c i | i > strlen s = 0.
+findCh s c i | charAt s i == c = i.
+findCh s c i = findCh s c (i + 1).
+reqMethod s = takeTok s 1 (strlen s).
+reqPath s = takeTok s (findCh s 32 1 + 1) (strlen s).
+
+slice s a b = slGo s a b "".
+slGo s i b acc | i > b = acc.
+slGo s i b acc = slGo s (i + 1) b (strcat acc (chr (charAt s i))).
+bodyOf req = boGo req (findSub req (strcat crlf crlf) 1).
+boGo req 0 = "".
+boGo req p = slice req (p + 4) (strlen req).
+
+# {"msg":"inc","arg":"3"} -- two fields, that is the entire protocol
+jfield body key =
+  k = "\"{key}\"";
+  jf1 body (findSub body k 1) (strlen k).
+jf1 body 0 kn = "".
+jf1 body p kn = jf2 body (toQuote body (p + kn) (strlen body)).
+toQuote s i n | i > n = 0.
+toQuote s i n | charAt s i == 34 = i + 1.
+toQuote s i n = toQuote s (i + 1) n.
+jf2 body 0 = "".
+jf2 body i = jfRead body i (strlen body) "".
+jfRead s i n acc | i > n = acc.
+jfRead s i n acc | charAt s i == 34 = acc.
+jfRead s i n acc = jfRead s (i + 1) n (strcat acc (chr (charAt s i))).
+
+readReq nd acc = rpoll (netPoll nd) nd acc.
+rpoll 2 nd acc = rtest nd (strcat acc (netRead nd)).
+rpoll 0 nd acc = rpoll (netPoll nd) nd acc.
+rpoll r nd acc = Err "conn lost".
+rtest nd acc | findSub acc (strcat crlf crlf) 1 > 0 = Ok acc.
+rtest nd acc = readReq nd acc.
+
+route "GET" "/" req app me = resp "text/html; charset=utf-8" "200 OK" (ask app me (Page me)).
+route "POST" "/live/event" req app me =
+  b = bodyOf req;
+  resp "application/json" "200 OK" (ask app me (Ev me (jfield b "msg") (jfield b "arg"))).
+route m p req app me = resp "application/json" "404 Not Found" "\{\"error\":\"no route\"}".
+
+ask app me r = askRes (send app r) me.
+askRes u me = unwrap (receiveRes me).
+unwrap (Ok s) = s.
+unwrap (Err e) = "\{\"error\":\"actor\"}".
+
+srv nd app me = spoll (netPoll nd) nd app me.
+spoll 2 nd app me = serve2 nd app me (readReq nd "").
+spoll r nd app me = srv nd app me.
+serve2 nd app me (Err e) = print "[live] dropped" >> srv nd app me.
+serve2 nd app me (Ok req) =
+  mth = reqMethod req;
+  p = reqPath req;
+  u = print "[live] {mth} {p}";
+  u2 = netWrite nd (route mth p req app me);
+  u3 = netClose nd;
+  srv nd app me.
+
+main =
+  nd = device "net";
+  app = spawnApp Unit;
+  me = myself 0;
+  print "[gen_view] serving on host :8000" >>
+  srv nd app me.
