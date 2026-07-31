@@ -1,0 +1,19 @@
+# v1 for Main
+
+# use occurs check for making sure types and functions are not mutually recursive
+# can actually define types and functions after the fact
+
+or a b | a = True.
+or a b | b = True.
+or _ _ = False.
+
+mycomplexcond a b = a `or` b.
+
+# print is already a newline
+# println s = print (strcat s "\n").
+
+main = print "hi" >> print "{mycomplexcond True False}" >> print "{mystringadder "foo" "bar"}".
+
+# + --> (+)/2 --> the most recent (+)/2 function defined in the scope that fits String -> String -> String, which would be Str.(+)
+mystringadder : String -> String -> String.
+mystringadder a b = a + b.
