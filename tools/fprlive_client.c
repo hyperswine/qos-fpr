@@ -540,7 +540,9 @@ static int mode_tty(void) {
 
 int main(int argc, char** argv) {
   const char* host = "127.0.0.1"; int port = 8790;
+
   enum { GOLDEN, SCRIPT, TTY } mode = SCRIPT;
+
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--golden")) mode = GOLDEN;
     else if (!strcmp(argv[i], "--script")) mode = SCRIPT;
@@ -548,21 +550,30 @@ int main(int argc, char** argv) {
     else if (strchr(argv[i], '.') || strchr(argv[i], ':')) host = argv[i];
     else port = atoi(argv[i]);
   }
+
   struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, * res;
+
   char ps[16]; snprintf(ps, sizeof ps, "%d", port);
+
   if (getaddrinfo(host, ps, &hints, &res)) die("resolve");
+
   sfd = socket(res->ai_family, res->ai_socktype, 0);
+
   if (connect(sfd, res->ai_addr, res->ai_addrlen)) die("connect (is livenotes running?)");
   int one = 1; setsockopt(sfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 
   if (mode == GOLDEN) return mode_golden();
+
   fetch_image();
+
   int totalwords = 0; for (int i = 0; i < ncode; i++) totalwords += codes[i].nwords;
+
   if (mode == SCRIPT)
     printf("backend: linux TUI over TCP, %d regs, %d-handle frame arena\n"
       "image:   %d nodes, %d binds, %d codes (%d words / %d bytes), %d cells\n"
       "contract: >= %d draws/sec, key-to-present <= %d us (round trip included)\n\n",
       NREGS, ARENA, nnode, nbind, ncode, totalwords, totalwords * 4, ncell,
       draw_hz_min, key_lat_us_max);
+
   return mode == SCRIPT ? mode_script() : mode_tty();
 }

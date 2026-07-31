@@ -18,7 +18,14 @@ WORK=$(mktemp -d)
 trap 'kill $SRV 2>/dev/null; rm -rf "$WORK"' EXIT
 
 echo "== build server (FP-RISC -> posix)"
-make -s posix.bin PROG=programs/livenotes.fpr >/dev/null || exit 1
+# when ARCH=a64, do POSIXARCH=a64
+POSIXARCH=$1
+# if no POSIXARCH is given, default to x86
+if [ -z "$POSIXARCH" ]; then
+  POSIXARCH=x86
+fi
+
+make -s posix.bin PROG=programs/livenotes.fpr POSIXARCH="$POSIXARCH" >/dev/null || exit 1
 echo "== build client (C)"
 cc -O2 -o "$WORK/client" tools/fprlive_client.c || exit 1
 
@@ -44,3 +51,6 @@ else
   exit 1
 fi
 exit $RC
+
+# on mac, do make posix-run PROG=programs/livenotes.fpr POSIXARCH=a64
+# then run PORT=8796 ./tools/livenotes-check.sh a64

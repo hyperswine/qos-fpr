@@ -18,3 +18,4 @@ apps_data.c
 qosp
 *.s.units
 out.txt
+trace.txt
