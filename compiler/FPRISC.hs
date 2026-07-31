@@ -342,7 +342,16 @@ stringLit = lexeme $ do
       choice
         [ SegExpr <$> (char '{' *> sc *> expr <* char '}'),
           SegStr . pure <$> (char '\\' *> escaped),
-          SegStr . pure <$> satisfy (\c -> c /= '"' && c /= '{' && c /= '\\')
+          -- A LITERAL source character is TEXT: encode it to UTF-8
+          -- bytes here, at the one place that knows it came from the
+          -- file rather than from a \xHH escape. FP-RISC strings are
+          -- BYTE strings (strlen counts bytes, charAt returns bytes),
+          -- so 'e-acute' becomes two chars and a wire escape stays one.
+          -- Doing this later is impossible: by then 0xB7 could equally
+          -- be a middle dot or an SPI payload byte, and guessing gets
+          -- one of them wrong (it got '·' wrong, and served invalid
+          -- UTF-8 to the browser).
+          SegStr . utf8Bytes . pure <$> satisfy (\c -> c /= '"' && c /= '{' && c /= '\\')
         ]
     escaped =
       choice
@@ -366,6 +375,15 @@ stringLit = lexeme $ do
       | c >= '0' && c <= '9' = fromIntegral (fromEnum c - fromEnum '0')
       | c >= 'a' && c <= 'f' = fromIntegral (fromEnum c - fromEnum 'a' + 10)
       | otherwise = fromIntegral (fromEnum c - fromEnum 'A' + 10)
+    utf8Bytes :: String -> String
+    utf8Bytes = concatMap enc
+      where
+        enc c
+          | v < 0x80 = [c]
+          | v < 0x800 = map toEnum [0xC0 + div v 64, 0x80 + mod v 64]
+          | v < 0x10000 = map toEnum [0xE0 + div v 4096, 0x80 + mod (div v 64) 64, 0x80 + mod v 64]
+          | otherwise = map toEnum [0xF0 + div v 262144, 0x80 + mod (div v 4096) 64, 0x80 + mod (div v 64) 64, 0x80 + mod v 64]
+          where v = fromEnum c
     mergeSegs (SegStr a : SegStr b : r) = mergeSegs (SegStr (a ++ b) : r)
     mergeSegs (x : r) = x : mergeSegs r
     mergeSegs [] = []

@@ -565,7 +565,20 @@ V fpr_prim_fn__x21_x3d(V a, V b) { return BOOL(!veq(a, b)); }
  * interpolation run concurrently on different harts. */
 #define rbuf (fpr_hart()->rbuf)
 #define rpos (fpr_hart()->rpos)
-static void remit(char c) { if (rpos < FPR_RBUF_SZ - 1) rbuf[rpos++] = c; }
+/* Overflow used to be SILENT: `if (rpos < CAP) ...` dropped every
+ * character past 4095 and returned a short string, so a large
+ * interpolation ("{bigString}") produced a truncated page with no
+ * error anywhere -- valid HTML, cut mid-token. Renders are bounded by
+ * design (this buffer is per-hart and fixed), so overflowing it is a
+ * program error and says so. The common case that USED to hit this --
+ * interpolating a value that is already a String -- no longer routes
+ * through the buffer at all; see fpr_prim_fn_str. */
+static void remit(char c) {
+  if (rpos >= FPR_RBUF_SZ - 1)
+    fpr_cpanic("str/print: render buffer full (4096B) -- build large "
+               "strings with strcat, not interpolation");
+  rbuf[rpos++] = c;
+}
 static void remits(const char *s) { while (*s) remit(*s++); }
 static void rdec(sw n) {
   char b[24];
@@ -621,6 +634,10 @@ static void render(V v) {
 }
 
 V fpr_prim_fn_str(V v) {
+  /* a String renders as itself: return it unchanged rather than
+   * copying it through the fixed render buffer. This is what makes
+   * "{s}" safe for strings of any size (and it saves the copy). */
+  if (!ISINT(v) && TID(v) == T_STR) return v;
   rpos = 0;
   render(v);
   return (V)fpr_mkstr((const uint8_t *)rbuf, (uw)rpos);
