@@ -17,3 +17,4 @@ apps_data.c
 *.qa
 qosp
 *.s.units
+out.txt
