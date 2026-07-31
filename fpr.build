@@ -1,4 +1,4 @@
-prog=programs/raster.fpr
+prog=tests/local/main.fpr
 target=a64-mac
-out=build/raster-a64
+out=build/main
 harts=2
