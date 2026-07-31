@@ -317,7 +317,7 @@ main =
   nd = device "net";
   mdl = spawnModel Unit;
   me = myself 0;
-  print "[docsite] embedded corpus: {docsCount (D.docs Unit)} docs; http on host :8000" >>
+  print "[docsite] embedded corpus: {docsCount (D.docs Unit)} docs; http on host :8000 (http://localhost:8000)" >>
   srv nd mdl me 0.
 docsCount Nil = 0.
 docsCount (e :: r) = 1 + docsCount r.
