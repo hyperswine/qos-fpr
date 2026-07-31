@@ -1,4 +1,4 @@
-prog=programs/liveview.fpr
+prog=tests/local/main.fpr
 target=a64-mac
-out=build/liveview
+out=build/main
 harts=2

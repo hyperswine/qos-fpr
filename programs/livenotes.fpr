@@ -32,6 +32,12 @@
 
 # ---- little prelude ---------------------------------------------------------
 
+# ideally should use actual prelude
+# FNV-1a is good for content-addressing
+# most of the module is kind of just the compiler-interpreter
+# ideally should also use operators like + for strcat more often, and |> and >>
+# [a, b, c] style list literals too
+
 and2 True b = b.
 and2 False b = False.
 
