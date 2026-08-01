@@ -29,7 +29,7 @@
  * from a symbol table: the link address is a CONSTANT, and an app.qa
  * built today loads under any qosp built tomorrow.  Everything after
  * the slot is the buddy arena that growth grants come from. */
-#define QOS_ARENA_BASE 0x40000000ul /* 1 GiB */
+#define QOS_ARENA_BASE 0x400000000ul /* 16 GiB (bumped for macOS arm64 mmap compatibility) */
 #define QOS_ARENA_SIZE (256ul << 20)
 #define QOS_SLOT_SIZE (16ul << 20) /* matches link-app.ld's SLOT LENGTH */
 #define QOS_SLOT_BASE QOS_ARENA_BASE

@@ -116,6 +116,20 @@ ifeq ($(GFX),1)
 $(error GFX=1 is Linux-only (EGL/evdev); the FPR_EVDEV keyboard sim works without it)
 endif
 endif
+
+# ---- qosp (QOS Portable host) build settings --------------------------
+# Mirror the Darwin handling used for the posix target.  On macOS we
+# cannot use bare -no-pie and must use the system compiler (cc/clang).
+# -Wl,-no_pie asks ld64 for a non-PIE executable so its text stays away
+# from the low fixed arena the apps are linked at.
+ifeq ($(UNAME_S),Darwin)
+QOSP_CC ?= cc
+QOSP_PIE ?= -Wl,-no_pie
+else
+QOSP_CC ?= gcc
+QOSP_PIE ?= -no-pie
+endif
+
 RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/mod.c \
                 $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
 
@@ -143,7 +157,8 @@ posix-run: posix.bin
 #   make portable-qa PROG=...                    # app.qa (QOSARCH=x64| a64)
 #   make portable-run PROG=...                   # both + run (auto-grant)
 #   make portable-qa QOSARCH=a64 PROG=...        # a64 app (e.g. on Pi)
-QOS_SLOT_BASE = 0x40000000
+QOS_SLOT_BASE = 0x400000000
+PROC_ARENA_END = 0x410000000
 QOSAPP_DIR   = runtime/qosapp
 PORTABLE_DIR = runtime/portable
 # non-pie: the host text must stay away from the fixed arena mapping
@@ -168,8 +183,12 @@ QOSP_STAMP = build/.qosp-gfx$(GFX)
 $(QOSP_STAMP):
 	@mkdir -p build && rm -f build/.qosp-gfx* && touch $@
 qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h $(QOSP_STAMP)
-	gcc -no-pie -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 $(QOSP_GFXFLAGS) \
+	$(QOSP_CC) $(QOSP_PIE) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 $(QOSP_GFXFLAGS) \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) -I$(RT_POSIX_DIR) $(QOSP_SRC) $(QOSP_LIBS) -o $@
+	@if [ "$(UNAME_S)" = "Darwin" ]; then \
+	  codesign --force --sign - --entitlements tools/qosp.entitlements --timestamp=none qosp 2>/dev/null || \
+	    echo "(ad-hoc codesign with entitlements note: if RWX mmap still fails, run manually)"; \
+	fi
 
 # QOSARCH selects the *app* image architecture for QOS Portable.
 #   QOSARCH=x64 (default): fprc --target=qx64 + ctx_x64.S (SysV, RIP-deTLS)
@@ -180,19 +199,25 @@ qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h $(QOSP_STAMP)
 QOSARCH ?= x64
 ifeq ($(QOSARCH),a64)
 QOSATOMICS = -mno-outline-atomics
-else
-QOSATOMICS =
-endif
-ifeq ($(QOSARCH),a64)
 QOSFPRTGT = qa64
 QOSCTX    = $(RT_POSIX_DIR)/ctx_a64.S
 QOSLD     = $(QOSAPP_DIR)/link-qosapp-a64.ld
-QOSCC    ?= aarch64-linux-gnu-gcc
+ifeq ($(UNAME_S),Darwin)
+# Build qa64 Linux ELF apps on macOS using Apple clang targeting
+# aarch64-linux + lld (for proper ELF output and GNU ld-style linker script).
+QOSCC    ?= clang --target=aarch64-linux-gnu
+QOSLDFLAGS ?= -fuse-ld=lld
 else
+QOSCC    ?= aarch64-linux-gnu-gcc
+QOSLDFLAGS ?=
+endif
+else
+QOSATOMICS =
 QOSFPRTGT = qx64
 QOSCTX    = $(RT_POSIX_DIR)/ctx_x64.S
 QOSLD     = $(QOSAPP_DIR)/link-qosapp.ld
 QOSCC    ?= gcc
+QOSLDFLAGS ?=
 endif
 
 # the app image: generated QOS-target code + its OWN copy of the portable
@@ -208,14 +233,14 @@ build/qosapp-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	LC_ALL=C.UTF-8 ./fprc --target=$(QOSFPRTGT) --prelude=programs/prelude.fpr $(PROG) $@
 
 build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOSLD)
-	$(QOSCC) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
+	$(QOSCC) $(QOSLDFLAGS) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic \
 	  $(QOSATOMICS) \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=1 \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) \
 	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
-	  -Wl,--defsym=_proc_arena_end=0x50000000 \
+  -Wl,--defsym=_proc_arena_end=$(PROC_ARENA_END) \
 	  -Wl,--build-id=none -Wl,-z,noexecstack \
 	  build/qosapp-prog.s $$(cat build/qosapp-prog.s.units) $(QOSAPP_RT) -o $@
 

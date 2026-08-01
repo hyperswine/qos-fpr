@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -104,15 +105,30 @@ int main(int argc, char **argv) {
   /* ---- Stage 1: Initializer ---------------------------------------- */
   TRACE("stage 1 (initializer): mapping arena at %#lx (+%lu MiB)\n",
         QOS_ARENA_BASE, QOS_ARENA_SIZE >> 20);
-  void *arena =
-      mmap((void *)QOS_ARENA_BASE, QOS_ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef __APPLE__
+  /* Force the exact address on Darwin (hint-only often ignored for large
+   * mappings). We map RW first then mprotect(RWX) because simultaneous
+   * W+X at mmap time can be denied even with entitlements. */
+  mmap_flags |= MAP_FIXED;
+#endif
+	void *arena =
+      mmap((void *)QOS_ARENA_BASE, QOS_ARENA_SIZE, PROT_READ | PROT_WRITE,
+           mmap_flags, -1, 0);
   if (arena != (void *)QOS_ARENA_BASE) {
+    if (arena != MAP_FAILED) munmap(arena, QOS_ARENA_SIZE);
     fprintf(stderr,
             "qosp: cannot map the arena at %#lx (ASLR collision or RWX "
             "policy) -- the app image is linked at this address, so there "
             "is no fallback\n",
             QOS_ARENA_BASE);
+    return 1;
+  }
+  /* Promote to RWX after mapping (entitlement permits this). */
+	if (mprotect((void *)QOS_ARENA_BASE, QOS_ARENA_SIZE,
+               PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+    fprintf(stderr, "qosp: mprotect RWX for arena failed (errno=%d %s)\n", errno, strerror(errno));
+    munmap(arena, QOS_ARENA_SIZE);
     return 1;
   }
   const qos_hal_t *hal = qosp_hal_table();
@@ -145,11 +161,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "qosp: elf load failed: %s\n", ld.err);
     return 1;
   }
-  uint64_t heap_base = ((uint64_t)ld.image_end + 15) & ~15ull;
+	uint64_t heap_base = ((uint64_t)ld.image_end + 15) & ~15ull;
   uint64_t heap_size = (QOS_SLOT_BASE + QOS_SLOT_SIZE) - heap_base;
   TRACE("stage 2: image [%#lx..%p), entry %p, heap %#" PRIx64 " (+%" PRIu64
         " KiB)\n",
         QOS_SLOT_BASE, ld.image_end, ld.entry, heap_base, heap_size >> 10);
+
+  /* Ensure instruction cache sees code we just wrote into the arena
+   * (important on arm64 hosts when running qa64 apps). */
+  __builtin___clear_cache((char *)QOS_SLOT_BASE, (char *)ld.image_end);
 
   static char caps[4096];
   uint64_t caps_len = qa_caps_serialize(&qa, caps, sizeof caps);
