@@ -33,6 +33,8 @@ conf = "fpr.build".
 progress = "build/build.log".
 report = "build/build-report.txt".
 
+# What this could do is also take prog, target, out, harts from the CLI
+
 # ---- vendored string helpers (self-contained: the SDK driver depends on
 # nothing outside this file + the sol binary) --------------------------------
 

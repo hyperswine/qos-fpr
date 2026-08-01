@@ -670,6 +670,8 @@ jumpV = 19661.                   # 0.30 / frame
 moveV = 19661.                   # 0.30 / frame
 termV = 32768.                   # 0.50 / frame
 
+# Ideally should be using the || operator
+
 # outside the box: blocked.  the wall the brief asked for, for free.
 outOfBounds px py pz =
   or2 (or2 (px - hw < 0) (px + hw >= wN * fx))

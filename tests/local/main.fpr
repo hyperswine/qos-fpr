@@ -12,7 +12,7 @@ mycomplexcond a b = a `or` b.
 # print is already a newline
 # println s = print (strcat s "\n").
 
-main = print "hi" >> print "{mycomplexcond True False}" >> print "{mystringadder "foo" "bar"}" >> print "{mylist}".
+main = print "hi" >> print "{mycomplexcond True False}" >> print "{mystringadder} foo bar" >> print "{mylist}".
 
 # + --> (+)/2 --> the most recent (+)/2 function defined in the scope that fits String -> String -> String, which would be Str.(+)
 mystringadder : String -> String -> String.
