@@ -107,6 +107,9 @@ POSIXLIBS = -lEGL -lGLESv2 -lm
 # static); a dynamic gfx image must therefore be non-PIE
 POSIXSTATIC = -no-pie
 else
+# no GL stack: the TERMINAL input tier satisfies inputPoll instead
+# (raw-tty stdin, or the FPR_EVDEV sim/replay via evdev_raw.c)
+RT_POSIX += $(RT_POSIX_DIR)/tty_raw.c $(RT_POSIX_DIR)/evdev_raw.c
 POSIXLIBS =
 POSIXSTATIC = -static
 endif

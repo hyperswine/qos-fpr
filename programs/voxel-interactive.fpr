@@ -1,0 +1,993 @@
+# ============================================================================
+# voxel-interactive.fpr -- voxel.fpr's 16^3 world, LIVE: a raw-mode
+# keyboard in, an ANSI terminal out, running until you press q.
+#
+#   same Model/view/render as voxel.fpr (SoA DDA raycast, baked sun,
+#   destroy/place with incremental rebake), three deliberate changes:
+#
+#   FLAT COLORS   the 10-tile atlas is solid color per block (red brick,
+#                 green grass, ...) -- the baked lightmap still shades
+#                 them, so steps and overhangs read in the terminal.
+#   ANSI FRAME    64x48 pixels -> 64x24 character cells, two pixels per
+#                 cell via the upper-half block (fg = top px, bg =
+#                 bottom px), 256-color cube.  A frame is drawn OVER the
+#                 last one from a cursor-home, never cleared between
+#                 frames: rows are built off-screen as strings and
+#                 emitted in one pass -- the terminal never sees a
+#                 half-erased frame, which is the double-buffer effect
+#                 without a second buffer.
+#   FRAME/ACTOR   voxel.fpr's header explains why a single actor buys
+#                 only ~6 frames: every SoA op returns a tuple and the
+#                 pool only comes back at actor DEATH.  So each frame
+#                 runs in a FRESH actor (poll -> update -> physics ->
+#                 render -> draw), and dies; the driver keeps only the
+#                 stable Vec handles and the model scalars, exchanged as
+#                 flat pinned message roots (ints + handles only --
+#                 nothing that lives in a dead actor's pool).
+#
+#   keys:  arrows move    w/s pitch  a/d yaw    space jump
+#          x destroy      f place    1..0 pick  q quit
+#
+#   make posix-run PROG=programs/voxel-interactive.fpr           # live tty
+#   FPR_EVDEV=script.evd make posix-run PROG=...                 # replay
+# ============================================================================
+
+# ---- little prelude ---------------------------------------------------------
+
+and2 True b = b.
+and2 False b = False.
+
+or2 True b = True.
+or2 False b = b.
+
+len Nil = 0.
+len (_ :: t) = 1 + len t.
+
+nth (x :: r) 0 = x.
+nth (x :: r) i = nth r (i - 1).
+
+elemI x Nil = False.
+elemI x (y :: r) | x == y = True.
+elemI x (y :: r) = elemI x r.
+
+maxI a b | a > b = a.
+maxI a b = b.
+minI a b | a < b = a.
+minI a b = b.
+absI n | n < 0 = 0 - n.
+absI n = n.
+clampI lo hi n = maxI lo (minI hi n).
+imod n d = n - (n / d) * d.
+
+sumF a n = a + n.                # the specialized-fold shape (vredsum)
+
+# ---- fixed point, screen, sun ----------------------------------------------
+
+fx = 65536.                      # 16.16
+scrW = 64.
+scrH = 48.
+wShift = 6.                      # log2 scrW: screen x/y split by shift
+tileN = 512.                     # 4 rows: every column block recycles
+nTiles = 6.                      # scrW * scrH / tileN
+focal = 48.
+ddaSteps = 26.                   # the box diagonal is ~28 cells, and a
+                                 # truncated ray reads as sky -- which is
+                                 # what a ray that far out is looking at
+
+# 11.25-degree steps: 32 entries per turn
+cosT = [65536, 64277, 60547, 54491, 46341, 36410, 25080, 12785, 0,
+        0 - 12785, 0 - 25080, 0 - 36410, 0 - 46341, 0 - 54491, 0 - 60547,
+        0 - 64277, 0 - 65536, 0 - 64277, 0 - 60547, 0 - 54491, 0 - 46341,
+        0 - 36410, 0 - 25080, 0 - 12785, 0, 12785, 25080, 36410, 46341,
+        54491, 60547, 64277].
+sinT = [0, 12785, 25080, 36410, 46341, 54491, 60547, 64277, 65536, 64277,
+        60547, 54491, 46341, 36410, 25080, 12785, 0, 0 - 12785, 0 - 25080,
+        0 - 36410, 0 - 46341, 0 - 54491, 0 - 60547, 0 - 64277, 0 - 65536,
+        0 - 64277, 0 - 60547, 0 - 54491, 0 - 46341, 0 - 36410, 0 - 25080,
+        0 - 12785].
+cosA i = nth cosT (imod (i + 32) 32).
+sinA i = nth sinT (imod (i + 32) 32).
+
+# sun direction (16.16, unit): up and to the -X/-Z
+sunX = 0 - 24969.
+sunY = 58262.
+sunZ = 0 - 16646.
+ambient = 62.
+sunPower = 160.
+shadowNum = 3.                   # shadowed faces keep 3/10 of the direct term
+shadowDen = 10.
+
+# ---- the world --------------------------------------------------------------
+# 16x16x16, cell index = x*256 + y*16 + z, 0-based.  0 = air.
+# blocks: 1 bedrock  2 stone  3 dirt   4 grass  5 sand
+#         6 ore      7 wood   8 leaves 9 brick 10 glass
+
+wN = 16.
+wCells = 4096.
+nFaces = 6.
+lmCells = 24576.                 # wCells * nFaces
+
+cellOf x y z = x * 256 + y * 16 + z.
+inW v = and2 (v >= 0) (v < wN).
+inWorld x y z = and2 (inW x) (and2 (inW y) (inW z)).
+
+# terrain: 4x4 plateaus at heights 3..6.  Deliberately terraced rather
+# than per-column noise -- a voxel world you can walk across needs flat
+# runs and clean steps, and the steps are what show the baked sun off.
+topAt x z = 3 + imod (plateauX x * 2 + plateauZ z * 3 + imod (plateauX x * plateauZ z) 5) 4.
+plateauX x = x / 4.
+plateauZ z = z / 4.
+
+# a tree at two fixed spots, so leaves/wood show up
+isTrunk x z = or2 (and2 (x == 4) (z == 11)) (and2 (x == 12) (z == 5)).
+trunkTop x z = topAt x z + 3.
+
+# leaves: the 3x3x2 cap around a trunk top
+nearTrunk x z = or2 (and2 (absI (x - 4) <= 1) (absI (z - 11) <= 1))
+                    (and2 (absI (x - 12) <= 1) (absI (z - 5) <= 1)).
+leafBase x z | and2 (absI (x - 4) <= 1) (absI (z - 11) <= 1) = trunkTop 4 11.
+leafBase x z = trunkTop 12 5.
+
+# a small brick hut wall with a glass window, so 9 and 10 appear
+isHut x z = and2 (and2 (x >= 8) (x <= 10)) (z == 13).
+hutY x z = topAt x z + 1.
+
+genAt x y z | y > 8 = airOrLeaf x y z.
+genAt x y z = genGround x y z (topAt x z).
+
+airOrLeaf x y z = genAbove x y z (topAt x z).
+
+genGround x y z top | y == 0 = 1.
+genGround x y z top | y < top - 1 = oreOrStone x y z.
+genGround x y z top | y < top = 3.
+genGround x y z top | y == top = grassOrSand x z.
+genGround x y z top = genAbove x y z top.
+
+oreOrStone x y z | imod (x * 31 + y * 17 + z * 7) 19 == 0 = 6.
+oreOrStone x y z = 2.
+
+grassOrSand x z | imod (x + z) 7 == 0 = 5.
+grassOrSand x z = 4.
+
+genAbove x y z top | and2 (isTrunk x z) (and2 (y > top) (y <= trunkTop x z)) = 7.
+genAbove x y z top | and2 (nearTrunk x z) (leafShell x y z) = 8.
+genAbove x y z top | and2 (isHut x z) (and2 (y > top) (y <= hutY x z + 1)) = hutBlock y (hutY x z).
+genAbove x y z top = 0.
+
+leafShell x y z = and2 (y >= leafBase x z) (y <= leafBase x z + 1).
+
+hutBlock y hy | y == hy + 1 = 10.       # glass course on top
+hutBlock y hy = 9.                      # brick below
+
+# build the block array once: 4096 pushes, index order
+buildWorld = wPush 0 (Vec.new Unit).
+wPush c v | c >= wCells = v.
+wPush c v = wPush (c + 1) (Vec.push (genAt (c / 256) (imod (c / 16) 16) (imod c 16)) v).
+
+# 1-based get/set on the 0-based cell index
+wGet w c = Vec.get (c + 1) w.
+wSet w c b = Vec.set (c + 1) b w.
+
+# solid = anything but air; glass still blocks (simplification: no
+# transparency in this PoC, glass is just a bright block)
+isSolidId b = b > 0.
+
+# ---- the 10-tile atlas, FLAT ------------------------------------------------
+# Same layout (10 tiles of 16x16, texel = tile*256 + v*16 + u) so
+# shade/1 is untouched -- but every texel of a tile is ONE color.  The
+# terminal has ~6 levels per channel; texture noise would just dither.
+# The lightmap still multiplies through litChan, so faces shade.
+
+atlasN = 2560.
+tTile i = i / 256.
+
+texR i | tTile i == 0 = 66.      # bedrock  dark gray
+texR i | tTile i == 1 = 152.     # stone    gray
+texR i | tTile i == 2 = 140.     # dirt     brown
+texR i | tTile i == 3 = 70.      # grass    green
+texR i | tTile i == 4 = 220.     # sand     tan
+texR i | tTile i == 5 = 90.      # ore      cyan
+texR i | tTile i == 6 = 132.     # wood     dark brown
+texR i | tTile i == 7 = 42.      # leaves   dark green
+texR i | tTile i == 8 = 188.     # brick    red
+texR i = 168.                    # glass    pale blue
+
+texG i | tTile i == 0 = 66.
+texG i | tTile i == 1 = 152.
+texG i | tTile i == 2 = 100.
+texG i | tTile i == 3 = 162.
+texG i | tTile i == 4 = 204.
+texG i | tTile i == 5 = 200.
+texG i | tTile i == 6 = 92.
+texG i | tTile i == 7 = 132.
+texG i | tTile i == 8 = 74.
+texG i = 210.
+
+texB i | tTile i == 0 = 72.
+texB i | tTile i == 1 = 158.
+texB i | tTile i == 2 = 60.
+texB i | tTile i == 3 = 58.
+texB i | tTile i == 4 = 142.
+texB i | tTile i == 5 = 216.
+texB i | tTile i == 6 = 52.
+texB i | tTile i == 7 = 52.
+texB i | tTile i == 8 = 60.
+texB i = 230.
+
+buildAtlas u =
+  ( Vec.map texR (Vec.iota atlasN),
+    Vec.map texG (Vec.iota atlasN),
+    Vec.map texB (Vec.iota atlasN) ).
+
+# ---- the baked sun lightmap -------------------------------------------------
+# One byte-ish value per (cell, face).  face 0 +X, 1 -X, 2 +Y, 3 -Y,
+# 4 +Z, 5 -Z.  A face is lit by lambert against the fixed sun direction
+# and then dimmed if a shadow march from the air cell in front of it
+# reaches a solid block before leaving the world.
+
+faceNX 0 = fx. faceNX 1 = 0 - fx. faceNX f = 0.
+faceNY 2 = fx. faceNY 3 = 0 - fx. faceNY f = 0.
+faceNZ 4 = fx. faceNZ 5 = 0 - fx. faceNZ f = 0.
+
+faceDot f = (faceNX f * sunX + faceNY f * sunY + faceNZ f * sunZ) / fx.
+
+# neighbour cell of (x,y,z) across face f, as a triple
+stepFX 0 = 1. stepFX 1 = 0 - 1. stepFX f = 0.
+stepFY 2 = 1. stepFY 3 = 0 - 1. stepFY f = 0.
+stepFZ 4 = 1. stepFZ 5 = 0 - 1. stepFZ f = 0.
+
+directLight f = maxI 0 (faceDot f) * sunPower / fx.
+
+litValue f 0 = ambient + directLight f.
+litValue f s = ambient + directLight f * shadowNum / shadowDen.
+
+# a scalar fixed-step march toward the sun: 1/2-block steps, 40 of them
+# (20 blocks of reach -- more than the 16^3 box diagonal needs)
+# (the DDA below is this same ray in its SoA form; the bake is off the
+# frame path, so the cheap form is the right one here)
+marchSun w px py pz 0 = (0, w).
+marchSun w px py pz k =
+  nx = px + sunX / 2;
+  ny = py + sunY / 2;
+  nz = pz + sunZ / 2;
+  marchAt w nx ny nz (k - 1) (nx / fx) (ny / fx) (nz / fx).
+
+# integer division truncates toward zero, so a coordinate of -0.4 lands
+# in cell 0 and a ray leaving through a low face aliases back into the
+# world.  Every marcher checks the fixed-point value, not the cell.
+negPos px py pz = or2 (or2 (px < 0) (py < 0)) (pz < 0).
+
+marchAt w nx ny nz k cx cy cz | negPos nx ny nz = (0, w).
+marchAt w nx ny nz k cx cy cz | inWorld cx cy cz == False = (0, w).
+marchAt w nx ny nz k cx cy cz =
+  (b, w2) = wGet w (cellOf cx cy cz);
+  marchHit w2 nx ny nz k b.
+
+marchHit w nx ny nz k b | isSolidId b = (1, w).
+marchHit w nx ny nz k b = marchSun w nx ny nz k.
+
+# bake one face of one cell into the lightmap
+bakeFace w lm c f b | isSolidId b == False = (w, Vec.set (c * nFaces + f + 1) 0 lm).
+bakeFace w lm c f b = bakeExposed w lm c f (nbrOf c f).
+
+nbrOf c f = ((c / 256) + stepFX f, imod (c / 16) 16 + stepFY f, imod c 16 + stepFZ f).
+
+bakeExposed w lm c f (nx, ny, nz) | inWorld nx ny nz == False =
+  (w, Vec.set (c * nFaces + f + 1) (litValue f 0) lm).
+bakeExposed w lm c f (nx, ny, nz) =
+  (nb, w2) = wGet w (cellOf nx ny nz);
+  bakeOpen w2 lm c f (nx, ny, nz) nb.
+
+bakeOpen w lm c f nbr nb | isSolidId nb = (w, Vec.set (c * nFaces + f + 1) ambient lm).
+bakeOpen w lm c f (nx, ny, nz) nb =
+  (sh, w2) = marchSun w (nx * fx + fx / 2) (ny * fx + fx / 2) (nz * fx + fx / 2) 40;
+  (w2, Vec.set (c * nFaces + f + 1) (litValue f sh) lm).
+
+bakeCellFaces w lm c f b | f >= nFaces = (w, lm).
+bakeCellFaces w lm c f b =
+  (w2, lm2) = bakeFace w lm c f b;
+  bakeCellFaces w2 lm2 c (f + 1) b.
+
+bakeCells w lm c | c >= wCells = (w, lm).
+bakeCells w lm c =
+  (b, w2) = wGet w c;
+  (w3, lm2) = bakeCellFaces w2 lm c 0 b;
+  bakeCells w3 lm2 (c + 1).
+
+# the lightmap is allocated ONCE and rewritten in place on every edit
+newLightmap = Vec.axpb 0 0 (Vec.iota lmCells).
+bakeLight w lm = bakeCells w lm 0.
+
+# ---- the incremental rebake -------------------------------------------------
+# The full bake is 24576 faces with a shadow march each.  After an edit
+# only two sets of faces can have changed value:
+#   * the faces of the edited cell and its six neighbours (exposure)
+#   * the faces whose shadow ray PASSES THROUGH the edited cell, which
+#     for a directional sun is exactly the cells lying along the
+#     anti-sun ray from it
+# so that is all this walks.  Same result as bakeLight, ~1/50th the work,
+# and it is the static/dynamic split doing something real: the lightmap
+# is static until an edit dirties a nameable slice of it.
+
+cellX c = c / 256.
+cellY c = imod (c / 16) 16.
+cellZ c = imod c 16.
+cellMid c = Pt (cellX c * fx + fx / 2) (cellY c * fx + fx / 2) (cellZ c * fx + fx / 2).
+
+rebakeCell w lm c =
+  (b, w2) = wGet w c;
+  bakeCellFaces w2 lm c 0 b.
+
+rebakeAt w lm x y z | inWorld x y z == False = (w, lm).
+rebakeAt w lm x y z = rebakeCell w lm (cellOf x y z).
+
+rebakeNbrs w lm c f | f >= nFaces = (w, lm).
+rebakeNbrs w lm c f =
+  (nx, ny, nz) = nbrOf c f;
+  (w2, lm2) = rebakeAt w lm nx ny nz;
+  rebakeNbrs w2 lm2 c (f + 1).
+
+antiSun w lm (Pt px py pz) k | k <= 0 = (w, lm).
+antiSun w lm (Pt px py pz) k | negPos px py pz = (w, lm).
+antiSun w lm (Pt px py pz) k =
+  nx = px - sunX / 2; ny = py - sunY / 2; nz = pz - sunZ / 2;
+  antiStep w lm (Pt nx ny nz) (k - 1) (nx / fx) (ny / fx) (nz / fx).
+
+antiStep w lm pt k cx cy cz | inWorld cx cy cz == False = (w, lm).
+antiStep w lm pt k cx cy cz =
+  (w2, lm2) = rebakeCell w lm (cellOf cx cy cz);
+  antiSun w2 lm2 pt k.
+
+rebakeEdit w lm c =
+  (w1, lm1) = rebakeCell w lm c;
+  (w2, lm2) = rebakeNbrs w1 lm1 c 0;
+  antiSun w2 lm2 (cellMid c) 40.
+
+# ============================================================================
+# THE RAYCASTER: a DDA voxel traversal run in the SoA SIMD tier.
+#
+# The screen is walked in 512-pixel tiles; every ray in a tile advances in
+# lockstep, one cell per iteration, with the axis chosen per lane by
+# zipEq against the running minimum of the three tMax columns.  Two
+# things keep the inner loop cheap:
+#
+#   * the ray tracks the CELL INDEX, not (x,y,z): the per-axis strides
+#     (+-256, +-16, +-1) are per-lane constants, so a step is one
+#     zipMul + zipAdd per axis and the world fetch is one gather.
+#   * a lane dies on TIME, not on bounds: tExit (the t at which the ray
+#     leaves the 16^3 box) is computed once at setup, so leaving the
+#     world costs one zipLt per iteration instead of six comparisons --
+#     and it is exactly what makes index-only tracking sound, since a
+#     ray that would alias across a world edge has already passed tExit.
+# ============================================================================
+
+cvec n k = Vec.axpb 0 k (Vec.iota n).
+
+# per-axis ray setup: everything the loop needs, computed once
+Ax = Type (Ax td tm te ds fid).
+
+# IDEALLY, should not be using low level Vec ops but just high level Vec.map style ops
+
+axSetup d o stride fbase =
+  (d1, dr) = Vec.dup d;
+  (d2, d3) = Vec.dup dr;
+  pos0 = Vec.ges 0 d1;                        # lane moves the + way?
+  (p1, pr) = Vec.dup pos0;
+  (p2, pq) = Vec.dup pr;
+  (p3, p4) = Vec.dup pq;
+  ds = Vec.axpb stride (0 - stride) (Vec.axpb 2 0 p1);   # +-stride
+  ad = Vec.maxS 1 (Vec.absv d2);
+  (td1, tdr) = Vec.dup (Vec.zipDiv (cvec tileN 4294967296) ad);
+  (td2, td3) = Vec.dup tdr;
+  frac = o - (o / fx) * fx;
+  dist0 = Vec.axpb (fx - 2 * frac) frac p2;             # + : fx-frac | - : frac
+  distE = Vec.axpb (wN * fx - 2 * o) o p3;              # + : 16-o    | - : o
+  _ = Vec.free d3;
+  Ax td1 (Vec.sar 16 (Vec.zipMul dist0 td2))
+        (Vec.sar 16 (Vec.zipMul distE td3))
+        ds (Vec.axpb 1 fbase p4).
+
+axFree (Ax td tm te ds fid) =
+  _ = Vec.free td; _ = Vec.free tm; _ = Vec.free te;
+  _ = Vec.free ds; Vec.free fid.
+
+# ---- the traversal state ----------------------------------------------------
+#   Rs idx tmx tmy tmz     the moving part
+#   Rk tdx tdy tdz         cell-crossing costs (constant per lane)
+#   Rd dsx dsy dsz         index strides, signed (constant per lane)
+#   Rf fx fy fz            face ids, already sign-resolved (constant)
+#   Rh alive blk face t cell
+
+Rs = Type (Rs idx tmx tmy tmz).
+Rk = Type (Rk tdx tdy tdz).
+Rd = Type (Rd dsx dsy dsz).
+Rf = Type (Rf ffx ffy ffz).
+Rh = Type (Rh alive blk face ht cell).
+
+freeRs (Rs a b c d) =
+  _ = Vec.free a; _ = Vec.free b; _ = Vec.free c; Vec.free d.
+freeRk (Rk a b c) = _ = Vec.free a; _ = Vec.free b; Vec.free c.
+freeRd (Rd a b c) = _ = Vec.free a; _ = Vec.free b; Vec.free c.
+freeRf (Rf a b c) = _ = Vec.free a; _ = Vec.free b; Vec.free c.
+
+# the whole traversal state, in one constructor: the ABI has Tup2/Tup3
+# and nothing wider, and a step has to hand back six of these at once
+Dda = Type (Dda rs rk rd rf rh te).
+
+# one iteration: choose the axis, step, sample, record
+ddaStep w (Dda rs rk rd rf rh te) =
+  (Rs idx tmx tmy tmz) = rs;
+  (Rk tdx tdy tdz) = rk;
+  (Rd dsx dsy dsz) = rd;
+  (Rf ffx ffy ffz) = rf;
+  (Rh alive blk face ht cell) = rh;
+  # --- the running minimum, and the three axis selectors
+  (tmx1, tmx2) = Vec.dup tmx;
+  (tmy1, tmy2) = Vec.dup tmy;
+  (tmz1, tmz2) = Vec.dup tmz;
+  (mA, mB) = Vec.dup (Vec.zipMin (Vec.zipMin tmx1 tmy1) tmz1);
+  (m1, m2) = Vec.dup mA;
+  (mT, mE) = Vec.dup mB;
+  (tmxE, tmxU) = Vec.dup tmx2;
+  (tmyE, tmyU) = Vec.dup tmy2;
+  # Each selector needs one copy per CONSUMER, and every op in this tier
+  # consumes what it writes: selX feeds the index step, the tMax update,
+  # the face term, and the notX that gates selY -- four copies, not
+  # three.  Handing one block to two consumers aliases them silently.
+  (sx1, sxr1) = Vec.dup (Vec.zipEq tmxE m1);            # selX
+  (sx2, sxr2) = Vec.dup sxr1;
+  (sx3, sx4) = Vec.dup sxr2;
+  (nx1, nx2) = Vec.dup (Vec.axpb (0 - 1) 1 sx4);        # notX = 1 - selX
+  (sy1, syr1) = Vec.dup (Vec.zipMul (Vec.zipEq tmyE m2) nx1);
+  (sy2, syr2) = Vec.dup syr1;
+  (sy3, sy4) = Vec.dup syr2;
+  (sz1, szr1) = Vec.dup (Vec.zipSub nx2 sy4);           # selZ = notX - selY
+  (sz2, sz3) = Vec.dup szr1;
+  # --- advance the cell index and the three tMax columns
+  (dsx1, dsx2) = Vec.dup dsx;
+  (dsy1, dsy2) = Vec.dup dsy;
+  (dsz1, dsz2) = Vec.dup dsz;
+  (tdx1, tdx2) = Vec.dup tdx;
+  (tdy1, tdy2) = Vec.dup tdy;
+  (tdz1, tdz2) = Vec.dup tdz;
+  idx2 = Vec.zipAdd (Vec.zipAdd (Vec.zipAdd idx (Vec.zipMul sx1 dsx1))
+                                (Vec.zipMul sy1 dsy1))
+                    (Vec.zipMul sz1 dsz1);
+  tmx3 = Vec.zipAdd tmxU (Vec.zipMul sx2 tdx1);
+  tmy3 = Vec.zipAdd tmyU (Vec.zipMul sy2 tdy1);
+  tmz3 = Vec.zipAdd tmz2 (Vec.zipMul sz2 tdz1);
+  # --- the face we entered through: sign was resolved at setup
+  (ffx1, ffx2) = Vec.dup ffx;
+  (ffy1, ffy2) = Vec.dup ffy;
+  (ffz1, ffz2) = Vec.dup ffz;
+  facN = Vec.zipAdd (Vec.zipAdd (Vec.zipMul sx3 ffx1) (Vec.zipMul sy3 ffy1))
+                    (Vec.zipMul sz3 ffz1);
+  # --- a lane dies when it crosses tExit: that IS the world boundary
+  (te1, te2) = Vec.dup te;
+  (al1, alr) = Vec.dup (Vec.zipMul alive (Vec.zipLt mE te1));
+  (al2, al3) = Vec.dup alr;
+  # --- sample the world (index clamped: the alive mask is the real guard)
+  # THREE copies of the index, and they are all needed: one is clamped
+  # into a gather operand, one is the cell recorded on a hit (blend
+  # consumes its source), and one is carried to the next iteration.
+  # Handing the same object to blend and to the next Rs is a
+  # use-after-free -- the blend frees it and the allocator hands the
+  # block straight back out.
+  (ix1, ixr) = Vec.dup idx2;
+  (ix2, ix3) = Vec.dup ixr;
+  (bl, w2) = Vec.gather (Vec.minS (wCells - 1) (Vec.maxS 0 ix1)) w;
+  (bl1, bl2) = Vec.dup bl;
+  (h1, hr) = Vec.dup (Vec.zipMul (Vec.ges 1 bl1) al1);
+  (h2, hq) = Vec.dup hr;
+  (h3, hp) = Vec.dup hq;
+  (h4, h5) = Vec.dup hp;
+  rh2 = Rh (Vec.zipMul al2 (Vec.axpb (0 - 1) 1 h1))
+           (Vec.blend h2 bl2 blk)
+           (Vec.blend h3 facN face)
+           (Vec.blend h4 mT ht)
+           (Vec.blend h5 ix2 cell);
+  (alv, cnt) = aliveCount al3;
+  _ = Vec.free alv;
+  (w2, Dda (Rs ix3 tmx3 tmy3 tmz3) (Rk tdx2 tdy2 tdz2) (Rd dsx2 dsy2 dsz2)
+           (Rf ffx2 ffy2 ffz2) rh2 te2, cnt).
+
+# the early out: once no lane is still traversing, the tile is done
+aliveCount v =
+  (n, v2) = Vec.fold sumF 0 v;
+  (v2, n).
+
+ddaLoop w dda k | k <= 0 = ddaDone w dda.
+ddaLoop w dda k =
+  (w2, dda2, cnt) = ddaStep w dda;
+  ddaLoop w2 dda2 (kNext k cnt).
+
+kNext k 0 = 0.
+kNext k cnt = k - 1.
+
+ddaDone w (Dda rs rk rd rf rh te) =
+  _ = freeRs rs; _ = freeRk rk; _ = freeRd rd; _ = freeRf rf;
+  _ = Vec.free te;
+  (w, rh).
+
+# ---- ray construction: camera-space pixel -> world direction ---------------
+# a = x - W/2 (pixels), b = H/2 - y, c = focal.  Pitch rotates (b, c)
+# about the camera's right axis, yaw rotates (a, c) about world Y.
+
+# the Scene: the entire dynamic surface render/6 is allowed to see
+Sc = Type (Sc ox oy oz yaw pit).
+
+Ray = Type (Ray dx dy dz yv).
+
+mkRays sc t =
+  (Sc ox oy oz yaw pit) = sc;
+  cw = cosA yaw; sw = sinA yaw;
+  cp = cosA pit; sp = sinA pit;
+  (i1, i2) = Vec.dup (Vec.axpb 1 (t * tileN) (Vec.iota tileN));
+  (y1, yr) = Vec.dup (Vec.sar wShift i1);                  # screen y
+  (y2, y3) = Vec.dup yr;
+  xs = Vec.zipSub i2 (Vec.axpb scrW 0 y1);                # screen x
+  (a1, a2) = Vec.dup (Vec.axpb fx (0 - (scrW / 2) * fx) xs);   # a, 16.16
+  (b1, b2) = Vec.dup (Vec.axpb (0 - 1) (scrH / 2) y2);         # b, pixels
+  (c1, c2) = Vec.dup (Vec.axpb (0 - sp) (focal * cp) b1); # c1 = f*cp - b*sp
+  dyv = Vec.axpb cp (focal * sp) b2;                      # b*cp + f*sp
+  dxv = Vec.sar 16 (Vec.zipAdd (Vec.axpb cw 0 a1) (Vec.axpb sw 0 c1));
+  dzv = Vec.sar 16 (Vec.zipSub (Vec.axpb cw 0 c2) (Vec.axpb sw 0 a2));
+  Ray dxv dyv dzv y3.
+
+# ============================================================================
+# SHADING: texel by gather from the 10-tile atlas, light by gather from
+# the baked lightmap, sky where the ray left the world.
+# ============================================================================
+
+skyR = 96. skyG = 140. skyB = 206.
+
+fracOf h =
+  (h1, h2) = Vec.dup h;
+  Vec.zipSub h1 (Vec.axpb fx 0 (Vec.sar 16 h2)).
+
+hitPoint t d o = Vec.axpb 1 o (Vec.sar 16 (Vec.zipMul t d)).
+
+shade atlas lm rh ray sc =
+  (Rh alive blk face ht cell) = rh;
+  (Ray dxv dyv dzv yv) = ray;
+  (Sc ox oy oz yaw pit) = sc;
+  _ = Vec.free alive;
+  (t1, tr) = Vec.dup ht;
+  (t2, t3) = Vec.dup tr;
+  fxv = fracOf (hitPoint t1 dxv ox);
+  fyv = fracOf (hitPoint t2 dyv oy);
+  fzv = fracOf (hitPoint t3 dzv oz);
+  (fa1, fa2) = Vec.dup face;
+  (ax1, ax2) = Vec.dup (Vec.sar 1 fa1);                   # 0 X, 1 Y, 2 Z
+  (fx1, fx2) = Vec.dup fxv;
+  # u: the X face reads z, everything else reads x
+  uu = Vec.sar 12 (Vec.blend (Vec.eqS 0 ax1) fzv fx1);
+  # v: the Y face reads x-flipped-none (z), the side faces read y flipped
+  vv = Vec.sar 12 (Vec.blend (Vec.eqS 1 ax2) fx2 (Vec.axpb (0 - 1) (fx - 1) fyv));
+  (b1, b2) = Vec.dup blk;
+  ti0 = Vec.zipAdd (Vec.zipAdd (Vec.axpb 256 (0 - 256) b1) (Vec.axpb 16 0 vv)) uu;
+  (ti1, tir) = Vec.dup (Vec.minS (atlasN - 1) (Vec.maxS 0 ti0));
+  (ti2, ti3) = Vec.dup tir;
+  (ar, ag, ab) = atlas;
+  (tr1, ar2) = Vec.gather ti1 ar;
+  (tg1, ag2) = Vec.gather ti2 ag;
+  (tb1, ab2) = Vec.gather ti3 ab;
+  li0 = Vec.zipAdd (Vec.axpb nFaces 0 cell) fa2;
+  (lt0, lm2) = Vec.gather (Vec.minS (lmCells - 1) (Vec.maxS 0 li0)) lm;
+  (l1, lr) = Vec.dup lt0;
+  (l2, l3) = Vec.dup lr;
+  (hm1, hmr) = Vec.dup (Vec.ges 1 b2);
+  (hm2, hm3) = Vec.dup hmr;
+  (yv1, yvr) = Vec.dup yv;
+  (yv2, yv3) = Vec.dup yvr;
+  ( (Vec.blend hm1 (litChan tr1 l1) (Vec.axpb 1 skyR (Vec.sar 2 yv1)),
+     Vec.blend hm2 (litChan tg1 l2) (Vec.axpb 1 skyG (Vec.sar 2 yv2)),
+     Vec.blend hm3 (litChan tb1 l3) (Vec.axpb 0 skyB yv3)),
+    (ar2, ag2, ab2), lm2 ).
+
+litChan tx l = Vec.minS 255 (Vec.sar 8 (Vec.zipMul tx l)).
+
+# ---- one tile: rays -> DDA -> shade -> blit --------------------------------
+
+# the batch carries the running frame checksum too: folding the three
+# 16384-element planes once per frame costs ~850 KB of intermediate the
+# actor never gets back, while folding each 512-pixel tile is free --
+# same sum, taken before the pixels are written instead of after
+Bt = Type (Bt w lm atlas fb cs).
+
+renderTile (Bt w lm atlas fb cs) sc t =
+  (Ray dxv dyv dzv yv) = mkRays sc t;
+  (Sc ox oy oz yaw pit) = sc;
+  (dx1, dx2) = Vec.dup dxv;
+  (dy1, dy2) = Vec.dup dyv;
+  (dz1, dz2) = Vec.dup dzv;
+  (Ax tdx tmx tex dsx ffx) = axSetup dx1 ox 256 0;
+  (Ax tdy tmy tey dsy ffy) = axSetup dy1 oy 16 2;
+  (Ax tdz tmz tez dsz ffz) = axSetup dz1 oz 1 4;
+  te = Vec.zipMin (Vec.zipMin tex tey) tez;
+  cell0 = cvec tileN (cellOf (ox / fx) (oy / fx) (oz / fx));
+  rh0 = Rh (cvec tileN 1) (cvec tileN 0) (cvec tileN 0) (cvec tileN 0) (cvec tileN 0);
+  (w2, rh) = ddaLoop w (Dda (Rs cell0 tmx tmy tmz) (Rk tdx tdy tdz)
+                            (Rd dsx dsy dsz) (Rf ffx ffy ffz) rh0 te) ddaSteps;
+  (cols, atlas2, lm2) = shade atlas lm rh (Ray dx2 dy2 dz2 yv) sc;
+  (fb2, cs2) = blit fb cols cs (t * tileN);
+  Bt w2 lm2 atlas2 fb2 cs2.
+
+blit (fr, fg, fb) (cr, cg, cb) (ar, ag, ab) off =
+  (sr, cr2) = Vec.fold sumF 0 cr;
+  (sg, cg2) = Vec.fold sumF 0 cg;
+  (sb, cb2) = Vec.fold sumF 0 cb;
+  ( (Vec.burst off cr2 fr, Vec.burst off cg2 fg, Vec.burst off cb2 fb),
+    (ar + sr, ag + sg, ab + sb) ).
+
+# ---- the render dispatcher: Scene in, framebuffer out ----------------------
+
+render bt sc t | t >= nTiles = bt.
+render bt sc t = render (renderTile bt sc t) sc (t + 1).
+
+# ============================================================================
+# PHYSICS: an AABB against the block field.  The world boundary is not a
+# special case -- everything outside the 16^3 box reads as SOLID, so the
+# invisible wall and the block collision are the SAME predicate.
+# ============================================================================
+
+hw = 19661.                      # 0.30 half-width
+ph = 117964.                     # 1.80 tall
+eyeH = 106168.                   # 1.62 eye
+gravA = 2949.                    # 0.045 / frame^2
+jumpV = 19661.                   # 0.30 / frame
+moveV = 19661.                   # 0.30 / frame
+termV = 32768.                   # 0.50 / frame
+
+# Ideally should be using the || operator
+
+# outside the box: blocked.  the wall the brief asked for, for free.
+outOfBounds px py pz =
+  or2 (or2 (px - hw < 0) (px + hw >= wN * fx))
+      (or2 (or2 (py < 0) (py + ph >= wN * fx))
+           (or2 (pz - hw < 0) (pz + hw >= wN * fx))).
+
+blockedAt w px py pz | outOfBounds px py pz = (True, w).
+blockedAt w px py pz =
+  scanX w ((px - hw) / fx) ((px + hw) / fx) (py / fx) ((py + ph) / fx)
+          ((pz - hw) / fx) ((pz + hw) / fx).
+
+scanX w x x1 y0 y1 z0 z1 | x > x1 = (False, w).
+scanX w x x1 y0 y1 z0 z1 =
+  (hit, w2) = scanY w x y0 y1 z0 z1;
+  scanXMore w2 hit x x1 y0 y1 z0 z1.
+scanXMore w True x x1 y0 y1 z0 z1 = (True, w).
+scanXMore w False x x1 y0 y1 z0 z1 = scanX w (x + 1) x1 y0 y1 z0 z1.
+
+scanY w x y y1 z0 z1 | y > y1 = (False, w).
+scanY w x y y1 z0 z1 =
+  (hit, w2) = scanZ w x y z0 z1;
+  scanYMore w2 hit x y y1 z0 z1.
+scanYMore w True x y y1 z0 z1 = (True, w).
+scanYMore w False x y y1 z0 z1 = scanY w x (y + 1) y1 z0 z1.
+
+scanZ w x y z z1 | z > z1 = (False, w).
+scanZ w x y z z1 =
+  (b, w2) = wGet w (cellOf x y z);
+  scanZMore w2 (isSolidId b) x y z z1.
+scanZMore w True x y z z1 = (True, w).
+scanZMore w False x y z z1 = scanZ w x y (z + 1) z1.
+
+# ---- the body ---------------------------------------------------------------
+
+Bd = Type (Bd px py pz vx vy vz grounded).
+
+# try one axis at a time; a blocked axis loses its velocity, and a
+# blocked DOWNWARD y move is what grounds the player
+moveX w (Bd px py pz vx vy vz g) =
+  (hit, w2) = blockedAt w (px + vx) py pz;
+  moveXR w2 hit (Bd px py pz vx vy vz g).
+moveXR w True (Bd px py pz vx vy vz g) = (w, Bd px py pz 0 vy vz g).
+moveXR w False (Bd px py pz vx vy vz g) = (w, Bd (px + vx) py pz vx vy vz g).
+
+moveZ w (Bd px py pz vx vy vz g) =
+  (hit, w2) = blockedAt w px py (pz + vz);
+  moveZR w2 hit (Bd px py pz vx vy vz g).
+moveZR w True (Bd px py pz vx vy vz g) = (w, Bd px py pz vx vy 0 g).
+moveZR w False (Bd px py pz vx vy vz g) = (w, Bd px py (pz + vz) vx vy vz g).
+
+moveY w (Bd px py pz vx vy vz g) =
+  (hit, w2) = blockedAt w px (py + vy) pz;
+  moveYR w2 hit (Bd px py pz vx vy vz g).
+moveYR w True (Bd px py pz vx vy vz g) = (w, Bd px py pz vx 0 vz (vy < 0)).
+moveYR w False (Bd px py pz vx vy vz g) = (w, Bd px (py + vy) pz vx vy vz False).
+
+physics w bd =
+  (Bd px py pz vx vy vz g) = bd;
+  vy2 = maxI (0 - termV) (vy - gravA);
+  (w2, b1) = moveX w (Bd px py pz vx vy2 vz g);
+  (w3, b2) = moveY w2 b1;
+  (w4, b3) = moveZ w3 b2;
+  (Bd qx qy qz wx wy wz g2) = b3;
+  (w4, Bd qx qy qz 0 wy 0 g2).      # horizontal impulses last one frame
+
+# ============================================================================
+# PICKING: the same ray as the renderer, in its scalar form -- a fixed
+# 1/8-block march from the eye.  Returns the first solid cell and the
+# last empty one before it (that is where a placed block goes).
+# ============================================================================
+
+Pick = Type (PkNone | PkHit cell prev).
+
+viewDX yaw pit = (cosA pit * sinA yaw) / fx.
+viewDY yaw pit = sinA pit.
+viewDZ yaw pit = (cosA pit * cosA yaw) / fx.
+
+# position and direction ride in constructors: the PoC ABI takes 8 args
+Pt = Type (Pt x y z).
+Vd = Type (Vd dx dy dz).
+
+pickAt w pt vd k prev | k <= 0 = (PkNone, w).
+pickAt w pt vd k prev =
+  (Pt px py pz) = pt;
+  (Vd dx dy dz) = vd;
+  nx = px + dx / 8; ny = py + dy / 8; nz = pz + dz / 8;
+  pickCell w (Pt nx ny nz) vd k prev (nx / fx) (ny / fx) (nz / fx).
+
+pickCell w (Pt px py pz) vd k prev cx cy cz | negPos px py pz = (PkNone, w).
+pickCell w pt vd k prev cx cy cz | inWorld cx cy cz == False = (PkNone, w).
+pickCell w pt vd k prev cx cy cz =
+  (b, w2) = wGet w (cellOf cx cy cz);
+  pickTest w2 pt vd k prev (cellOf cx cy cz) b.
+
+pickTest w pt vd k prev c b | isSolidId b = (PkHit c prev, w).
+pickTest w pt vd k prev c b = pickAt w pt vd (k - 1) c.
+
+pickFrom w (Bd px py pz vx vy vz g) yaw pit =
+  pickAt w (Pt px (py + eyeH) pz)
+           (Vd (viewDX yaw pit) (viewDY yaw pit) (viewDZ yaw pit)) 80 (0 - 1).
+
+# ============================================================================
+# THE MODEL.  Only scalars live here: the world, lightmap, atlas and
+# framebuffer are the STATIC BATCH, threaded alongside and mutated in
+# place, never rebuilt.
+# ============================================================================
+
+Mdl = Type (Mdl body yaw pit sel act).
+
+# ---- input map (evdev) ------------------------------------------------------
+#   arrows 103 up / 108 down / 105 left / 106 right   move
+#   17 w / 31 s   pitch      30 a / 32 d   yaw
+#   57 space  jump    45 x  destroy    33 f  place
+#   2..11     select block 1..10
+
+applyKey 103 m w lm = (moveBy m 1 0, w, lm).
+applyKey 108 m w lm = (moveBy m (0 - 1) 0, w, lm).
+applyKey 105 m w lm = (moveBy m 0 (0 - 1), w, lm).
+applyKey 106 m w lm = (moveBy m 0 1, w, lm).
+applyKey 17 m w lm = (pitchBy m 1, w, lm).
+applyKey 31 m w lm = (pitchBy m (0 - 1), w, lm).
+applyKey 30 m w lm = (yawBy m (0 - 1), w, lm).
+applyKey 32 m w lm = (yawBy m 1, w, lm).
+applyKey 57 m w lm = (jump m, w, lm).
+applyKey 45 m w lm = editWorld m w lm 0.
+applyKey 33 m w lm = editWorld m w lm 1.
+applyKey k m w lm | and2 (k >= 2) (k <= 11) = (selectBlock m (k - 1), w, lm).
+applyKey k m w lm = (m, w, lm).
+
+applyKeys Nil m w lm = (m, w, lm).
+applyKeys (k :: r) m w lm =
+  (m2, w2, lm2) = applyKey k m w lm;
+  applyKeys r m2 w2 lm2.
+
+# movement is yaw-relative: forward (sin, cos), right (cos, -sin)
+moveBy (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) f r =
+  sw = sinA yaw; cw = cosA yaw;
+  nvx = (f * sw + r * cw) * moveV / fx;
+  nvz = (f * cw - r * sw) * moveV / fx;
+  Mdl (Bd px py pz (vx + nvx) vy (vz + nvz) g) yaw pit sel "move".
+
+pitchBy (Mdl b yaw pit sel act) d = Mdl b yaw (clampI (0 - 5) 5 (pit + d)) sel "look".
+yawBy (Mdl b yaw pit sel act) d = Mdl b (imod (yaw + d + 32) 32) pit sel "look".
+selectBlock (Mdl b yaw pit sel act) k = Mdl b yaw pit k "select {k}".
+
+jump (Mdl (Bd px py pz vx vy vz True) yaw pit sel act) =
+  Mdl (Bd px py pz vx jumpV vz False) yaw pit sel "jump".
+jump m = m.
+
+# ---- editing: destroy / place, then rebake the sun ------------------------
+
+editWorld m w lm mode =
+  (Mdl bd yaw pit sel act) = m;
+  (pk, w2) = pickFrom w bd yaw pit;
+  editApply m w2 lm mode pk.
+
+editApply m w lm mode PkNone = (missMsg m mode, w, lm).
+editApply m w lm 0 (PkHit c prev) =
+  (Mdl bd yaw pit sel act) = m;
+  w2 = wSet w c 0;
+  (w3, lm2) = rebakeEdit w2 lm c;
+  (Mdl bd yaw pit sel "destroy {c}", w3, lm2).
+editApply m w lm 1 (PkHit c prev) | prev < 0 = (missMsg m 1, w, lm).
+editApply m w lm 1 (PkHit c prev) =
+  (Mdl bd yaw pit sel act) = m;
+  placeAt m w lm sel prev (occupiedBy bd prev).
+
+occupiedBy (Bd px py pz vx vy vz g) c =
+  and2 (and2 ((px - hw) / fx <= c / 256) ((px + hw) / fx >= c / 256))
+       (and2 (and2 (py / fx <= imod (c / 16) 16) ((py + ph) / fx >= imod (c / 16) 16))
+             (and2 ((pz - hw) / fx <= imod c 16) ((pz + hw) / fx >= imod c 16))).
+
+placeAt m w lm sel c True = (missMsg m 1, w, lm).
+placeAt m w lm sel c False =
+  (Mdl bd yaw pit sel2 act) = m;
+  w2 = wSet w c sel;
+  (w3, lm2) = rebakeEdit w2 lm c;
+  (Mdl bd yaw pit sel2 "place {sel} at {c}", w3, lm2).
+
+missMsg (Mdl bd yaw pit sel act) 0 = Mdl bd yaw pit sel "destroy (no target)".
+missMsg (Mdl bd yaw pit sel act) mode = Mdl bd yaw pit sel "place (blocked)".
+
+# ---- view: Model -> Scene.  This is the whole dynamic surface. -------------
+
+view (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) =
+  Sc px (py + eyeH) pz yaw pit.
+
+blockName 1 = "bedrock". blockName 2 = "stone". blockName 3 = "dirt".
+blockName 4 = "grass". blockName 5 = "sand". blockName 6 = "ore".
+blockName 7 = "wood". blockName 8 = "leaves". blockName 9 = "brick".
+blockName 10 = "glass". blockName k = "?".
+
+# ============================================================================
+# OUTPUT: the ANSI frame.  Row strings stay ~1.7 KB: under the 4 KB
+# print render buffer and the 8 KiB block ceiling both.
+# ============================================================================
+
+esc = chr 27.
+hbk = "{chr 226}{chr 150}{chr 128}".      # U+2580 upper half block, UTF-8
+
+c6 v = clampI 0 5 (v * 6 / 256).
+cIdx r g b = 16 + c6 r * 36 + c6 g * 6 + c6 b.
+
+# one character cell: fg <- pixel (yb+x), bg <- pixel one row down
+cellStr (fr, fg, fb) ti bi =
+  (r1, fr1) = Vec.get ti fr;
+  (g1, fg1) = Vec.get ti fg;
+  (b1, fb1) = Vec.get ti fb;
+  (r2, fr2) = Vec.get bi fr1;
+  (g2, fg2) = Vec.get bi fg1;
+  (b2, fb2) = Vec.get bi fb1;
+  ((fr2, fg2, fb2),
+   "{esc}[38;5;{cIdx r1 g1 b1}m{esc}[48;5;{cIdx r2 g2 b2}m{hbk}").
+
+rowChunk fb yb x k acc | k >= 8 = (fb, acc).
+rowChunk fb yb x k acc =
+  (fb2, s) = cellStr fb (yb + x + k + 1) (yb + scrW + x + k + 1);
+  rowChunk fb2 yb x (k + 1) (strcat acc s).
+
+rowStr fb yb x acc | x >= scrW = (fb, acc).
+rowStr fb yb x acc =
+  (fb2, s) = rowChunk fb yb x 0 "";
+  rowStr fb2 yb (x + 8) (strcat acc s).
+
+# home rides on row 0's print: print appends a newline, so a bare
+# "ESC[H" print would push row 0 down a line
+rowLead 0 s = strcat "{esc}[H" s.
+rowLead y s = s.
+
+drawRows fb y | y >= scrH = fb.
+drawRows fb y =
+  (fb2, s) = rowStr fb (y * scrW) 0 "";
+  _ = print (rowLead y s);
+  drawRows fb2 (y + 2).
+
+status m n =
+  (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) = m;
+  print "{esc}[0mf{n}  pos {fixed px} {fixed py} {fixed pz}  yaw {yaw} pit {pit}  {ground g}  hold {blockName sel}  {act}{esc}[K".
+
+fixed v = "{v / fx}.{pad2 (imod (v * 100 / fx) 100)}".
+pad2 n | n < 10 = "0{n}".
+pad2 n = "{n}".
+ground True = "gnd".
+ground False = "air".
+
+# ============================================================================
+# INPUT: drain the poll (raw tty or FPR_EVDEV behind fpr_g_inputPoll),
+# presses only.  Poll replies are worker-pool values -- the worker dies
+# this frame, so nothing needs dropping.
+# ============================================================================
+
+pollKeys ks n | n <= 0 = (ks, 0).
+pollKeys ks n = pollStep ks n (inputPoll 0).
+pollStep ks n (0, a, b) = (ks, 0).
+pollStep ks n (4, 16, 1) = (ks, 1).                # q: quit
+pollStep ks n (4, code, 1) = pollKeys (code :: ks) (n - 1).
+pollStep ks n ev = pollKeys ks (n - 1).
+
+# ============================================================================
+# THE FRAME ACTOR.  One per frame; all per-frame allocation dies here.
+# Request/reply roots are FLAT (ints and Vec handles only): send pins a
+# root until its receiver drops it, but a root's CHILDREN share its
+# slab only if nothing else intervened -- flat roots make that a
+# non-question.  Vec handles are stable identities (set/get/burst
+# return the same object), so a handle allocated in main's immortal
+# pool stays valid however many workers thread it.
+# ============================================================================
+
+Rq = Type (Rq px py pz vx vy vz gi sel).           # body + held block
+Bk = Type (Bk w lm ar ag ab fr fg fb).             # the static batch
+
+gi True = 1.
+gi False = 0.
+
+frameWorker self =
+  m1 = receive self; (parent, wv, lm) = m1;
+  m2 = receive self; (ar, ag, ab) = m2;
+  m3 = receive self; (fr, fg, fb) = m3;
+  m4 = receive self; (Rq px py pz vx vy vz g sel) = m4;
+  m5 = receive self; (yaw, pit, n) = m5;
+  _ = drop m1; _ = drop m2; _ = drop m3; _ = drop m4; _ = drop m5;
+  (ks, q) = pollKeys Nil 16;
+  m0 = Mdl (Bd px py pz vx vy vz (g == 1)) yaw pit sel "";
+  (mA, w1, lm1) = applyKeys ks m0 wv lm;
+  (Mdl bdA yawA pitA selA act) = mA;
+  (w2, bd2) = physics w1 bdA;
+  mB = Mdl bd2 yawA pitA selA act;
+  (Bt w3 lm2 atlas2 fb2 cs2) = render (Bt w2 lm1 (ar, ag, ab) (fr, fg, fb) (0, 0, 0))
+                                       (view mB) 0;
+  (fr3, fg3, fb3) = drawRows fb2 0;
+  _ = status mB n;
+  (ar2, ag2, ab2) = atlas2;
+  (Bd qx qy qz wx wy wz g2) = bd2;
+  _ = send parent (q, yawA, pitA);
+  _ = send parent (Rq qx qy qz wx wy wz (gi g2) selA);
+  send parent (Bk w3 lm2 ar2 ag2 ab2 fr3 fg3 fb3).
+
+# ============================================================================
+# THE DRIVER.  Long-lived and nearly allocation-free per frame: it
+# spins on the clint mtime register (made ONCE -- a fresh reg32 per
+# read would bump the pool every spin), forwards the batch and model
+# roots to a fresh worker, drops last frame's roots, receives this
+# frame's.  The Rq root is FORWARDED as the request (incref on send,
+# so drop here + drop there balance).
+# ============================================================================
+
+tick = 500000.                       # 10 MHz clint: 50 ms -> 20 fps
+
+waitTick mt t0 | read mt - t0 >= tick = read mt.
+waitTick mt t0 = waitTick mt t0.
+
+driver me mt tP n rB rM rS =
+  t = waitTick mt tP;
+  (Bk wv lm ar ag ab fr fg fb) = rB;
+  (q0, yaw, pit) = rS;
+  wk = spawn frameWorker;
+  _ = send wk (me, wv, lm);
+  _ = send wk (ar, ag, ab);
+  _ = send wk (fr, fg, fb);
+  _ = send wk rM;
+  _ = send wk (yaw, pit, n);
+  _ = drop rB; _ = drop rM; _ = drop rS;
+  r1 = receive me;                   # (q, yaw, pit)
+  r2 = receive me;                   # Rq
+  r3 = receive me;                   # Bk
+  (qf, y2, p2) = r1;
+  driveNext me mt t n r3 r2 r1 qf.
+
+driveNext me mt t n rB rM rS 1 = print "{esc}[0m{esc}[?25h\nvoxel-interactive: bye ({n} frames)".
+driveNext me mt t n rB rM rS q = driver me mt t (n + 1) rB rM rS.
+
+# ============================================================================
+# MAIN: build once (in this immortal pool), hand the loop its roots.
+# ============================================================================
+
+main =
+  _ = print "voxel-interactive: {wN}^3 world -> {scrW}x{scrH} ANSI half-blocks";
+  w0 = buildWorld;
+  (w1, lm1) = bakeLight w0 newLightmap;
+  _ = print "world built, sun baked ({lmCells} face lights) -- q quits";
+  (ar, ag, ab) = buildAtlas Unit;
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  me = myself 0;
+  _ = print "{esc}[2J{esc}[?25l";
+  rB = Bk w1 lm1 ar ag ab (cvec (scrW * scrH) 0) (cvec (scrW * scrH) 0)
+          (cvec (scrW * scrH) 0);
+  rM = Rq (6 * fx + fx / 2) (6 * fx) (6 * fx + fx / 2) 0 0 0 0 4;
+  rS = (0, 0, 0 - 1);
+  driver me mt (read mt) 1 rB rM rS.

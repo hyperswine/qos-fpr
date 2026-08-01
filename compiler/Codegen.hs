@@ -38,7 +38,7 @@ import Control.Monad (when)
 import Control.Monad.State.Strict
 import Data.Bits (shiftR, (.&.))
 import Data.Char (isAlphaNum, ord)
-import Data.List (intercalate, nub, sort)
+import Data.List (foldl', intercalate, nub, sort)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Numeric (showHex)
@@ -133,10 +133,9 @@ wcetAnnotate fname lns =
         go cur acc (Left lbl : rest) = (cur, reverse acc) : go lbl [] rest
         go cur acc (Right i : rest) = go cur (i : acc) rest
     labels = [l | (l, _) <- blocks]
-    nextOf l = case dropWhile ((/= l) . fst) blocks of
-      (_ : (n, _) : _) -> Just (fst' n)
-      _ -> Nothing
-      where fst' = id
+    labelSet = S.fromList labels
+    nextMap = M.fromList (zip labels (drop 1 labels))
+    nextOf l = M.lookup l nextMap
     -- ---- classify one instruction ----
     isReset ws = case ws of
       ("call" : t : _) -> t == "fpr_fuel_exhausted" || isFprFn t
@@ -168,26 +167,44 @@ wcetAnnotate fname lns =
         fallsOff = null is || not (isUncond lastI || isRet lastI || endsInFprJump lastI)
         endsInFprJump w = case w of ("j" : t : _) -> isFprFn t; ("jmp" : t : _) -> isFprFn t; _ -> False
         uncondT = [target lastI | not (null is), isUncond lastI]
-        succs = filter (`elem` labels) (condTargets ++ uncondT ++ [n | fallsOff, Just n <- [nextOf lbl]])
+        succs = filter (`S.member` labelSet) (condTargets ++ uncondT ++ [n | fallsOff, Just n <- [nextOf lbl]])
         exits = (not (null is) && (isRet lastI || endsInFprJump lastI)) || (fallsOff && nextOf lbl == Nothing)
     bmap = [(l, summarize l is) | (l, is) <- blocks]
-    look l = lookup l bmap
+    blockMap = M.fromList bmap
     -- ---- maxFrom: max insns from block start to first reset/exit ----
-    -- DAG walk with a visited path guard: a back-edge (shouldn't exist —
-    -- all loops are tail calls) yields Nothing = UNBOUNDED, loudly.
-    maxFrom :: [String] -> String -> Maybe Int
-    maxFrom path l
-      | l `elem` path = Nothing
-      | otherwise = case look l of
-          Nothing -> Just 0
+    -- Memoized DFS with a grey (on-stack) set: a back-edge (shouldn't
+    -- exist — all loops are tail calls) yields Nothing = UNBOUNDED,
+    -- loudly, exactly as before; the memo table makes the walk linear.
+    -- (The previous path-guarded walk recomputed every diamond's tail
+    -- once per path through the diamond — exponential in join depth;
+    -- voxel's ddaStep was the first function big enough to make that
+    -- non-terminating in practice.)
+    maxTab :: M.Map String (Maybe Int)
+    maxTab = foldl' (\m l -> fst (visit S.empty m l)) M.empty labels
+    visit grey m l
+      | Just v <- M.lookup l m = (m, v)
+      | S.member l grey = (m, Nothing) -- back-edge: l is on a real cycle
+      | otherwise = case M.lookup l blockMap of
+          Nothing -> (m, Just 0)
           Just b ->
             let r1 = head (wRuns b)
              in if length (wRuns b) > 1
-                  then Just r1 -- reset inside this block ends the segment
-                  else fmap (r1 +) (succMax (l : path) b)
-    succMax path b
+                  then (M.insert l (Just r1) m, Just r1) -- reset inside this block ends the segment
+                  else
+                    let (m1, v) = visitSuccs (S.insert l grey) m b
+                        r = fmap (r1 +) v
+                     in (M.insert l r m1, r)
+    visitSuccs grey m b
+      | null (wSuccs b) = (m, Just 0)
+      | otherwise =
+          let step (mm, acc) s = let (mm1, v) = visit grey mm s in (mm1, v : acc)
+              (m1, vs) = foldl' step (m, []) (wSuccs b)
+           in (m1, maximumM vs)
+    maxFrom :: String -> Maybe Int
+    maxFrom l = M.findWithDefault (Just 0) l maxTab -- absent label: not a block, 0 (as before)
+    succMax b
       | null (wSuccs b) = Just 0
-      | otherwise = maximumM [maxFrom path s | s <- wSuccs b]
+      | otherwise = maximumM [maxFrom s | s <- wSuccs b]
     maximumM ms = if any (== Nothing) ms then Nothing else Just (maximum [m | Just m <- ms])
     -- segments STARTING at a reset inside a block: trailing run + onward
     afterResets :: Maybe [Int]
@@ -199,10 +216,10 @@ wcetAnnotate fname lns =
           let inner = init (drop 1 (wRuns b)), -- complete segments inside the block
           seg <-
             map Just inner
-              ++ [fmap (lastRun +) (succMax [l] b)]
+              ++ [fmap (lastRun +) (succMax b)]
       ]
     segMax' = do
-      entry <- maxFrom [] (fst (head bmap))
+      entry <- maxFrom (fst (head bmap))
       rest <- afterResets
       pure (maximum (entry : rest ++ [0]))
     -- exit-tail: max insns from the LAST reset to a ret (for chaining)
