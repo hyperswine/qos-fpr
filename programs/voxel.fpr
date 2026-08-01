@@ -397,6 +397,8 @@ cvec n k = Vec.axpb 0 k (Vec.iota n).
 # per-axis ray setup: everything the loop needs, computed once
 Ax = Type (Ax td tm te ds fid).
 
+# IDEALLY, should not be using low level Vec ops but just high level Vec.map style ops
+
 axSetup d o stride fbase =
   (d1, dr) = Vec.dup d;
   (d2, d3) = Vec.dup dr;
