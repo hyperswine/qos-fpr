@@ -36,8 +36,7 @@ escShell u =
 chkRc 0 p out = out.
 chkRc rc p out = error "docsgen: cannot read {p}".
 
-bodyClause (name, title) =
-  "body \"{name}\" = \"{escFile name}\".{nl}".
+bodyClause (name, title) = "body \"{name}\" = \"{escFile name}\".{nl}".
 bodyClauses lst = case lst of [] -> "" | e :: r -> "{bodyClause e}{bodyClauses r}".
 
 listRow (name, title) = "(\"{name}\", \"{title}\")".
