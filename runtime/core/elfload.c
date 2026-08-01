@@ -19,6 +19,8 @@
 #include "fpr.h"
 
 #define PT_LOAD 1
+#define PF_X 1
+#define PF_W 2
 
 typedef struct {
   unsigned char e_ident[16];
@@ -46,18 +48,18 @@ typedef struct {
 } Elf32_Phdr;
 
 static fpr_elf_load_t fail(const char *why) {
-  fpr_elf_load_t r = {0, 0, 0, why};
+  fpr_elf_load_t r = {0, 0, 0, why, 0, (void *)~(uw)0};
   return r;
 }
 
 /* one PT_LOAD segment, in a class-neutral shape, after we've decoded
  * either the 32- or 64-bit header variant */
-typedef struct { uw type, offset, vaddr, filesz, memsz; } seg_t;
+typedef struct { uw type, flags, offset, vaddr, filesz, memsz; } seg_t;
 
 static fpr_elf_load_t load_segments(const unsigned char *bytes, uw len, seg_t *segs, int nseg,
                                      void *slot_base, uw slot_size, uw entry) {
   uw sb = (uw)slot_base, se = sb + slot_size;
-  uw max_end = 0;
+  uw max_end = 0, exec_end = 0, rw_start = ~(uw)0;
   for (int i = 0; i < nseg; i++) {
     if (segs[i].type != PT_LOAD) continue;
     if (segs[i].vaddr < sb || segs[i].vaddr + segs[i].memsz > se || segs[i].vaddr + segs[i].memsz < segs[i].vaddr)
@@ -71,10 +73,12 @@ static fpr_elf_load_t load_segments(const unsigned char *bytes, uw len, seg_t *s
     for (uw k = segs[i].filesz; k < segs[i].memsz; k++) ((unsigned char *)dst)[k] = 0; /* .bss tail */
     uw end = segs[i].vaddr + segs[i].memsz;
     if (end > max_end) max_end = end;
+    if ((segs[i].flags & PF_X) && end > exec_end) exec_end = end;
+    if ((segs[i].flags & PF_W) && segs[i].vaddr < rw_start) rw_start = segs[i].vaddr;
   }
   if (max_end == 0) return fail("no PT_LOAD segments found");
   if (entry < sb || entry >= se) return fail("entry point falls outside the target slot");
-  fpr_elf_load_t r = {(void *)entry, (void *)max_end, 1, 0};
+  fpr_elf_load_t r = {(void *)entry, (void *)max_end, 1, 0, (void *)exec_end, (void *)rw_start};
   return r;
 }
 
@@ -97,6 +101,7 @@ fpr_elf_load_t fpr_elf_load(const unsigned char *bytes, uw len, void *slot_base,
     for (uw i = 0; i < phnum; i++) {
       const Elf64_Phdr *ph = (const Elf64_Phdr *)(bytes + phoff + i * phentsize);
       segs[i].type = ph->p_type;
+      segs[i].flags = ph->p_flags;
       segs[i].offset = ph->p_offset;
       segs[i].vaddr = ph->p_vaddr;
       segs[i].filesz = ph->p_filesz;
@@ -116,6 +121,7 @@ fpr_elf_load_t fpr_elf_load(const unsigned char *bytes, uw len, void *slot_base,
     for (uw i = 0; i < phnum; i++) {
       const Elf32_Phdr *ph = (const Elf32_Phdr *)(bytes + phoff + i * phentsize);
       segs[i].type = ph->p_type;
+      segs[i].flags = ph->p_flags;
       segs[i].offset = ph->p_offset;
       segs[i].vaddr = ph->p_vaddr;
       segs[i].filesz = ph->p_filesz;

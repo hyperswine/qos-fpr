@@ -253,3 +253,11 @@ On Mac:
 ```
 make posix-run POSIXARCH=a64 PROG=tests/actors.fpr
 ```
+
+For QOSP:
+
+```
+make qosp
+make portable-qa QOSARCH=a64 PROG=tests/orig1.fpr
+./qosp --trace --yes app.qa
+```

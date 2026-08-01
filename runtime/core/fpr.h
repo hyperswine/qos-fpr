@@ -186,7 +186,13 @@ extern fpr_grant_t (*fpr_grow_memory)(uw want_bytes);
  * address (no relocation is performed; see docs/PROCESS-LOADING.md for
  * why that is a real, stated scope limit, not an oversight). Segments
  * must fall entirely within [slot_base, slot_base+slot_size). */
-typedef struct { void *entry; void *image_end; int ok; const char *err; } fpr_elf_load_t;
+typedef struct { void *entry; void *image_end; int ok; const char *err;
+                 void *exec_end; /* high-water mark of PF_X PT_LOADs (0 if none) */
+                 void *rw_start; /* low-water mark of PF_W PT_LOADs ((void*)-1 if
+                                  * none); together these let a hosted loader
+                                  * mprotect code r-x and leave data rw (macOS
+                                  * arm64 forbids w+x on one page) */
+} fpr_elf_load_t;
 fpr_elf_load_t fpr_elf_load(const unsigned char *bytes, uw len, void *slot_base, uw slot_size);
 
 /* proc_entry.c: compiled into an APP image (not the top-level boot).

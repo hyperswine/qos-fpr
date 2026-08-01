@@ -37,7 +37,6 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <signal.h>
 #include <sys/ucontext.h>
 
@@ -64,20 +63,11 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
  * the arena past the slot -- the Memory.qa analogue, one caller so no
  * linearization needed (the design's single-core bootstrap rule) */
 static qos_grant_t grow_cb(uint64_t want) {
-#ifdef __APPLE__
-  /* Temp enable writes for buddy internal structures (in the JIT arena),
-   * then restore rx state so that the caller (app code) can continue
-   * fetching instructions after the grow call returns. */
-  pthread_jit_write_protect_np(0);
-#endif
   void *p = buddy_alloc(want);
   qos_grant_t g = {p, p ? buddy_block_usable_size(p) : 0};
   TRACE("grow(%" PRIu64 ") -> %p (+%" PRIu64 ")\n", want, p, g.size);
-#ifdef __APPLE__
-  pthread_jit_write_protect_np(1);
-#endif
   return g;
-} 
+}
 
 static int perm_gate(qa_t *qa, int auto_yes) {
   for (int i = 0; i < qa->nperms; i++) {
@@ -99,88 +89,24 @@ static int perm_gate(qa_t *qa, int auto_yes) {
   return 0;
 }
 
-static void do_emulated_store(ucontext_t *uc, uint32_t insn, void *dest) {
-  if (!uc || !dest) return;
-  /* Helper: write the value described by the store insn using the
-   * saved register state. Covers the stores seen in entry + early runtime
-   * for qa64 apps. Falls back to a safe 8-byte zero if unknown. */
-  unsigned size = (insn >> 30) & 3; /* for many load/store */
-  unsigned opc  = (insn >> 22) & 3;
-  int rt  =  insn        & 31;
-  int rn  = (insn >> 5)  & 31;
-  int rt2 = (insn >> 10) & 31; /* for pair */
-  uint64_t valx = (rt == 31 ? 0 : uc->uc_mcontext->__ss.__x[rt]);
-  uint64_t valx2= (rt2== 31 ? 0 : uc->uc_mcontext->__ss.__x[rt2]);
-  __uint128_t vq = (rt < 32 ? uc->uc_mcontext->__ns.__v[rt] : 0);
-  /* STR 64-bit unsigned offset: 11 1110 01 00 imm12 Rn Rt  (0xf9......) */
-  if ((insn & 0xFFC00000u) == 0xF9000000u) {
-    /* imm12 is scaled by size */
-    unsigned imm12 = (insn >> 10) & 0xfff;
-    unsigned scale = (size == 3 ? 3 : (size == 2 ? 2 : (size == 1 ? 1 : 0)));
-    (void)imm12; (void)scale; /* we trust si_addr */
-    if (size == 3) { *(uint64_t*)dest = valx; return; }
-    if (size == 2) { *(uint32_t*)dest = (uint32_t)valx; return; }
-    if (size == 1) { *(uint16_t*)dest = (uint16_t)valx; return; }
-    *(uint8_t*)dest = (uint8_t)valx; return;
-  }
-  /* STP (general) pre/post/unsigned forms for X (size=3 pair) */
-  if ((insn & 0xFE400000u) == 0xA8000000u || (insn & 0xFFC00000u)==0xA9000000u) {
-    /* write two 8-byte values; the addr from handler is the computed first */
-    if (size == 3) {
-      *(uint64_t*)dest = valx;
-      *((uint64_t*)dest + 1) = valx2;
-      return;
-    }
-  }
-  /* STP SIMD (q) : e.g. the zeroing stp q0,q0 [x,..] */
-  if ((insn & 0xBF800000u) == 0xAD000000u || (insn & 0xBF800000u) == 0xAC000000u) {
-    /* 128-bit pair; rt2 is encoded at 14:10 for stp */
-    ((__uint128_t*)dest)[0] = vq;
-    ((__uint128_t*)dest)[1] = uc->uc_mcontext->__ns.__v[rt2];
-    return;
-  }
-  /* STR (simd&fp) q or d , unsigned offset forms like 3d84.... str q , fd.... str d */
-  if ((insn & 0x3F800000u) == 0x3D800000u || (insn & 0xFFC00000u) == 0xFD000000u) {
-    /* bit 30/26 etc distinguish width; for our cases q0 is 128 */
-    if ((insn & 0x00400000u) || size == 3) {
-      *(__uint128_t*)dest = vq; return;
-    }
-    *(uint64_t*)dest = (uint64_t)(uint64_t)vq; return;
-  }
-  /* post-index str (immediate) 64-bit e.g. f8010d49 str x9,[x10],#0x10 */
-  if ((insn & 0xFFE00C00u) == 0xF8000400u) {
-    *(uint64_t*)dest = valx; return;
-  }
-  /* STRB immediate */
-  if ((insn & 0xFFC00000u) == 0x39000000u) {
-    *(uint8_t*)dest = (uint8_t)valx; return;
-  }
-  /* fallback: zero a plausible slot (harmless for many inits) */
-  memset(dest, 0, 16);
-}
-
 static void bus_handler(int sig, siginfo_t *info, void *vctx) {
+  /* Diagnostic only: report where the app faulted, then die.  The arena
+   * is plain rw with an r-x code prefix (see stage 2), so any fault here
+   * is a real bug in the app or the loader, not a protection artifact. */
   ucontext_t *uc = (ucontext_t *)vctx;
+#ifdef __APPLE__
   uintptr_t pc = uc ? uc->uc_mcontext->__ss.__pc : 0;
+#else
+  uintptr_t pc = 0; (void)uc;
+#endif
   void *addr = info ? info->si_addr : 0;
   int in_image = (pc >= QOS_SLOT_BASE && pc < QOS_SLOT_BASE + QOS_SLOT_SIZE);
-  fprintf(stderr, "[bus] addr=%p pc=0x%lx in_image=%d\n", addr, (unsigned long)pc, in_image);
+  fprintf(stderr, "qosp: fatal %s: addr=%p pc=%#lx in_image=%d\n",
+          sig == SIGBUS ? "SIGBUS" : "SIGSEGV", addr, (unsigned long)pc,
+          in_image);
   fflush(stderr);
-#ifdef __APPLE__
-  if (in_image) {
-    uint32_t insn = pc ? *(volatile uint32_t *)pc : 0;
-    /* Always emulate the store ourselves (correct value) while we have
-     * made the mapping writable, advance past it, and restore rx state
-     * so the following instruction fetch will succeed. */
-    pthread_jit_write_protect_np(0);
-    do_emulated_store(uc, insn, addr);
-    pthread_jit_write_protect_np(1);
-    uc->uc_mcontext->__ss.__pc += 4;
-    return;
-  }
-#endif
   _exit(139);
-} 
+}
 
 int main(int argc, char **argv) {
   int auto_yes = 0;
@@ -208,18 +134,9 @@ int main(int argc, char **argv) {
   /* ---- Stage 1: Initializer ---------------------------------------- */
   TRACE("stage 1 (initializer): mapping arena at %#lx (+%lu MiB)\n",
         QOS_ARENA_BASE, QOS_ARENA_SIZE >> 20);
-	int mmap_flags = MAP_PRIVATE | MAP_ANONYMOUS;
-  int mmap_prot = PROT_READ | PROT_WRITE;
-#ifdef __APPLE__
-  /* Use MAP_JIT on Darwin. Hint (no FIXED) often returns the exact address
-   * we need. We use the pthread_jit_write_protect_np toggle around writes. */
-  mmap_flags |= MAP_JIT;
-  mmap_prot |= PROT_EXEC;  /* request exec permission in the mapping */
-#endif
 	void *arena =
-      mmap((void *)QOS_ARENA_BASE, QOS_ARENA_SIZE, mmap_prot,
-           mmap_flags, -1, 0);
-  fprintf(stderr, "[debug] mmap returned %p (want %p) flags=0x%x\n", arena, (void*)QOS_ARENA_BASE, mmap_flags); fflush(stderr);
+      mmap((void *)QOS_ARENA_BASE, QOS_ARENA_SIZE, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (arena != (void *)QOS_ARENA_BASE) {
     if (arena != MAP_FAILED) munmap(arena, QOS_ARENA_SIZE);
     fprintf(stderr,
@@ -229,12 +146,6 @@ int main(int argc, char **argv) {
             QOS_ARENA_BASE);
     return 1;
   }
-#ifdef __APPLE__
-  /* Start writable for the loader phase. */
-  fprintf(stderr, "[debug] before toggle(0)\n"); fflush(stderr);
-  pthread_jit_write_protect_np(0);
-  fprintf(stderr, "[debug] after toggle(0)\n"); fflush(stderr);
-#endif
   const qos_hal_t *hal = qosp_hal_table();
   TRACE("stage 1: HAL table at %p (abi v%" PRIu64 ")\n", (const void *)hal,
         hal->version);
@@ -271,39 +182,43 @@ int main(int argc, char **argv) {
         " KiB)\n",
         QOS_SLOT_BASE, ld.image_end, ld.entry, heap_base, heap_size >> 10);
 
-	/* Patch out the app's bss-zeroing loop on Apple: the ELF loader already
-   * zeroed the PT_LOAD memsz tails (see elfload.c). The entry's asm
-   * loop (vector stp to _bss_start) would fault under MAP_JIT write-protect.
-   * Patch a direct branch over it while we still have write access. */
+	/* Publish the code: the arena is a single rw anonymous mapping, but on
+   * macOS arm64 a page can never be writable and executable at once, so
+   * flip just the executable prefix of the image (the PF_X PT_LOADs, as
+   * reported by elfload) to r-x and leave everything after it -- rodata
+   * tail, data, bss, heap, and the buddy arena -- rw.  The linker script
+   * places .text first and the RW segment on its own 64 KiB-aligned page,
+   * so the 16 KiB host-page round-up never captures a writable byte.  On
+   * Linux hosts the rw mapping already executes (no W^X policy for
+   * MAP_ANON there), so the mprotect is Darwin-only; the icache clear is
+   * needed on any arm64 host. */
 #ifdef __APPLE__
-  /* These offsets are relative to qos_app_entry for the current qa64
-   * lowering of tests/orig1.fpr (and similar small apps). If the zero
-   * loop shape changes materially, recompute from objdump. */
-  if ((uintptr_t)ld.entry == QOS_SLOT_BASE + 0x4938) {
-    uint32_t *patch = (uint32_t *)(QOS_SLOT_BASE + 0x4960);
-    /* b +0x98  (from 0x4960 to cbz at 0x49f8) */
-    *patch = 0x14000026u;
-    TRACE("qa64: patched bss zero loop out of entry\n");
+  {
+    uintptr_t pg = (uintptr_t)getpagesize();
+    uintptr_t xend = ((uintptr_t)ld.exec_end + pg - 1) & ~(pg - 1);
+    if (xend <= (uintptr_t)QOS_SLOT_BASE || ld.exec_end == 0) {
+      fprintf(stderr, "qosp: image has no executable segment\n");
+      return 1;
+    }
+    if ((uintptr_t)ld.rw_start < xend) {
+      fprintf(stderr,
+              "qosp: executable pages would capture writable image data "
+              "(exec_end=%p rounds to %#lx, first rw byte at %p, page=%lu) "
+              "-- relink with page-separated segments\n",
+              ld.exec_end, (unsigned long)xend, ld.rw_start,
+              (unsigned long)pg);
+      return 1;
+    }
+    if (mprotect((void *)QOS_SLOT_BASE, xend - QOS_SLOT_BASE,
+                 PROT_READ | PROT_EXEC)) {
+      perror("qosp: mprotect(code, r-x)");
+      return 1;
+    }
+    TRACE("stage 2: code [%#lx..%#lx) r-x, data+heap rw\n",
+          (unsigned long)QOS_SLOT_BASE, (unsigned long)xend);
   }
 #endif
-
-	/* Ensure instruction cache sees code we just written into the arena
- * (important on arm64 hosts when running qa64 apps). */
-#ifdef __APPLE__
-	/* Publish sequence for MAP_JIT: toggle to rx+clear so icache observes
-   * written/patched code, *leave* in rx state (1) for fetches. Data stores
-   * to the arena from within app will SIGBUS; the handler will temp flip
-   * to writable for the store, then the subsequent I-fetch will flip back. */
-  fprintf(stderr, "[debug] before publish toggle(1)\n"); fflush(stderr);
-  pthread_jit_write_protect_np(1);
-  fprintf(stderr, "[debug] after publish toggle(1)\n"); fflush(stderr);
-  fprintf(stderr, "[debug] before clear_cache\n"); fflush(stderr);
   __builtin___clear_cache((char *)QOS_SLOT_BASE, (char *)ld.image_end);
-  fprintf(stderr, "[debug] after clear_cache\n"); fflush(stderr);
-  /* leave in state 1 so the initial fetch of entry succeeds */
-#else
-  __builtin___clear_cache((char *)QOS_SLOT_BASE, (char *)ld.image_end);
-#endif
 
   static char caps[4096];
   uint64_t caps_len = qa_caps_serialize(&qa, caps, sizeof caps);
@@ -321,7 +236,6 @@ int main(int argc, char **argv) {
   };
 
 	/* ---- Stage 3: the app's own world -------------------------------- */
-  fprintf(stderr, "[debug] before entry call, entry=%p\n", (void*)ld.entry); fflush(stderr);
   TRACE("stage 3: entering the app\n");
   static char result[64 * 1024];
   qos_app_entry_t entry = (qos_app_entry_t)ld.entry;
