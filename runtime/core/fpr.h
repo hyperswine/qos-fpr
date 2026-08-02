@@ -84,10 +84,19 @@ typedef struct fpr_slab {
 } fpr_slab_t;
 
 typedef struct fpr_pool {
-  fpr_slab_t *cur;             /* bump target; also the chain head */
-  void *buckets[FPR_NBUCKETS]; /* recycled blocks: CAS push (any hart), owner drains */
-  uw allocated;                /* gauge: bytes ever bumped by this owner */
+  fpr_slab_t *cur;  /* bump target; also the chain head */
+  void **buckets;   /* FPR_NBUCKETS recycled-block heads, OUT-OF-LINE
+                     * (CAS push any hart, owner drains).  Out-of-line
+                     * so the array is reclaimed at actor death -- with
+                     * it inline, every dead acb kept 4 KiB forever.
+                     * Reuse is type-stable under arc_lock; a dead
+                     * pool is unreachable by fpr_free (teardown
+                     * orphans escaped slabs first).  runtime.c owns
+                     * the recycler (bkt_take/bkt_put). */
+  uw allocated;     /* gauge: bytes ever bumped by this owner */
 } fpr_pool_t;
+void **fpr_bkt_take(void);   /* runtime.c: bucket-array recycler */
+void fpr_bkt_put(void **b);
 
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a); /* actors.c: &a->pool */
 void fpr_pool_reclaim(struct fpr_acb *a);    /* runtime.c: death teardown */
@@ -107,6 +116,9 @@ typedef struct {
   struct fpr_acb *rq_head, *rq_tail; /* local run queue (owner-only) */
   uw sched_ctx[16];               /* the hart loop's context */
   volatile uw idle;               /* 1 while polling with nothing to run */
+  volatile uw epoch;              /* hart-loop iteration count: the
+                                   * quiescence clock for deferred
+                                   * channel-block reuse (actors.c) */
   uw fuel_preempts;
   char rbuf[FPR_RBUF_SZ];         /* per-hart render buffer (str/print) */
   int rpos;

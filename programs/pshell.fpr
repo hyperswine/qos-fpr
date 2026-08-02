@@ -200,7 +200,9 @@ vals (Fd s frame lastR lastKey scomp notes input) =
 frameWorker parent gfx st sl fd self =
   dy = S2.dyns sl (vals fd);
   r = svcCall self gfx (Render (S2.scene st dy));
-  send parent r.
+  _ = send parent r;
+  drop r.                # forward then release OUR ref: the reply's
+                         # ARC entry dies when the shell drops its own
 
 # ---- input -----------------------------------------------------------------
 # evdev (kind 4): Linux keycodes, presses only.  stdin (kind 1): ascii
@@ -219,6 +221,7 @@ drain me inp n acc | n == 0 = revK Nil acc.
 drain me inp n acc =
   ev = svcCall me inp (Poll 0);
   (kind, a, b) = ev;
+  _ = drop ev;           # every received message is dropped once read
   drainEv me inp n acc kind a b.
 drainEv me inp n acc kind a b | kind == 0 = revK Nil acc.
 drainEv me inp n acc kind a b | kind == 4 =
@@ -380,7 +383,12 @@ frame me gfx dsp inp mt cache m2 t0 =
 
 bumpS m 0 = m.
 bumpS (Md s f notes inp fr lr lk sc) n = Md s f notes inp fr lr lk (sc + n).
-advance (Md s f notes inp fr lr lk sc) r = Md s f notes inp (fr + 1) r lk sc.
+# the reply tuple ESCAPED into this immortal actor (worker -> shell
+# send); dropping the previous one releases its ARC entry -- without
+# this, one live entry per frame fills the ARC table in ~50 s of idle
+advance (Md s f notes inp fr lr lk sc) r =
+  _ = drop lr;
+  Md s f notes inp (fr + 1) r lk sc.
 
 # ---- main ------------------------------------------------------------------
 

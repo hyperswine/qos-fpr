@@ -80,7 +80,12 @@ typedef struct {
 typedef struct fpr_acb {
   uint32_t tid, var; /* var = status word (atomic; doubles as header) */
   uw ctx[16];        /* ra sp gp tp s0..s11 */
-  chan_t ch[MAXSND];
+  chan_t *ch;        /* MAXSND channels, OUT-OF-LINE (see chblk below):
+                      * the acb stays permanent (send-to-dead reads
+                      * var), but its 8 KiB of rings is reclaimed at
+                      * reap -- the permanent residue per dead actor is
+                      * now ~sizeof(acb_t) ~= 250 B, which is what the
+                      * "stated ceiling" always meant to say */
   uint32_t scan; /* round-robin cursor for fair receive (owner-only) */
   V entry;       /* PAP to run: body = entry(self); 0 for main */
   struct fpr_acb *next; /* run-queue link (owner hart only) */
@@ -108,14 +113,140 @@ static void *big_block(uw n) {
   return (g.ptr && g.size >= n) ? g.ptr : 0;
 }
 
+/* ---- process-mode spawn-side recycling ------------------------------
+ * Grants are never returned to the loader, so without recycling every
+ * spawn leaks a full stack grant and a mostly-empty acb grant --
+ * frame-per-actor designs (pshell) burn the whole arena in seconds.
+ *
+ *   stacks: all STACK_SZ, so dead stacks go on a free list and the
+ *           next spawn pops one (mirrors runtime.c's slab recycler);
+ *   acbs:   PERMANENT by contract (the acb IS the actor value that
+ *           send-to-dead reads), so they cannot be recycled -- but a
+ *           bump arena carves many acbs from one grant instead of
+ *           wasting a 64 KiB minimum grant on each 8 KiB acb. */
+static void *stack_pool;
+static fpr_lock_t stack_lock;
+static char *acb_hp, *acb_end;
+
+static void *stack_block(void) {
+  if (!fpr_is_process) return buddy_alloc(STACK_SZ);
+  fpr_lock(&stack_lock);
+  void *p = stack_pool;
+  if (p) stack_pool = *(void **)p;
+  fpr_unlock(&stack_lock);
+  return p ? p : big_block(STACK_SZ);
+}
+
+static void stack_recycle(void *p) {
+  fpr_lock(&stack_lock);
+  *(void **)p = stack_pool;
+  stack_pool = p;
+  fpr_unlock(&stack_lock);
+}
+
+static acb_t *acb_block(void) {
+  if (!fpr_is_process) return (acb_t *)buddy_alloc(sizeof(acb_t));
+  uw sz = (sizeof(acb_t) + 15) & ~(uw)15;
+  fpr_lock(&stack_lock);
+  if (acb_hp + sz > acb_end) {
+    uw want = 4 * sz; /* a few acbs per grant amortizes the 64K floor */
+    fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(want) : (fpr_grant_t){0, 0};
+    if (!g.ptr || g.size < sz) {
+      fpr_unlock(&stack_lock);
+      return 0;
+    }
+    acb_hp = (char *)g.ptr;
+    acb_end = (char *)g.ptr + g.size;
+  }
+  acb_t *a = (acb_t *)acb_hp;
+  acb_hp += sz;
+  fpr_unlock(&stack_lock);
+  return a;
+}
+
+/* ---- out-of-line channel blocks: type-stable, epoch-deferred --------
+ * The acb permanence contract exists so a stale handle's send is a
+ * harmless read of var==ST_DEAD.  But send CHECKS var and then TOUCHES
+ * the channels -- so channel memory cannot be handed to anything else
+ * while such a send may be in flight.  Two properties make reuse
+ * sound:
+ *
+ *   TYPE-STABLE: a channel block is only ever reused as a channel
+ *   block, so a racing access reads well-formed channel memory;
+ *
+ *   EPOCH-DEFERRED: every hart bumps h->epoch once per hart-loop
+ *   iteration, and a send runs INSIDE one scheduler segment on its
+ *   hart -- its hart's epoch cannot advance past it.  A reaped block
+ *   parks on a limbo list stamped with every live hart's epoch and is
+ *   reused only after each has advanced by 2: any send that loaded a
+ *   stale var==READY has long since completed.
+ *
+ * Without this, frame-per-actor designs retire 8 KiB of dead rings
+ * per frame forever (pshell exhausted a Pi 4's arena in minutes). */
+typedef struct chblk {
+  chan_t ch[MAXSND];
+  struct chblk *nx;
+  uw stamp[FPR_NHARTS];
+} chblk_t;
+static chblk_t *chb_free, *chb_limbo;
+static fpr_lock_t chb_lock;
+
+static int chb_matured(chblk_t *b) {
+  for (uw i = 0; i < fpr_live_harts; i++)
+    if (fpr_harts[i].epoch < b->stamp[i] + 2) return 0;
+  return 1;
+}
+
+static chan_t *chb_take(void) {
+  chblk_t *b = 0;
+  fpr_lock(&chb_lock);
+  /* matured limbo first, then the free list */
+  chblk_t **pp = &chb_limbo;
+  while (*pp) {
+    if (chb_matured(*pp)) {
+      b = *pp;
+      *pp = b->nx;
+      break;
+    }
+    pp = &(*pp)->nx;
+  }
+  if (!b && chb_free) {
+    b = chb_free;
+    chb_free = b->nx;
+  }
+  fpr_unlock(&chb_lock);
+  if (!b) b = (chblk_t *)big_block(sizeof(chblk_t));
+  if (!b) return 0;
+  for (int i = 0; i < MAXSND; i++) {
+    b->ch[i].sender = 0;
+    b->ch[i].rh = b->ch[i].rt = 0;
+  }
+  return b->ch;
+}
+
+static void chb_limbo_put(chan_t *ch) {
+  chblk_t *b = (chblk_t *)ch; /* ch is the block's first member */
+  fpr_lock(&chb_lock);
+  for (uw i = 0; i < FPR_NHARTS; i++)
+    b->stamp[i] = (i < fpr_live_harts) ? fpr_harts[i].epoch : 0;
+  b->nx = chb_limbo;
+  chb_limbo = b;
+  fpr_unlock(&chb_lock);
+}
+
 /* death reclamation (called from the hart loop, NEVER on the dying
  * actor's own stack): slabs via the ARC-locked teardown, stack -- which
  * cannot escape -- straight back to buddy.  Idempotent via stack=0. */
 static void reap(acb_t *a) {
   if (!a->stack) return;
   fpr_pool_reclaim(a);
-  if (!fpr_is_process) buddy_free(a->stack); /* process blocks: freed with the slot */
+  if (fpr_is_process) stack_recycle(a->stack);
+  else buddy_free(a->stack);
   a->stack = 0;
+  if (a->ch) {
+    chb_limbo_put(a->ch); /* deferred: see the epoch essay above */
+    a->ch = 0;
+  }
   if (a->entry) { fpr_arc_decref(a->entry); a->entry = 0; } /* unpin the closure */
   /* the acb itself stays: it IS the actor value other actors hold
    * (send-to-dead reads a->var).  ~sizeof(acb_t) per actor, stated. */
@@ -369,6 +500,7 @@ static void hart_loop(fpr_hart_t *h) {
   h->lcg = h->id * 2654435761u + 12345u; /* decorrelated, deterministic */
   hal_wfi_enable(); /* mie on, mstatus.MIE off: wfi wakes, never traps */
   for (;;) {
+    h->epoch++; /* the quiescence clock (see chblk above) */
     if (fpr_process_done) return; /* process mode: clean C return to the loader */
     if (__atomic_load_n(&fpr_shutdown, __ATOMIC_ACQUIRE))
       for (;;) hal_wfi();
@@ -587,17 +719,19 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   for (uw i = 0; i < fpr_live_harts; i++) hal_timer_park(i);
   main_acb.tid = T_ACTOR;
   main_acb.var = ST_READY;
-  for (int i = 0; i < MAXSND; i++) main_acb.ch[i].sender = 0;
+  main_acb.ch = chb_take();
+  if (!main_acb.ch) fpr_cpanic("boot: no memory for actor 0's channels");
   main_acb.scan = 0;
   main_acb.entry = 0; /* trampoline runs fpr_fn_main + fpr_exit */
   main_acb.id = 0;
   main_acb.hart = 0;
   main_acb.pin = 1; /* the result carrier never migrates */
-  char *stk = (char *)big_block(STACK_SZ);
+  char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
   main_acb.pool.cur = 0;
   main_acb.pool.allocated = 0;
-  for (int i = 0; i < FPR_NBUCKETS; i++) main_acb.pool.buckets[i] = 0;
+  static void *main_bkts[FPR_NBUCKETS]; /* actor 0 lives forever */
+  main_acb.pool.buckets = main_bkts;
   main_acb.stack = stk;
   for (int i = 0; i < 16; i++) main_acb.ctx[i] = 0;
   fpr_ctx_fabricate(main_acb.ctx, (void (*)(void))trampoline,
@@ -620,16 +754,18 @@ void fpr_hart_secondary(int id) {
 static V spawn_on(uw hart, V f, uw pin) {
   if (hart >= fpr_live_harts) fpr_cpanic("spawnOn: no such hart (Sys.harts is the live count)");
   if (ISINT(f) || TID(f) != T_PAP) fpr_cpanic("spawn: argument must be a function");
-  acb_t *a = (acb_t *)big_block(sizeof(acb_t));
-  char *stk = (char *)big_block(STACK_SZ);
+  acb_t *a = (acb_t *)acb_block();
+  char *stk = (char *)stack_block();
   if (!a || !stk) fpr_cpanic("spawn: buddy has no free block");
   a->pool.cur = 0;
   a->pool.allocated = 0;
-  for (int i = 0; i < FPR_NBUCKETS; i++) a->pool.buckets[i] = 0;
+  a->pool.buckets = fpr_bkt_take(); /* zeroed; teardown returns it */
+  if (!a->pool.buckets) fpr_cpanic("spawn: no memory for a bucket array");
   fpr_arc_incref(f); /* the entry closure escapes into the child: pin it */
   a->tid = T_ACTOR;
   a->var = ST_READY;
-  for (int i = 0; i < MAXSND; i++) a->ch[i].sender = 0;
+  a->ch = chb_take(); /* cleared by chb_take */
+  if (!a->ch) fpr_cpanic("spawn: no memory for a channel block");
   a->scan = 0;
   a->entry = f;
   a->next = 0;
@@ -692,7 +828,8 @@ void *fpr_syscall_mailbox(void) {
     syscall_mb.tid = T_ACTOR;
     syscall_mb.var = ST_READY; /* pinned: wake CAS never matches */
     syscall_mb.hart = 0;
-    for (int i = 0; i < MAXSND; i++) syscall_mb.ch[i].sender = 0;
+    static chblk_t syscall_chb; /* static: the mailbox never dies */
+    syscall_mb.ch = syscall_chb.ch;
   }
   return &syscall_mb;
 }

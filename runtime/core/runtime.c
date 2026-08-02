@@ -49,11 +49,15 @@ void fpr_hart_secondary(int id);  /* actors.c: tp setup + hart loop */
  * unresolved). mstatus is PER-HART: every hart's init calls it. */
 __attribute__((weak)) void fpr_rvv_enable(void) {}
 
+/* the hart pools live forever: static bucket arrays, no recycler */
+static void *hart_bkts[FPR_NHARTS][FPR_NBUCKETS];
+
 static void hart_init(int id) {
   fpr_hart_t *h = &fpr_harts[id];
   h->id = (uw)id;
   h->pool.cur = 0;
   h->pool.allocated = 0;
+  h->pool.buckets = hart_bkts[id];
   for (int i = 0; i < FPR_NBUCKETS; i++) h->pool.buckets[i] = 0;
   h->current = 0;
   h->rq_head = h->rq_tail = 0;
@@ -113,6 +117,7 @@ static fpr_pool_t *cur_pool(fpr_hart_t *h) {
  * hart (cross-actor drop-to-zero), so the owner drains by atomic
  * exchange -- ABA-free, and everything taken is exclusively ours. */
 static void *bucket_take(fpr_pool_t *pool, uw idx) {
+  if (!pool->buckets) return 0;
   void *head = __atomic_exchange_n(&pool->buckets[idx], (void *)0, __ATOMIC_ACQUIRE);
   if (!head) return 0;
   void *rest = *(void **)head;
@@ -128,6 +133,70 @@ static void *bucket_take(fpr_pool_t *pool, uw idx) {
     rest = nx;
   }
   return head;
+}
+
+/* ---- process-mode slab recycling -----------------------------------
+ * The host never takes grants back (wholesale-at-exit is the loader
+ * contract), but the PROCESS can certainly reuse them: a dead actor's
+ * escape-free slabs go on this list and the next slab request shops
+ * here before asking the loader to grow.  Without it, any
+ * actor-per-unit-of-work design leaks its whole footprint per unit --
+ * found the hard way when pshell's frame-per-actor renderer exhausted
+ * a 256 MiB arena in fourteen seconds of idle shell on a Pi 4.
+ * Own lock, taken while arc_lock may be held (never the reverse). */
+static fpr_slab_t *grant_pool;
+static fpr_lock_t grant_lock;
+
+static fpr_slab_t *grant_take(uw total) {
+  fpr_lock(&grant_lock);
+  fpr_slab_t **pp = &grant_pool, *sl = grant_pool;
+  while (sl) {
+    if ((uw)(sl->end - (char *)(sl + 1)) >= total) {
+      *pp = sl->next;
+      break;
+    }
+    pp = &sl->next;
+    sl = sl->next;
+  }
+  fpr_unlock(&grant_lock);
+  return sl;
+}
+
+static void grant_put(fpr_slab_t *sl) {
+  fpr_lock(&grant_lock);
+  sl->next = grant_pool;
+  grant_pool = sl;
+  fpr_unlock(&grant_lock);
+}
+
+/* bucket-array recycler (see fpr.h): fixed-size, type-stable */
+typedef struct bktblk { void *b[FPR_NBUCKETS]; } bktblk_t;
+static bktblk_t *bkt_free;
+static fpr_lock_t bkt_lock;
+
+void **fpr_bkt_take(void) {
+  fpr_lock(&bkt_lock);
+  bktblk_t *k = bkt_free;
+  if (k) bkt_free = *(bktblk_t **)k;
+  fpr_unlock(&bkt_lock);
+  if (!k) {
+    if (fpr_is_process && fpr_grow_memory) {
+      fpr_grant_t g = fpr_grow_memory(sizeof(bktblk_t));
+      k = (g.ptr && g.size >= sizeof(bktblk_t)) ? (bktblk_t *)g.ptr : 0;
+    } else
+      k = (bktblk_t *)buddy_alloc(sizeof(bktblk_t));
+  }
+  if (!k) return 0;
+  for (int i = 0; i < FPR_NBUCKETS; i++) k->b[i] = 0;
+  return k->b;
+}
+
+void fpr_bkt_put(void **b) {
+  bktblk_t *k = (bktblk_t *)b;
+  fpr_lock(&bkt_lock);
+  *(bktblk_t **)k = bkt_free;
+  bkt_free = k;
+  fpr_unlock(&bkt_lock);
 }
 
 V fpr_alloc(V raw_bytes) {
@@ -147,13 +216,17 @@ V fpr_alloc(V raw_bytes) {
     /* a loaded process grows through its loader's grant, exactly as
      * before -- its "slab" is whatever System.qa's buddy handed over */
     if (fpr_is_process && fpr_grow_memory) {
-      uw want = total + sizeof(fpr_slab_t);
-      if (want < SLAB_SZ) want = SLAB_SZ;
-      fpr_grant_t g = fpr_grow_memory(want);
-      if (!g.ptr || g.size < total + sizeof(fpr_slab_t))
-        fpr_cpanic("heap exhausted (process arena growth denied)");
-      sl = (fpr_slab_t *)g.ptr;
-      sl->end = (char *)g.ptr + g.size;
+      /* recycled grant first; only a miss grows the arena */
+      sl = grant_take(total);
+      if (!sl) {
+        uw want = total + sizeof(fpr_slab_t);
+        if (want < SLAB_SZ) want = SLAB_SZ;
+        fpr_grant_t g = fpr_grow_memory(want);
+        if (!g.ptr || g.size < total + sizeof(fpr_slab_t))
+          fpr_cpanic("heap exhausted (process arena growth denied)");
+        sl = (fpr_slab_t *)g.ptr;
+        sl->end = (char *)g.ptr + g.size;
+      }
     } else {
       uw want = total + sizeof(fpr_slab_t);
       if (want < SLAB_SZ) want = SLAB_SZ;
@@ -189,6 +262,7 @@ void fpr_free(V v) {
   uw idx = total / 16 - 1;
   *(uw *)p = 0; /* poison size: crude double-free tripwire */
   void *old;
+  if (!pool->buckets) return;
   do {
     old = __atomic_load_n(&pool->buckets[idx], __ATOMIC_RELAXED);
     *(void **)p = old;
@@ -280,9 +354,11 @@ void fpr_arc_decref(V v) {
     fpr_slab_t *sl = slab_of(v);
     if (sl) {
       sl->escaped--;
-      if (!sl->owner && sl->escaped == 0 && !fpr_is_process) {
-        /* last escapee of an orphaned slab: the whole slab goes home */
-        buddy_free(sl);
+      if (!sl->owner && sl->escaped == 0) {
+        /* last escapee of an orphaned slab: the whole slab goes home
+         * (machine boot: to buddy; process: to the grant recycler) */
+        if (fpr_is_process) grant_put(sl);
+        else buddy_free(sl);
       } else {
         fpr_free(v); /* under arc_lock: owner read is death-race-free */
       }
@@ -295,21 +371,24 @@ void fpr_arc_decref(V v) {
  * escape-free slabs return to buddy; the rest are orphaned. */
 void fpr_arc_teardown_pool(fpr_pool_t *pool) {
   fpr_lock(&arc_lock);
-  if (fpr_is_process) { /* grant-backed slabs: freed with the slot at exit */
-    pool->cur = 0;
-    for (int i = 0; i < FPR_NBUCKETS; i++) pool->buckets[i] = 0;
-    fpr_unlock(&arc_lock);
-    return;
-  }
   fpr_slab_t *sl = pool->cur;
   while (sl) {
     fpr_slab_t *nx = sl->next;
-    if (sl->escaped == 0) buddy_free(sl);
-    else sl->owner = 0; /* orphan: freed at last drop above */
+    if (sl->escaped == 0) {
+      /* machine boot: back to buddy.  Process: onto the grant
+       * recycler -- the loader keeps the memory either way, the
+       * process reuses it (see grant_take above). */
+      if (fpr_is_process) grant_put(sl);
+      else buddy_free(sl);
+    } else
+      sl->owner = 0; /* orphan: freed at last drop above */
     sl = nx;
   }
   pool->cur = 0;
-  for (int i = 0; i < FPR_NBUCKETS; i++) pool->buckets[i] = 0;
+  if (pool->buckets) {
+    fpr_bkt_put(pool->buckets); /* type-stable reuse; see fpr.h */
+    pool->buckets = 0;
+  }
   fpr_unlock(&arc_lock);
 }
 

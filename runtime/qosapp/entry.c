@@ -85,7 +85,10 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
    * proc_entry.c shape */
   h->pool.cur = 0;
   h->pool.allocated = 0;
-  for (int i = 0; i < FPR_NBUCKETS; i++) h->pool.buckets[i] = 0;
+  {
+    static void *boot_bkts[FPR_NBUCKETS]; /* hart 0 lives forever */
+    h->pool.buckets = boot_bkts;
+  }
   {
     fpr_slab_t *sl = (fpr_slab_t *)boot->heap_base;
     sl->next = 0;

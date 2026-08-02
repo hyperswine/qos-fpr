@@ -75,7 +75,14 @@ all: image.elf
 # same portable code.  GFX=1 stays Linux-only (EGL/evdev), but the
 # FPR_EVDEV simulated-keyboard tier is portable (see evdev_raw.c).
 UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+# default the posix target to the HOST's arch: x64 on x86-64, a64 on
+# native aarch64 (a Pi 4 says `make posix-run` and gets itself)
+ifeq ($(UNAME_M),aarch64)
+POSIXARCH ?= a64
+else
 POSIXARCH ?= x64
+endif
 POSIXHARTS ?= 2
 # QOS Portable hart cap: the app image's compile-time FPR_NHARTS (the
 # static array size).  The LIVE count is resolved at qosp boot: env
@@ -87,6 +94,11 @@ ifeq ($(UNAME_S),Darwin)
 POSIXCC  ?= cc
 POSIXRUN ?=
 POSIXFPRTGT = a64mac
+else ifeq ($(UNAME_M),aarch64)
+# NATIVE aarch64 Linux (a Pi, an ARM server): no cross prefix, no qemu
+POSIXCC  ?= gcc
+POSIXRUN ?=
+POSIXFPRTGT = a64
 else
 POSIXCC  ?= aarch64-linux-gnu-gcc
 POSIXRUN ?= qemu-aarch64
