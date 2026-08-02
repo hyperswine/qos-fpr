@@ -6,8 +6,8 @@
 #   sudo install -m755 qosp /opt/qos/qosp
 #   sudo install -m644 app.qa /opt/qos/pshell.qa      # portable-qa PROG=programs/pshell.fpr
 #   sudo install -m644 systemd/qos-pshell.service /etc/systemd/system/
-#   sudo useradd -r -G video,render,input qos
-#   sudo systemctl disable getty@tty1
+#   sudo useradd -r -G video,render,input qos         # unless you already have it with e.g. pi
+#   sudo systemctl disable getty@tty1                 # disable login screen
 #   sudo systemctl enable --now qos-pshell
 #
 # Keyboard input: a real keyboard via FPR_EVDEV=/dev/input/eventN, or
@@ -25,6 +25,9 @@
 # DRM/GBM scanout on the SBC is the qos-shell C shim's proven path and
 # is the planned next port into gfx_raw -- this unit's contract does
 # not change when it lands: same qosp, same .qa, same FIFO.
+
+# For Pi, just do it so /tmp/kbd is tty and /run/qos/kbd is tty
+# Make qosp then copy to opt. Then build pshell.qa and copy to opt. Then install this unit file and enable it. Then reboot.
 
 [Unit]
 Description=QOS Portable shell (pshell.qa under qosp)

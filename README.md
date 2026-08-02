@@ -261,3 +261,8 @@ make qosp
 make portable-qa QOSARCH=a64 PROG=tests/orig1.fpr
 ./qosp --trace --yes app.qa
 ```
+
+```
+make qosp GFX=1 QOSARCH=a64 QOSCC=gcc
+make portable-qa PROG=programs/pshell.fpr QOSARCH=a64
+```
