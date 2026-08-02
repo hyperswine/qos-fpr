@@ -128,16 +128,19 @@ static void *stack_pool;
 static fpr_lock_t stack_lock;
 static char *acb_hp, *acb_end;
 
-static void *stack_block(void) {
-  if (!fpr_is_process) return buddy_alloc(STACK_SZ);
+	static void *stack_block(void) {
   fpr_lock(&stack_lock);
   void *p = stack_pool;
   if (p) stack_pool = *(void **)p;
   fpr_unlock(&stack_lock);
-  return p ? p : big_block(STACK_SZ);
+  if (p) return p;
+  if (fpr_is_process)
+    return big_block(STACK_SZ);
+  return buddy_alloc(STACK_SZ);
 }
 
-static void stack_recycle(void *p) {
+	static void stack_recycle(void *p) {
+  if (!p) return;
   fpr_lock(&stack_lock);
   *(void **)p = stack_pool;
   stack_pool = p;
@@ -234,14 +237,14 @@ static void chb_limbo_put(chan_t *ch) {
   fpr_unlock(&chb_lock);
 }
 
-/* death reclamation (called from the hart loop, NEVER on the dying
+	/* death reclamation (called from the hart loop, NEVER on the dying
  * actor's own stack): slabs via the ARC-locked teardown, stack -- which
- * cannot escape -- straight back to buddy.  Idempotent via stack=0. */
+ * cannot escape -- straight back to the recycler (or buddy for
+ * non-process if the recycler is empty on alloc).  Idempotent via stack=0. */
 static void reap(acb_t *a) {
   if (!a->stack) return;
   fpr_pool_reclaim(a);
-  if (fpr_is_process) stack_recycle(a->stack);
-  else buddy_free(a->stack);
+  stack_recycle(a->stack);
   a->stack = 0;
   if (a->ch) {
     chb_limbo_put(a->ch); /* deferred: see the epoch essay above */

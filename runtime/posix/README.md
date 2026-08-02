@@ -117,10 +117,10 @@ lowering.  Four differences, all in A64.hs:
 
 The runtime side: heap.S grows a Mach-O branch (an ordered `.zerofill`
 group standing in for the .bss label sequence — `nm -n` shows
-`__heap_end` at exactly start + 64 MiB), ctx_a64.S spells its one
+	`__heap_end` at exactly start + 256 MiB), ctx_a64.S spells its one
 symbol through a `SYM()` cpp guard, and evdev_raw.c defines the
 `input_event` wire struct locally off-Linux so the FPR_EVDEV
-simulated-keyboard/replay tier stays portable.  Linking is dynamic —
+simulated-keyboard/replay tier stays portable.  Linking is dynamic --
 Mach-O has no `-static`; libSystem is the concession, the way Mesa is
 for GFX.  GFX=1 stays Linux-only (EGL/evdev hardware tier).
 

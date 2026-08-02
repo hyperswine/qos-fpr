@@ -135,15 +135,12 @@ static void *bucket_take(fpr_pool_t *pool, uw idx) {
   return head;
 }
 
-/* ---- process-mode slab recycling -----------------------------------
- * The host never takes grants back (wholesale-at-exit is the loader
- * contract), but the PROCESS can certainly reuse them: a dead actor's
- * escape-free slabs go on this list and the next slab request shops
- * here before asking the loader to grow.  Without it, any
- * actor-per-unit-of-work design leaks its whole footprint per unit --
- * found the hard way when pshell's frame-per-actor renderer exhausted
- * a 256 MiB arena in fourteen seconds of idle shell on a Pi 4.
- * Own lock, taken while arc_lock may be held (never the reverse). */
+	/* ---- slab recycling for processes and machine boots ----------------
+ * The host never takes grants back, but a PROCESS reuses via grant_pool.
+ * For plain machine boots (posix-run, virt), we have an equivalent
+ * slab_pool so frame-per-actor designs (pshell) don't churn buddy with
+ * 256 KiB slabs per unit of work.  Same locking rules.
+ */
 static fpr_slab_t *grant_pool;
 static fpr_lock_t grant_lock;
 
@@ -167,6 +164,32 @@ static void grant_put(fpr_slab_t *sl) {
   sl->next = grant_pool;
   grant_pool = sl;
   fpr_unlock(&grant_lock);
+}
+
+/* Machine-boot (posix/virt) slab recycler -- same shape as grant_pool. */
+static fpr_slab_t *slab_pool;
+static fpr_lock_t slab_lock;
+
+static fpr_slab_t *slab_take(uw total) {
+  fpr_lock(&slab_lock);
+  fpr_slab_t **pp = &slab_pool, *sl = slab_pool;
+  while (sl) {
+    if ((uw)(sl->end - (char *)(sl + 1)) >= total) {
+      *pp = sl->next;
+      break;
+    }
+    pp = &sl->next;
+    sl = sl->next;
+  }
+  fpr_unlock(&slab_lock);
+  return sl;
+}
+
+static void slab_put(fpr_slab_t *sl) {
+  fpr_lock(&slab_lock);
+  sl->next = slab_pool;
+  slab_pool = sl;
+  fpr_unlock(&slab_lock);
 }
 
 /* bucket-array recycler (see fpr.h): fixed-size, type-stable */
@@ -227,12 +250,15 @@ V fpr_alloc(V raw_bytes) {
         sl = (fpr_slab_t *)g.ptr;
         sl->end = (char *)g.ptr + g.size;
       }
-    } else {
+	} else {
       uw want = total + sizeof(fpr_slab_t);
       if (want < SLAB_SZ) want = SLAB_SZ;
-      sl = (fpr_slab_t *)buddy_alloc(want);
-      if (!sl) fpr_cpanic("heap exhausted (buddy has no free block)");
-      sl->end = (char *)sl + buddy_block_usable_size(sl);
+      sl = slab_take(want);
+      if (!sl) {
+        sl = (fpr_slab_t *)buddy_alloc(want);
+        if (!sl) fpr_cpanic("heap exhausted (buddy has no free block)");
+        sl->end = (char *)sl + buddy_block_usable_size(sl);
+      }
     }
     sl->owner = pool;
     sl->escaped = 0;
@@ -270,10 +296,10 @@ void fpr_free(V v) {
                                         __ATOMIC_RELEASE, __ATOMIC_RELAXED));
 }
 
-/* death teardown (hart loop, after the switch OFF the actor's stack):
- * slabs with no escaped objects return to buddy now; the rest are
- * orphaned and return when their last promoted object is dropped.
- * The stack never escapes: always reclaimed. */
+	/* death teardown (hart loop, after the switch OFF the actor's stack):
+ * slabs with no escaped objects return to the recycler (slab_pool or
+ * grant_pool) now; the rest are orphaned and return when their last
+ * promoted object is dropped.  The stack never escapes: always reclaimed. */
 void fpr_arc_teardown_pool(fpr_pool_t *pool); /* below, with the ARC state */
 void fpr_pool_reclaim(struct fpr_acb *a) {
   fpr_arc_teardown_pool(fpr_acb_pool(a));
@@ -352,13 +378,13 @@ void fpr_arc_decref(V v) {
     arct[i].ptr = ARC_TOMB; /* tombstone keeps probe chains intact */
     arc_live--;
     fpr_slab_t *sl = slab_of(v);
-    if (sl) {
+	    if (sl) {
       sl->escaped--;
       if (!sl->owner && sl->escaped == 0) {
         /* last escapee of an orphaned slab: the whole slab goes home
-         * (machine boot: to buddy; process: to the grant recycler) */
+         * (machine boot: to our slab recycler; process: to the grant recycler) */
         if (fpr_is_process) grant_put(sl);
-        else buddy_free(sl);
+        else slab_put(sl);
       } else {
         fpr_free(v); /* under arc_lock: owner read is death-race-free */
       }
@@ -374,12 +400,12 @@ void fpr_arc_teardown_pool(fpr_pool_t *pool) {
   fpr_slab_t *sl = pool->cur;
   while (sl) {
     fpr_slab_t *nx = sl->next;
-    if (sl->escaped == 0) {
-      /* machine boot: back to buddy.  Process: onto the grant
+	    if (sl->escaped == 0) {
+      /* machine boot: back to our slab recycler.  Process: onto the grant
        * recycler -- the loader keeps the memory either way, the
        * process reuses it (see grant_take above). */
       if (fpr_is_process) grant_put(sl);
-      else buddy_free(sl);
+      else slab_put(sl);
     } else
       sl->owner = 0; /* orphan: freed at last drop above */
     sl = nx;
