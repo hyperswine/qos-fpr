@@ -18,13 +18,13 @@ esac
 echo "== fprc"
 # [ -x ./fprc ] || (cd compiler && ghc -O1 -o ../fprc Main.hs)
 
-	echo "== heap layout (Mach-O .zerofill ordering: end must be start + 256 MiB)"
+echo "== heap layout (Mach-O .zerofill ordering: end must be start + 64 MiB)"
 cc -c runtime/posix/heap.S -o /tmp/qos-heap.o
 nm -n /tmp/qos-heap.o | grep -E "_heap|_proc_arena"
 START=$(nm /tmp/qos-heap.o | awk '/__heap_start/{print "0x"$1}')
 END=$(nm /tmp/qos-heap.o | awk '/__heap_end/{print "0x"$1}')
-[ $((END - START)) -eq 268435456 ] || { echo "FAIL: heap span $(($END - $START))"; exit 1; }
-echo "ok: heap span 256 MiB, symbols ordered"
+[ $((END - START)) -eq 67108864 ] || { echo "FAIL: heap span $(($END - $START))"; exit 1; }
+echo "ok: heap span 64 MiB, symbols ordered"
 
 echo "== single-actor program"
 make posix-run POSIXARCH=a64 PROG=tests/orig1.fpr
