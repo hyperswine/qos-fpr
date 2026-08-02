@@ -25,7 +25,19 @@ void qosp_store_bind(const char *app_id) {
   snprintf(g_path, sizeof g_path, "qos-store/%s.kv", app_id);
 }
 
-int64_t qosp_store_call(uint64_t tag, const char *pay, uint64_t plen, char *out,
+#include <pthread.h>
+static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
+static int64_t store_call_locked(uint64_t tag, const char *pay,
+                                 uint64_t plen, char *out, uint64_t outcap);
+int64_t qosp_store_call(uint64_t tag, const char *pay, uint64_t plen,
+                        char *out, uint64_t outcap) {
+  /* v2: any hart thread may persist; the kv file wants one writer */
+  pthread_mutex_lock(&store_mu);
+  int64_t r = store_call_locked(tag, pay, plen, out, outcap);
+  pthread_mutex_unlock(&store_mu);
+  return r;
+}
+static int64_t store_call_locked(uint64_t tag, const char *pay, uint64_t plen, char *out,
                         uint64_t outcap) {
   if (!g_path[0]) return -2; /* no app bound: "no disk" to the app */
   if (tag == 2) { /* append */

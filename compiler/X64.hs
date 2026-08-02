@@ -58,31 +58,71 @@ module X64 (lowerX64, deTlsQosApp, x64Rev) where
 
 
 import Data.Char (isDigit, isSpace)
-import Data.List (isPrefixOf, stripPrefix)
+import Data.List (isPrefixOf, isSuffixOf, stripPrefix)
 
 -- bump when the lowering changes: folded into the unit-cache tag, so a
 -- lowering fix invalidates cached lowered units (learned the hard way:
 -- the section-aware fixup fix left stale corrupt prelude units behind)
 x64Rev :: Int
-x64Rev = 3
+x64Rev = 4
 
 -- deTlsQosApp: the QOS-x86_64 (--target=qx64) refinement.  A loaded
--- QOS Portable app image is (a) single-hart in this design pass and
--- (b) a fixed-slot ELF with no dynamic loader behind it -- nothing
--- registers a TLS block for it, and its @tpoff constants would index
--- the HOST's %fs TCB.  So the three thread-local cells the plain x64
--- lowering uses (fpr_posix_hart, fpr_x64_a6/a7) become PLAIN GLOBALS,
--- loaded RIP-relative -- correct because one hart means one writer.
--- Applied as a textual post-pass over the lowered output, same
--- line-discipline as the lowering itself; runtime/qosapp compiles the
--- C side with FPR_QOSAPP so its declarations drop __thread to match.
+-- QOS Portable app image is a fixed-slot ELF with no dynamic loader
+-- behind it -- nothing registers a TLS block for it, and its link-time
+-- @tpoff constants would index the HOST's %fs TCB at meaningless
+-- offsets.  v1 solved this by making the three thread-local cells
+-- (fpr_posix_hart, fpr_x64_a6/a7) plain globals -- correct only while
+-- one hart meant one writer.  v2 (multi-hart qosp) BORROWS THE HOST'S
+-- TLS instead: qosp declares one __thread borrow block
+-- {hart, a6, a7} per hart thread and publishes its offset from the
+-- thread pointer in the boot record; entry.c stores it in the plain
+-- global fpr_g_tlsoff.  The offset is the same in every thread (the
+-- executable's static TLS block sits at a fixed displacement from %fs
+-- in all of them), so every access rewrites to
+--
+--   load  SYM     ->  movq fpr_g_tlsoff(%rip), DST
+--                     movq %fs:OFF(DST), DST
+--   store SYM     ->  pushq SCR
+--                     movq fpr_g_tlsoff(%rip), SCR
+--                     movq SRC, %fs:OFF(SCR)
+--                     popq SCR          (SCR = %r10, or %r11 if SRC is %r10;
+--                                        push/pop is transparent to live regs
+--                                        and balanced before any call)
+--
+-- with OFF = 0/8/16 for hart/a6/a7 (the borrow block's layout, pinned
+-- by qos_abi.h).  Applied as a textual post-pass over the lowered
+-- output; runtime/qosapp compiles the C side with FPR_QOSAPP so its
+-- accessors go through the same fpr_g_tlsoff borrow (fpr.h).
 deTlsQosApp :: String -> String
-deTlsQosApp = unlines . map detls . lines
+deTlsQosApp = unlines . concatMap detls . lines
   where
     detls l = case splitTls l of
-      Just (pre, sym, post) -> pre ++ sym ++ "(%rip)" ++ post
-      Nothing -> l
-    -- rewrite every "%fs:SYM@tpoff" occurrence to "SYM(%rip)"
+      Nothing -> [l]
+      Just (pre, sym, post)
+        | ", " `isSuffixOf` pre ->
+            -- store: "<ind>movq SRC, %fs:SYM@tpoff[ # comment]"
+            let ind = takeWhile isSpace pre
+                body = dropWhile isSpace pre -- "movq SRC, "
+                src = takeWhile (/= ',') (drop 5 body)
+                scr = if src == "%r10" then "%r11" else "%r10"
+             in [ ind ++ "pushq " ++ scr,
+                  ind ++ "movq fpr_g_tlsoff(%rip), " ++ scr,
+                  ind ++ "movq " ++ src ++ ", %fs:" ++ tlsOff sym ++ "(" ++ scr ++ ")" ++ post,
+                  ind ++ "popq " ++ scr ]
+        | otherwise ->
+            -- load: "<ind>movq %fs:SYM@tpoff, DST[ # comment]"
+            let ind = takeWhile isSpace pre
+                after = dropWhile (== ' ') (drop 1 post) -- past ", "
+                dst = takeWhile (\c -> c /= ' ' && c /= '#') after
+                rest = drop (length dst) after
+                tail' = if null rest then "" else " " ++ dropWhile (== ' ') rest
+             in [ ind ++ "movq fpr_g_tlsoff(%rip), " ++ dst,
+                  ind ++ "movq %fs:" ++ tlsOff sym ++ "(" ++ dst ++ "), " ++ dst ++ tail' ]
+    tlsOff "fpr_posix_hart" = "0"
+    tlsOff "fpr_x64_a6" = "8"
+    tlsOff "fpr_x64_a7" = "16"
+    tlsOff s = error ("deTlsQosApp: unexpected TLS symbol " ++ s)
+    -- find "%fs:SYM@tpoff" in a line
     splitTls s = case breakOn "%fs:" s of
       Nothing -> Nothing
       Just (pre, after) -> case breakOn "@tpoff" after of

@@ -9,6 +9,7 @@
  */
 #include "fpr.h"
 #include <pthread.h>
+#include <stdlib.h>
 
 /* the hosted stand-in for tp (one per hart THREAD): generated x64/a64
  * code TLS-loads this where generated rv64 code reads tp. */
@@ -27,8 +28,21 @@ static void *hart_thread(void *arg) {
 }
 
 int main(void) {
+  /* FPR_HARTS=n lowers (or raises up to the compile cap) the live hart
+   * count -- FPR_HARTS=1 is the determinism switch for byte-compared
+   * runs.  Default stays the compile-time value: posix.bin's test
+   * outputs are pinned against POSIXHARTS. */
+  {
+    const char *e = getenv("FPR_HARTS");
+    if (e && *e) {
+      long n = strtol(e, 0, 10);
+      if (n < 1) n = 1;
+      if (n > FPR_NHARTS) n = FPR_NHARTS;
+      fpr_live_harts = (uw)n;
+    }
+  }
   fpr_rt_init(); /* runtime/core: buddy, hart blocks, actor 0, smp_go */
-  for (uintptr_t i = 1; i < FPR_NHARTS; i++) {
+  for (uintptr_t i = 1; i < fpr_live_harts; i++) {
     pthread_t t;
     if (pthread_create(&t, 0, hart_thread, (void *)i))
       fpr_cpanic("posix: pthread_create");

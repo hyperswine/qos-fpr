@@ -161,3 +161,67 @@ narrates the stages, `FPR_PORT` picks the net port (default 8000).
   lowering; the ABI header is already word-size clean).
 - TLS-terminating net tier; blocking service actors parked on real
   syscalls (polling today, like virt and posix).
+
+## Multi-hart (ABI v2): the TLS borrow
+
+v1 apps were single-hart for one structural reason: the de-TLS pass.
+A fixed-slot .qa has no loader-registered TLS block, so the three
+thread-local cells (the hart pointer; x64's a6/a7 arg-staging cells)
+were rewritten to plain globals -- correct only while one hart meant
+one writer.
+
+v2 keeps the image TLS-free and gets per-hart cells anyway by
+BORROWING THE HOST'S TLS.  qosp declares one `__thread` borrow block
+`{hart, a6, a7}` per hart thread and publishes its displacement from
+the thread pointer in the boot record (`tls_off`); the executable's
+static TLS block sits at the same displacement in every thread, so one
+constant serves all harts.  entry.c lands it in the plain global
+`fpr_g_tlsoff` before anything else runs; `--target=qx64/qa64` rewrite
+every TLS access to index through it (x64: a two-instruction load, and
+push/pop-guarded stores for the staging cells; a64: the same
+four-instruction footprint with x16 scratch), and fpr.h's FPR_QOSAPP
+accessors give the shared C runtime the identical view.
+
+Threads come from the host -- the app is freestanding -- via the
+appended-at-the-end `hal.start_hart` (NULLABLE: a NULL is an honest
+single-hart host).  `hal.nharts` is the host's RESOLVED count: env
+`FPR_HARTS`, else the online-core count; the app clamps to its own
+compile cap (`QOSHARTS`, default 8) and `Sys.harts`/`harts` report the
+live number.  The scheduler's scans, the deadlock detector, and
+spawnOn bounds all follow `fpr_live_harts`; explicit `spawnOn`
+placement now PINS an actor (the donation tier skips it) -- placement
+is an affinity contract, which is exactly what a GL-owning service
+actor needs.  `FPR_HARTS=1` is the determinism switch: those runs stay
+byte-identical to posix.bin and to qa64 under qemu.
+
+Two host-side truths this surfaced: a plain rw anonymous mapping is
+NOT executable on modern Linux (the r-x mprotect over the image's PF_X
+prefix now runs on every host, not just Darwin), and the linker
+scripts now emit two PT_LOADs (text+rodata r-x / data+bss rw, 64 KiB
+apart) so that boundary is real on 4 KiB and 16 KiB page hosts alike.
+
+## pshell: the startup shell (programs/pshell.fpr)
+
+A keyboard-driven 2D shell rendered entirely through the scene
+walker's GLES backend.  mods/scene2d.fpr is the gen_view bridge: a
+Box/Lbl/Slot view AST with typed attrs, an integer measure/place
+layout in 320x240 virtual pixels, a 3x5 rect font, and `build tree ->
+(statics, slots)` / `dyns slots vals` -- the LiveView static/dynamic
+split mapped onto the walker's static/dynamic GPU buffers.  Statics
+recompile only when the retained statics VALUE changes (screen or
+focus), which the walker now detects by value identity; steady-state
+frames re-upload only the changed glyphs, and the RENDER tile shows
+the walker's own draws/dynBytes as the proof.
+
+The shell is gfxdemo's service-actor architecture with the graphics
+and display actors `spawnOn 0` (pinned; the EGL context is
+thread-bound and gfx.c also rebinds defensively on a thread change),
+and a fresh worker actor per frame (voxel-interactive's shape) so
+per-frame allocation dies with its actor.  NOTES commits persist
+through `Sys.storeReq` -- the qosp kv trampoline, or an `FPR_STORE`
+file on co-compiled posix, same framing -- and replay at boot.
+
+    tools/pshell-check.sh          # both paths, snapshots, persistence
+    systemd/qos-pshell.service     # the SBC boot story
+    tools/kbdsim.py --tty FIFO     # the ssh virtual keyboard (raw
+                                   # termios in, evdev bytes out)

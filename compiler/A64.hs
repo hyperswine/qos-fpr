@@ -64,7 +64,7 @@ import Data.Word (Word64)
 
 -- bump when the lowering changes (unit-cache tag component; see X64.hs)
 a64Rev :: Int
-a64Rev = 6
+a64Rev = 7
 
 lowerA64 :: Bool -> String -> String
 lowerA64 mach =
@@ -332,23 +332,34 @@ instr mach body = case parts body of
       movImm "x16" (readInt n) ++ [op ++ " " ++ xreg rd ++ ", " ++ xreg rs ++ ", x16"]
 
 -- deTlsQosAppA64: the QOS-aarch64 (--target=qa64) refinement.
--- Same purpose as X64.hs deTlsQosApp: a loaded QOS Portable app is
--- single-hart and fixed-slot with no TLS block registered by a dynamic
--- loader.  The A64 lowering emits a 4-instruction local-exec TLS load
--- using tpidr_el0 + :tprel_* on fpr_posix_hart.  Rewrite the whole
--- sequence to a plain adrp+ldr of the global (RIP-relative in the
--- image), and update the banner.  Applied as a post-pass like the x64
--- version.
+-- Same purpose as X64.hs deTlsQosApp (see the v2 essay there): a
+-- loaded QOS Portable app is fixed-slot with no TLS block registered
+-- by a dynamic loader, so its :tprel_* constants are meaningless -- but
+-- multi-hart qosp needs a per-hart-thread cell, so instead of the v1
+-- plain-global rewrite the app BORROWS THE HOST'S TLS: qosp publishes
+-- the tpidr_el0 offset of its __thread borrow block in the boot
+-- record (fpr_g_tlsoff), and the 4-instruction local-exec sequence
+-- rewrites to mrs + adrp/ldr of the offset + one indexed load.
+-- Applied as a post-pass like the x64 version.
 deTlsQosAppA64 :: String -> String
 deTlsQosAppA64 = unlines . go . lines
   where
     go [] = []
     go (l:ls)
       | Just (pre, xd) <- matchTls4 (l:ls) =
+          -- v2 (multi-hart qosp): borrow the HOST's TLS.  The offset of
+          -- qosp's per-hart-thread borrow block from tpidr_el0 arrives
+          -- in the boot record and lands in the plain global
+          -- fpr_g_tlsoff (entry.c); the hart pointer is the block's
+          -- first word.  x16 is IP0 scratch, free within one lowered
+          -- instruction (the file-header contract); xd is an IR
+          -- register and never maps to x16/x17.
           let rest = drop 4 ls
-              adrp = pre ++ "adrp " ++ xd ++ ", fpr_posix_hart"
-              ldr  = pre ++ "ldr  " ++ xd ++ ", [" ++ xd ++ ", #:lo12:fpr_posix_hart]"
-          in adrp : ldr : go rest
+              a = pre ++ "mrs  x16, tpidr_el0"
+              b = pre ++ "adrp " ++ xd ++ ", fpr_g_tlsoff"
+              c = pre ++ "ldr  " ++ xd ++ ", [" ++ xd ++ ", #:lo12:fpr_g_tlsoff]"
+              d = pre ++ "ldr  " ++ xd ++ ", [x16, " ++ xd ++ "]"
+          in a : b : c : d : go rest
       | otherwise = fixBanner l : go ls
 
     -- Detect the exact 4-line tpidr sequence emitted by lowerA64 (non-mach)

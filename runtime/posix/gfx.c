@@ -46,6 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <pthread.h>
 
 /* ==== small math (vecmath.hpp, column-major, ported verbatim) ======== */
 typedef struct { float x, y, z; } v3;
@@ -179,7 +180,22 @@ static struct {
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
   int staticCompiled;
+  uint64_t lastStatics; /* value identity of the compiled statics list */
+  pthread_t boundTid; int haveTid; /* thread the context is current on */
 } G;
+
+/* EGL contexts are thread-bound.  The graphics service actor's mailbox
+ * is the intended serialization, but the multi-hart scheduler may
+ * migrate an unpinned actor between hart threads -- so every entry
+ * point rebinds if it finds itself on a new thread.  Callers are still
+ * serialized (one graphics actor); this only moves the binding. */
+static void gfx_bind_thread(void) {
+  pthread_t self = pthread_self();
+  if (G.haveTid && pthread_equal(G.boundTid, self)) return;
+  if (!eglMakeCurrent(G.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, G.ctx))
+    fpr_cpanic("gfx: eglMakeCurrent (thread rebind) failed");
+  G.boundTid = self; G.haveTid = 1;
+}
 
 static const char *kVS =
     "#version 310 es\n"
@@ -256,6 +272,7 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (G.ctx == EGL_NO_CONTEXT) fpr_cpanic("gfx: eglCreateContext(ES 3.1) failed");
   if (!eglMakeCurrent(G.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, G.ctx))
     fpr_cpanic("gfx: eglMakeCurrent (surfaceless) failed");
+  G.boundTid = pthread_self(); G.haveTid = 1;
   fprintf(stderr, "[gfx] EGL %d.%d (%s)  %s / %s\n", maj, min, how,
           glGetString(GL_RENDERER), glGetString(GL_VERSION));
 
@@ -352,13 +369,24 @@ static V *fields(V v, uint32_t tid, const char *what) {
   if (ISINT(v) || TID(v) != tid) fpr_cpanic(what);
   return (V *)((char *)v + 8);
 }
+/* scene (4 fields) and entity (5 fields) arrived as flat tuples in the
+ * PoC -- which the compiler now honestly rejects (Tup2/Tup3 only), so
+ * they are app-declared CONSTRUCTORS (e.g. Scene s d l c / Ent m p y
+ * s c in gfxdemo.fpr).  Constructor payloads lay out exactly like
+ * tuple payloads (hdr + V fields at +8) and the walker's contract is
+ * POSITIONAL, so any 4-/5-field heap value works: check only that it
+ * is a heap object and read the fields. */
+static V *nfields(V v, const char *what) {
+  if (ISINT(v)) fpr_cpanic(what);
+  return (V *)((char *)v + 8);
+}
 static v3 walk_v3(V v) {
   V *f = fields(v, 5, "gfx: expected (x, y, z) triple");
   return (v3){fmilli(f[0]), fmilli(f[1]), fmilli(f[2])};
 }
 /* entity = (mesh, pos, yawMilli, scale, color): stage one instance */
 static void walk_entity(V v) {
-  V *f = fields(v, 4, "gfx: expected entity 5-tuple");
+  V *f = nfields(v, "gfx: expected entity (Ent mesh pos yaw scale color)");
   V ms = f[0];
   if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String");
   str_t *s = (str_t *)ms;
@@ -399,10 +427,24 @@ static void stage_clear(void) {
 int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out) {
   V scene = (V)scenev;
   if (!G.inited) fpr_cpanic("glRender: glInit first");
-  V *f = fields(scene, 4, "gfx: scene must be (statics, dynamics, lights, camera)");
+  gfx_bind_thread();
+  V *f = nfields(scene, "gfx: scene must be (Scene statics dynamics lights camera)");
   int draws = 0; sw dynBytes = 0;
 
-  /* statics: compiled to GPU buffers exactly once (first frame) */
+  /* statics: compiled to GPU buffers ONCE PER STATICS VALUE.  Value
+   * identity is the invalidation: a shell that flips screens hands a
+   * different (immutable, retained) statics list, and the compiled
+   * buffers rebuild -- the gen_view discipline, on GPU buffers.  Same
+   * pointer = same value here because the app RETAINS the list it
+   * passes (a freed-and-recycled address cannot still be handed in). */
+  if (G.staticCompiled && G.lastStatics != (uint64_t)f[0]) {
+    for (int i = 0; i < G.nmeshes; i++) {
+      mesh_t *m = &G.meshes[i];
+      if (m->staticVBO) { glDeleteBuffers(1, &m->staticVBO); m->staticVBO = 0; }
+      m->staticCount = 0;
+    }
+    G.staticCompiled = 0;
+  }
   if (!G.staticCompiled) {
     stage_clear();
     walk_list(f[0], walk_entity);
@@ -416,6 +458,7 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
       m->staticCount = m->nstage;
     }
     G.staticCompiled = 1;
+    G.lastStatics = (uint64_t)f[0];
   }
 
   /* dynamics: staged from the value and re-uploaded, every frame */
@@ -476,6 +519,7 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
 
 int gfx_save_ppm(const char *path) {
   if (!G.inited) fpr_cpanic("glSavePpm: glInit first");
+  gfx_bind_thread();
   int w = G.w, h = G.h;
   unsigned char *pix = malloc((size_t)w * h * 4);
   if (!pix) return 1;

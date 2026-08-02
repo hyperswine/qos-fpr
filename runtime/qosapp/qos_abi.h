@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 1u
+#define QOS_ABI_VERSION 2u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -45,7 +45,11 @@
  * matching stubs.c's missing-capability behavior. */
 typedef struct {
   uint64_t version; /* QOS_ABI_VERSION */
-  uint64_t nharts;  /* informational; v1 apps are single-hart */
+  uint64_t nharts;  /* v2: the host's RESOLVED hart-thread count (env
+                     * FPR_HARTS, else the online-CPU count, clamped);
+                     * the app clamps again to its own compile-time
+                     * FPR_NHARTS cap and reports the result via
+                     * Sys.harts.  1 under a v1-shaped single-hart run. */
 
   /* console + machine */
   void (*putc)(char c);
@@ -79,6 +83,15 @@ typedef struct {
   int (*gfx_render)(uint64_t scene, int64_t *draws, int64_t *dyn_bytes);
   int (*gfx_save_ppm)(const char *path);
   int (*gfx_input_poll)(int64_t *kind, int64_t *a, int64_t *c);
+
+  /* ---- v2 additions (appended: v1 offsets unchanged) ----------------
+   * start_hart (NULLABLE: NULL = single-hart host): create one host
+   * thread for app hart `idx` and call fn(idx) on it -- the posix
+   * pthread_create dance done host-side, because the app is
+   * freestanding and cannot make threads.  The host trampoline owns
+   * the thread; it joins them all after the entry returns (every hart
+   * loop exits through fpr_process_done, so the joins are prompt). */
+  int (*start_hart)(uint64_t idx, void (*fn)(uint64_t idx));
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------
@@ -108,6 +121,21 @@ typedef struct {
    * trampoline (process.c): 2 = kv append, 3 = kv replay */
   int64_t (*syscall_fn)(uint64_t tag, const char *pay, uint64_t len,
                         char *out, uint64_t outcap);
+  /* ---- v2 additions (appended: v1 offsets unchanged) ----------------
+   * tls_off: the TLS BORROW.  The app image carries no TLS block, but
+   * multi-hart needs a per-hart-thread cell for the hart pointer (and
+   * the x64 a6/a7 arg-staging cells).  qosp declares one __thread
+   * borrow block per hart thread --
+   *
+   *     struct { void *hart; uint64_t a6, a7; }   (offsets 0/8/16)
+   *
+   * -- and publishes its displacement from the thread pointer here.
+   * The executable's static TLS block sits at the SAME displacement in
+   * every thread, so one constant serves all harts; --target=qx64/qa64
+   * code reads it from the plain global fpr_g_tlsoff (entry.c copies
+   * it there before anything else runs), and fpr.h's FPR_QOSAPP
+   * accessors give the C-side runtime the same view. */
+  uint64_t tls_off;
 } qos_boot_t;
 
 /* ---- the entry ------------------------------------------------------

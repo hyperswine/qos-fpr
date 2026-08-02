@@ -21,6 +21,7 @@ extern char _heap_start[], _heap_end[];
 
 /* per-hart control blocks; tp points at ours (see fpr.h essay) */
 fpr_hart_t fpr_harts[FPR_NHARTS];
+uw fpr_live_harts = FPR_NHARTS; /* hosted boots may lower this (fpr.h) */
 
 /* process-loading growth hook; NULL for a normal machine boot */
 fpr_grant_t (*fpr_grow_memory)(uw want_bytes) = 0;
@@ -421,12 +422,16 @@ static V callf(uw fn, uw ar, V *a) {
      * cells and calls through the 6-register cast; the lowered callee
      * reads the cells in its prologue (see compiler/X64.hs). */
     case 7: {
+#ifndef FPR_QOSAPP
       extern FPR_TLS uw fpr_x64_a6;
+#endif
       fpr_x64_a6 = (uw)a[6];
       return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
     }
     case 8: {
+#ifndef FPR_QOSAPP
       extern FPR_TLS uw fpr_x64_a6, fpr_x64_a7;
+#endif
       fpr_x64_a6 = (uw)a[6];
       fpr_x64_a7 = (uw)a[7];
       return ((F6)fn)(a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -499,7 +504,7 @@ V fpr_applyN(V f, uw n, V *rargs) {
 #undef RARG
 }
 
-static V g_sys_harts(V d) { (void)d; return TAG(FPR_NHARTS); }
+static V g_sys_harts(V d) { (void)d; return TAG((sw)fpr_live_harts); }
 FPR_FN(fpr_g_Sys_x2eharts, g_sys_harts, 1);
 
 /* builtin Result constructors for C-side service code */

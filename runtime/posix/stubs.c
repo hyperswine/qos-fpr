@@ -59,3 +59,49 @@ FPR_FN(fpr_g_Pin_x2ewrite, h_pin_write, 2);
 FPR_FN(fpr_g_Pin_x2eread, h_pin_read, 1);
 static V h_pin_wire(V n, V f) { (void)n; (void)f; fpr_cpanic("Pin.wire: no pin bus on the posix HAL"); return (V)&fpr_unit; }
 FPR_FN(fpr_g_Pin_x2ewire, h_pin_wire, 2);
+
+/* Sys.storeReq -- the storage syscall channel, hosted.  Under qosp the
+ * host's kv trampoline serves this (runtime/portable/store.c); the
+ * co-compiled posix image gets the same record framing against a file
+ * named by FPR_STORE, or the standalone "no disk" Result when unset --
+ * matching entry.c's no-channel behavior, so a program like pshell
+ * runs identically both ways. */
+#include <stdio.h>
+#include <stdlib.h>
+static V h_store_req(V tagv, V payv) {
+  if (ISINT(tagv) == 0) fpr_cpanic("Sys.storeReq: tag must be an Int");
+  if (ISINT(payv) || ((hdr_t *)payv)->tid != T_STR)
+    fpr_cpanic("Sys.storeReq: payload must be a String");
+  const char *path = getenv("FPR_STORE");
+  if (!path || !*path) return fpr_mkresult(1, "no disk");
+  str_t *s = (str_t *)payv;
+  uw tag = (uw)UNTAG(tagv);
+  if (tag == 2) {
+    FILE *f = fopen(path, "ab");
+    if (!f) return fpr_mkresult(1, "storage error");
+    fprintf(f, "%llu\n", (unsigned long long)s->len);
+    fwrite(s->bytes, 1, s->len, f);
+    fputc('\n', f);
+    fclose(f);
+    return fpr_mkresult(0, "");
+  }
+  if (tag == 3) {
+    static char out[256 * 1024];
+    FILE *f = fopen(path, "rb");
+    uw n = 0;
+    if (f) {
+      char line[32];
+      while (fgets(line, sizeof line, f)) {
+        unsigned long long rl = strtoull(line, 0, 10);
+        if (n + rl > sizeof out) break;
+        if (fread(out + n, 1, rl, f) != rl) break;
+        n += rl;
+        fgetc(f);
+      }
+      fclose(f);
+    }
+    return fpr_mkresultn(0, out, n);
+  }
+  return fpr_mkresult(1, "storage error");
+}
+FPR_FN(fpr_g_Sys_x2estoreReq, h_store_req, 2);

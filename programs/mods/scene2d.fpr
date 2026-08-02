@@ -1,0 +1,341 @@
+# scene2d.fpr -- gen_view for the GPU: a 2D view AST rendered through
+# the Scene walker's OpenGL ES backend (runtime/posix/gfx.c).
+#
+# The web gen_view (mods/genview.fpr) splits a tree into statics fixed
+# by SHAPE and dynamics that move, and the client patches only slots.
+# The gfx walker has the SAME split in hardware terms: the statics
+# entity list compiles to GPU buffers once per VALUE, the dynamics
+# list re-uploads every frame.  This module is the bridge --
+#
+#   build root      -> (statics, slots)   done once per SCREEN STATE
+#   dyns slots vals -> dynamics           done every frame
+#   scene st dy     -> Scene st dy lights camera
+#
+# -- so a shell's steady-state frame ships ONLY the glyphs that
+# changed screens' worth of text (clock, counters, input line), and a
+# focus/screen change hands the walker a NEW statics value, which is
+# exactly its recompile trigger.  gen_view's discipline, on VBOs.
+#
+# GEOMETRY.  Virtual screen 320x240 px, top-left origin, y down.  One
+# entity per box / border strip / lit font cell, all "cube" instances
+# scaled thin (the front face is what you see).  World mapping: 1 px =
+# 25 milli-units; camera on +Z at 6.0 units with fovMilli 927
+# (tan(0.4635) = 0.5 -> half-height 3.0 units = 120 px, exact); light
+# parked far behind the camera so front faces carry their instance
+# color essentially unshaded.  Nesting depth steps +5 milli toward the
+# camera: enough for the depth test, too small (0.08%) to see.
+#
+# TEXT.  A 3x5 cell font (15 bits per glyph, row-major) drawn as one
+# cube per lit cell; advance 4 cells.  Lowercase folds to uppercase.
+# A Lbl's cells land in the statics; a Slot reserves a FIXED box (cap
+# chars) and its cells land in the dynamics from the current vals --
+# the reservation is what keeps the statics' shape independent of the
+# text, the same reason genview wraps dynamics in <span data-slot>.
+#
+# LAYOUT.  Two integer passes, CSS-flexbox-in-miniature: measure gives
+# every node its natural size (text from cap/len, boxes from children
+# + Gap/Pad, W/H override); place walks top-down handing out
+# positions, splitting slack among Grow children along the axis.
+# Children align to the container's padded origin on the cross axis.
+
+# ---- the view AST ----------------------------------------------------------
+
+At = Type (Row | Col | Pad p | Gap g | W w | H h | Grow
+         | Bg c | Fg c | Bord c | Sc s).
+Sn = Type (Box attrs kids | Lbl attrs text | Slot attrs idx cap).
+
+# entity + scene shapes (the walker's positional contract; gfxdemo.fpr)
+Gfx = Type (Scene statics dynamics lights camera
+          | Ent mesh pos yaw scale color
+          | Sl idx x y sc fg cap).
+
+# ---- attribute readers -----------------------------------------------------
+
+isRow Nil = False.
+isRow (Row :: r) = True.
+isRow (a :: r) = isRow r.
+
+padOf Nil = 0.
+padOf (Pad p :: r) = p.
+padOf (a :: r) = padOf r.
+
+gapOf Nil = 0.
+gapOf (Gap g :: r) = g.
+gapOf (a :: r) = gapOf r.
+
+wOf Nil = 0 - 1.
+wOf (W w :: r) = w.
+wOf (a :: r) = wOf r.
+
+hOf Nil = 0 - 1.
+hOf (H h :: r) = h.
+hOf (a :: r) = hOf r.
+
+grows Nil = False.
+grows (Grow :: r) = True.
+grows (a :: r) = grows r.
+
+scOf Nil = 1.
+scOf (Sc s :: r) = s.
+scOf (a :: r) = scOf r.
+
+# color readers return (has, (r,g,b))
+bgOf Nil = (False, (0, 0, 0)).
+bgOf (Bg c :: r) = (True, c).
+bgOf (a :: r) = bgOf r.
+
+fgOf Nil = (False, (0, 0, 0)).
+fgOf (Fg c :: r) = (True, c).
+fgOf (a :: r) = fgOf r.
+
+bordOf Nil = (False, (0, 0, 0)).
+bordOf (Bord c :: r) = (True, c).
+bordOf (a :: r) = bordOf r.
+
+attrsOf (Box a k) = a.
+attrsOf (Lbl a t) = a.
+attrsOf (Slot a i c) = a.
+
+# ---- measure: natural (w, h) -----------------------------------------------
+
+textW n sc = (4 * n - 1) * sc.
+textH sc = 5 * sc.
+
+# override natural size with W/H when given
+sized a (nw, nh) =
+  w = wOf a; h = hOf a;
+  ((case w < 0 of True -> nw | False -> w),
+   (case h < 0 of True -> nh | False -> h)).
+
+measure (Lbl a t) = sized a (textW (strlen t) (scOf a), textH (scOf a)).
+measure (Slot a i cap) = sized a (textW cap (scOf a), textH (scOf a)).
+measure (Box a kids) =
+  p = padOf a; g = gapOf a;
+  (mw, mh, n) = msum (isRow a) kids;
+  gaps = case n > 1 of True -> g * (n - 1) | False -> 0;
+  inner = case isRow a of
+    True -> (mw + gaps, mh)
+  | False -> (mw, mh + gaps);
+  (iw, ih) = inner;
+  sized a (iw + 2 * p, ih + 2 * p).
+
+# along-axis sum + cross-axis max + count, in one walk
+msum row Nil = (0, 0, 0).
+msum row (k :: r) =
+  (kw, kh) = measure k;
+  (sw, sh, n) = msum row r;
+  case row of
+    True -> (kw + sw, imax kh sh, n + 1)
+  | False -> (imax kw sw, kh + sh, n + 1).
+
+imax a b | a > b = a.
+imax a b = b.
+
+# ---- place + emit: one walk building (statics, slots) ----------------------
+# Ctx threads (ents, slots) exactly like genview's Ctx threads
+# (statics, dyns).
+
+C2 = Type (C2 ents slots).
+
+build root =
+  fin (node (C2 Nil Nil) root 0 0 0).
+fin (C2 es sl) = (rev Nil es, rev Nil sl).
+
+rev acc Nil = acc.
+rev acc (x :: r) = rev (x :: acc) r.
+
+node c n x y d =
+  a = attrsOf n;
+  (w, h) = measure n;
+  c1 = boxBg c a x y w h d;
+  c2 = boxBord c1 a x y w h d;
+  body c2 n x y w h d.
+
+body c (Lbl a t) x y w h d =
+  emitText c t x y (scOf a) (fgCol a) (d + 2).
+body c (Slot a i cap) x y w h d = addSlot c (Sl i x y (scOf a) (fgCol a) cap).
+body c (Box a kids) x y w h d =
+  p = padOf a;
+  slack = grownSlack (isRow a) a kids w h p;
+  kidsGo c (isRow a) kids (x + p) (y + p) (gapOf a) slack (d + 1).
+
+fgCol a = (has, col) = fgOf a; case has of True -> col | False -> (900, 910, 930).
+
+addSlot (C2 es sl) s = C2 es (s :: sl).
+
+# leftover space along the axis, split among Grow children
+grownSlack row a kids w h p =
+  (mw, mh, n) = msum row kids;
+  g = gapOf a;
+  gaps = case n > 1 of True -> g * (n - 1) | False -> 0;
+  avail = case row of True -> w - 2 * p | False -> h - 2 * p;
+  used = case row of True -> mw + gaps | False -> mh + gaps;
+  ng = countGrow kids;
+  case ng > 0 of
+    True -> idiv (avail - used) ng
+  | False -> 0.
+
+countGrow Nil = 0.
+countGrow (k :: r) =
+  n = countGrow r;
+  case grows (attrsOf k) of True -> n + 1 | False -> n.
+
+idiv a b | b == 0 = 0.
+idiv a b | a < 0 = 0.
+idiv a b = a / b.
+
+kidsGo c row Nil x y g slack d = c.
+kidsGo c row (k :: r) x y g slack d =
+  (kw, kh) = measure k;
+  extra = case grows (attrsOf k) of True -> slack | False -> 0;
+  c1 = case row of
+    True -> node c (widen k extra 0) x y d
+  | False -> node c (widen k 0 extra) x y d;
+  case row of
+    True -> kidsGo c1 row r (x + kw + extra + g) y g slack d
+  | False -> kidsGo c1 row r x (y + kh + extra + g) g slack d.
+
+# hand a grown child its final size by overriding W/H
+widen k 0 0 = k.
+widen k dx dy =
+  (w, h) = measure k;
+  case k of
+    Box a kids -> Box (W (w + dx) :: H (h + dy) :: a) kids
+  | Lbl a t -> Lbl (W (w + dx) :: H (h + dy) :: a) t
+  | Slot a i cap -> Slot (W (w + dx) :: H (h + dy) :: a) i cap.
+
+# ---- entity emission -------------------------------------------------------
+# px -> world milli: x right, y down, centered rect (x,y,w,h) at depth
+# d (each depth step 5 milli toward the camera).
+
+pxm = 25.
+
+exent x y w h d col =
+  wx = idiv2 ((2 * x + w - 320) * pxm);
+  wy = idiv2 ((240 - 2 * y - h) * pxm);
+  Ent "cube" (wx, wy, d * 5) 0 (w * pxm, h * pxm, 2) col.
+
+# floor-divide by 2 for negatives too (integer / truncates toward 0)
+idiv2 n | n < 0 = 0 - ((0 - n) / 2).
+idiv2 n = n / 2.
+
+boxBg c a x y w h d =
+  (has, col) = bgOf a;
+  case has of
+    True -> addEnt c (exent x y w h d col)
+  | False -> c.
+
+addEnt (C2 es sl) e = C2 (e :: es) sl.
+
+boxBord c a x y w h d =
+  (has, col) = bordOf a;
+  case has of
+    True ->
+      addEnt (addEnt (addEnt (addEnt c (exent x y w 1 (d + 1) col))
+                             (exent x (y + h - 1) w 1 (d + 1) col))
+                     (exent x y 1 h (d + 1) col))
+             (exent (x + w - 1) y 1 h (d + 1) col)
+  | False -> c.
+
+# ---- the 3x5 font ----------------------------------------------------------
+# 15 bits, row-major from the top-left; bit (r*3+c).  Space = 0.
+
+emitText c t x y sc col d = etGo c t 1 (strlen t) x y (sc, col, d).
+etGo c t i n x y st | i > n = c.
+etGo c t i n x y st =
+  (sc, col, d) = st;
+  c1 = glyph c (font (charAt t i)) x y sc col d;
+  etGo c1 t (i + 1) n (x + 4 * sc) y st.
+
+glyph c 0 x y sc col d = c.
+glyph c bits x y sc col d = glCell c bits 0 x y sc col d.
+glCell c bits b x y sc col d | b == 15 = c.
+glCell c 0 b x y sc col d = c.
+glCell c bits b x y sc col d =
+  c1 = case band bits 1 == 1 of
+    True -> addEnt c (exent (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
+  | False -> c;
+  glCell c1 (bits / 2) (b + 1) x y sc col d.
+
+imod a b = a - (a / b) * b.
+
+# dynamics: current text for every slot, clipped to its reservation
+dyns slots vals = dynGo (C2 Nil Nil) slots vals.
+dynGo (C2 es sl) Nil vals = rev Nil es.
+dynGo c (Sl i x y sc col cap :: r) vals =
+  s = clip (nth vals i) cap;
+  dynGo (emitText c s x y sc col 9) r vals.
+
+nth Nil i = "".
+nth (v :: r) 0 = v.
+nth (v :: r) i = nth r (i - 1).
+
+clip s cap | strlen s > cap = substr s (strlen s - cap + 1) cap.
+clip s cap = s.
+
+# ---- the fixed frame -------------------------------------------------------
+
+lights2d = ((0, 0, 240000), (1000, 1000, 1000)) :: Nil.
+camera2d = ((0, 0, 6000), (0, 0, 0), 927).
+scene st dy = Scene st dy lights2d camera2d.
+
+# ---- glyphs ----------------------------------------------------------------
+# uppercase-fold, then a clause per code.  Layout literals are decimal
+# renderings of the 15-bit patterns (LSB = top-left).
+
+font c | c > 96 = font (c - 32).      # a-z -> A-Z
+font 32 = 0.                    # space
+font 46 = 8192.                 # .
+font 58 = 1040.                 # :
+font 45 = 448.                  # -
+font 47 = 4772.                 # /
+font 62 = 5393.                 # >
+font 60 = 17492.                # <
+font 95 = 28672.                # _
+font 39 = 18.                   # '
+font 33 = 8338.                 # !
+font 63 = 8359.                 # ?
+font 40 = 8778.                 # (
+font 41 = 10530.                # )
+font 48 = 31599.                # 0
+font 49 = 29850.                # 1
+font 50 = 29671.                # 2
+font 51 = 31207.                # 3
+font 52 = 18925.                # 4
+font 53 = 31183.                # 5
+font 54 = 31695.                # 6
+font 55 = 9511.                 # 7
+font 56 = 31727.                # 8
+font 57 = 31215.                # 9
+font 65 = 23530.                # A
+font 66 = 15083.                # B
+font 67 = 25166.                # C
+font 68 = 15211.                # D
+font 69 = 29391.                # E
+font 70 = 4815.                 # F
+font 71 = 27470.                # G
+font 72 = 23533.                # H
+font 73 = 29847.                # I
+font 74 = 11044.                # J
+font 75 = 23277.                # K
+font 76 = 29257.                # L
+font 77 = 23549.                # M
+font 78 = 24573.                # N
+font 79 = 11114.                # O
+font 80 = 4843.                 # P
+font 81 = 26474.                # Q
+font 82 = 23275.                # R
+font 83 = 14478.                # S
+font 84 = 9367.                 # T
+font 85 = 31597.                # U
+font 86 = 11117.                # V
+font 87 = 24557.                # W
+font 88 = 23213.                # X
+font 89 = 9389.                 # Y
+font 90 = 29351.                # Z
+font c = 21845.                       # unknown: checker
+
+# debug helpers (harmless exports)
+entCount (C2 es sl) = dbgLen es.
+dbgLen Nil = 0.
+dbgLen (x :: r) = 1 + dbgLen r.

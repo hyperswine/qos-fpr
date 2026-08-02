@@ -89,7 +89,11 @@ typedef struct fpr_acb {
   uw weight;   /* selection weight for the randomized default tier (>=1) */
   char *stack;
   uw id;
-  uw hart;         /* pinned owner hart */
+  uw hart;         /* owner hart (donation can move it unless pin) */
+  uw pin;          /* 1 = never donated: actor 0, and spawnOn-placed
+                    * actors -- explicit placement is an affinity
+                    * contract (a graphics actor's EGL context is bound
+                    * to its hart's thread on hosted targets) */
   fpr_pool_t pool; /* this actor's slabs + recycle buckets (slab refactor) */
 } acb_t;
 
@@ -195,13 +199,18 @@ static uw steal_h, steal_t;
 static void backlog_add(fpr_hart_t *h, acb_t *a);
 
 static void donate(fpr_hart_t *h) {
-  /* pop our OLDEST (head) and publish it; full ring = keep it local */
-  acb_t *a = h->bl_head;
+  /* publish our OLDEST UNPINNED entry; full ring = keep it local.
+   * Pinned actors (actor 0, spawnOn placements) never migrate -- the
+   * walk is bounded by the backlog, which donation itself keeps near
+   * DONATE_HI. */
+  acb_t *prev = 0, *a = h->bl_head;
+  while (a && a->pin) { prev = a; a = a->bl_next; }
   if (!a) return;
   fpr_lock(&steal_lock);
   if (steal_t - steal_h < SCAP) {
-    h->bl_head = a->bl_next;
-    if (!h->bl_head) h->bl_tail = 0;
+    if (prev) prev->bl_next = a->bl_next;
+    else h->bl_head = a->bl_next;
+    if (h->bl_tail == a) h->bl_tail = prev;
     h->bl_len--;
     steal_ring[steal_t % SCAP] = a;
     steal_t++;
@@ -402,7 +411,7 @@ static void hart_loop(fpr_hart_t *h) {
       uw act = __atomic_load_n(&g_activity, __ATOMIC_RELAXED);
       uw blk = __atomic_load_n(&g_blocked, __ATOMIC_RELAXED);
       int all_idle = 1;
-      for (int i = 0; i < FPR_NHARTS; i++)
+      for (uw i = 0; i < fpr_live_harts; i++)
         if (!fpr_harts[i].idle) all_idle = 0;
       if (all_idle && blk > 0 && act == last_act) {
         if (++stable > DETECT_QUIET)
@@ -575,7 +584,7 @@ static V take_at(chan_t *c, uint32_t k) {
 static acb_t main_acb; /* actor 0 */
 
 void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
-  for (int i = 0; i < FPR_NHARTS; i++) hal_timer_park((uw)i);
+  for (uw i = 0; i < fpr_live_harts; i++) hal_timer_park(i);
   main_acb.tid = T_ACTOR;
   main_acb.var = ST_READY;
   for (int i = 0; i < MAXSND; i++) main_acb.ch[i].sender = 0;
@@ -583,6 +592,7 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   main_acb.entry = 0; /* trampoline runs fpr_fn_main + fpr_exit */
   main_acb.id = 0;
   main_acb.hart = 0;
+  main_acb.pin = 1; /* the result carrier never migrates */
   char *stk = (char *)big_block(STACK_SZ);
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
   main_acb.pool.cur = 0;
@@ -607,8 +617,8 @@ void fpr_hart_secondary(int id) {
 
 /* ---- FPRISC-facing API ------------------------------------------------ */
 
-static V spawn_on(uw hart, V f) {
-  if (hart >= FPR_NHARTS) fpr_cpanic("spawnOn: no such hart (raise HARTS= at build time)");
+static V spawn_on(uw hart, V f, uw pin) {
+  if (hart >= fpr_live_harts) fpr_cpanic("spawnOn: no such hart (Sys.harts is the live count)");
   if (ISINT(f) || TID(f) != T_PAP) fpr_cpanic("spawn: argument must be a function");
   acb_t *a = (acb_t *)big_block(sizeof(acb_t));
   char *stk = (char *)big_block(STACK_SZ);
@@ -626,6 +636,7 @@ static V spawn_on(uw hart, V f) {
   a->stack = stk;
   a->id = __atomic_add_fetch(&next_id, 1, __ATOMIC_RELAXED);
   a->hart = hart;
+  a->pin = pin;
   for (int i = 0; i < 16; i++) a->ctx[i] = 0;
   /* first-activation state is machine-specific (x86 needs a stack-
    * alignment bias; rv needs tp) -- the ctx layer owns fabrication */
@@ -637,10 +648,10 @@ static V spawn_on(uw hart, V f) {
   return (V)a;
 }
 
-static V a_spawn(V f) { return spawn_on(fpr_hart()->id, f); }
+static V a_spawn(V f) { return spawn_on(fpr_hart()->id, f, 0); }
 static V a_spawn_at(V hv, V f) {
   if (ISINT(hv) == 0) fpr_cpanic("spawnOn: hart must be an Int");
-  return spawn_on((uw)UNTAG(hv), f);
+  return spawn_on((uw)UNTAG(hv), f, 1); /* explicit placement pins */
 }
 
 /* the send core, sender key EXPLICIT: a_send passes the current acb;
@@ -782,7 +793,7 @@ static V a_myself(V dummy) {
 }
 
 static V g_hart_id(V d) { (void)d; return TAG((sw)fpr_hart()->id); }
-static V g_harts(V d) { (void)d; return TAG(FPR_NHARTS); }
+static V g_harts(V d) { (void)d; return TAG((sw)fpr_live_harts); }
 
 /* scheduler introspection + tuning (docs/SCHED-MODEL.md) */
 static V g_sched_tau(V d) { (void)d; return TAG((sw)g_tau); }

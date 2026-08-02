@@ -19,11 +19,11 @@
 #include "fpr.h"
 #include "qos_abi.h"
 
-/* the cells that --target=qx64/qa64 code loads RIP-relative via the
- * deTlsQosApp* passes.  runtime.c writes to a6/a7 only on the x64 path
- * (SysV stack args); they are unused (but harmless) on qa64. */
-fpr_hart_t *fpr_posix_hart;
-uw fpr_x64_a6, fpr_x64_a7;
+/* the TLS BORROW (ABI v2, qos_abi.h): the one plain global the
+ * deTlsQosApp* passes and fpr.h's FPR_QOSAPP accessors index the
+ * host's per-hart-thread borrow block through.  Written once below,
+ * before any generated code or hart loop runs. */
+uw fpr_g_tlsoff;
 
 const qos_hal_t *qos_hal; /* installed before anything can call out */
 
@@ -55,6 +55,12 @@ static V h_sys_store_req(V tagv, V payv) {
 }
 FPR_FN(fpr_g_Sys_x2estoreReq, h_sys_store_req, 2);
 
+/* the function start_hart runs on each new host thread: join the
+ * scheduler as hart i.  fpr_hart_secondary sets tp (through the
+ * borrow) and enters the hart loop; the loop returns when
+ * fpr_process_done ends the world, and the host joins the thread. */
+static void qos_hart_thread(uint64_t i) { fpr_hart_secondary((int)i); }
+
 int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
                       uw result_cap) {
   extern char _bss_start[], _bss_end[];
@@ -68,6 +74,8 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
   if (!boot || boot->abi_version != QOS_ABI_VERSION) return -1;
   qos_hal = boot->hal; /* first: panics from here on can reach putc */
   if (!qos_hal || qos_hal->version != QOS_ABI_VERSION) return -1;
+  fpr_g_tlsoff = boot->tls_off; /* before ANY tp read: fpr_set_tp below
+                                 * already goes through the borrow */
 
   fpr_hart_t *h = &fpr_harts[0];
   h->id = 0;
@@ -101,9 +109,33 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
   fpr_is_process = 1;
   fpr_process_done = 0;
 
+  /* ---- multi-hart (ABI v2): resolve, init, start ------------------
+   * The host resolved a desired count (hal->nharts); clamp to this
+   * image's compile-time cap.  Hart blocks 1..live-1 need only their
+   * id -- .bss zero is a correct empty pool/backlog, and each hart's
+   * first allocation pulls a grant exactly like hart 0's overflow
+   * path.  Threads come from the host (start_hart): the app is
+   * freestanding and cannot make them itself; each thread's borrow
+   * block already exists (host __thread), so fpr_hart_secondary's
+   * fpr_set_tp lands in the right slot from the first instruction. */
+  uw live = qos_hal->nharts ? qos_hal->nharts : 1;
+  if (live > FPR_NHARTS) live = FPR_NHARTS;
+  if (!qos_hal->start_hart) live = 1; /* v1-shaped host: honest fallback */
+  fpr_live_harts = live;
+  for (uw i = 1; i < live; i++) {
+    fpr_hart_t *hi = &fpr_harts[i];
+    hi->id = i;
+    hi->fuel = 0;
+  }
+
   fpr_actors_init(); /* actor 0 (main) onto hart 0 */
+  for (uw i = 1; i < live; i++)
+    if (qos_hal->start_hart(i, qos_hart_thread))
+      fpr_cpanic("boot: start_hart failed");
   fpr_hart_main(0);  /* returns when actor 0 finishes (fpr_is_process
-                      * routes the exit through fpr_process_done) */
+                      * routes the exit through fpr_process_done --
+                      * which also ends every secondary hart loop, so
+                      * the host's joins are prompt) */
 
   V result = fpr_process_result_get();
   /* render into the host's buffer: fpr_prim_fn_str allocates the

@@ -118,18 +118,21 @@ and2 False b = False.
 # buffers once); only the dynamic tier re-uploads -- the MVU render
 # discipline and the renderer's static/dynamic split are the same idea.
 
+# the scene ABI's wide shapes are constructors now (Tup2/Tup3-only ABI)
+Gfx = Type (Scene statics dynamics lights camera | Ent mesh pos yaw scale color).
+
 statics =
-  ("plane", (0, 0, 0), 0, (8000, 1000, 8000), (300, 420, 320))
-    :: ("cube", (0 - 2500, 400, 0 - 2000), 300, (800, 800, 800), (900, 450, 250))
-    :: ("cube", (2500, 400, 0 - 2000), 600, (800, 800, 800), (250, 450, 900))
+  Ent "plane" (0, 0, 0) 0 (8000, 1000, 8000) (300, 420, 320)
+    :: Ent "cube" (0 - 2500, 400, 0 - 2000) 300 (800, 800, 800) (900, 450, 250)
+    :: Ent "cube" (2500, 400, 0 - 2000) 600 (800, 800, 800) (250, 450, 900)
     :: Nil.
 lights = ((4000, 6000, 4000), (1000, 1000, 1000)) :: Nil.
 
 view (yaw, dist, x) =
-  (statics,
-   ("cube", (x, 900, 0), yaw, (1400, 1400, 1400), (950, 800, 250)) :: Nil,
-   lights,
-   ((0, 3000, dist), (0, 500, 0 - 1000), 900)).
+  Scene statics
+    (Ent "cube" (x, 900, 0) yaw (1400, 1400, 1400) (950, 800, 250) :: Nil)
+    lights
+    ((0, 3000, dist), (0, 500, 0 - 1000), 900).
 
 # ---- the MVU loop ----------------------------------------------------------
 # EVENT-DRIVEN with a wall-clock session budget: render only when the

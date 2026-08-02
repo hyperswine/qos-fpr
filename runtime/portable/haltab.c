@@ -57,9 +57,9 @@ static void t_mmio_write(uint64_t addr, uint64_t v, uint32_t width) {
   }
 }
 
-static const qos_hal_t the_table = {
+static qos_hal_t the_table = {
     .version = QOS_ABI_VERSION,
-    .nharts = 1,
+    .nharts = 1, /* main.c raises this (and installs start_hart) at boot */
     .putc = t_putc,
     .poweroff = t_poweroff,
     .wfi = t_wfi,
@@ -79,3 +79,11 @@ static const qos_hal_t the_table = {
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }
+
+/* multi-hart wiring (ABI v2): the resolved live count and the host's
+ * thread-creation callback, both owned by main.c */
+void qosp_hal_set_smp(uint64_t nharts,
+                      int (*sh)(uint64_t, void (*)(uint64_t))) {
+  the_table.nharts = nharts;
+  the_table.start_hart = sh;
+}

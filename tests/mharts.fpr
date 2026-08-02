@@ -1,0 +1,80 @@
+# mharts.fpr -- the LIVE hart count (multi-hart QOS Portable / posix
+# FPR_HARTS override).  Three claims:
+#
+#   1. harts/Sys reports the RESOLVED live count, not the compile cap:
+#      under `FPR_HARTS=3 qosp` this prints 3 even though the image was
+#      built with FPR_NHARTS=8.
+#   2. spawnOn reaches EVERY live hart: one reporter per hart, each
+#      names the hart it actually ran on -- the full set must come back.
+#   3. spawnOn placement is PINNED: a placed worker's hartId stays the
+#      one it was given across a burst of donation-triggering load
+#      (plain-spawn siblings flood the backlog past DONATE_HI; the
+#      pinned worker must never migrate with them).
+#
+#   FPR_HARTS=3 make portable-run PROG=tests/mharts.fpr
+#   FPR_HARTS=3 ./posix.bin        (posix.bin: cap POSIXHARTS first)
+
+reporter self =
+  case Actor.recv self of
+    (parent, n) -> Actor.send parent (Ok (hartId 0)).
+
+# pinned worker: answers with its CURRENT hart every time it is asked
+pinServe self =
+  case Actor.recv self of
+    (parent, n) ->
+      case n == 0 of
+        True  -> 0
+      | False -> (Actor.send parent (Ok (hartId 0))) >> pinServe self.
+
+# backlog flooder: enough plain spawns to push past DONATE_HI so the
+# steal tier engages while we interrogate the pinned worker
+noise self = 0.
+flood me 0 = 0.
+flood me n = _ = Actor.spawn noise; flood me (n - 1).
+
+getRes me = case Actor.recvRes me of Ok r -> r.
+
+askAll me h n | h == n = Nil.
+askAll me h n =
+  r = Actor.spawnOn h reporter;
+  _ = Actor.send r (me, 1);
+  got = getRes me;
+  got :: askAll me (h + 1) n.
+
+# every hart id 0..n-1 present exactly where it was placed?
+allPlaced Nil n = True.
+allPlaced (h :: r) n | h == n = allPlaced r (n + 1).
+allPlaced (h :: r) n = False.
+
+probe me w 0 bad = bad.
+probe me w n bad =
+  _ = flood me 6;
+  _ = Actor.send w (me, 1);
+  got = getRes me;
+  _ = yield me;
+  case got == 1 of
+    True  -> probe me w (n - 1) bad
+  | False -> probe me w (n - 1) (bad + 1).
+
+placeReport True = print "spawnOn reached every live hart in order".
+placeReport False = print "PLACEMENT FAILED".
+
+pinReport 0 = print "pinned worker stayed on hart 1 across 40 flooded probes".
+pinReport bad = print "PIN FAILED: {bad} migrations observed".
+
+# the pin claim only bites with a second hart to migrate to
+pinProbe me n | n > 1 =
+  w = Actor.spawnOn 1 pinServe;
+  bad = probe me w 40 0;
+  _ = Actor.send w (me, 0);
+  pinReport bad.
+pinProbe me n = print "(single hart: pin probe skipped)".
+
+main =
+  me = Actor.self 0;
+  n = harts 0;
+  _ = print "live harts: {n}";
+  seen = askAll me 0 n;
+  _ = placeReport (allPlaced seen 0);
+  _ = pinProbe me n;
+  print "mharts done".

@@ -23,10 +23,20 @@ serves real hardware and simulation identically.  Three modes:
       tools/kbdsim.py --uinput "w*5 a*3" &
       FPR_EVDEV=/dev/input/eventN ./qosp --yes app.qa
 
+  tty mode -- an INTERACTIVE virtual keyboard: put the controlling tty
+    in raw mode and translate every keystroke live into evdev units on
+    the target (usually a FIFO the shell reads).  This is the ssh
+    story for a keyboardless SBC:
+      # on the box:   mkfifo /tmp/kbd && FPR_EVDEV=/tmp/kbd qosp ...
+      # over ssh -t:  tools/kbdsim.py --tty /tmp/kbd
+    Arrows arrive as ESC[A-D and are decoded; a lone ESC is the esc
+    key; ctrl-c exits.  No uinput, no udev, no X -- raw termios in,
+    struct input_event out.
+
 The spec is space-separated tokens `<key>` or `<key>*<n>`: each unit is
 one press (value 1) + one release (value 0), each followed by an
 EV_SYN frame marker, matching real device traffic.  Keys: a-z, 0-9,
-space, up/down/left/right, esc.
+space, up/down/left/right, esc, enter, backspace, tab.
 """
 import argparse, os, struct, sys, time
 
@@ -35,7 +45,8 @@ EV_SYN, EV_KEY = 0x00, 0x01
 KEY = {**{chr(ord('a')+i): c for i, c in enumerate(
         [30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,20,22,47,17,45,21,44])},
        **{str(d): c for d, c in zip(range(10), [11,2,3,4,5,6,7,8,9,10])},
-       'space': 57, 'esc': 1, 'up': 103, 'down': 108, 'left': 105, 'right': 106}
+       'space': 57, 'esc': 1, 'up': 103, 'down': 108, 'left': 105, 'right': 106,
+       'enter': 28, 'backspace': 14, 'tab': 15}
 
 def ev(etype, code, value):
     # 64-bit struct input_event: timeval (2x u64) + type,code (u16) + value (s32)
@@ -45,6 +56,38 @@ def ev(etype, code, value):
 def key_unit(code):
     return (ev(EV_KEY, code, 1) + ev(EV_SYN, 0, 0) +
             ev(EV_KEY, code, 0) + ev(EV_SYN, 0, 0))
+
+ASCII_EXTRA = {'\n': 28, '\r': 28, ' ': 57, '\x7f': 14, '\x08': 14, '\t': 15}
+def tty_mode(path):
+    import termios, tty as ttymod, select
+    out = open(path, 'wb', buffering=0)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    ttymod.setraw(fd)
+    sys.stderr.write("kbdsim --tty: keys go live; ctrl-c exits\r\n")
+    try:
+        while True:
+            ch = os.read(fd, 1).decode('latin1')
+            if ch == '\x03' or ch == '\x04':
+                break
+            code = None
+            if ch == '\x1b':
+                # arrow escape or a lone esc (50 ms decides)
+                r, _, _ = select.select([fd], [], [], 0.05)
+                if r and os.read(fd, 1) == b'[':
+                    a = os.read(fd, 1)
+                    code = {b'A': 103, b'B': 108, b'D': 105, b'C': 106}.get(a)
+                else:
+                    code = 1
+            elif ch in ASCII_EXTRA:
+                code = ASCII_EXTRA[ch]
+            elif ch.lower() in KEY:
+                code = KEY[ch.lower()]
+            if code:
+                out.write(key_unit(code))
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
 
 def parse_spec(spec):
     units = []
@@ -78,12 +121,15 @@ def run_uinput(units, rate):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--tty", action="store_true", help="interactive: raw tty keystrokes -> evdev units at PATH, live")
     ap.add_argument("--fifo", action="store_true", help="pace writes for a live FIFO")
     ap.add_argument("--uinput", action="store_true", help="create a real virtual device")
     ap.add_argument("--rate", type=float, default=0.05, help="seconds between presses (fifo/uinput)")
     ap.add_argument("path_or_spec")
     ap.add_argument("spec", nargs="?")
     a = ap.parse_args()
+    if a.tty:
+        return tty_mode(a.path_or_spec)
     if a.uinput:
         run_uinput(parse_spec(a.path_or_spec if a.spec is None else a.spec), a.rate)
         return

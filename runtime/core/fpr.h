@@ -118,16 +118,34 @@ typedef struct {
 } fpr_hart_t;
 
 extern fpr_hart_t fpr_harts[FPR_NHARTS];
+/* how many hart blocks are LIVE this run (threads actually started):
+ * FPR_NHARTS is the compile-time cap and the static array size; the
+ * hosted boots (posix main.c, qosapp entry.c) may run fewer -- env
+ * FPR_HARTS, or the host's resolved core count under qosp.  Scheduler
+ * scans, the deadlock detector, and spawnOn bounds all use this. */
+extern uw fpr_live_harts;
 
 #if defined(FPR_QOSAPP)
-/* a loaded QOS Portable app image (runtime/qosapp): single-hart per
- * process AND fixed-slot with no dynamic loader behind it -- nothing
- * registers a TLS block for the image, and link-time @tpoff constants
- * would index the HOST's %fs TCB.  One hart = one writer, so the cell
- * is a PLAIN GLOBAL; fprc's --target=qx64 emits the matching
- * RIP-relative loads (X64.hs deTlsQosApp). */
-#define FPR_TLS /* plain */
-extern fpr_hart_t *fpr_posix_hart;
+/* a loaded QOS Portable app image (runtime/qosapp): fixed-slot with no
+ * dynamic loader behind it -- nothing registers a TLS block for the
+ * image, and link-time @tpoff constants would index the HOST's TCB at
+ * meaningless offsets.  Multi-hart (ABI v2) therefore BORROWS THE
+ * HOST'S TLS: qosp keeps one __thread borrow block {hart, a6, a7} per
+ * hart thread and publishes its thread-pointer displacement in the
+ * boot record; entry.c lands it in fpr_g_tlsoff before anything else
+ * runs.  The displacement is identical in every thread (static TLS),
+ * so these accessors -- and the matching --target=qx64/qa64 emission
+ * (X64.hs/A64.hs deTls passes) -- are per-hart-correct with zero app
+ * TLS.  fpr_posix_hart/fpr_x64_a6/a7 become lvalue MACROS over the
+ * block so the shared runtime sources read unchanged. */
+#define FPR_TLS /* accessed through the borrow block */
+extern uw fpr_g_tlsoff; /* entry.c: boot->tls_off */
+static inline char *fpr_tls_blk(void) {
+  return (char *)__builtin_thread_pointer() + fpr_g_tlsoff;
+}
+#define fpr_posix_hart (*(fpr_hart_t **)fpr_tls_blk())
+#define fpr_x64_a6 (*(uw *)(fpr_tls_blk() + 8))
+#define fpr_x64_a7 (*(uw *)(fpr_tls_blk() + 16))
 static inline fpr_hart_t *fpr_hart(void) { return fpr_posix_hart; }
 #elif defined(FPR_POSIX)
 /* hosted: no free per-thread register (tpidr_el0/fs belong to libc

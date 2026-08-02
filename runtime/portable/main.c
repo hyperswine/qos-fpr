@@ -39,11 +39,13 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/ucontext.h>
+#include <pthread.h>
 
 /* runtime/core, compiled hosted into qosp (buddy.c + elfload.c only) */
 #include "fpr.h"
 
 const qos_hal_t *qosp_hal_table(void);
+void qosp_hal_set_smp(uint64_t nharts, int (*sh)(uint64_t, void (*)(uint64_t)));
 void qosp_store_bind(const char *app_id);
 int64_t qosp_store_call(uint64_t, const char *, uint64_t, char *, uint64_t);
 
@@ -62,11 +64,77 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
 /* the growth callback wired into the boot record: buddy grants from
  * the arena past the slot -- the Memory.qa analogue, one caller so no
  * linearization needed (the design's single-core bootstrap rule) */
+static pthread_mutex_t grow_mu = PTHREAD_MUTEX_INITIALIZER;
 static qos_grant_t grow_cb(uint64_t want) {
+  /* v2: every app hart thread grows through here -- buddy is the
+   * host's single-threaded allocator, so this callback is the
+   * linearization point (the Memory.qa mailbox, as a mutex) */
+  pthread_mutex_lock(&grow_mu);
   void *p = buddy_alloc(want);
   qos_grant_t g = {p, p ? buddy_block_usable_size(p) : 0};
+  pthread_mutex_unlock(&grow_mu);
   TRACE("grow(%" PRIu64 ") -> %p (+%" PRIu64 ")\n", want, p, g.size);
   return g;
+}
+
+/* ---- multi-hart (ABI v2) --------------------------------------------
+ * The TLS borrow block: one per hart THREAD, host __thread -- the app
+ * indexes it through the thread pointer plus the constant displacement
+ * published in the boot record (static TLS: same in every thread).
+ * Layout is pinned by qos_abi.h: {hart, a6, a7} at 0/8/16. */
+struct qosp_tls { void *hart; uint64_t a6, a7; };
+static __thread struct qosp_tls qosp_tls_blk;
+static uint64_t qosp_tls_off(void) {
+  return (uint64_t)((char *)&qosp_tls_blk -
+                    (char *)__builtin_thread_pointer());
+}
+
+/* start_hart: pthread_create done host-side (the app is freestanding).
+ * The trampoline touches the borrow block (forcing nothing -- static
+ * TLS always exists -- but documenting the dependency) and calls the
+ * app's hart entry; the thread returns when the app world ends
+ * (fpr_process_done fails every hart loop), and main joins them all
+ * after the entry returns. */
+#define QOSP_MAXHARTS 64
+static pthread_t hart_threads[QOSP_MAXHARTS];
+static unsigned hart_nthreads;
+struct hart_arg { uint64_t idx; void (*fn)(uint64_t); };
+static void *hart_tramp(void *p) {
+  struct hart_arg a = *(struct hart_arg *)p;
+  free(p);
+  qosp_tls_blk.hart = 0; /* the app's fpr_set_tp fills it */
+  a.fn(a.idx);
+  return 0;
+}
+static int start_hart_cb(uint64_t idx, void (*fn)(uint64_t)) {
+  if (hart_nthreads >= QOSP_MAXHARTS) return -1;
+  struct hart_arg *a = malloc(sizeof *a);
+  if (!a) return -1;
+  a->idx = idx; a->fn = fn;
+  if (pthread_create(&hart_threads[hart_nthreads], 0, hart_tramp, a)) {
+    free(a);
+    return -1;
+  }
+  hart_nthreads++;
+  return 0;
+}
+static void join_harts(void) {
+  for (unsigned i = 0; i < hart_nthreads; i++)
+    pthread_join(hart_threads[i], 0);
+  hart_nthreads = 0;
+}
+
+/* the resolved live-hart count: FPR_HARTS env wins, else the online
+ * core count -- "auto detect the host's n cores and spawn that many
+ * pthread harts".  The app clamps again to its own compile-time cap. */
+static uint64_t resolve_nharts(void) {
+  const char *e = getenv("FPR_HARTS");
+  long n = 0;
+  if (e && *e) n = strtol(e, 0, 10);
+  if (n <= 0) n = sysconf(_SC_NPROCESSORS_ONLN);
+  if (n < 1) n = 1;
+  if (n > QOSP_MAXHARTS) n = QOSP_MAXHARTS;
+  return (uint64_t)n;
 }
 
 static int perm_gate(qa_t *qa, int auto_yes) {
@@ -188,11 +256,13 @@ int main(int argc, char **argv) {
    * reported by elfload) to r-x and leave everything after it -- rodata
    * tail, data, bss, heap, and the buddy arena -- rw.  The linker script
    * places .text first and the RW segment on its own 64 KiB-aligned page,
-   * so the 16 KiB host-page round-up never captures a writable byte.  On
-   * Linux hosts the rw mapping already executes (no W^X policy for
-   * MAP_ANON there), so the mprotect is Darwin-only; the icache clear is
+   * so the 16 KiB host-page round-up never captures a writable byte.
+   * This runs on EVERY host: a plain rw anonymous mapping is NOT
+   * executable on modern Linux either (NX applies; "no W^X policy"
+   * only means an rwx mmap is *allowed*, not that rw implies x) --
+   * discovered when the Darwin-only version of this block left Linux
+   * qosp jumping into a non-exec page.  The icache clear below is
    * needed on any arm64 host. */
-#ifdef __APPLE__
   {
     uintptr_t pg = (uintptr_t)getpagesize();
     uintptr_t xend = ((uintptr_t)ld.exec_end + pg - 1) & ~(pg - 1);
@@ -217,7 +287,6 @@ int main(int argc, char **argv) {
     TRACE("stage 2: code [%#lx..%#lx) r-x, data+heap rw\n",
           (unsigned long)QOS_SLOT_BASE, (unsigned long)xend);
   }
-#endif
   __builtin___clear_cache((char *)QOS_SLOT_BASE, (char *)ld.image_end);
 
   static char caps[4096];
@@ -233,13 +302,19 @@ int main(int argc, char **argv) {
       .caps = (const unsigned char *)caps,
       .caps_len = caps_len,
       .syscall_fn = qosp_store_call,
+      .tls_off = qosp_tls_off(),
   };
+  qosp_hal_set_smp(resolve_nharts(), start_hart_cb);
+  TRACE("stage 2: nharts %" PRIu64 " (cores %ld), tls_off %" PRId64 "\n",
+        resolve_nharts(), sysconf(_SC_NPROCESSORS_ONLN),
+        (int64_t)boot.tls_off);
 
 	/* ---- Stage 3: the app's own world -------------------------------- */
   TRACE("stage 3: entering the app\n");
   static char result[64 * 1024];
   qos_app_entry_t entry = (qos_app_entry_t)ld.entry;
   int64_t rc = entry(&boot, result, sizeof result);
+  join_harts(); /* every hart loop exited through fpr_process_done */
   if (rc) {
     fprintf(stderr, "qosp: app entry rejected the boot record (%" PRId64
                     ", abi mismatch?)\n",

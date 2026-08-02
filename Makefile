@@ -77,6 +77,10 @@ all: image.elf
 UNAME_S := $(shell uname -s)
 POSIXARCH ?= x64
 POSIXHARTS ?= 2
+# QOS Portable hart cap: the app image's compile-time FPR_NHARTS (the
+# static array size).  The LIVE count is resolved at qosp boot: env
+# FPR_HARTS, else the host's online-core count, clamped to this cap.
+QOSHARTS ?= 8
 ifeq ($(POSIXARCH),a64)
 POSIXCTX = $(RT_POSIX_DIR)/ctx_a64.S
 ifeq ($(UNAME_S),Darwin)
@@ -186,7 +190,7 @@ QOSP_STAMP = build/.qosp-gfx$(GFX)
 $(QOSP_STAMP):
 	@mkdir -p build && rm -f build/.qosp-gfx* && touch $@
 qosp: $(QOSP_SRC) $(QOSAPP_DIR)/qos_abi.h $(PORTABLE_DIR)/qa.h $(QOSP_STAMP)
-	$(QOSP_CC) $(QOSP_PIE) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=1 $(QOSP_GFXFLAGS) \
+	$(QOSP_CC) $(QOSP_PIE) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(QOSHARTS) $(QOSP_GFXFLAGS) \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) -I$(RT_POSIX_DIR) $(QOSP_SRC) $(QOSP_LIBS) -o $@
 	@if [ "$(UNAME_S)" = "Darwin" ]; then \
 	  codesign --force --sign - --entitlements tools/qosp.entitlements --timestamp=none qosp 2>/dev/null || \
@@ -215,7 +219,11 @@ QOSCC    ?= aarch64-linux-gnu-gcc
 QOSLDFLAGS ?=
 endif
 else
-QOSATOMICS =
+# -mcmodel=large: the image is linked at the 16 GiB slot; the small
+# model's 32-bit absolute relocations (which -fno-pic makes gcc reach
+# for on array-indexing patterns) cannot express those addresses.
+# Generated qx64 code is unaffected -- fprc emits RIP-relative only.
+QOSATOMICS = -mcmodel=large
 QOSFPRTGT = qx64
 QOSCTX    = $(RT_POSIX_DIR)/ctx_x64.S
 QOSLD     = $(QOSAPP_DIR)/link-qosapp.ld
@@ -239,7 +247,7 @@ build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOSLD)
 	$(QOSCC) $(QOSLDFLAGS) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic \
 	  $(QOSATOMICS) \
-	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=1 \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) \
 	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \

@@ -19,14 +19,18 @@
 # services as real actors rather than in-process helpers.
 #
 # The scene ABI (runtime/posix/gfx.c): all numbers Int MILLI-units.
-#   scene  = (statics, dynamics, lights, camera)
-#   entity = (mesh, (x,y,z), yawMilli, (sx,sy,sz), (r,g,b))
+#   scene  = Scene statics dynamics lights camera   (constructors: no 4/5-tuples)
+#   entity = Ent mesh (x,y,z) yawMilli (sx,sy,sz) (r,g,b)
 #   light  = ((x,y,z), (r,g,b))     camera = (eye, target, fovMilli)
 #
 #   make posix-run GFX=1 PROG=programs/gfxdemo.fpr
 # ============================================================================
 
 Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
+
+# the scene ABI's wide shapes as constructors (the walker is positional;
+# flat 4-/5-tuples don't exist in this ABI -- Tup2/Tup3 only)
+Gfx = Type (Scene statics dynamics lights camera | Ent mesh pos yaw scale color).
 
 # ---- the System actor: URL -> service actor discovery ----------------------
 
@@ -94,21 +98,21 @@ svcCall me svc q =
 
 ring 0 = Nil.
 ring n =
-  ("cube", (2500 * (n - 3), 400, 0 - 2000), 300 * n, (800, 800, 800), (900, 350 + 100 * n, 250))
+  Ent "cube" (2500 * (n - 3), 400, 0 - 2000) (300 * n) (800, 800, 800) (900, 350 + 100 * n, 250)
     :: ring (n - 1).
 
 statics =
-  ("plane", (0, 0, 0), 0, (8000, 1000, 8000), (300, 420, 320)) :: ring 5.
+  Ent "plane" (0, 0, 0) 0 (8000, 1000, 8000) (300, 420, 320) :: ring 5.
 
 dynamics t =
-  ("sphere", (0 - 1500 + 500 * t, 1200, 0 - 500), 0, (1000, 1000, 1000), (950, 800, 250))
-    :: ("sphere", (1500 - 400 * t, 800, 500), 0, (700, 700, 700), (350, 550, 950))
+  Ent "sphere" (0 - 1500 + 500 * t, 1200, 0 - 500) 0 (1000, 1000, 1000) (950, 800, 250)
+    :: Ent "sphere" (1500 - 400 * t, 800, 500) 0 (700, 700, 700) (350, 550, 950)
     :: Nil.
 
 lights = ((4000, 6000, 4000), (1000, 1000, 1000)) :: Nil.
 camera = ((0, 3000, 6000), (0, 500, 0 - 1000), 900).
 
-scene t = (statics, dynamics t, lights, camera).
+scene t = Scene statics (dynamics t) lights camera.
 
 # ---- main ------------------------------------------------------------------
 

@@ -1,0 +1,408 @@
+# ============================================================================
+# pshell.fpr -- the QOS Portable startup shell: a keyboard-driven 2D UI
+# rendered ENTIRELY through the Scene walker's OpenGL ES backend, with
+# the view built by mods/scene2d (gen_view's static/dynamic split mapped
+# onto the walker's static/dynamic GPU buffers).
+#
+#   HOME       a tile grid: NOTES (a real app), plus live RENDER /
+#              HARTS / CLOCK / STORE tiles whose text arrives as
+#              dynamics -- steady state re-uploads ONLY those glyphs
+#              (the dynBytes readout on the RENDER tile is the proof,
+#              measured by the walker itself).  Moving the focus ring
+#              hands the walker a NEW statics value: that is its
+#              recompile trigger, and the S readout counts them.
+#   NOTES      type a line, ENTER commits, ESC returns.  Notes persist
+#              through the storage syscall channel (Sys.storeReq: kv
+#              append on commit, replay at boot) -- kill the shell,
+#              relaunch, the notes are back.
+#
+# Architecture = gfxdemo.fpr's service actors: graphics/display own the
+# GL context and are spawnOn 0 -- explicit placement now PINS an actor
+# (multi-hart qosp donates unpinned backlog to idle harts; an EGL
+# context is thread-bound, so the gfx actors opt out).  Every frame is
+# a fresh WORKER actor (voxel-interactive's frame-per-actor shape): it
+# formats the dynamics text, builds the scene, drives Render, reports,
+# and dies -- per-frame allocation dies with it, the shell's own pool
+# grows only with real state.
+#
+#   keys   arrows move focus / ENTER open / ESC back / letters type
+#          p = snapshot pshell<frame>.ppm    q (at home) = quit
+#
+#   make portable-run GFX=1 PROG=programs/pshell.fpr        # under qosp
+#   make posix-run GFX=1 PROG=programs/pshell.fpr           # co-compiled
+#   FPR_EVDEV=script.evd ...                                # scripted
+# ============================================================================
+
+S2 = use "mods/scene2d".
+Box = S2.Box. Lbl = S2.Lbl. Slot = S2.Slot.
+Row = S2.Row. Col = S2.Col. Pad = S2.Pad. Gap = S2.Gap.
+W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
+Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
+
+Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
+Md = Type (Md screen focus notes input frame lastR lastKey scomp).
+Fd = Type (Fd screen frame lastR lastKey scomp notes input).
+Cm = Type (CQuit | CSnap | CSave s).
+
+# ---- the System actor + services (gfxdemo.fpr verbatim) --------------------
+
+strEqGo a b i n | i > n = True.
+strEqGo a b i n | charAt a i == charAt b i = strEqGo a b (i + 1) n.
+strEqGo a b i n = False.
+strEq a b | strlen a == strlen b = strEqGo a b 1 (strlen a).
+strEq a b = False.
+
+findSvc Nil url = 0.
+findSvc ((u, a) :: r) url | strEq u url = a.
+findSvc ((u, a) :: r) url = findSvc r url.
+
+systemActor me = sysLoop me Nil.
+sysServe me reg =
+  (replyTo, Lookup url) = receive me;
+  send replyTo (findSvc reg url) >> sysServe me reg.
+sysLoop me reg0 =
+  (replyTo, q) = receive me;
+  case q of
+    Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
+  | Reg reg -> send replyTo 1 >> sysServe me reg.
+
+graphicsActor me =
+  _ = glInit 640 480;
+  gfxServe me.
+gfxServe me =
+  m = receive me;
+  (replyTo, Render scene) = m;
+  send replyTo (glRender scene) >> drop m >> gfxServe me.
+
+displayActor me =
+  m = receive me;
+  (replyTo, Present path) = m;
+  send replyTo (glSavePpm path) >> drop m >> displayActor me.
+
+inputActor me =
+  m = receive me;
+  (replyTo, Poll u) = m;
+  send replyTo (inputPoll u) >> drop m >> inputActor me.
+
+svcCall me a q = _ = send a (me, q); receive me.
+svcLookup me sys url = svcCall me sys (Lookup url).
+
+# ---- colors ----------------------------------------------------------------
+
+cBg u = (62, 70, 88).
+cPanel u = (92, 104, 130).
+cPanelHi u = (112, 128, 162).
+cText u = (930, 940, 960).
+cDim u = (560, 590, 650).
+cAccent u = (999, 800, 300).
+cFocus u = (330, 720, 999).
+cEdge u = (150, 165, 200).
+cOk u = (420, 900, 560).
+
+# ---- views -----------------------------------------------------------------
+# HOME slots: 0 clock  1 notes-count  2 render  3 harts  4 store  5 status
+# NOTES slots: 0 count  1..6 lines (oldest..newest of the last 6)
+#              7 input  8 status
+
+tileBord f i | f == i = Bord (330, 720, 999).
+tileBord f i = Bord (150, 165, 200).
+
+tile f i title si cap =
+  Box [Col, Pad 6, Gap 5, W 140, H 52, Bg (92, 104, 130), tileBord f i]
+    [ Lbl [Sc 2, Fg (930, 940, 960)] title
+    , Slot [Fg (999, 800, 300)] si cap ].
+
+homeTree f =
+  Box [Col, Pad 8, Gap 6, W 320, H 240, Bg (62, 70, 88)]
+    [ Box [Row, Gap 6]
+        [ Lbl [Sc 3, Fg (930, 940, 960)] "QOS"
+        , Box [Grow] Nil
+        , Slot [Sc 2, Fg (560, 590, 650)] 0 9 ]
+    , Box [Row, Gap 6]
+        [ tile f 0 "NOTES" 1 12
+        , tile f 1 "RENDER" 2 14 ]
+    , Box [Row, Gap 6]
+        [ tile f 2 "HARTS" 3 14
+        , tile f 3 "STORE" 4 14 ]
+    , Box [Grow] Nil
+    , Box [Row, Pad 4, Bg (92, 104, 130)]
+        [ Slot [Fg (560, 590, 650)] 5 40 ] ].
+
+noteLine i =
+  Box [Row, Pad 2] [ Slot [Fg (930, 940, 960)] i 40 ].
+
+notesTree u =
+  Box [Col, Pad 8, Gap 4, W 320, H 240, Bg (62, 70, 88)]
+    [ Box [Row, Gap 6]
+        [ Lbl [Sc 2, Fg (930, 940, 960)] "NOTES"
+        , Box [Grow] Nil
+        , Slot [Fg (560, 590, 650)] 0 12 ]
+    , Box [Col, Gap 2, Grow, Bord (150, 165, 200), Pad 3]
+        [ noteLine 1, noteLine 2, noteLine 3
+        , noteLine 4, noteLine 5, noteLine 6 ]
+    , Box [Row, Pad 4, Gap 4, Bord (330, 720, 999), Bg (92, 104, 130)]
+        [ Lbl [Fg (999, 800, 300)] ">"
+        , Slot [Fg (930, 940, 960)] 7 36 ]
+    , Lbl [Fg (560, 590, 650)] "ENTER SAVE   ESC BACK   TYPE A-Z 0-9" ].
+
+treeFor 0 f = homeTree f.
+treeFor s f = notesTree 0.
+
+# ---- dynamics: the per-frame text, formatted IN THE WORKER -----------------
+
+len Nil = 0.
+len (x :: r) = 1 + len r.
+
+nthS Nil i = "".
+nthS (v :: r) 0 = v.
+nthS (v :: r) i = nthS r (i - 1).
+
+# last 6 notes, oldest first (notes list is newest-first)
+lastSix notes = padTo (rev6 (take6 notes) Nil) 6.
+take6 l = takeN l 6.
+takeN Nil n = Nil.
+takeN l 0 = Nil.
+takeN (x :: r) n = x :: takeN r (n - 1).
+rev6 Nil acc = acc.
+rev6 (x :: r) acc = rev6 r (x :: acc).
+padTo l n | len l >= n = l.
+padTo l n = padTo (apnd l "") n.
+apnd Nil x = x :: Nil.
+apnd (a :: r) x = a :: apnd r x.
+
+clock u =
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  t = read mt / 1000000;
+  "T {t / 60}:{pad2 (imod2 t 60)}".
+pad2 n | n < 10 = "0{n}".
+pad2 n = "{n}".
+imod2 a b = a - (a / b) * b.
+
+vals (Fd 0 frame lastR lastKey scomp notes input) =
+  (draws, dynB) = lastR;
+  [ clock 0
+  , "{len notes} SAVED"
+  , "{draws}D {dynB}B"
+  , "{harts 0} LIVE"
+  , "KV APPEND"
+  , "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B" ].
+vals (Fd s frame lastR lastKey scomp notes input) =
+  six = lastSix notes;
+  [ "{len notes} SAVED"
+  , nthS six 0, nthS six 1, nthS six 2
+  , nthS six 3, nthS six 4, nthS six 5
+  , "{input}_"
+  , "" ].
+
+# ---- the frame worker (frame-per-actor) ------------------------------------
+
+frameWorker parent gfx st sl fd self =
+  dy = S2.dyns sl (vals fd);
+  r = svcCall self gfx (Render (S2.scene st dy));
+  send parent r.
+
+# ---- input -----------------------------------------------------------------
+# evdev (kind 4): Linux keycodes, presses only.  stdin (kind 1): ascii
+# folded onto the same codes so a live tty behaves.
+
+ascii2code c | c == 27 = 1.
+ascii2code c | c == 10 = 28.
+ascii2code c | c == 13 = 28.
+ascii2code c | c == 127 = 14.
+ascii2code c | c == 8 = 14.
+ascii2code c = 0 - c.               # negative = literal ascii char
+
+# NB acc is prepend-built: reverse before returning so keys inside one
+# frame apply in ARRIVAL order (the voxel-interactive pollKeys lesson)
+drain me inp n acc | n == 0 = revK Nil acc.
+drain me inp n acc =
+  ev = svcCall me inp (Poll 0);
+  (kind, a, b) = ev;
+  drainEv me inp n acc kind a b.
+drainEv me inp n acc kind a b | kind == 0 = revK Nil acc.
+drainEv me inp n acc kind a b | kind == 4 =
+  case b == 1 of
+    True -> drain me inp (n - 1) (a :: acc)
+  | False -> drain me inp (n - 1) acc.
+drainEv me inp n acc kind a b | kind == 1 =
+  drain me inp (n - 1) (ascii2code a :: acc).
+drainEv me inp n acc kind a b = drain me inp (n - 1) acc.
+
+# keycode -> typed char ("" = not typable); kbdsim's code table
+revK acc Nil = acc.
+revK acc (x :: r) = revK (x :: acc) r.
+
+keyChar 57 = " ".
+keyChar 30 = "a". keyChar 48 = "b". keyChar 46 = "c". keyChar 32 = "d".
+keyChar 18 = "e". keyChar 33 = "f". keyChar 34 = "g". keyChar 35 = "h".
+keyChar 23 = "i". keyChar 36 = "j". keyChar 37 = "k". keyChar 38 = "l".
+keyChar 50 = "m". keyChar 49 = "n". keyChar 24 = "o". keyChar 25 = "p".
+keyChar 16 = "q". keyChar 19 = "r". keyChar 31 = "s". keyChar 20 = "t".
+keyChar 22 = "u". keyChar 47 = "v". keyChar 17 = "w". keyChar 45 = "x".
+keyChar 21 = "y". keyChar 44 = "z".
+keyChar 11 = "0". keyChar 2 = "1". keyChar 3 = "2". keyChar 4 = "3".
+keyChar 5 = "4". keyChar 6 = "5". keyChar 7 = "6". keyChar 8 = "7".
+keyChar 9 = "8". keyChar 10 = "9".
+keyChar c | c < 0 = chr (0 - c).    # stdin literal
+keyChar c = "".
+
+# ---- update ----------------------------------------------------------------
+# update k model -> (model', cmds)
+
+clampF f | f < 0 = 0.
+clampF f | f > 3 = 3.
+clampF f = f.
+
+moveF f 105 | imod2 f 2 == 1 = f - 1.
+moveF f 106 | imod2 f 2 == 0 = f + 1.
+moveF f 103 = clampF (f - 2).
+moveF f 108 = clampF (f + 2).
+moveF f k = f.
+
+dropLast s | strlen s < 2 = "".
+dropLast s = substr s 1 (strlen s - 1).
+
+typed inp k | strlen inp > 29 = inp.
+typed inp k = strcat inp (keyChar k).
+
+# home screen
+update k (Md 0 f notes inp fr lr lk sc) | k == 16 =
+  (Md 0 f notes inp fr lr k sc, [CQuit]).
+update k (Md 0 f notes inp fr lr lk sc) | k == 25 =
+  (Md 0 f notes inp fr lr k sc, [CSnap]).
+update k (Md 0 f notes inp fr lr lk sc) | k == 28 =
+  homeEnter f (Md 0 f notes inp fr lr k sc).
+update k (Md 0 f notes inp fr lr lk sc) =
+  (Md 0 (moveF f k) notes inp fr lr k sc, Nil).
+# notes screen
+update k (Md 1 f notes inp fr lr lk sc) | k == 1 =
+  (Md 0 f notes inp fr lr k sc, Nil).
+update k (Md 1 f notes inp fr lr lk sc) | k == 25 =
+  (Md 1 f notes inp fr lr k sc, [CSnap]).
+update k (Md 1 f notes inp fr lr lk sc) | k == 14 =
+  (Md 1 f notes (dropLast inp) fr lr k sc, Nil).
+update k (Md 1 f notes inp fr lr lk sc) | k == 28 =
+  case strlen inp > 0 of
+    True -> (Md 1 f (inp :: notes) "" fr lr k sc, [CSave inp])
+  | False -> (Md 1 f notes inp fr lr k sc, Nil).
+update k (Md 1 f notes inp fr lr lk sc) =
+  (Md 1 f notes (typed inp k) fr lr k sc, Nil).
+
+homeEnter f (Md s g notes inp fr lr lk sc) | f == 0 =
+  (Md 1 g notes "" fr lr lk sc, Nil).
+homeEnter f m = (m, Nil).
+
+applyKeys Nil mc = mc.
+applyKeys (k :: r) (m, cs) =
+  (m2, c2) = update k m;
+  applyKeys r (m2, cat cs c2).
+cat Nil b = b.
+cat (a :: r) b = a :: cat r b.
+
+# ---- effects ---------------------------------------------------------------
+
+doCmds me dsp fr Nil = 0.
+doCmds me dsp fr (c :: r) =
+  _ = doCmd me dsp fr c;
+  doCmds me dsp fr r.
+doCmd me dsp fr CQuit = 0.
+doCmd me dsp fr CSnap = svcCall me dsp (Present "pshell{fr}.ppm").
+doCmd me dsp fr (CSave s) = saveNote s.
+
+wantsQuit Nil = False.
+wantsQuit (CQuit :: r) = True.
+wantsQuit (c :: r) = wantsQuit r.
+
+saveNote s =
+  case Sys.storeReq 2 "{s}\n" of
+    Ok u -> 1
+  | Err e -> 0.
+
+# boot replay: "a\nb\n..." -> newest-first list
+loadNotes u =
+  case Sys.storeReq 3 "" of
+    Ok s -> splitNl s 1 1 Nil
+  | Err e -> Nil.
+splitNl s i st acc | i > strlen s = acc.
+splitNl s i st acc | charAt s i == 10 =
+  case i > st of
+    True -> splitNl s (i + 1) (i + 1) (substr s st (i - st) :: acc)
+  | False -> splitNl s (i + 1) (i + 1) acc.
+splitNl s i st acc = splitNl s (i + 1) st acc.
+
+# ---- the shell loop --------------------------------------------------------
+# cache = (skey, statics, slots): the statics VALUE lives here across
+# frames -- pointer-stable while retained, which is the walker's
+# recompile trigger when a screen/focus change swaps it out.
+
+tick = 50000.                        # 50 ms -> 20 fps (10 MHz clint)
+
+waitTick mt t0 | read mt - t0 >= tick = read mt.
+waitTick mt t0 = waitTick mt t0.
+
+skeyOf (Md s f notes inp fr lr lk sc) = s * 10 + f.
+
+ensure cache key =
+  (k, st, sl) = cache;
+  case k == key of
+    True -> (cache, 0)
+  | False -> (rebuildTree key, 1).
+rebuildTree key =
+  (st2, sl2) = S2.build (treeFor (key / 10) (imod2 key 10));
+  (key, st2, sl2).
+
+fdOf (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc notes inp.
+
+result (Md s f notes inp fr lr lk sc) =
+  "pshell: {fr} frames, {sc} statics compiles, {len notes} notes".
+
+loop me gfx dsp inp mt cache model =
+  t0 = read mt;
+  ks = drain me inp 16 Nil;
+  (m2, cmds) = applyKeys ks (model, Nil);
+  _ = doCmds me dsp (frOf m2) cmds;
+  case wantsQuit cmds of
+    True -> result m2
+  | False -> frame me gfx dsp inp mt cache m2 t0.
+
+frOf (Md s f notes inp fr lr lk sc) = fr.
+
+frame me gfx dsp inp mt cache m2 t0 =
+  (cache2, rebuilt) = ensure cache (skeyOf m2);
+  m3 = bumpS m2 rebuilt;
+  (k, st, sl) = cache2;
+  _ = spawn (frameWorker me gfx st sl (fdOf m3));
+  r = receive me;
+  m4 = advance m3 r;
+  _ = waitTick mt t0;
+  loop me gfx dsp inp mt cache2 m4.
+
+bumpS m 0 = m.
+bumpS (Md s f notes inp fr lr lk sc) n = Md s f notes inp fr lr lk (sc + n).
+advance (Md s f notes inp fr lr lk sc) r = Md s f notes inp (fr + 1) r lk sc.
+
+# ---- main ------------------------------------------------------------------
+
+main =
+  me = myself 0;
+  _ = print "pshell: QOS Portable shell (gen_view -> GLES via scene2d)";
+  sys = spawn systemActor;
+  gfx = spawnOn 0 graphicsActor;    # pinned: the EGL context is
+  dsp = spawnOn 0 displayActor;     # thread-bound; hart 0 owns GL
+  inp = spawn inputActor;
+  reg = ("/services/graphics", gfx)
+     :: ("/services/display", dsp)
+     :: ("/services/input", inp) :: Nil;
+  _ = send sys (me, Reg reg);
+  _ = receive me;
+  g = svcLookup me sys "/services/graphics";
+  d = svcLookup me sys "/services/display";
+  i = svcLookup me sys "/services/input";
+  notes = loadNotes 0;
+  _ = print "pshell: {len notes} notes replayed; q quits (home), p snapshots";
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  cache0 = (0 - 1, Nil, Nil);
+  m0 = Md 0 0 notes "" 0 (0, 0) 0 0;
+  loop me g d i mt cache0 m0.
