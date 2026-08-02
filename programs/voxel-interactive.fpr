@@ -25,8 +25,28 @@
 #                 flat pinned message roots (ints + handles only --
 #                 nothing that lives in a dead actor's pool).
 #
+#   plus three live niceties (Aug 2026):
+#
+#   RESIZE        the tty tier reports the terminal size as a kind-5
+#                 poll event (once at startup, again on SIGWINCH); the
+#                 frame picks the largest resolution from a fixed
+#                 ladder (64x48 .. 144x96) that fits it.  The ladder
+#                 keeps every entry's pixel count a multiple of the
+#                 512-lane tile, so the SoA tier's block sizes -- and
+#                 everything voxel.fpr's header says about them --
+#                 never change.  A piped/evdev run sees no kind-5
+#                 events and stays at 64x48: replays are unchanged.
+#   LATENCY       the driver clocks each frame actor spawn->reply on
+#                 the same clint mtime it paces with; a 30-frame ring
+#                 (a Vec in main's immortal pool, mutated in place by
+#                 each worker) averages it for the status line.
+#   MORE WORLD    four trees, three surface boulders, a water pond on
+#                 the corner plateau, and three static cloud slabs at
+#                 y 13/14 -- which cast real shadows, because the sun
+#                 bake never cared what a block is, only that it is.
+#
 #   keys:  arrows move    w/s pitch  a/d yaw    space jump
-#          x destroy      f place    1..0 pick  q quit
+#          x destroy      f place    1..0 pick  v water  c cloud  q quit
 #
 #   make posix-run PROG=programs/voxel-interactive.fpr           # live tty
 #   FPR_EVDEV=script.evd make posix-run PROG=...                 # replay
@@ -64,12 +84,21 @@ sumF a n = a + n.                # the specialized-fold shape (vredsum)
 # ---- fixed point, screen, sun ----------------------------------------------
 
 fx = 65536.                      # 16.16
-scrW = 64.
-scrH = 48.
-wShift = 6.                      # log2 scrW: screen x/y split by shift
-tileN = 512.                     # 4 rows: every column block recycles
-nTiles = 6.                      # scrW * scrH / tileN
-focal = 48.
+scrW0 = 64.                      # the starting (and piped-run) size
+scrH0 = 48.
+tileN = 512.                     # FIXED: every SoA block stays <= 4 KB,
+                                 # so the free-list ceiling story holds
+                                 # at every resolution on the ladder
+latN = 30.                       # frames in the latency window
+
+# the resolution ladder: every pw*ph is a multiple of tileN, pw is a
+# multiple of 8 (rowChunk), and a 144-wide row string worst-cases at
+# ~3.6 KB -- still under the 4 KB print render buffer
+resLadder = [(64, 48), (80, 64), (96, 64), (112, 64), (128, 80), (144, 96)].
+maxW = 144.
+maxH = 96.
+fbCap = 13824.                   # maxW * maxH: framebuffer capacity
+focalOf pw = pw * 3 / 4.         # 64 -> 48: the original FOV, kept
 ddaSteps = 26.                   # the box diagonal is ~28 cells, and a
                                  # truncated ray reads as sky -- which is
                                  # what a ray that far out is looking at
@@ -99,8 +128,10 @@ shadowDen = 10.
 
 # ---- the world --------------------------------------------------------------
 # 16x16x16, cell index = x*256 + y*16 + z, 0-based.  0 = air.
-# blocks: 1 bedrock  2 stone  3 dirt   4 grass  5 sand
-#         6 ore      7 wood   8 leaves 9 brick 10 glass
+# blocks: 1 bedrock  2 stone  3 dirt    4 grass  5 sand   6 ore
+#         7 wood     8 leaves 9 brick  10 glass 11 water 12 cloud
+# (water and cloud are solid and opaque like glass: no transparency or
+#  swimming in this PoC -- they are texture blocks that shade and shadow)
 
 wN = 16.
 wCells = 4096.
@@ -118,15 +149,44 @@ topAt x z = 3 + imod (plateauX x * 2 + plateauZ z * 3 + imod (plateauX x * plate
 plateauX x = x / 4.
 plateauZ z = z / 4.
 
-# a tree at two fixed spots, so leaves/wood show up
-isTrunk x z = or2 (and2 (x == 4) (z == 11)) (and2 (x == 12) (z == 5)).
+# trees at fixed spots, generalized to a list so adding one is one pair
+trunks = [(4, 11), (12, 5), (7, 8), (14, 14)].
 trunkTop x z = topAt x z + 3.
 
+Tk = Type (TkNone | TkAt tx tz).
+
+# the first list entry within Chebyshev radius rad of (x, z)
+findNear x z rad Nil = TkNone.
+findNear x z rad (p :: r) = findNear2 x z rad p r.
+findNear2 x z rad (tx, tz) r
+  | and2 (absI (x - tx) <= rad) (absI (z - tz) <= rad) = TkAt tx tz.
+findNear2 x z rad (tx, tz) r = findNear x z rad r.
+
+isHitT TkNone = False.
+isHitT t = True.
+
+isTrunk x z = isHitT (findNear x z 0 trunks).
+
 # leaves: the 3x3x2 cap around a trunk top
-nearTrunk x z = or2 (and2 (absI (x - 4) <= 1) (absI (z - 11) <= 1))
-                    (and2 (absI (x - 12) <= 1) (absI (z - 5) <= 1)).
-leafBase x z | and2 (absI (x - 4) <= 1) (absI (z - 11) <= 1) = trunkTop 4 11.
-leafBase x z = trunkTop 12 5.
+nearTrunk x z = isHitT (findNear x z 1 trunks).
+leafBase x z = leafOf (findNear x z 1 trunks).
+leafOf (TkAt tx tz) = trunkTop tx tz.
+leafOf TkNone = 99.              # unreachable: guarded by nearTrunk
+
+# lone stone boulders sitting on the surface
+rocks = [(10, 3), (1, 13), (13, 9)].
+isRock x z = isHitT (findNear x z 0 rocks).
+
+# a pond: the corner plateau (top = 3) gets water for its surface
+inPond x z = and2 (and2 (x >= 0) (x <= 3)) (and2 (z >= 0) (z <= 3)).
+
+# static cloud slabs -- solid white blocks at y 13/14.  They shadow the
+# ground below, because the bake only asks isSolidId.
+cloudBox x z x0 x1 z0 z1 =
+  and2 (and2 (x >= x0) (x <= x1)) (and2 (z >= z0) (z <= z1)).
+isCloud x y z | y == 13 = or2 (cloudBox x z 3 5 3 4) (cloudBox x z 10 12 9 10).
+isCloud x y z | y == 14 = cloudBox x z 7 8 13 14.
+isCloud x y z = False.
 
 # a small brick hut wall with a glass window, so 9 and 10 appear
 isHut x z = and2 (and2 (x >= 8) (x <= 10)) (z == 13).
@@ -140,7 +200,7 @@ airOrLeaf x y z = genAbove x y z (topAt x z).
 genGround x y z top | y == 0 = 1.
 genGround x y z top | y < top - 1 = oreOrStone x y z.
 genGround x y z top | y < top = 3.
-genGround x y z top | y == top = grassOrSand x z.
+genGround x y z top | y == top = surfBlock x z.
 genGround x y z top = genAbove x y z top.
 
 oreOrStone x y z | imod (x * 31 + y * 17 + z * 7) 19 == 0 = 6.
@@ -149,8 +209,13 @@ oreOrStone x y z = 2.
 grassOrSand x z | imod (x + z) 7 == 0 = 5.
 grassOrSand x z = 4.
 
+surfBlock x z | inPond x z = 11.
+surfBlock x z = grassOrSand x z.
+
 genAbove x y z top | and2 (isTrunk x z) (and2 (y > top) (y <= trunkTop x z)) = 7.
 genAbove x y z top | and2 (nearTrunk x z) (leafShell x y z) = 8.
+genAbove x y z top | and2 (isRock x z) (y == top + 1) = 2.
+genAbove x y z top | isCloud x y z = 12.
 genAbove x y z top | and2 (isHut x z) (and2 (y > top) (y <= hutY x z + 1)) = hutBlock y (hutY x z).
 genAbove x y z top = 0.
 
@@ -172,13 +237,13 @@ wSet w c b = Vec.set (c + 1) b w.
 # transparency in this PoC, glass is just a bright block)
 isSolidId b = b > 0.
 
-# ---- the 10-tile atlas, FLAT ------------------------------------------------
-# Same layout (10 tiles of 16x16, texel = tile*256 + v*16 + u) so
+# ---- the 12-tile atlas, FLAT ------------------------------------------------
+# Same layout (12 tiles of 16x16, texel = tile*256 + v*16 + u) so
 # shade/1 is untouched -- but every texel of a tile is ONE color.  The
 # terminal has ~6 levels per channel; texture noise would just dither.
 # The lightmap still multiplies through litChan, so faces shade.
 
-atlasN = 2560.
+atlasN = 3072.
 tTile i = i / 256.
 
 texR i | tTile i == 0 = 66.      # bedrock  dark gray
@@ -190,7 +255,9 @@ texR i | tTile i == 5 = 90.      # ore      cyan
 texR i | tTile i == 6 = 132.     # wood     dark brown
 texR i | tTile i == 7 = 42.      # leaves   dark green
 texR i | tTile i == 8 = 188.     # brick    red
-texR i = 168.                    # glass    pale blue
+texR i | tTile i == 9 = 168.     # glass    pale blue
+texR i | tTile i == 10 = 58.     # water    deep blue
+texR i = 236.                    # cloud    white
 
 texG i | tTile i == 0 = 66.
 texG i | tTile i == 1 = 152.
@@ -201,7 +268,9 @@ texG i | tTile i == 5 = 200.
 texG i | tTile i == 6 = 92.
 texG i | tTile i == 7 = 132.
 texG i | tTile i == 8 = 74.
-texG i = 210.
+texG i | tTile i == 9 = 210.
+texG i | tTile i == 10 = 112.
+texG i = 240.
 
 texB i | tTile i == 0 = 72.
 texB i | tTile i == 1 = 158.
@@ -212,7 +281,9 @@ texB i | tTile i == 5 = 216.
 texB i | tTile i == 6 = 52.
 texB i | tTile i == 7 = 52.
 texB i | tTile i == 8 = 60.
-texB i = 230.
+texB i | tTile i == 9 = 230.
+texB i | tTile i == 10 = 222.
+texB i = 244.
 
 buildAtlas u =
   ( Vec.map texR (Vec.iota atlasN),
@@ -518,18 +589,21 @@ Sc = Type (Sc ox oy oz yaw pit).
 
 Ray = Type (Ray dx dy dz yv).
 
-mkRays sc t =
+# the screen width is no longer a power of two on every ladder rung, so
+# the y/x split is a zipDiv against a constant column instead of a sar
+mkRays sc t pw ph =
   (Sc ox oy oz yaw pit) = sc;
   cw = cosA yaw; sw = sinA yaw;
   cp = cosA pit; sp = sinA pit;
+  foc = focalOf pw;
   (i1, i2) = Vec.dup (Vec.axpb 1 (t * tileN) (Vec.iota tileN));
-  (y1, yr) = Vec.dup (Vec.sar wShift i1);                  # screen y
+  (y1, yr) = Vec.dup (Vec.zipDiv i1 (cvec tileN pw));      # screen y
   (y2, y3) = Vec.dup yr;
-  xs = Vec.zipSub i2 (Vec.axpb scrW 0 y1);                # screen x
-  (a1, a2) = Vec.dup (Vec.axpb fx (0 - (scrW / 2) * fx) xs);   # a, 16.16
-  (b1, b2) = Vec.dup (Vec.axpb (0 - 1) (scrH / 2) y2);         # b, pixels
-  (c1, c2) = Vec.dup (Vec.axpb (0 - sp) (focal * cp) b1); # c1 = f*cp - b*sp
-  dyv = Vec.axpb cp (focal * sp) b2;                      # b*cp + f*sp
+  xs = Vec.zipSub i2 (Vec.axpb pw 0 y1);                  # screen x
+  (a1, a2) = Vec.dup (Vec.axpb fx (0 - (pw / 2) * fx) xs);     # a, 16.16
+  (b1, b2) = Vec.dup (Vec.axpb (0 - 1) (ph / 2) y2);           # b, pixels
+  (c1, c2) = Vec.dup (Vec.axpb (0 - sp) (foc * cp) b1);   # c1 = f*cp - b*sp
+  dyv = Vec.axpb cp (foc * sp) b2;                        # b*cp + f*sp
   dxv = Vec.sar 16 (Vec.zipAdd (Vec.axpb cw 0 a1) (Vec.axpb sw 0 c1));
   dzv = Vec.sar 16 (Vec.zipSub (Vec.axpb cw 0 c2) (Vec.axpb sw 0 a2));
   Ray dxv dyv dzv y3.
@@ -595,8 +669,8 @@ litChan tx l = Vec.minS 255 (Vec.sar 8 (Vec.zipMul tx l)).
 # same sum, taken before the pixels are written instead of after
 Bt = Type (Bt w lm atlas fb cs).
 
-renderTile (Bt w lm atlas fb cs) sc t =
-  (Ray dxv dyv dzv yv) = mkRays sc t;
+renderTile (Bt w lm atlas fb cs) sc t pw ph =
+  (Ray dxv dyv dzv yv) = mkRays sc t pw ph;
   (Sc ox oy oz yaw pit) = sc;
   (dx1, dx2) = Vec.dup dxv;
   (dy1, dy2) = Vec.dup dyv;
@@ -622,8 +696,8 @@ blit (fr, fg, fb) (cr, cg, cb) (ar, ag, ab) off =
 
 # ---- the render dispatcher: Scene in, framebuffer out ----------------------
 
-render bt sc t | t >= nTiles = bt.
-render bt sc t = render (renderTile bt sc t) sc (t + 1).
+render bt sc t pw ph | t >= pw * ph / tileN = bt.
+render bt sc t pw ph = render (renderTile bt sc t pw ph) sc (t + 1) pw ph.
 
 # ============================================================================
 # PHYSICS: an AABB against the block field.  The world boundary is not a
@@ -754,7 +828,10 @@ Mdl = Type (Mdl body yaw pit sel act).
 #   arrows 103 up / 108 down / 105 left / 106 right   move
 #   17 w / 31 s   pitch      30 a / 32 d   yaw
 #   57 space  jump    45 x  destroy    33 f  place
-#   2..11     select block 1..10
+#   2..11     select block 1..10    47 v water   46 c cloud
+# kind 5 is the tty tier's terminal size, (5, cols, rows): once at
+# startup and again on every SIGWINCH.  Neither the evdev tier nor a
+# fully piped run ever emits one, so replays are byte-stable.
 
 applyKey 103 m w lm = (moveBy m 1 0, w, lm).
 applyKey 108 m w lm = (moveBy m (0 - 1) 0, w, lm).
@@ -767,13 +844,22 @@ applyKey 32 m w lm = (yawBy m 1, w, lm).
 applyKey 57 m w lm = (jump m, w, lm).
 applyKey 45 m w lm = editWorld m w lm 0.
 applyKey 33 m w lm = editWorld m w lm 1.
+applyKey 47 m w lm = (selectBlock m 11, w, lm).           # v: water
+applyKey 46 m w lm = (selectBlock m 12, w, lm).           # c: cloud
 applyKey k m w lm | and2 (k >= 2) (k <= 11) = (selectBlock m (k - 1), w, lm).
 applyKey k m w lm = (m, w, lm).
 
-applyKeys Nil m w lm = (m, w, lm).
-applyKeys (k :: r) m w lm =
+# pollKeys builds its list by PREPENDING, so it arrives reversed --
+# applyKeys re-reverses it first: keys in one frame apply in arrival
+# order (select-then-place inside a single frame does what you meant)
+revK acc Nil = acc.
+revK acc (x :: r) = revK (x :: acc) r.
+
+applyKeys ks m w lm = applyKeysF (revK Nil ks) m w lm.
+applyKeysF Nil m w lm = (m, w, lm).
+applyKeysF (k :: r) m w lm =
   (m2, w2, lm2) = applyKey k m w lm;
-  applyKeys r m2 w2 lm2.
+  applyKeysF r m2 w2 lm2.
 
 # movement is yaw-relative: forward (sin, cos), right (cos, -sin)
 moveBy (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) f r =
@@ -831,7 +917,8 @@ view (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) =
 blockName 1 = "bedrock". blockName 2 = "stone". blockName 3 = "dirt".
 blockName 4 = "grass". blockName 5 = "sand". blockName 6 = "ore".
 blockName 7 = "wood". blockName 8 = "leaves". blockName 9 = "brick".
-blockName 10 = "glass". blockName k = "?".
+blockName 10 = "glass". blockName 11 = "water". blockName 12 = "cloud".
+blockName k = "?".
 
 # ============================================================================
 # OUTPUT: the ANSI frame.  Row strings stay ~1.7 KB: under the 4 KB
@@ -845,6 +932,8 @@ c6 v = clampI 0 5 (v * 6 / 256).
 cIdx r g b = 16 + c6 r * 36 + c6 g * 6 + c6 b.
 
 # one character cell: fg <- pixel (yb+x), bg <- pixel one row down
+# (indices are into the linear ACTIVE prefix of the fbCap framebuffer:
+# the row stride is whatever pw rendered this frame)
 cellStr (fr, fg, fb) ti bi =
   (r1, fr1) = Vec.get ti fr;
   (g1, fg1) = Vec.get ti fg;
@@ -855,30 +944,30 @@ cellStr (fr, fg, fb) ti bi =
   ((fr2, fg2, fb2),
    "{esc}[38;5;{cIdx r1 g1 b1}m{esc}[48;5;{cIdx r2 g2 b2}m{hbk}").
 
-rowChunk fb yb x k acc | k >= 8 = (fb, acc).
-rowChunk fb yb x k acc =
-  (fb2, s) = cellStr fb (yb + x + k + 1) (yb + scrW + x + k + 1);
-  rowChunk fb2 yb x (k + 1) (strcat acc s).
+rowChunk fb yb pw x k acc | k >= 8 = (fb, acc).
+rowChunk fb yb pw x k acc =
+  (fb2, s) = cellStr fb (yb + x + k + 1) (yb + pw + x + k + 1);
+  rowChunk fb2 yb pw x (k + 1) (strcat acc s).
 
-rowStr fb yb x acc | x >= scrW = (fb, acc).
-rowStr fb yb x acc =
-  (fb2, s) = rowChunk fb yb x 0 "";
-  rowStr fb2 yb (x + 8) (strcat acc s).
+rowStr fb yb pw x acc | x >= pw = (fb, acc).
+rowStr fb yb pw x acc =
+  (fb2, s) = rowChunk fb yb pw x 0 "";
+  rowStr fb2 yb pw (x + 8) (strcat acc s).
 
 # home rides on row 0's print: print appends a newline, so a bare
 # "ESC[H" print would push row 0 down a line
 rowLead 0 s = strcat "{esc}[H" s.
 rowLead y s = s.
 
-drawRows fb y | y >= scrH = fb.
-drawRows fb y =
-  (fb2, s) = rowStr fb (y * scrW) 0 "";
+drawRows fb y pw ph | y >= ph = fb.
+drawRows fb y pw ph =
+  (fb2, s) = rowStr fb (y * pw) pw 0 "";
   _ = print (rowLead y s);
-  drawRows fb2 (y + 2).
+  drawRows fb2 (y + 2) pw ph.
 
-status m n =
+status m n pw ph ms10 =
   (Mdl (Bd px py pz vx vy vz g) yaw pit sel act) = m;
-  print "{esc}[0mf{n}  pos {fixed px} {fixed py} {fixed pz}  yaw {yaw} pit {pit}  {ground g}  hold {blockName sel}  {act}{esc}[K".
+  print "{esc}[0mf{n} {pw}x{ph}  lat {ms10 / 10}.{imod ms10 10}ms  pos {fixed px} {fixed py} {fixed pz}  yaw {yaw} pit {pit}  {ground g}  hold {blockName sel}  {act}{esc}[K".
 
 fixed v = "{v / fx}.{pad2 (imod (v * 100 / fx) 100)}".
 pad2 n | n < 10 = "0{n}".
@@ -892,12 +981,32 @@ ground False = "air".
 # this frame, so nothing needs dropping.
 # ============================================================================
 
-pollKeys ks n | n <= 0 = (ks, 0).
-pollKeys ks n = pollStep ks n (inputPoll 0).
-pollStep ks n (0, a, b) = (ks, 0).
-pollStep ks n (4, 16, 1) = (ks, 1).                # q: quit
-pollStep ks n (4, code, 1) = pollKeys (code :: ks) (n - 1).
-pollStep ks n ev = pollKeys ks (n - 1).
+Dm = Type (Dm dc dr).                              # (cols, rows); (0,0) = none
+
+pollKeys ks dm n | n <= 0 = (ks, 0, dm).
+pollKeys ks dm n = pollStep ks dm n (inputPoll 0).
+pollStep ks dm n (0, a, b) = (ks, 0, dm).
+pollStep ks dm n (4, 16, 1) = (ks, 1, dm).         # q: quit
+pollStep ks dm n (4, code, 1) = pollKeys (code :: ks) dm (n - 1).
+pollStep ks dm n (5, c, r) = pollKeys ks (Dm c r) (n - 1).
+pollStep ks dm n ev = pollKeys ks dm (n - 1).
+
+# the largest ladder entry that fits (cols, rows): pw <= cols and the
+# ph/2 pixel rows plus the status line fit in rows
+applyDim pw ph (Dm 0 0) = (pw, ph).
+applyDim pw ph (Dm c r) = pickRes resLadder scrW0 scrH0 c r.
+pickRes Nil bw bh c r = (bw, bh).
+pickRes (p :: rest) bw bh c r = pickRes2 p rest bw bh c r.
+pickRes2 (lw, lh) rest bw bh c r
+  | and2 (lw <= c) (lh / 2 + 1 <= r) = pickRes rest lw lh c r.
+pickRes2 p rest bw bh c r = pickRes rest bw bh c r.
+
+# a size change leaves the old frame's cells outside the new box: clear
+clearIf pw ph ow oh | and2 (pw == ow) (ph == oh) = 0.
+clearIf pw ph ow oh = 1.
+clearScr 0 = 0.
+clearScr k = clearScr2 (print "{esc}[2J").
+clearScr2 r = 0.
 
 # ============================================================================
 # THE FRAME ACTOR.  One per frame; all per-frame allocation dies here.
@@ -911,6 +1020,9 @@ pollStep ks n ev = pollKeys ks (n - 1).
 
 Rq = Type (Rq px py pz vx vy vz gi sel).           # body + held block
 Bk = Type (Bk w lm ar ag ab fr fg fb).             # the static batch
+St = Type (St yaw pit n sw sh lat lv).             # look + frame no + screen
+                                                   # + last latency + the ring
+Vw = Type (Vw q yaw pit sw sh lv).                 # the reply that drives on
 
 gi True = 1.
 gi False = 0.
@@ -920,21 +1032,30 @@ frameWorker self =
   m2 = receive self; (ar, ag, ab) = m2;
   m3 = receive self; (fr, fg, fb) = m3;
   m4 = receive self; (Rq px py pz vx vy vz g sel) = m4;
-  m5 = receive self; (yaw, pit, n) = m5;
+  m5 = receive self; (St yaw pit n sw sh lat lv) = m5;
   _ = drop m1; _ = drop m2; _ = drop m3; _ = drop m4; _ = drop m5;
-  (ks, q) = pollKeys Nil 16;
+  (ks, q, dm) = pollKeys Nil (Dm 0 0) 16;
+  (pw, ph) = applyDim sw sh dm;
+  _ = clearScr (clearIf pw ph sw sh);
+  # the latency ring: write LAST frame's spawn->reply time (driver-
+  # measured, in 10 MHz clint ticks) into slot n mod latN, then average.
+  # lv is a main-pool handle: set/fold hand the same object back, so
+  # mutating it here and displaying it next frame needs no plumbing.
+  lv1 = Vec.set (imod n latN + 1) lat lv;
+  (lsum, lv2) = Vec.fold sumF 0 lv1;
+  ms10 = lsum / minI n latN / 1000;                # ticks -> tenths of ms
   m0 = Mdl (Bd px py pz vx vy vz (g == 1)) yaw pit sel "";
   (mA, w1, lm1) = applyKeys ks m0 wv lm;
   (Mdl bdA yawA pitA selA act) = mA;
   (w2, bd2) = physics w1 bdA;
   mB = Mdl bd2 yawA pitA selA act;
   (Bt w3 lm2 atlas2 fb2 cs2) = render (Bt w2 lm1 (ar, ag, ab) (fr, fg, fb) (0, 0, 0))
-                                       (view mB) 0;
-  (fr3, fg3, fb3) = drawRows fb2 0;
-  _ = status mB n;
+                                       (view mB) 0 pw ph;
+  (fr3, fg3, fb3) = drawRows fb2 0 pw ph;
+  _ = status mB n pw ph ms10;
   (ar2, ag2, ab2) = atlas2;
   (Bd qx qy qz wx wy wz g2) = bd2;
-  _ = send parent (q, yawA, pitA);
+  _ = send parent (Vw q yawA pitA pw ph lv2);
   _ = send parent (Rq qx qy qz wx wy wz (gi g2) selA);
   send parent (Bk w3 lm2 ar2 ag2 ab2 fr3 fg3 fb3).
 
@@ -952,32 +1073,35 @@ tick = 500000.                       # 10 MHz clint: 50 ms -> 20 fps
 waitTick mt t0 | read mt - t0 >= tick = read mt.
 waitTick mt t0 = waitTick mt t0.
 
-driver me mt tP n rB rM rS =
+# lat rides as a plain int: measured here (reply receipt minus spawn
+# tick, same mtime register the pacing spins on) and handed to the NEXT
+# worker to record -- the driver itself never touches the ring
+driver me mt tP n rB rM rS lat =
   t = waitTick mt tP;
   (Bk wv lm ar ag ab fr fg fb) = rB;
-  (q0, yaw, pit) = rS;
+  (Vw q0 yaw pit sw sh lv) = rS;
   wk = spawn frameWorker;
   _ = send wk (me, wv, lm);
   _ = send wk (ar, ag, ab);
   _ = send wk (fr, fg, fb);
   _ = send wk rM;
-  _ = send wk (yaw, pit, n);
+  _ = send wk (St yaw pit n sw sh lat lv);
   _ = drop rB; _ = drop rM; _ = drop rS;
-  r1 = receive me;                   # (q, yaw, pit)
+  r1 = receive me;                   # Vw
   r2 = receive me;                   # Rq
   r3 = receive me;                   # Bk
-  (qf, y2, p2) = r1;
-  driveNext me mt t n r3 r2 r1 qf.
+  driveNext me mt t n r3 r2 r1 (read mt - t).
 
-driveNext me mt t n rB rM rS 1 = print "{esc}[0m{esc}[?25h\nvoxel-interactive: bye ({n} frames)".
-driveNext me mt t n rB rM rS q = driver me mt t (n + 1) rB rM rS.
+driveNext me mt t n rB rM (Vw 1 y p sw sh lv) lat =
+  print "{esc}[0m{esc}[?25h\nvoxel-interactive: bye ({n} frames)".
+driveNext me mt t n rB rM rS lat = driver me mt t (n + 1) rB rM rS lat.
 
 # ============================================================================
 # MAIN: build once (in this immortal pool), hand the loop its roots.
 # ============================================================================
 
 main =
-  _ = print "voxel-interactive: {wN}^3 world -> {scrW}x{scrH} ANSI half-blocks";
+  _ = print "voxel-interactive: {wN}^3 world -> up to {maxW}x{maxH} ANSI half-blocks";
   w0 = buildWorld;
   (w1, lm1) = bakeLight w0 newLightmap;
   _ = print "world built, sun baked ({lmCells} face lights) -- q quits";
@@ -986,8 +1110,9 @@ main =
   mt = reg32 clint 49144;
   me = myself 0;
   _ = print "{esc}[2J{esc}[?25l";
-  rB = Bk w1 lm1 ar ag ab (cvec (scrW * scrH) 0) (cvec (scrW * scrH) 0)
-          (cvec (scrW * scrH) 0);
+  # framebuffer at LADDER CAPACITY, in this immortal pool, once; every
+  # frame writes and reads only the pw*ph active prefix
+  rB = Bk w1 lm1 ar ag ab (cvec fbCap 0) (cvec fbCap 0) (cvec fbCap 0);
   rM = Rq (6 * fx + fx / 2) (6 * fx) (6 * fx + fx / 2) 0 0 0 0 4;
-  rS = (0, 0, 0 - 1);
-  driver me mt (read mt) 1 rB rM rS.
+  rS = Vw 0 0 (0 - 1) scrW0 scrH0 (cvec latN 0);
+  driver me mt (read mt) 1 rB rM rS 0.

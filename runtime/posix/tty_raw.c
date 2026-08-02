@@ -23,17 +23,41 @@
 
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <termios.h>
 #include <unistd.h>
 
-int qos_evdev_poll(int64_t *kind, int64_t *a, int64_t *c); /* evdev_raw.c */
+int qos_evdev_poll(int64_t* kind, int64_t* a, int64_t* c); /* evdev_raw.c */
 
 /* ---- raw-mode lifecycle --------------------------------------------- */
 
 static int tty_state; /* 0 untried, 1 raw, -1 not a tty (pipe: still read) */
 static struct termios tty_saved;
+
+/* ---- terminal size ---------------------------------------------------
+ * Reported through the SAME poll as keys, as kind 5: (5, cols, rows).
+ * Dirty at startup (so a program learns its terminal on the first poll)
+ * and again on every SIGWINCH; a poll with the flag set reports the
+ * size BEFORE any queued key.  Size is read from whichever of stdout/
+ * stdin is a tty -- a fully piped run (both redirected) never sees a
+ * kind-5 event, so replay-style tests keep their exact event stream,
+ * and the FPR_EVDEV tier is untouched (no sizes there either). */
+static volatile sig_atomic_t win_dirty = 1;
+static void tty_winch(int s) { (void)s; win_dirty = 1; }
+
+static int win_poll(int64_t* kind, int64_t* a, int64_t* c) {
+  struct winsize ws;
+  int fd;
+  if (!win_dirty) return 0;
+  win_dirty = 0;
+  fd = isatty(1) ? 1 : (isatty(0) ? 0 : -1);
+  if (fd < 0 || ioctl(fd, TIOCGWINSZ, &ws)) return 0;
+  if (!ws.ws_col || !ws.ws_row) return 0;
+  *kind = 5; *a = (int64_t)ws.ws_col; *c = (int64_t)ws.ws_row;
+  return 1;
+}
 
 static void tty_restore(void) {
   if (tty_state == 1) tcsetattr(0, TCSAFLUSH, &tty_saved);
@@ -45,6 +69,7 @@ static void tty_sig(int s) {
 }
 static void tty_init(void) {
   if (tty_state) return;
+  signal(SIGWINCH, tty_winch);
   if (!isatty(0)) {
     /* a pipe: VMIN/VTIME don't apply, so an empty read would BLOCK the
      * frame loop -- make it nonblocking (the tty path gets the same
@@ -83,26 +108,29 @@ static void shift(size_t k) {
 }
 
 /* Linux input-event-codes for the keys the demos map:
- *   w 17  a 30  s 31  d 32  x 45  f 33  space 57  q 16
+ *   w 17  a 30  s 31  d 32  x 45  f 33  c 46  v 47  space 57  q 16
  *   1..9 -> 2..10   0 -> 11   arrows: up 103 down 108 left 105 right 106 */
 static int code_of(unsigned char b) {
   switch (b) {
-    case 'w': case 'W': return 17;
-    case 'a': case 'A': return 30;
-    case 's': case 'S': return 31;
-    case 'd': case 'D': return 32;
-    case 'x': case 'X': return 45;
-    case 'f': case 'F': return 33;
-    case ' ': return 57;
-    case 'q': case 'Q': return 16;
-    case '0': return 11;
-    default: return (b >= '1' && b <= '9') ? (int)(b - '1') + 2 : 0;
+  case 'w': case 'W': return 17;
+  case 'a': case 'A': return 30;
+  case 's': case 'S': return 31;
+  case 'd': case 'D': return 32;
+  case 'x': case 'X': return 45;
+  case 'f': case 'F': return 33;
+  case ' ': return 57;
+  case 'q': case 'Q': return 16;
+  case 'c': case 'C': return 46;
+  case 'v': case 'V': return 47;
+  case '0': return 11;
+  default: return (b >= '1' && b <= '9') ? (int)(b - '1') + 2 : 0;
   }
 }
 
 /* one key per poll, the evdev tier's record discipline */
-static int tty_poll(int64_t *kind, int64_t *a, int64_t *c) {
+static int tty_poll(int64_t* kind, int64_t* a, int64_t* c) {
   tty_init();
+  if (win_poll(kind, a, c)) return 1;
   topup();
   while (qn) {
     if (q[0] == 27) {
@@ -111,7 +139,7 @@ static int tty_poll(int64_t *kind, int64_t *a, int64_t *c) {
         shift(3);
         esc_stale = 0;
         int code = f == 'A' ? 103 : f == 'B' ? 108 : f == 'C' ? 106
-                 : f == 'D' ? 105 : 0;
+          : f == 'D' ? 105 : 0;
         if (!code) continue;
         *kind = 4; *a = code; *c = 1;
         return 1;
@@ -143,8 +171,8 @@ static V h_inputPoll(V u) {
   int64_t kind = 0, a = 0, c = 0;
   if (getenv("FPR_EVDEV")) qos_evdev_poll(&kind, &a, &c);
   else tty_poll(&kind, &a, &c);
-  V *t = (V *)fpr_alloc(32);
-  ((hdr_t *)t)->tid = 5; ((hdr_t *)t)->var = 0; /* triple */
+  V* t = (V*)fpr_alloc(32);
+  ((hdr_t*)t)->tid = 5; ((hdr_t*)t)->var = 0; /* triple */
   t[1] = TAG((sw)kind); t[2] = TAG((sw)a); t[3] = TAG((sw)c);
   return (V)t;
 }
