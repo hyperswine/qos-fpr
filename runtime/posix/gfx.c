@@ -47,6 +47,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include "drm_scanout.h"
 
 /* ==== small math (vecmath.hpp, column-major, ported verbatim) ======== */
 typedef struct { float x, y, z; } v3;
@@ -182,6 +183,7 @@ static struct {
   int staticCompiled;
   uint64_t lastStatics; /* value identity of the compiled statics list */
   pthread_t boundTid; int haveTid; /* thread the context is current on */
+  drm_out_t drm; /* the monitor link (drm_scanout.h); .on = 0 offscreen */
 } G;
 
 /* EGL contexts are thread-bound.  The graphics service actor's mailbox
@@ -304,6 +306,9 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
     fpr_cpanic("gfx: offscreen framebuffer incomplete");
   G.inited = 1;
+  /* the monitor link: auto-probe /dev/dri (FPR_DRM=0 disables); a miss
+   * means offscreen exactly as before */
+  drm_scanout_init(&G.drm, w, h);
 }
 
 /* content-addressed upload: a MeshId is uploaded once, ever */
@@ -415,6 +420,38 @@ static void stage_clear(void) {
   for (int i = 0; i < G.nmeshes; i++) G.meshes[i].nstage = 0;
 }
 
+/* ---- packed-dynamics vector reader ----------------------------------
+ * The walker may run HOST-SIDE (qosp) against an APP-side vector, so
+ * it reads the storage raw -- these mirrors restate vec.c's layout,
+ * which is PINNED ("field offsets here are mirrored by Codegen.hs"):
+ * a directory of geometrically-sized blocks (block j holds 16 << j
+ * words), one unboxed Int column, cells stored TAGGED. */
+typedef struct { uw nblk; uw *blk[24]; } gfx_col_t;
+typedef struct {
+  uint32_t tid, var;
+  uw len, eltid, elvar, ncols, kinds;
+  gfx_col_t *cols[1];
+} gfx_vec_t;
+
+static sw gfx_vec_int_at(V vec, uw i) {
+  gfx_vec_t *x = (gfx_vec_t *)vec;
+  if (ISINT(vec) || x->ncols < 1)
+    fpr_cpanic("gfx: packed dynamics: not an Int vector");
+  if (i >= x->len) fpr_cpanic("gfx: packed dynamics: index out of range");
+  gfx_col_t *c = x->cols[0];
+  uw q = i / 16 + 1;
+  int j = 0;
+  while (q >>= 1) j++;              /* log2(i/16 + 1) */
+  uw off = i - 16 * ((((uw)1) << j) - 1);
+  /* unboxed Int columns (kinds bit 0) store RAW sw words; boxed store
+   * tagged values -- match get_cell's convention exactly */
+  uw raw = c->blk[j][off];
+  if (x->kinds & 1) return (sw)raw;
+  V v = (V)raw;
+  if (!ISINT(v)) fpr_cpanic("gfx: packed dynamics: element not an Int");
+  return UNTAG(v);
+}
+
 /* ==== the raw surface (gfx_raw.h) ====================================
  * The V-CONSTRUCTING layer was factored out (gfx_fpr.c) the same way
  * net.c's socket tier was (net_raw.c), and for the same reason: this
@@ -461,9 +498,45 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
     G.lastStatics = (uint64_t)f[0];
   }
 
-  /* dynamics: staged from the value and re-uploaded, every frame */
+  /* dynamics: staged from the value and re-uploaded, every frame.
+   * Two shapes are accepted:
+   *   a LIST of Ent values -- the general walk; or
+   *   (vecHandle, n)       -- PACKED dynamics: n cube instances laid
+   *                           out [x y z yaw sx sy sz r g b] * n in
+   *                           one Int vector.  The app owns the vector
+   *                           (typically double-buffered, mutated in
+   *                           place with Vec.set) and no per-frame
+   *                           list is ever allocated -- the gen_view
+   *                           delta as a linear framebuffer handle. */
   stage_clear();
-  walk_list(f[1], walk_entity);
+  {
+    V dyn = f[1];
+    int packed = 0;
+    if (!ISINT(dyn) && TID(dyn) == 4) { /* a 2-tuple, not a list cell */
+      V *df = (V *)((char *)dyn + 8);
+      if (!ISINT(df[0]) && ISINT(df[1])) {
+        uw n = (uw)UNTAG(df[1]);
+        mesh_t *m = gfx_mesh("cube", 4);
+        if (n > MAX_INST) fpr_cpanic("gfx: packed dynamics: too many instances");
+        for (uw i = 0; i < n; i++) {
+          uw b = i * 10;
+          sw w[10];
+          for (int k = 0; k < 10; k++)
+            w[k] = gfx_vec_int_at(df[0], b + (uw)k);
+          inst_t *it = &m->stage[m->nstage++];
+          v3 pos = {(float)w[0] / 1000.0f, (float)w[1] / 1000.0f, (float)w[2] / 1000.0f};
+          v3 sc = {(float)w[4] / 1000.0f, (float)w[5] / 1000.0f, (float)w[6] / 1000.0f};
+          v3 col = {(float)w[7] / 1000.0f, (float)w[8] / 1000.0f, (float)w[9] / 1000.0f};
+          m4 model = m4mul(m4translate(pos),
+                           m4mul(m4rotY((float)w[3] / 1000.0f), m4scale(sc)));
+          memcpy(it->model, model.m, sizeof it->model);
+          it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z;
+        }
+        packed = 1;
+      }
+    }
+    if (!packed) walk_list(f[1], walk_entity);
+  }
   for (int i = 0; i < G.nmeshes; i++) {
     mesh_t *m = &G.meshes[i];
     if (!m->nstage) continue;
@@ -514,6 +587,11 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
   }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
+  /* scanout present: FBO -> dumb buffer, every rendered frame */
+  if (G.drm.on) {
+    glReadPixels(0, 0, G.w, G.h, GL_RGBA, GL_UNSIGNED_BYTE, G.drm.rd);
+    drm_scanout_present(&G.drm);
+  }
   return 0;
 }
 
@@ -540,6 +618,12 @@ int gfx_save_ppm(const char *path) {
 }
 
 /* ==== input ========================================================== */
+#include <termios.h>
+static struct termios gfx_tty_orig;
+static int gfx_tty_restore_armed;
+static void gfx_tty_restore(void) {
+  if (gfx_tty_restore_armed) tcsetattr(0, TCSANOW, &gfx_tty_orig);
+}
 static int mice_fd = -2; /* -2 = untried, -1 = unavailable */
 int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
   /* evdev keyboard first (FPR_EVDEV -- a real event node, a simulated
@@ -547,7 +631,28 @@ int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
    * release arrive as distinct (4, keycode, value) events, which is
    * what a control-input consumer actually wants and stdin can't say */
   if (qos_evdev_poll(kind_out, a_out, c_out)) return 1;
-  /* keyboard: one nonblocking stdin byte */
+  /* keyboard: one nonblocking stdin byte.  If stdin is a TERMINAL,
+   * flip it raw once (no canonical buffering, no echo) so keys arrive
+   * as they are pressed -- typing straight into the qosp/posix.bin
+   * terminal then drives the shell live, no FIFO needed.  Restored at
+   * exit. */
+  static int raw_done = 0;
+  if (!raw_done) {
+    raw_done = 1;
+    if (isatty(0)) {
+      static struct termios orig;
+      if (tcgetattr(0, &orig) == 0) {
+        struct termios t = orig;
+        t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+        t.c_cc[VMIN] = 0;
+        t.c_cc[VTIME] = 0;
+        tcsetattr(0, TCSANOW, &t);
+        gfx_tty_orig = orig;
+        gfx_tty_restore_armed = 1;
+        atexit(gfx_tty_restore);
+      }
+    }
+  }
   int fl = fcntl(0, F_GETFL);
   fcntl(0, F_SETFL, fl | O_NONBLOCK);
   unsigned char b;

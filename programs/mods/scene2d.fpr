@@ -339,3 +339,63 @@ font c = 21845.                       # unknown: checker
 entCount (C2 es sl) = dbgLen es.
 dbgLen Nil = 0.
 dbgLen (x :: r) = 1 + dbgLen r.
+
+# ---- packed dynamics: the linear-framebuffer path --------------------------
+# The list path above allocates one Ent per lit cell per frame.  This
+# path allocates NOTHING per frame: the app owns one (or, double-
+# buffered, two) Int VECTORS with the walker's packed layout
+#
+#     [x y z yaw sx sy sz r g b] per cube instance (milli-units)
+#
+# and per frame the slot text is written straight into it with Vec.set
+# -- mutation through a linear handle, the same discipline as
+# voxel-interactive's framebuffer.  Render then takes (fb, n) as the
+# scene's dynamics.  cap is in INSTANCES; make the vector 10*cap long
+# (fbNew) and never resize it.
+#
+#     fb = S2.fbNew 1024;                    # once, in an immortal pool
+#     (fb2, n) = S2.dynsInto fb slots vals;  # every frame
+#     ... Scene statics (fb2, n) ...
+
+cvec2 n k = Vec.axpb 0 k (Vec.iota n).
+fbNew cap = cvec2 (cap * 10) 0.
+
+dynsInto fb slots vals = diGo fb slots vals 0.
+diGo fb Nil vals n = (fb, n).
+diGo fb (Sl i x y sc col cap :: r) vals n =
+  s = clip (nth vals i) cap;
+  (fb2, n2) = textInto fb s x y (sc, col, 9) n;
+  diGo fb2 r vals n2.
+
+textInto fb t x y st n = tiGo fb t 1 (strlen t) x y st n.
+tiGo fb t i m x y st n | i > m = (fb, n).
+tiGo fb t i m x y st n =
+  (sc, col, d) = st;
+  (fb2, n2) = glyphInto fb (font (charAt t i)) x y st n;
+  tiGo fb2 t (i + 1) m (x + 4 * sc) y st n2.
+
+glyphInto fb 0 x y st n = (fb, n).
+glyphInto fb bits x y st n = giCell fb bits 0 x y st n.
+giCell fb bits b x y st n | b == 15 = (fb, n).
+giCell fb 0 b x y st n = (fb, n).
+giCell fb bits b x y st n =
+  (sc, col, d) = st;
+  (fb2, n2) = case band bits 1 == 1 of
+    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d n, n + 1)
+  | False -> (fb, n);
+  giCell fb2 (bits / 2) (b + 1) x y st n2.
+
+# one cube instance at virtual-pixel rect (x, y, sc, sc), depth d
+cellInto fb x y sc col d n =
+  (r, g, bl) = col;
+  base = n * 10;
+  f1 = Vec.set (base + 1) (idiv2 ((2 * x + sc - 320) * pxm)) fb;
+  f2 = Vec.set (base + 2) (idiv2 ((240 - 2 * y - sc) * pxm)) f1;
+  f3 = Vec.set (base + 3) (d * 5) f2;
+  f4 = Vec.set (base + 4) 0 f3;
+  f5 = Vec.set (base + 5) (sc * pxm) f4;
+  f6 = Vec.set (base + 6) (sc * pxm) f5;
+  f7 = Vec.set (base + 7) 2 f6;
+  f8 = Vec.set (base + 8) r f7;
+  f9 = Vec.set (base + 9) g f8;
+  Vec.set (base + 10) bl f9.

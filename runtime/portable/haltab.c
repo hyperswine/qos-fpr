@@ -29,13 +29,9 @@ static void t_putc(char c) {
 static void t_poweroff(int code) { exit(code); }
 
 static void t_wfi(void) { /* poll pace, posix hal.c's value */
-  static int wfi_count = 0;
-  if ((++wfi_count % 1000) == 0) {
-    fprintf(stderr, "[wfi %d]\n", wfi_count); fflush(stderr);
-  }
   struct timespec ts = {0, 200 * 1000};
   nanosleep(&ts, 0);
-} 
+}
 
 static uint64_t t_mmio_read(uint64_t addr, uint32_t width) {
   (void)width;

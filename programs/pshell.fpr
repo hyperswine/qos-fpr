@@ -41,8 +41,11 @@ Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
 Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
 Md = Type (Md screen focus notes input frame lastR lastKey scomp).
-Fd = Type (Fd screen frame lastR lastKey scomp notes input).
+Fd = Type (Fd screen frame lastR lastKey scomp notes input fb).
 Cm = Type (CQuit | CSnap | CSave s).
+Rt = Type (Rt cache fbA fbB back).   # loop roots: statics cache + the
+                                     # two packed framebuffers + which
+                                     # one is the back buffer this frame
 
 # ---- the System actor + services (gfxdemo.fpr verbatim) --------------------
 
@@ -179,7 +182,7 @@ pad2 n | n < 10 = "0{n}".
 pad2 n = "{n}".
 imod2 a b = a - (a / b) * b.
 
-vals (Fd 0 frame lastR lastKey scomp notes input) =
+vals (Fd 0 frame lastR lastKey scomp notes input fb) =
   (draws, dynB) = lastR;
   [ clock 0
   , "{len notes} SAVED"
@@ -187,7 +190,7 @@ vals (Fd 0 frame lastR lastKey scomp notes input) =
   , "{harts 0} LIVE"
   , "KV APPEND"
   , "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B" ].
-vals (Fd s frame lastR lastKey scomp notes input) =
+vals (Fd s frame lastR lastKey scomp notes input fb) =
   six = lastSix notes;
   [ "{len notes} SAVED"
   , nthS six 0, nthS six 1, nthS six 2
@@ -197,9 +200,16 @@ vals (Fd s frame lastR lastKey scomp notes input) =
 
 # ---- the frame worker (frame-per-actor) ------------------------------------
 
+# PACKED, DOUBLE-BUFFERED dynamics: the shell owns two framebuffer
+# VECTORS (S2.fbNew, immortal pool); each frame the worker writes the
+# slot text straight into the BACK one with Vec.set -- mutation through
+# a linear handle, zero per-frame list allocation -- and Render takes
+# (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
+# the frame being written is never the one the walker just consumed.
 frameWorker parent gfx st sl fd self =
-  dy = S2.dyns sl (vals fd);
-  r = svcCall self gfx (Render (S2.scene st dy));
+  Fd s fr lr lk sc notes inp fb = fd;
+  (fb2, n) = S2.dynsInto fb sl (vals fd);
+  r = svcCall self gfx (Render (S2.scene st (fb2, n)));
   _ = send parent r;
   drop r.                # forward then release OUR ref: the reply's
                          # ARC entry dies when the shell drops its own
@@ -355,31 +365,35 @@ rebuildTree key =
   (st2, sl2) = S2.build (treeFor (key / 10) (imod2 key 10));
   (key, st2, sl2).
 
-fdOf (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc notes inp.
+fdOf fb (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc notes inp fb.
 
 result (Md s f notes inp fr lr lk sc) =
   "pshell: {fr} frames, {sc} statics compiles, {len notes} notes".
 
-loop me gfx dsp inp mt cache model =
+loop me gfx dsp inp mt rt model =
   t0 = read mt;
   ks = drain me inp 16 Nil;
   (m2, cmds) = applyKeys ks (model, Nil);
   _ = doCmds me dsp (frOf m2) cmds;
   case wantsQuit cmds of
     True -> result m2
-  | False -> frame me gfx dsp inp mt cache m2 t0.
+  | False -> frame me gfx dsp inp mt rt m2 t0.
 
 frOf (Md s f notes inp fr lr lk sc) = fr.
 
-frame me gfx dsp inp mt cache m2 t0 =
-  (cache2, rebuilt) = ensure cache (skeyOf m2);
+frame me gfx dsp inp mt rt m2 t0 =
+  (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (fdOf m3));
+  _ = spawn (frameWorker me gfx st sl (fdOf (backFb rt) m3));
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
-  loop me gfx dsp inp mt cache2 m4.
+  loop me gfx dsp inp mt (swapRt rt cache2) m4.
+
+ensureRt (Rt cache a b bk) key = ensure cache key.
+backFb (Rt cache a b bk) = case bk == 0 of True -> a | False -> b.
+swapRt (Rt cache a b bk) cache2 = Rt cache2 a b (1 - bk).
 
 bumpS m 0 = m.
 bumpS (Md s f notes inp fr lr lk sc) n = Md s f notes inp fr lr lk (sc + n).
@@ -412,5 +426,10 @@ main =
   clint = device "clint";
   mt = reg32 clint 49144;
   cache0 = (0 - 1, Nil, Nil);
+  # the two packed framebuffers, allocated ONCE here (immortal pool --
+  # handle addresses stay put, the voxel-interactive discipline); 4096
+  # instances each = the walker's MAX_INST
+  fbA = S2.fbNew 4096;
+  fbB = S2.fbNew 4096;
   m0 = Md 0 0 notes "" 0 (0, 0) 0 0;
-  loop me g d i mt cache0 m0.
+  loop me g d i mt (Rt cache0 fbA fbB 0) m0.

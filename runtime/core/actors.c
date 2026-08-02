@@ -145,18 +145,31 @@ static void stack_recycle(void *p) {
 }
 
 static acb_t *acb_block(void) {
-  if (!fpr_is_process) return (acb_t *)buddy_alloc(sizeof(acb_t));
+  /* BOTH modes bump-carve: acbs are permanent by contract, and the
+   * lower allocators have a 64 KiB floor (buddy's BUDDY_MIN_BLOCK, the
+   * loader's grant rounding) -- one block per 250 B acb exhausted the
+   * posix heap in ~1000 spawns on a Pi 4.  Carving packs ~250 acbs
+   * into each floor-sized block. */
   uw sz = (sizeof(acb_t) + 15) & ~(uw)15;
   fpr_lock(&stack_lock);
   if (acb_hp + sz > acb_end) {
-    uw want = 4 * sz; /* a few acbs per grant amortizes the 64K floor */
-    fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(want) : (fpr_grant_t){0, 0};
-    if (!g.ptr || g.size < sz) {
+    uw want = 16 * sz;
+    char *p;
+    uw got;
+    if (fpr_is_process && fpr_grow_memory) {
+      fpr_grant_t g = fpr_grow_memory(want);
+      p = (char *)g.ptr;
+      got = g.size;
+    } else {
+      p = (char *)buddy_alloc(want);
+      got = p ? buddy_block_usable_size(p) : 0;
+    }
+    if (!p || got < sz) {
       fpr_unlock(&stack_lock);
       return 0;
     }
-    acb_hp = (char *)g.ptr;
-    acb_end = (char *)g.ptr + g.size;
+    acb_hp = p;
+    acb_end = p + got;
   }
   acb_t *a = (acb_t *)acb_hp;
   acb_hp += sz;
@@ -215,8 +228,23 @@ static chan_t *chb_take(void) {
     chb_free = b->nx;
   }
   fpr_unlock(&chb_lock);
-  if (!b) b = (chblk_t *)big_block(sizeof(chblk_t));
-  if (!b) return 0;
+  if (!b) {
+    /* fresh backing: the floor-sized block carves several channel
+     * blocks; the extras seed the free list (type-stable forever) */
+    uw sz = (sizeof(chblk_t) + 15) & ~(uw)15;
+    uw want = sz * 4;
+    char *p = (char *)big_block(want);
+    if (!p) return 0;
+    uw got = fpr_is_process ? want : buddy_block_usable_size(p);
+    if (got < sz) got = sz;
+    b = (chblk_t *)p;
+    fpr_lock(&chb_lock);
+    for (char *q = p + sz; q + sz <= p + got; q += sz) {
+      ((chblk_t *)q)->nx = chb_free;
+      chb_free = (chblk_t *)q;
+    }
+    fpr_unlock(&chb_lock);
+  }
   for (int i = 0; i < MAXSND; i++) {
     b->ch[i].sender = 0;
     b->ch[i].rh = b->ch[i].rt = 0;
