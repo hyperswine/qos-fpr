@@ -265,4 +265,9 @@ make portable-qa QOSARCH=a64 PROG=tests/orig1.fpr
 ```
 make qosp GFX=1 QOSARCH=a64 QOSCC=gcc
 make portable-qa PROG=programs/pshell.fpr QOSARCH=a64
+
+To remove, use the typical systemd removal, disable and rm the service.
+Can use script to rebuild, reinstall
+
+Github/qos-fpr/tools/kbdsim.py --tty /run/qos/kbd
 ```
