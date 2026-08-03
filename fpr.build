@@ -1,4 +1,4 @@
-prog=tests/local/main.fpr
+prog=tests/actors.fpr
 target=a64-mac
-out=build/main
+out=build/actor-test
 harts=2

@@ -1,3 +1,5 @@
+#!/usr/bin/env sol
+
 # build.sol -- the FP-RISC hosted-target build driver, in Sol.
 #
 #   sol tools/build.sol
@@ -27,8 +29,10 @@
 #   a64-mac => ctx_a64.S, cc (Apple clang), fprc --target=a64mac
 #              (Mach-O syntax: _sym, @PAGE/@PAGEOFF, Darwin TLV),
 #              and NO -static (Mach-O has no static libSystem; the
-#              philosophy concedes libSystem the way GFX concedes Mesa).
 
+# A bit slow to load for some reason.
+
+# Note these are just constant strings
 conf = "fpr.build".
 progress = "build/build.log".
 report = "build/build-report.txt".
@@ -39,16 +43,26 @@ report = "build/build-report.txt".
 # nothing outside this file + the sol binary) --------------------------------
 
 nl = Str.fromCode 10.
+
 pI s = case s == "" of True -> 0 | False -> Str.parse s.
+
 not2 a = case a of True -> False | False -> True.
+
+# Ideally should be using e.g. Str.map, filter, find directly / recursion scheme based rather than this stuff
+
+# 1-based substring (inclusive) of a string, or "" if i > j
+# substr : Str -> Int -> Int -> Str
 substr s i j = case i > j of True -> "" | False -> "{Str.fromCode (Str.at s i)}{substr s (i + 1) j}".
+# find the first occurrence of c in s, starting at index i (1-based). With Str.at we get O(1) indexing, so this is O(n) in the length of s.
 findCh c s i = case i > Str.len s of True -> 0 | False -> (case Str.at s i == c of True -> i | False -> findCh c s (i + 1)).
+# Split a string on a character, returning a list of strings.
 splitCh c s | s == "" = [].
 splitCh c s =
   k = findCh c s 1;
   case k of
     0 -> [s]
   | _ -> substr s 1 (k - 1) :: splitCh c (substr s (k + 1) (Str.len s)).
+
 append2 xs ys = case xs of [] -> ys | x :: r -> x :: append2 r ys.
 
 # ---- config ---------------------------------------------------------------
@@ -130,6 +144,7 @@ buildLib tgt harts srcs want lib stampF =
   u4 = writePath stampF want;
   lib.
 
+# Try to read p if it exists otherwise return the default
 readPathOr p dflt = case exists p of True -> readPath p | False -> dflt.
 
 # ---- main -----------------------------------------------------------------

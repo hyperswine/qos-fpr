@@ -5,6 +5,7 @@
 # tail-recursive functions (TCO makes them O(1) stack); state is just
 # the accumulator argument, exactly the Erlang shape.
 
+# device "uart" / UART0 becomes stdout on POSIX targets
 uart = device "uart" .
 
 # ---- console (same as demo.fpr) --------------------------------------
