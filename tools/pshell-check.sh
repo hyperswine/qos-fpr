@@ -88,4 +88,17 @@ out=$(FPR_STORE=/tmp/pshell-check.kv FPR_EVDEV=/tmp/pshell-quit.evd timeout 60 .
 echo "$out" | grep -q "builtin notes" || fail "posix should fall back to builtin"
 echo "  posix: honest qosp-only refusal + builtin fallback: PASS"
 
+echo "== reclamation soak (25s idle, 4 harts) =="
+# a leak of even one slab per frame dies here; steady state is a few
+# dozen grows total (the acb ledger), not hundreds
+rm -rf qos-store
+rm -f /tmp/pshell-soak.fifo && mkfifo /tmp/pshell-soak.fifo
+(FPR_HARTS=4 FPR_EVDEV=/tmp/pshell-soak.fifo timeout 40 ./qosp --yes --trace app.qa </dev/null >/tmp/pshell-soak.txt 2>&1 &)
+sleep 1; exec 8>/tmp/pshell-soak.fifo; sleep 25
+cat /tmp/pshell-quit.evd >&8; exec 8>&-; sleep 2
+grep -q "PANIC" /tmp/pshell-soak.txt && fail "soak panicked: $(grep PANIC /tmp/pshell-soak.txt | head -1)"
+grows=$(grep -c 'grow(' /tmp/pshell-soak.txt)
+[ "$grows" -lt 120 ] || fail "soak leaking: $grows grows in 25s (expect a few dozen)"
+echo "  soak: $grows grows, no panic: PASS"
+
 echo "pshell-check: ALL PASS"

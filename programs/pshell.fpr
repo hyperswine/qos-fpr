@@ -79,12 +79,15 @@ graphicsActor me =
   gfxServe me d.
 gfxServe me d =
   m = receive me;
-  gfxMsg me d m.
-gfxMsg me d (replyTo, Render scene) =
-  r = glRender scene;
-  send replyTo r >> gfxServe me d.
-gfxMsg me d (replyTo, Dims u) =
-  send replyTo d >> gfxServe me d.
+  (replyTo, pl) = m;
+  _ = gfxAct d replyTo pl;
+  _ = drop m;              # the received root: without this every
+                           # frame's Render message pins its worker's
+                           # slab forever (the leak that took a Pi 4
+                           # down in 439 frames -- twice, deterministically)
+  gfxServe me d.
+gfxAct d replyTo (Render scene) = send replyTo (glRender scene).
+gfxAct d replyTo (Dims u) = send replyTo d.
 
 displayActor me =
   m = receive me;
