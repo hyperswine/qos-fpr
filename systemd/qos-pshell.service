@@ -45,6 +45,7 @@ StateDirectory=qos
 # notes survive restarts because the append log does
 ExecStartPre=/bin/sh -c 'rm -f /run/qos/kbd && mkfifo -m660 /run/qos/kbd'
 Environment=FPR_EVDEV=/run/qos/kbd
+# Environment=XDG_CACHE_HOME=/var/lib/qos/cache
 # FPR_HARTS unset: qosp auto-detects the online core count (v2 ABI);
 # pin with Environment=FPR_HARTS=1 for deterministic replays
 ExecStart=/opt/qos/qosp --yes /opt/qos/pshell.qa
