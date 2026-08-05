@@ -1,0 +1,3 @@
+# hello root: module-table carrier only
+A = use "../programs/mods/helloapp".
+main = A.appMeta 0.

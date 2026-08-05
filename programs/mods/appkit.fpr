@@ -1,0 +1,59 @@
+# ============================================================================
+# appkit.fpr -- the SHARED vocabulary between pshell and its app plugins.
+#
+# Everything two separately compiled images exchange must be built from
+# constructors THEY BOTH COMPILED FROM THE SAME SOURCE: tids are
+# hash-derived per (module, type), so this module appearing in the
+# shell AND in every app is what makes a LogAdd built in hello.qa
+# pattern-match in the shell's log actor.  Keep it small and stable --
+# editing it changes the hash, which obliges rebuilding the shell and
+# every app together.
+#
+# The app contract (each app plugin exports exactly these names;
+# the launcher resolves them PER TABLE with Mod.findAt):
+#   appMeta u            -> (title, subtitle)     tile text
+#   appInit env          -> st                    runs in the shell actor;
+#                                                 may spawn the app's own
+#                                                 actors, replay storage
+#   appUpdate k st       -> st                    a key for the focused app
+#                                                 (esc/p/q are the shell's)
+#   appTree vw           -> scene2d tree
+#   appVals self env st  -> vals                  runs in the frame worker
+#                                                 actor; may svcCall
+# env = (log, mt): the log-service capability and the mtime handle --
+# capabilities are PASSED, never ambient.
+# ============================================================================
+
+Ak = Type (LogAdd line | LogSnap u).
+
+# ---- service call (one request, one reply) ---------------------------------
+call me a q = _ = send a (me, q); receive me.
+
+logAdd me log line = call me log (LogAdd line).
+
+# ---- keys ------------------------------------------------------------------
+keyChar 57 = " ".
+keyChar 30 = "a". keyChar 48 = "b". keyChar 46 = "c". keyChar 32 = "d".
+keyChar 18 = "e". keyChar 33 = "f". keyChar 34 = "g". keyChar 35 = "h".
+keyChar 23 = "i". keyChar 36 = "j". keyChar 37 = "k". keyChar 38 = "l".
+keyChar 50 = "m". keyChar 49 = "n". keyChar 24 = "o". keyChar 25 = "p".
+keyChar 16 = "q". keyChar 19 = "r". keyChar 31 = "s". keyChar 20 = "t".
+keyChar 22 = "u". keyChar 47 = "v". keyChar 17 = "w". keyChar 45 = "x".
+keyChar 21 = "y". keyChar 44 = "z".
+keyChar 11 = "0". keyChar 2 = "1". keyChar 3 = "2". keyChar 4 = "3".
+keyChar 5 = "4". keyChar 6 = "5". keyChar 7 = "6". keyChar 8 = "7".
+keyChar 9 = "8". keyChar 10 = "9".
+keyChar c | c < 0 = chr (0 - c).    # stdin literal
+keyChar c = "".
+
+# ---- time ------------------------------------------------------------------
+imodK a b = a - (a / b) * b.
+pad2 n | n < 10 = "0{n}".
+pad2 n = "{n}".
+clockStr mt =
+  t = read mt / 10000000;           # 10 MHz clint -> seconds
+  "{pad2 (imodK (t / 60) 100)}:{pad2 (imodK t 60)}".
+
+# spin until `ticks` clint units pass (an app actor's crude pacing)
+waitTicks mt t0 n | read mt - t0 >= n = read mt.
+waitTicks mt t0 n = waitTicks mt t0 n.

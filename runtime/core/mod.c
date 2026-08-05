@@ -101,6 +101,24 @@ static V h_modresolve(V hash, V name) {
   return mktup2(TAG(0), TAG(0));
 }
 
+/* Mod.plugs () -> the number of attached tables; Mod.findAt i name ->
+ * (1, fn) | (0, 0) searching table i ONLY.  The app-launcher contract
+ * uses one fixed export-name set (appMeta, appInit, ...) in EVERY app
+ * plugin, so cross-table search would always find the first app --
+ * scoped search is what makes N apps coexist. */
+static V h_modplugs(V u) { (void)u; return TAG(nxtabs); }
+
+static V h_modfindat(V iv, V name) {
+  if (!ISINT(iv)) fpr_cpanic("Mod.findAt: index not an Int");
+  if (ISINT(name) || TID(name) != T_STR) fpr_cpanic("Mod.findAt: name not a String");
+  sw i = UNTAG(iv);
+  if (i < 0 || i >= nxtabs) return mktup2(TAG(0), TAG(0));
+  const str_t *n = (const str_t *)name;
+  for (const uw *p = xtabs[i]; p && p[0]; p += 3)
+    if (str_eq((const str_t *)p[1], n)) return mktup2(TAG(1), (V)p[2]);
+  return mktup2(TAG(0), TAG(0));
+}
+
 /* Mod.find name -> (1, fn) | (0, 0): name-only, ATTACHED tables only */
 static V h_modfind(V name) {
   if (ISINT(name) || TID(name) != T_STR) fpr_cpanic("Mod.find: name not a String");
@@ -113,5 +131,7 @@ static V h_modfind(V name) {
 
 FPR_FN(fpr_g_Mod_x2efn, h_modfn, 2);
 FPR_FN(fpr_g_Mod_x2efind, h_modfind, 1);
+FPR_FN(fpr_g_Mod_x2eplugs, h_modplugs, 1);
+FPR_FN(fpr_g_Mod_x2efindAt, h_modfindat, 2);
 FPR_FN(fpr_g_Mod_x2ehas, h_modhas, 1);
 FPR_FN(fpr_g_Mod_x2eresolve, h_modresolve, 2);

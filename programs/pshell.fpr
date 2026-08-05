@@ -39,13 +39,19 @@ Row = S2.Row. Col = S2.Col. Pad = S2.Pad. Gap = S2.Gap.
 W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
 Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
+AK = use "mods/appkit".
+
 Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a | Dims a).
-Md = Type (Md screen focus notes input frame lastR lastKey scomp).
-Fd = Type (Fd screen frame lastR lastKey scomp ed fb pv).  # ed = (notes, input)
-Cm = Type (CQuit | CSnap | CSave s).
-Rt = Type (Rt cache fbA fbB back vw pv).
-Pv = Type (Pv tfn vfn | PvNone).      # the notes plugin's resolved
-                                      # view functions, or the builtin   # loop roots: statics cache + the
+# sts = the per-app STATE LIST, parallel to the launcher's app list --
+# suspension IS this list: leaving an app just stops rendering it; its
+# state value sits here until re-entry.  screen 0 = home, i+1 = app i.
+Md = Type (Md screen focus sts frame lastR lastKey scomp).
+Fd = Type (Fd screen frame lastR lastKey scomp av fb env).
+Av = Type (AvHome | AvApp vlsF st).
+Cm = Type (CQuit | CSnap).
+Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vw, env)
+# a discovered app: metas + the four resolved contract functions
+Ap = Type (Ap nm sb ini upd tre vls).   # loop roots: statics cache + the
                                      # two packed framebuffers + which
                                      # one is the back buffer this frame
 
@@ -61,15 +67,22 @@ findSvc Nil url = 0.
 findSvc ((u, a) :: r) url | strEq u url = a.
 findSvc ((u, a) :: r) url = findSvc r url.
 
+# one loop, forever: lookups answered, registrations APPENDED -- a
+# service can be registered at any time, not only in one boot batch.
+# Received roots dropped (immortal actor).
 systemActor me = sysLoop me Nil.
-sysServe me reg =
-  (replyTo, Lookup url) = receive me;
-  send replyTo (findSvc reg url) >> sysServe me reg.
 sysLoop me reg0 =
-  (replyTo, q) = receive me;
-  case q of
-    Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
-  | Reg reg -> send replyTo 1 >> sysServe me reg.
+  m = receive me;
+  (replyTo, q) = m;
+  sysMsg me reg0 replyTo q m.
+sysMsg me reg0 replyTo (Lookup url) m =
+  _ = send replyTo (findSvc reg0 url);
+  _ = drop m;
+  sysLoop me reg0.
+sysMsg me reg0 replyTo (Reg reg) m =
+  _ = send replyTo 1;
+  _ = drop m;
+  sysLoop me (cat reg reg0).
 
 # AUTO RESOLUTION: glInit 0 0 sizes the FBO to the connected display's
 # own mode (640x480 headless) and returns what it settled on; the shell
@@ -99,6 +112,50 @@ inputActor me =
   (replyTo, Poll u) = m;
   send replyTo (inputPoll u) >> drop m >> inputActor me.
 
+# the log service: /services/log.  A capped ring of lines; every write
+# also echoes to the console ("[log] ...") -- the simple log itself.
+# Received roots are dropped (immortal actor, the law); a line falling
+# off the ring is dropped too (its writer's slab pin ends here).
+logActor me = logServe me Nil 0.
+logServe me lines n =
+  m = receive me;
+  (replyTo, q) = m;
+  logMsg me lines n replyTo q m.
+logMsg me lines n replyTo (LogAdd line) m =
+  _ = print "[log] {line}";
+  # COPY the line into OUR pool before dropping the request: promotion
+  # pinned only the message ROOT -- the nested string rides that pin,
+  # and dropping the root frees the sender's slab out from under
+  # anything nested we kept.  Retention beyond the root's life = copy.
+  # NOTE "{line}" is NOT a copy -- one-segment interpolation desugars
+  # to `str line`, identity on a string.  substr always mkstr's.
+  own = substr line 1 (strlen line);
+  (l2, n2) = logPush lines n own;
+  _ = send replyTo 0;
+  _ = drop m;
+  logServe me l2 n2.
+logMsg me lines n replyTo (LogSnap u) m =
+  # NEVER send live state: the caller rightly drops what it received,
+  # and dropping OUR ring root would free it under us.  Fresh cells
+  # (the strings inside are ours and immortal-pooled; sharing them is
+  # fine -- it is the SPINE that must be disposable).
+  _ = send replyTo (snapCopy lines);
+  _ = drop m;
+  logServe me lines n.
+snapCopy Nil = Nil.
+snapCopy (x :: r) = x :: snapCopy r.
+logPush lines n line | n < 12 = (line :: lines, n + 1).
+logPush lines n line =
+  (kept, old) = logSplit lines 11 Nil;
+  _ = drop old;
+  (line :: logRev kept Nil, n).
+logSplit (x :: r) 0 acc = (logRev acc Nil, x).
+logSplit (x :: r) k acc = logSplit r (k - 1) (x :: acc).
+logRev Nil acc = acc.
+logRev (x :: r) acc = logRev r (x :: acc).
+LogAdd = AK.LogAdd.
+LogSnap = AK.LogSnap.
+
 svcCall me a q = _ = send a (me, q); receive me.
 svcLookup me sys url = svcCall me sys (Lookup url).
 
@@ -127,41 +184,43 @@ tile f i title si cap =
     [ Lbl [Sc 2, Fg (930, 940, 960)] title
     , Slot [Fg (999, 800, 300)] si cap ].
 
-homeTree vw f =
+# app tiles two to a row; slot i = tile i's subtitle (see homeVals)
+tileRows apps f i =
+  case apps of
+    Nil -> Nil
+  | (a :: r) -> tileRowsGo a r f i.
+tileRowsGo a Nil f i =
+  Box [Row, Gap 6] [ apTile a f i, Box [Grow] Nil ] :: Nil.
+tileRowsGo a (b :: r) f i =
+  Box [Row, Gap 6] [ apTile a f i, apTile b f (i + 1) ]
+    :: tileRows r f (i + 2).
+apTile (Ap nm sb ini upd tre vls) f i = tile f i nm i 14.
+
+homeTree apps vw f =
+  n = appN apps;
   Box [Col, Pad 8, Gap 6, W vw, H 240, Bg (62, 70, 88)]
-    [ Box [Row, Gap 6]
-        [ Lbl [Sc 3, Fg (930, 940, 960)] "QOS"
-        , Box [Grow] Nil
-        , Slot [Sc 2, Fg (560, 590, 650)] 0 9 ]
-    , Box [Row, Gap 6]
-        [ tile f 0 "NOTES" 1 12
-        , tile f 1 "RENDER" 2 14 ]
-    , Box [Row, Gap 6]
-        [ tile f 2 "HARTS" 3 14
-        , tile f 3 "STORE" 4 14 ]
-    , Box [Grow] Nil
-    , Box [Row, Pad 4, Bg (92, 104, 130)]
-        [ Slot [Fg (560, 590, 650)] 5 40 ] ].
+    (cat
+      ( Box [Row, Gap 8]
+          [ Lbl [Sc 3, Fg (930, 940, 960)] "QOS"
+          , Box [Grow] Nil
+          , Lbl [Fg (560, 590, 650)] "T"
+          , Slot [Fg (930, 940, 960)] n 6 ]
+        :: tileRows apps f 0)
+      ( Box [Row, Gap 6]
+          [ tile f n "RENDER" (n + 1) 12
+          , tile f (n + 1) "HARTS" (n + 2) 12 ]
+        :: Box [Grow] Nil
+        :: Box [Row, Pad 4, Bg (92, 104, 130)]
+             [ Slot [Fg (999, 800, 300)] (n + 3) 60 ]
+        :: Nil )).
+appN Nil = 0.
+appN (a :: r) = 1 + appN r.
 
-noteLine i =
-  Box [Row, Pad 2] [ Slot [Fg (930, 940, 960)] i 40 ].
-
-notesTree vw =
-  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
-    [ Box [Row, Gap 6]
-        [ Lbl [Sc 2, Fg (930, 940, 960)] "NOTES"
-        , Box [Grow] Nil
-        , Slot [Fg (560, 590, 650)] 0 12 ]
-    , Box [Col, Gap 2, Grow, Bord (150, 165, 200), Pad 3]
-        [ noteLine 1, noteLine 2, noteLine 3
-        , noteLine 4, noteLine 5, noteLine 6 ]
-    , Box [Row, Pad 4, Gap 4, Bord (330, 720, 999), Bg (92, 104, 130)]
-        [ Lbl [Fg (999, 800, 300)] ">"
-        , Slot [Fg (930, 940, 960)] 7 36 ]
-    , Lbl [Fg (560, 590, 650)] "ENTER SAVE   ESC BACK   TYPE A-Z 0-9" ].
-
-treeFor pv vw 0 f = homeTree vw f.
-treeFor pv vw s f = case pv of Pv tfn vfn -> tfn vw | PvNone -> notesTree vw.
+treeFor apps vw 0 f = homeTree apps vw f.
+treeFor apps vw s f = apTree (nthAp apps (s - 1)) vw.
+apTree (Ap nm sb ini upd tre vls) vw = tre vw.
+nthAp (a :: r) 0 = a.
+nthAp (a :: r) i = nthAp r (i - 1).
 
 # ---- dynamics: the per-frame text, formatted IN THE WORKER -----------------
 
@@ -194,28 +253,23 @@ pad2 n | n < 10 = "0{n}".
 pad2 n = "{n}".
 imod2 a b = a - (a / b) * b.
 
-vals (Fd 0 frame lastR lastKey scomp ed fb pv) =
-  (notes, input) = ed;
+# home: slot 0..n-1 = tile subtitles, n = clock, n+1 = render,
+# n+2 = harts, n+3 = status.  App screens: the app's own appVals, run
+# HERE in the frame worker with self (it may svcCall services).
+wvals apps (Fd 0 frame lastR lastKey scomp av fb env) self =
+  (log, mt) = env;
   (draws, dynB) = lastR;
-  [ clock 0
-  , "{len notes} SAVED"
-  , "{draws}D {dynB}B"
-  , "{harts 0} LIVE"
-  , plugTag pv
-  , "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B" ].
-vals (Fd s frame lastR lastKey scomp ed fb pv) =
-  case pv of
-    Pv tfn vfn -> vfn ed          # the loaded plugin renders its screen
-  | PvNone -> builtinVals ed.
-builtinVals (notes, input) =
-  six = lastSix notes;
-  [ "{len notes} SAVED"
-  , nthS six 0, nthS six 1, nthS six 2
-  , nthS six 3, nthS six 4, nthS six 5
-  , "{input}_"
-  , "" ].
-plugTag (Pv t v) = "PNOTES.QA".
-plugTag PvNone = "KV APPEND".
+  cat (subs apps)
+      ( AK.clockStr mt
+        :: "{draws}D {dynB}B"
+        :: "{harts 0} LIVE"
+        :: "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B"
+        :: Nil ).
+wvals apps (Fd s frame lastR lastKey scomp av fb env) self =
+  AvApp vlsF st = av;
+  vlsF self env st.
+subs Nil = Nil.
+subs (Ap nm sb ini upd tre vls :: r) = sb :: subs r.
 
 # ---- the frame worker (frame-per-actor) ------------------------------------
 
@@ -225,9 +279,11 @@ plugTag PvNone = "KV APPEND".
 # a linear handle, zero per-frame list allocation -- and Render takes
 # (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
 # the frame being written is never the one the walker just consumed.
-frameWorker parent gfx st sl fd self =
-  Fd s fr lr lk sc ed fb pv = fd;
-  (fb2, n) = S2.dynsInto fb sl (vals fd);
+frameWorker parent gfx st sl fdw self =
+  (apps, fd) = fdw;
+  Fd sN fr lr lk sc av fb env = fd;
+  vs = wvals apps fd self;
+  (fb2, n) = S2.dynsInto fb sl vs;
   r = svcCall self gfx (Render (S2.scene st (fb2, n)));
   _ = send parent r;
   drop r.                # forward then release OUR ref: the reply's
@@ -282,53 +338,52 @@ keyChar c = "".
 # ---- update ----------------------------------------------------------------
 # update k model -> (model', cmds)
 
-clampF f | f < 0 = 0.
-clampF f | f > 3 = 3.
-clampF f = f.
+clampF t f | f < 0 = 0.
+clampF t f | f > t - 1 = t - 1.
+clampF t f = f.
 
-moveF f 105 | imod2 f 2 == 1 = f - 1.
-moveF f 106 | imod2 f 2 == 0 = f + 1.
-moveF f 103 = clampF (f - 2).
-moveF f 108 = clampF (f + 2).
-moveF f k = f.
-
-dropLast s | strlen s < 2 = "".
-dropLast s = substr s 1 (strlen s - 1).
-
-typed inp k | strlen inp > 29 = inp.
-typed inp k = strcat inp (keyChar k).
+moveF t f 105 | imod2 f 2 == 1 = f - 1.
+moveF t f 106 | imod2 f 2 == 0 = clampF t (f + 1).
+moveF t f 103 = clampF t (f - 2).
+moveF t f 108 = clampF t (f + 2).
+moveF t f k = f.
 
 # home screen
-update k (Md 0 f notes inp fr lr lk sc) | k == 16 =
-  (Md 0 f notes inp fr lr k sc, [CQuit]).
-update k (Md 0 f notes inp fr lr lk sc) | k == 25 =
-  (Md 0 f notes inp fr lr k sc, [CSnap]).
-update k (Md 0 f notes inp fr lr lk sc) | k == 28 =
-  homeEnter f (Md 0 f notes inp fr lr k sc).
-update k (Md 0 f notes inp fr lr lk sc) =
-  (Md 0 (moveF f k) notes inp fr lr k sc, Nil).
-# notes screen
-update k (Md 1 f notes inp fr lr lk sc) | k == 1 =
-  (Md 0 f notes inp fr lr k sc, Nil).
-update k (Md 1 f notes inp fr lr lk sc) | k == 25 =
-  (Md 1 f notes inp fr lr k sc, [CSnap]).
-update k (Md 1 f notes inp fr lr lk sc) | k == 14 =
-  (Md 1 f notes (dropLast inp) fr lr k sc, Nil).
-update k (Md 1 f notes inp fr lr lk sc) | k == 28 =
-  case strlen inp > 0 of
-    True -> (Md 1 f (inp :: notes) "" fr lr k sc, [CSave inp])
-  | False -> (Md 1 f notes inp fr lr k sc, Nil).
-update k (Md 1 f notes inp fr lr lk sc) =
-  (Md 1 f notes (typed inp k) fr lr k sc, Nil).
+# The launcher's key protocol: esc = suspend (back to home, state
+# kept), p = snapshot, q-at-home = quit; everything else while an app
+# is focused goes to THAT app's appUpdate, which returns its new state
+# value -- setNth into the state list and carry on.  Suspension is
+# nothing but this list.
+update apps k (Md 0 f sts fr lr lk sc) | k == 16 =
+  (Md 0 f sts fr lr k sc, [CQuit]).
+update apps k (Md 0 f sts fr lr lk sc) | k == 25 =
+  (Md 0 f sts fr lr k sc, [CSnap]).
+update apps k (Md 0 f sts fr lr lk sc) | k == 28 =
+  (homeEnter (appN apps) f (Md 0 f sts fr lr k sc), Nil).
+update apps k (Md 0 f sts fr lr lk sc) =
+  (Md 0 (moveF (appN apps + 2) f k) sts fr lr k sc, Nil).
+update apps k (Md sN f sts fr lr lk sc) | k == 1 =
+  (Md 0 f sts fr lr k sc, Nil).
+update apps k (Md sN f sts fr lr lk sc) | k == 25 =
+  (Md sN f sts fr lr k sc, [CSnap]).
+update apps k (Md sN f sts fr lr lk sc) =
+  st2 = apUpd (nthAp apps (sN - 1)) k (nthSt sts (sN - 1));
+  (Md sN f (setNth sts (sN - 1) st2) fr lr k sc, Nil).
+apUpd (Ap nm sb ini upd tre vls) k st = upd k st.
 
-homeEnter f (Md s g notes inp fr lr lk sc) | f == 0 =
-  (Md 1 g notes "" fr lr lk sc, Nil).
-homeEnter f m = (m, Nil).
+homeEnter n f m | f < n = openApp (f + 1) m.
+homeEnter n f m = m.
+openApp sN (Md s g sts fr lr lk sc) = Md sN g sts fr lr lk sc.
 
-applyKeys Nil mc = mc.
-applyKeys (k :: r) (m, cs) =
-  (m2, c2) = update k m;
-  applyKeys r (m2, cat cs c2).
+nthSt (x :: r) 0 = x.
+nthSt (x :: r) i = nthSt r (i - 1).
+setNth (x :: r) 0 v = v :: r.
+setNth (x :: r) i v = x :: setNth r (i - 1) v.
+
+applyKeys apps Nil mc = mc.
+applyKeys apps (k :: r) (m, cs) =
+  (m2, c2) = update apps k m;
+  applyKeys apps r (m2, cat cs c2).
 cat Nil b = b.
 cat (a :: r) b = a :: cat r b.
 
@@ -340,28 +395,9 @@ doCmds me dsp fr (c :: r) =
   doCmds me dsp fr r.
 doCmd me dsp fr CQuit = 0.
 doCmd me dsp fr CSnap = svcCall me dsp (Present "pshell{fr}.ppm").
-doCmd me dsp fr (CSave s) = saveNote s.
-
 wantsQuit Nil = False.
 wantsQuit (CQuit :: r) = True.
 wantsQuit (c :: r) = wantsQuit r.
-
-saveNote s =
-  case Sys.storeReq 2 "{s}\n" of
-    Ok u -> 1
-  | Err e -> 0.
-
-# boot replay: "a\nb\n..." -> newest-first list
-loadNotes u =
-  case Sys.storeReq 3 "" of
-    Ok s -> splitNl s 1 1 Nil
-  | Err e -> Nil.
-splitNl s i st acc | i > strlen s = acc.
-splitNl s i st acc | charAt s i == 10 =
-  case i > st of
-    True -> splitNl s (i + 1) (i + 1) (substr s st (i - st) :: acc)
-  | False -> splitNl s (i + 1) (i + 1) acc.
-splitNl s i st acc = splitNl s (i + 1) st acc.
 
 # ---- the shell loop --------------------------------------------------------
 # cache = (skey, statics, slots): the statics VALUE lives here across
@@ -373,56 +409,66 @@ tick = 50000.                        # 50 ms -> 20 fps (10 MHz clint)
 waitTick mt t0 | read mt - t0 >= tick = read mt.
 waitTick mt t0 = waitTick mt t0.
 
-skeyOf (Md s f notes inp fr lr lk sc) = s * 10 + f.
+skeyOf (Md s f sts fr lr lk sc) = s * 100 + f.
 
-ensure pv vw cache key =
+ensure apps vw cache key =
   (k, st, sl) = cache;
   case k == key of
     True -> (cache, 0)
-  | False -> (rebuildTree pv vw key, 1).
-rebuildTree pv vw key =
-  (st2, sl2) = S2.buildW vw (treeFor pv vw (key / 10) (imod2 key 10));
+  | False -> (rebuildTree apps vw key, 1).
+rebuildTree apps vw key =
+  (st2, sl2) = S2.buildW vw (treeFor apps vw (key / 100) (imod2 key 100));
   (key, st2, sl2).
 
-fdOf fb pv (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc (notes, inp) fb pv.
+# av for the worker: home = 0, app screen = (that app's vals fn, state)
+fdOf fb env apps (Md sN f sts fr lr lk sc) =
+  Fd sN fr lr lk sc (avFor apps sN sts) fb env.
+avFor apps 0 sts = AvHome.
+avFor apps sN sts = AvApp (apVls (nthAp apps (sN - 1))) (nthSt sts (sN - 1)).
+apVls (Ap nm sb ini upd tre vls) = vls.
 
-result (Md s f notes inp fr lr lk sc) =
-  "pshell: {fr} frames, {sc} statics compiles, {len notes} notes".
+result apps (Md s f sts fr lr lk sc) =
+  "pshell: {fr} frames, {sc} statics compiles, {appN apps} apps".
 
 loop me gfx dsp inp mt rt model =
   t0 = read mt;
   ks = drain me inp 16 Nil;
-  (m2, cmds) = applyKeys ks (model, Nil);
+  (m2, cmds) = applyKeys (appsOf rt) ks (model, Nil);
   _ = doCmds me dsp (frOf m2) cmds;
   case wantsQuit cmds of
-    True -> result m2
+    True -> result (appsOf rt) m2
   | False -> frame me gfx dsp inp mt rt m2 t0.
 
-frOf (Md s f notes inp fr lr lk sc) = fr.
+frOf (Md s f sts fr lr lk sc) = fr.
 
 frame me gfx dsp inp mt rt m2 t0 =
   (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (fdOf (backFb rt) (pvOf rt) m3));
+  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3));
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
   loop me gfx dsp inp mt (swapRt rt cache2) m4.
 
-ensureRt (Rt cache a b bk vw pv) key = ensure pv vw cache key.
-backFb (Rt cache a b bk vw pv) = case bk == 0 of True -> a | False -> b.
-pvOf (Rt cache a b bk vw pv) = pv.
-swapRt (Rt cache a b bk vw pv) cache2 = Rt cache2 a b (1 - bk) vw pv.
+ensureRt (Rt cache a b bk cfg apps) key =
+  (vw, env) = cfg;
+  ensure apps vw cache key.
+backFb (Rt cache a b bk cfg apps) = case bk == 0 of True -> a | False -> b.
+appsOf (Rt cache a b bk cfg apps) = apps.
+envOf (Rt cache a b bk cfg apps) =
+  (vw, env) = cfg;
+  env.
+swapRt (Rt cache a b bk cfg apps) cache2 = Rt cache2 a b (1 - bk) cfg apps.
 
 bumpS m 0 = m.
-bumpS (Md s f notes inp fr lr lk sc) n = Md s f notes inp fr lr lk (sc + n).
+bumpS (Md s f sts fr lr lk sc) n = Md s f sts fr lr lk (sc + n).
 # the reply tuple ESCAPED into this immortal actor (worker -> shell
 # send); dropping the previous one releases its ARC entry -- without
 # this, one live entry per frame fills the ARC table in ~50 s of idle
-advance (Md s f notes inp fr lr lk sc) r =
+advance (Md s f sts fr lr lk sc) r =
   _ = drop lr;
-  Md s f notes inp (fr + 1) r lk sc.
+  Md s f sts (fr + 1) r lk sc.
 
 # ---- main ------------------------------------------------------------------
 
@@ -441,10 +487,14 @@ main =
   g = svcLookup me sys "/services/graphics";
   d = svcLookup me sys "/services/display";
   i = svcLookup me sys "/services/input";
-  notes = loadNotes 0;
-  _ = print "pshell: {len notes} notes replayed; q quits (home), p snapshots";
   clint = device "clint";
   mt = reg32 clint 49144;
+  # /services/log: the ring every app actor writes through
+  logA = spawn logActor;
+  _ = send sys (me, Reg (("/services/log", logA) :: Nil));
+  _ = receive me;
+  log = svcLookup me sys "/services/log";
+  env = (log, mt);
   cache0 = (0 - 1, Nil, Nil);
   # the two packed framebuffers, allocated ONCE here (immortal pool --
   # handle addresses stay put, the voxel-interactive discipline); 4096
@@ -454,30 +504,46 @@ main =
   (gw, gh) = svcCall me g (Dims 0);
   vw = clampVw (240 * gw / imax1 gh);
   _ = print "pshell: display {gw}x{gh} -> virtual {vw}x240";
-  pv = attachNotes 0;
-  m0 = Md 0 0 notes "" 0 (0, 0) 0 0;
-  loop me g d i mt (Rt cache0 fbA fbB 0 vw pv) m0.
+  # attach every app .qa present, discover contracts per table, init
+  # each app (inits run HERE -- an app may spawn its own actors now)
+  _ = tryAttach "pnotes.qa";
+  _ = tryAttach "clock.qa";
+  _ = tryAttach "hello.qa";
+  _ = tryAttach "logs.qa";
+  apps = discover 0 (Mod.plugs 0);
+  _ = print "pshell: {appN apps} apps loaded; q quits (home), p snapshots, esc suspends";
+  sts = initAll apps env;
+  m0 = Md 0 0 sts 0 (0, 0) 0 0;
+  loop me g d i mt (Rt cache0 fbA fbB 0 (vw, env) apps) m0.
 
-# the notes plugin: a separately compiled .qa loaded into the plugin
-# slot at boot and resolved BY NAME -- absence (no file, standalone
-# posix run, load error) falls back to the builtin screen, stated once
-attachNotes u =
-  case Sys.attachQa "pnotes.qa" of
-    Err e -> attachMiss e
-  | Ok u2 -> attachResolve 0.
-attachResolve u =
-  (t1, tfn) = Mod.find "pnTree";
-  (t2, vfn) = Mod.find "pnVals";
-  attachGot (t1 * t2) tfn vfn.
-attachMiss e =
-  _ = print "pshell: builtin notes ({e})";
-  PvNone.
-attachGot ok tfn vfn | ok == 1 =
-  _ = print "pshell: notes plugin attached (pnotes.qa)";
-  Pv tfn vfn.
-attachGot ok tfn vfn =
-  _ = print "pshell: plugin lacks pnTree/pnVals; builtin notes";
-  PvNone.
+tryAttach nm =
+  case Sys.attachQa nm of
+    Ok u -> 1
+  | Err e -> attachMiss nm e.
+attachMiss nm e =
+  _ = print "pshell: {nm}: {e}";
+  0.
+
+# per attached table: the contract or nothing (a plugin that is not an
+# app -- or a partial one -- is skipped, stated)
+discover i n | i >= n = Nil.
+discover i n =
+  (h1, meta) = Mod.findAt i "appMeta";
+  (h2, ini) = Mod.findAt i "appInit";
+  (h3, upd) = Mod.findAt i "appUpdate";
+  (h4, tre) = Mod.findAt i "appTree";
+  (h5, vls) = Mod.findAt i "appVals";
+  discovered (h1 * h2 * h3 * h4 * h5) meta ini upd tre vls i n.
+discovered ok meta ini upd tre vls i n | ok == 1 =
+  (nm, sb) = meta 0;
+  _ = print "pshell: app {i}: {nm}";
+  Ap nm sb ini upd tre vls :: discover (i + 1) n.
+discovered ok meta ini upd tre vls i n =
+  _ = print "pshell: table {i}: not an app (skipped)";
+  discover (i + 1) n.
+
+initAll Nil env = Nil.
+initAll (Ap nm sb ini upd tre vls :: r) env = ini env :: initAll r env.
 
 imax1 h | h < 1 = 1.
 imax1 h = h.

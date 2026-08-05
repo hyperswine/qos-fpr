@@ -1,0 +1,48 @@
+# logsapp.fpr -- Logs.qa: the log service, read back.  appVals runs in
+# the frame worker actor, so it may hold a conversation: snapshot the
+# ring through the same capability the writers used.  The received
+# reply root is dropped once read (an immortal-adjacent actor keeps
+# every undropped root's ARC entry -- the lesson is now law).
+S2 = use "scene2d".
+AK = use "appkit".
+Box = S2.Box. Lbl = S2.Lbl. Slot = S2.Slot.
+Row = S2.Row. Col = S2.Col. Pad = S2.Pad. Gap = S2.Gap.
+W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
+Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
+
+appMeta u = ("LOGS", "READS SERVICE").
+appInit env = 0.
+appUpdate k n = n.
+
+lgLine i =
+  Box [Row, Pad 1] [ Slot [Fg (930, 940, 960)] i 44 ].
+
+appTree vw =
+  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
+    [ Box [Row, Gap 6]
+        [ Lbl [Sc 2, Fg (420, 900, 560)] "LOGS"
+        , Lbl [Fg (560, 590, 650)] "/services/log"
+        , Box [Grow] Nil
+        , Slot [Fg (560, 590, 650)] 0 10 ]
+    , Box [Col, Gap 2, Grow, Bord (150, 165, 200), Pad 3]
+        [ lgLine 1, lgLine 2, lgLine 3, lgLine 4
+        , lgLine 5, lgLine 6, lgLine 7, lgLine 8 ]
+    , Lbl [Fg (560, 590, 650)] "NEWEST FIRST   ESC BACK" ].
+
+appVals self env n =
+  (log, mt) = env;
+  sn = AK.call self log (LogSnap 0);
+  vs = lgFormat sn;
+  _ = drop sn;
+  vs.
+LogSnap = AK.LogSnap.
+
+lgFormat lines =
+  [ "{lgLen lines} LINES"
+  , lgNth lines 0, lgNth lines 1, lgNth lines 2, lgNth lines 3
+  , lgNth lines 4, lgNth lines 5, lgNth lines 6, lgNth lines 7 ].
+lgLen Nil = 0.
+lgLen (x :: r) = 1 + lgLen r.
+lgNth Nil i = "".
+lgNth (v :: r) 0 = v.
+lgNth (v :: r) i = lgNth r (i - 1).

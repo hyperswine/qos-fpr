@@ -305,12 +305,19 @@ plugin-qa: fprc tools/mkqa.py
 	  $(QOSATOMICS) \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \
 	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) \
-	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=0x408000000 \
+	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=$(PLUGBASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
 	  -Wl,--defsym=_proc_arena_end=$(PROC_ARENA_END) \
 	  -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-e,fpr_plugtab \
 	  build/plug-prog.s $$(cat build/plug-prog.s.units) build/plug-syms.ld -o build/plug.elf
 	ID=$$(basename $(PLUG) .fpr); 	printf 'name = "%s"\nid = "%s"\nentry = "n/a"\nversion = "1"\nloadMode = "plugin"\n' $$ID $$ID > build/plug-gen.toml; 	python3 tools/mkqa.py build/plug-gen.toml build/plug.elf -o $(PLUGOUT)
+
+# the full app set, each at its own sub-slot
+apps-qa:
+	$(MAKE) -s plugin-qa PLUG=apps/pnotes.fpr PLUGOUT=qos-apps/pnotes.qa PLUGBASE=0x408000000
+	$(MAKE) -s plugin-qa PLUG=apps/clock.fpr  PLUGOUT=qos-apps/clock.qa  PLUGBASE=0x408400000
+	$(MAKE) -s plugin-qa PLUG=apps/hello.fpr  PLUGOUT=qos-apps/hello.qa  PLUGBASE=0x408800000
+	$(MAKE) -s plugin-qa PLUG=apps/logs.fpr   PLUGOUT=qos-apps/logs.qa   PLUGBASE=0x408c00000
 
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs compiler/A64.hs compiler/X64.hs compiler/Infer.hs compiler/Struct.hs compiler/Precond.hs
 	cd compiler && cabal build -v0

@@ -71,10 +71,12 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
  * discipline as the shell image, and hand back the module-table
  * address (the plugin's e_entry -- it is linked with -e fpr_plugtab).
  * One plugin slot, first-load-wins re-load refused (v1: no unload). */
-static int plug_loaded;
+#define PLUG_MAX 8
+static struct { uintptr_t lo, hi; } plug_ranges[PLUG_MAX];
+static int plug_n;
 int64_t qosp_load_plugin(const char *name, char *err, uint64_t errcap) {
-  if (plug_loaded) {
-    snprintf(err, errcap, "plugin slot already occupied");
+  if (plug_n >= PLUG_MAX) {
+    snprintf(err, errcap, "plugin registry full");
     return -1;
   }
   char path[256];
@@ -93,23 +95,37 @@ int64_t qosp_load_plugin(const char *name, char *err, uint64_t errcap) {
     snprintf(err, errcap, "plugin elf: %s", ld.err);
     return -1;
   }
+  /* each image declares its own base via its phdrs (it was LINKED for
+   * a sub-slot of the plugin window); require no overlap with anything
+   * already loaded, then W^X its executable prefix */
+  /* fpr_elf_load bounds-checked the window; recover the image span from
+   * its results: exec starts at the lowest PT_LOAD (linker script puts
+   * text first) */
   uintptr_t pg = (uintptr_t)getpagesize();
   uintptr_t xend = ((uintptr_t)ld.exec_end + pg - 1) & ~(pg - 1);
-  if (ld.exec_end == 0 || xend <= (uintptr_t)QOS_PLUG_BASE ||
-      (uintptr_t)ld.rw_start < xend) {
+  uintptr_t imlo = xend ? (xend - 1) & ~((uintptr_t)(4 << 20) - 1) : 0;
+  uintptr_t imhi = ((uintptr_t)ld.image_end + pg - 1) & ~(pg - 1);
+  if (ld.exec_end == 0 || (uintptr_t)ld.rw_start < xend) {
     snprintf(err, errcap, "plugin not page-separated (exec_end=%p rw=%p)",
              ld.exec_end, ld.rw_start);
     return -1;
   }
-  if (mprotect((void *)QOS_PLUG_BASE, xend - QOS_PLUG_BASE,
-               PROT_READ | PROT_EXEC)) {
+  for (int i = 0; i < plug_n; i++)
+    if (imlo < plug_ranges[i].hi && imhi > plug_ranges[i].lo) {
+      snprintf(err, errcap, "plugin overlaps an already-loaded image "
+               "(link each app at its own sub-slot base)");
+      return -1;
+    }
+  if (mprotect((void *)imlo, xend - imlo, PROT_READ | PROT_EXEC)) {
     snprintf(err, errcap, "plugin mprotect: %s", strerror(errno));
     return -1;
   }
-  __builtin___clear_cache((char *)QOS_PLUG_BASE, (char *)ld.image_end);
-  plug_loaded = 1;
-  fprintf(stderr, "[qosp] plugin %s: table at %p, code r-x to %#lx\n", path,
-          ld.entry, (unsigned long)xend);
+  __builtin___clear_cache((char *)imlo, (char *)ld.image_end);
+  plug_ranges[plug_n].lo = imlo;
+  plug_ranges[plug_n].hi = imhi;
+  plug_n++;
+  fprintf(stderr, "[qosp] plugin %s: table at %p, image %#lx-%#lx\n", path,
+          ld.entry, (unsigned long)imlo, (unsigned long)imhi);
   return (int64_t)(uintptr_t)ld.entry;
 }
 

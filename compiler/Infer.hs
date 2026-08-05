@@ -448,6 +448,8 @@ builtinEnv =
       ("Mod.resolve", scheme [0] (TFn tStr (TFn tStr (sv 0)))),
       ("Mod.fn", scheme [0] (TFn tStr (TFn tStr (sv 0)))),
       ("Mod.find", scheme [0] (TFn tStr (sv 0))),
+      ("Mod.plugs", scheme [0] (TFn tInt tInt)),
+      ("Mod.findAt", scheme [0] (TFn tInt (TFn tStr (sv 0)))),
       ("Sys.attachQa", scheme [0] (TFn tStr (sv 0))),
       ("Mod.has", mono (TFn tStr tBool)),
       -- Apps registry + Sys binding seam

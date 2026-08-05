@@ -1,5 +1,3 @@
-# pnotes.fpr -- the plugin ROOT: exists only to make fprc emit a module
-# table carrying mods/pnotes' exports.  Its main never runs -- a plugin
-# image's entry point IS its module table (Makefile plugin-qa).
-PN = use "../programs/mods/pnotes".
-main = PN.pnLen Nil.
+# pnotes root: module-table carrier only
+A = use "../programs/mods/pnotes".
+main = A.appMeta 0.
