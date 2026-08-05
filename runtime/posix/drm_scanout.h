@@ -167,11 +167,12 @@ static int drm_try_card(drm_out_t *o, const char *path, int gw, int gh) {
   o->mh = mode.vdisplay;
   o->gw = gw;
   o->gh = gh;
-  o->rd = (unsigned char *)malloc((size_t)gw * gh * 4);
-  o->on = o->rd != 0;
-  if (o->on)
-    fprintf(stderr, "[gfx] scanout: %s %ux%u, frame %dx%d centered\n", path,
-            o->mw, o->mh, gw, gh);
+  /* gw==0: the AUTO path -- caller sizes the frame to the mode and
+   * allocates rd itself once it knows */
+  o->rd = gw ? (unsigned char *)malloc((size_t)gw * gh * 4) : 0;
+  o->on = gw ? (o->rd != 0) : 1;
+  fprintf(stderr, "[gfx] scanout: %s %ux%u (frame %s)\n", path, o->mw, o->mh,
+          gw ? "centered" : "fullscreen");
   return o->on;
 }
 

@@ -39,11 +39,13 @@ Row = S2.Row. Col = S2.Col. Pad = S2.Pad. Gap = S2.Gap.
 W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
 Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
-Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a).
+Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a | Dims a).
 Md = Type (Md screen focus notes input frame lastR lastKey scomp).
-Fd = Type (Fd screen frame lastR lastKey scomp notes input fb).
+Fd = Type (Fd screen frame lastR lastKey scomp ed fb pv).  # ed = (notes, input)
 Cm = Type (CQuit | CSnap | CSave s).
-Rt = Type (Rt cache fbA fbB back).   # loop roots: statics cache + the
+Rt = Type (Rt cache fbA fbB back vw pv).
+Pv = Type (Pv tfn vfn | PvNone).      # the notes plugin's resolved
+                                      # view functions, or the builtin   # loop roots: statics cache + the
                                      # two packed framebuffers + which
                                      # one is the back buffer this frame
 
@@ -69,13 +71,20 @@ sysLoop me reg0 =
     Lookup url -> send replyTo (findSvc reg0 url) >> sysServe me reg0
   | Reg reg -> send replyTo 1 >> sysServe me reg.
 
+# AUTO RESOLUTION: glInit 0 0 sizes the FBO to the connected display's
+# own mode (640x480 headless) and returns what it settled on; the shell
+# asks via Dims and lays out to vw = 240 * w / h.
 graphicsActor me =
-  _ = glInit 640 480;
-  gfxServe me.
-gfxServe me =
+  d = glInit 0 0;
+  gfxServe me d.
+gfxServe me d =
   m = receive me;
-  (replyTo, Render scene) = m;
-  send replyTo (glRender scene) >> drop m >> gfxServe me.
+  gfxMsg me d m.
+gfxMsg me d (replyTo, Render scene) =
+  r = glRender scene;
+  send replyTo r >> gfxServe me d.
+gfxMsg me d (replyTo, Dims u) =
+  send replyTo d >> gfxServe me d.
 
 displayActor me =
   m = receive me;
@@ -111,12 +120,12 @@ tileBord f i | f == i = Bord (330, 720, 999).
 tileBord f i = Bord (150, 165, 200).
 
 tile f i title si cap =
-  Box [Col, Pad 6, Gap 5, W 140, H 52, Bg (92, 104, 130), tileBord f i]
+  Box [Col, Pad 6, Gap 5, H 52, Grow, Bg (92, 104, 130), tileBord f i]
     [ Lbl [Sc 2, Fg (930, 940, 960)] title
     , Slot [Fg (999, 800, 300)] si cap ].
 
-homeTree f =
-  Box [Col, Pad 8, Gap 6, W 320, H 240, Bg (62, 70, 88)]
+homeTree vw f =
+  Box [Col, Pad 8, Gap 6, W vw, H 240, Bg (62, 70, 88)]
     [ Box [Row, Gap 6]
         [ Lbl [Sc 3, Fg (930, 940, 960)] "QOS"
         , Box [Grow] Nil
@@ -134,8 +143,8 @@ homeTree f =
 noteLine i =
   Box [Row, Pad 2] [ Slot [Fg (930, 940, 960)] i 40 ].
 
-notesTree u =
-  Box [Col, Pad 8, Gap 4, W 320, H 240, Bg (62, 70, 88)]
+notesTree vw =
+  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
     [ Box [Row, Gap 6]
         [ Lbl [Sc 2, Fg (930, 940, 960)] "NOTES"
         , Box [Grow] Nil
@@ -148,8 +157,8 @@ notesTree u =
         , Slot [Fg (930, 940, 960)] 7 36 ]
     , Lbl [Fg (560, 590, 650)] "ENTER SAVE   ESC BACK   TYPE A-Z 0-9" ].
 
-treeFor 0 f = homeTree f.
-treeFor s f = notesTree 0.
+treeFor pv vw 0 f = homeTree vw f.
+treeFor pv vw s f = case pv of Pv tfn vfn -> tfn vw | PvNone -> notesTree vw.
 
 # ---- dynamics: the per-frame text, formatted IN THE WORKER -----------------
 
@@ -182,21 +191,28 @@ pad2 n | n < 10 = "0{n}".
 pad2 n = "{n}".
 imod2 a b = a - (a / b) * b.
 
-vals (Fd 0 frame lastR lastKey scomp notes input fb) =
+vals (Fd 0 frame lastR lastKey scomp ed fb pv) =
+  (notes, input) = ed;
   (draws, dynB) = lastR;
   [ clock 0
   , "{len notes} SAVED"
   , "{draws}D {dynB}B"
   , "{harts 0} LIVE"
-  , "KV APPEND"
+  , plugTag pv
   , "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B" ].
-vals (Fd s frame lastR lastKey scomp notes input fb) =
+vals (Fd s frame lastR lastKey scomp ed fb pv) =
+  case pv of
+    Pv tfn vfn -> vfn ed          # the loaded plugin renders its screen
+  | PvNone -> builtinVals ed.
+builtinVals (notes, input) =
   six = lastSix notes;
   [ "{len notes} SAVED"
   , nthS six 0, nthS six 1, nthS six 2
   , nthS six 3, nthS six 4, nthS six 5
   , "{input}_"
   , "" ].
+plugTag (Pv t v) = "PNOTES.QA".
+plugTag PvNone = "KV APPEND".
 
 # ---- the frame worker (frame-per-actor) ------------------------------------
 
@@ -207,7 +223,7 @@ vals (Fd s frame lastR lastKey scomp notes input fb) =
 # (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
 # the frame being written is never the one the walker just consumed.
 frameWorker parent gfx st sl fd self =
-  Fd s fr lr lk sc notes inp fb = fd;
+  Fd s fr lr lk sc ed fb pv = fd;
   (fb2, n) = S2.dynsInto fb sl (vals fd);
   r = svcCall self gfx (Render (S2.scene st (fb2, n)));
   _ = send parent r;
@@ -356,16 +372,16 @@ waitTick mt t0 = waitTick mt t0.
 
 skeyOf (Md s f notes inp fr lr lk sc) = s * 10 + f.
 
-ensure cache key =
+ensure pv vw cache key =
   (k, st, sl) = cache;
   case k == key of
     True -> (cache, 0)
-  | False -> (rebuildTree key, 1).
-rebuildTree key =
-  (st2, sl2) = S2.build (treeFor (key / 10) (imod2 key 10));
+  | False -> (rebuildTree pv vw key, 1).
+rebuildTree pv vw key =
+  (st2, sl2) = S2.buildW vw (treeFor pv vw (key / 10) (imod2 key 10));
   (key, st2, sl2).
 
-fdOf fb (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc notes inp fb.
+fdOf fb pv (Md s f notes inp fr lr lk sc) = Fd s fr lr lk sc (notes, inp) fb pv.
 
 result (Md s f notes inp fr lr lk sc) =
   "pshell: {fr} frames, {sc} statics compiles, {len notes} notes".
@@ -385,15 +401,16 @@ frame me gfx dsp inp mt rt m2 t0 =
   (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (fdOf (backFb rt) m3));
+  _ = spawn (frameWorker me gfx st sl (fdOf (backFb rt) (pvOf rt) m3));
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
   loop me gfx dsp inp mt (swapRt rt cache2) m4.
 
-ensureRt (Rt cache a b bk) key = ensure cache key.
-backFb (Rt cache a b bk) = case bk == 0 of True -> a | False -> b.
-swapRt (Rt cache a b bk) cache2 = Rt cache2 a b (1 - bk).
+ensureRt (Rt cache a b bk vw pv) key = ensure pv vw cache key.
+backFb (Rt cache a b bk vw pv) = case bk == 0 of True -> a | False -> b.
+pvOf (Rt cache a b bk vw pv) = pv.
+swapRt (Rt cache a b bk vw pv) cache2 = Rt cache2 a b (1 - bk) vw pv.
 
 bumpS m 0 = m.
 bumpS (Md s f notes inp fr lr lk sc) n = Md s f notes inp fr lr lk (sc + n).
@@ -431,5 +448,36 @@ main =
   # instances each = the walker's MAX_INST
   fbA = S2.fbNew 4096;
   fbB = S2.fbNew 4096;
+  (gw, gh) = svcCall me g (Dims 0);
+  vw = clampVw (240 * gw / imax1 gh);
+  _ = print "pshell: display {gw}x{gh} -> virtual {vw}x240";
+  pv = attachNotes 0;
   m0 = Md 0 0 notes "" 0 (0, 0) 0 0;
-  loop me g d i mt (Rt cache0 fbA fbB 0) m0.
+  loop me g d i mt (Rt cache0 fbA fbB 0 vw pv) m0.
+
+# the notes plugin: a separately compiled .qa loaded into the plugin
+# slot at boot and resolved BY NAME -- absence (no file, standalone
+# posix run, load error) falls back to the builtin screen, stated once
+attachNotes u =
+  case Sys.attachQa "pnotes.qa" of
+    Err e -> attachMiss e
+  | Ok u2 -> attachResolve 0.
+attachResolve u =
+  (t1, tfn) = Mod.find "pnTree";
+  (t2, vfn) = Mod.find "pnVals";
+  attachGot (t1 * t2) tfn vfn.
+attachMiss e =
+  _ = print "pshell: builtin notes ({e})";
+  PvNone.
+attachGot ok tfn vfn | ok == 1 =
+  _ = print "pshell: notes plugin attached (pnotes.qa)";
+  Pv tfn vfn.
+attachGot ok tfn vfn =
+  _ = print "pshell: plugin lacks pnTree/pnVals; builtin notes";
+  PvNone.
+
+imax1 h | h < 1 = 1.
+imax1 h = h.
+clampVw v | v < 320 = 320.
+clampVw v | v > 720 = 720.
+clampVw v = v.

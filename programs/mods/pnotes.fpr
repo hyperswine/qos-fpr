@@ -1,0 +1,75 @@
+# ============================================================================
+# pnotes.fpr -- the NOTES screen as a LOADABLE PLUGIN module.
+#
+# Compiled into pnotes.qa (make plugin-qa): an image linked at the
+# plugin slot against the running shell's symbol addresses, carrying
+# only its own generated code + module table.  pshell attaches it at
+# boot (Sys.attachQa) and resolves pnTree / pnVals by name (Mod.find);
+# the tree and vals it builds are ordinary scene2d values -- tids are
+# hash-derived from source, so two separately compiled images agree on
+# every constructor tag.  The header row says PNOTES (the shell's
+# builtin fallback says NOTES): what you see on screen is which code
+# built it.
+#
+# The shell keeps input handling and persistence; the plugin owns the
+# VIEW.  Slot map (must match pshell's notes-screen vals order):
+#   0 count   1..6 lines (oldest..newest of the last 6)
+#   7 input   8 status
+# ============================================================================
+
+S2 = use "scene2d".
+Box = S2.Box. Lbl = S2.Lbl. Slot = S2.Slot.
+Row = S2.Row. Col = S2.Col. Pad = S2.Pad. Gap = S2.Gap.
+W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
+Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
+
+pnLine i =
+  Box [Row, Pad 2] [ Slot [Fg (930, 940, 960)] i 40 ].
+
+pnTree vw =
+  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
+    [ Box [Row, Gap 6]
+        [ Lbl [Sc 2, Fg (420, 900, 560)] "PNOTES"
+        , Lbl [Fg (560, 590, 650)] "loaded .qa"
+        , Box [Grow] Nil
+        , Slot [Fg (560, 590, 650)] 0 12 ]
+    , Box [Col, Gap 2, Grow, Bord (420, 900, 560), Pad 3]
+        [ pnLine 1, pnLine 2, pnLine 3
+        , pnLine 4, pnLine 5, pnLine 6 ]
+    , Box [Row, Pad 4, Gap 4, Bord (330, 720, 999), Bg (92, 104, 130)]
+        [ Lbl [Fg (999, 800, 300)] ">"
+        , Slot [Fg (930, 940, 960)] 7 36 ]
+    , Lbl [Fg (560, 590, 650)] "ENTER SAVE   ESC BACK   SERVED BY PNOTES.QA" ].
+
+# ---- vals: (notes, input) -> the 9 slot strings ----------------------------
+
+pnLen Nil = 0.
+pnLen (x :: r) = 1 + pnLen r.
+
+pnNth Nil i = "".
+pnNth (v :: r) 0 = v.
+pnNth (v :: r) i = pnNth r (i - 1).
+
+pnTakeN Nil n = Nil.
+pnTakeN l 0 = Nil.
+pnTakeN (x :: r) n = x :: pnTakeN r (n - 1).
+
+pnRev Nil acc = acc.
+pnRev (x :: r) acc = pnRev r (x :: acc).
+
+pnApnd Nil x = x :: Nil.
+pnApnd (a :: r) x = a :: pnApnd r x.
+
+pnPadTo l n | pnLen l >= n = l.
+pnPadTo l n = pnPadTo (pnApnd l "") n.
+
+pnLastSix notes = pnPadTo (pnRev (pnTakeN notes 6) Nil) 6.
+
+pnVals ed =
+  (notes, input) = ed;
+  six = pnLastSix notes;
+  [ "{pnLen notes} SAVED"
+  , pnNth six 0, pnNth six 1, pnNth six 2
+  , pnNth six 3, pnNth six 4, pnNth six 5
+  , "{input}_"
+  , "" ].

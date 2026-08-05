@@ -5,7 +5,7 @@
  * byte-for-byte with qosp's HAL table.  The FPRISC surface is
  * unchanged from before the split:
  *
- *   glInit w h     -> Int 1                glRender scene -> (draws, dynBytes)
+ *   glInit w h     -> (w, h)   0 0 = auto     glRender scene -> (draws, dynBytes)
  *   glSavePpm path -> Int 0/1              inputPoll u    -> 0 | (kind, a, b)
  */
 #include "fpr.h"
@@ -14,7 +14,14 @@
 static V h_glInit(V wv, V hv) {
   if (!ISINT(wv) || !ISINT(hv)) fpr_cpanic("glInit: w h must be Ints");
   gfx_init((int)UNTAG(wv), (int)UNTAG(hv));
-  return TAG(1);
+  /* returns the SETTLED size: with 0 0 that is the display's own mode
+   * (or 640x480 headless) -- the app lays out to what it actually got */
+  int w = 0, h = 0;
+  gfx_dims(&w, &h);
+  V *r = (V *)fpr_alloc(24);
+  ((hdr_t *)r)->tid = 4; ((hdr_t *)r)->var = 0;
+  r[1] = TAG(w); r[2] = TAG(h);
+  return (V)r;
 }
 
 static V h_glRender(V scene) {

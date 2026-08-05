@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 2u
+#define QOS_ABI_VERSION 3u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -33,6 +33,20 @@
 #define QOS_ARENA_SIZE (256ul << 20)
 #define QOS_SLOT_SIZE (16ul << 20) /* matches link-app.ld's SLOT LENGTH */
 #define QOS_SLOT_BASE QOS_ARENA_BASE
+/* the PLUGIN slot: a second, smaller fixed-address window inside the
+ * arena for DYNAMICALLY LOADED .qa libraries -- images linked at this
+ * base against the running shell image's symbol addresses (a
+ * PROVIDE()-script of the shell's nm output), carrying only their own
+ * generated code + module table.  Loaded via syscall tag 4, registered
+ * with the module registry, called through Mod.find PAPs.  The app
+ * runtime EXCLUDES this range from fpr_in_heap (plugin rodata is
+ * immortal literal data, not slab-backed heap). */
+#define QOS_PLUG_BASE (QOS_ARENA_BASE + (128ul << 20))
+#define QOS_PLUG_SIZE (16ul << 20)
+/* syscall channel tags (boot->syscall_fn): 2 kv-append, 3 kv-replay,
+ * 4 load-plugin (payload = filename; returns the module-table address
+ * as the int64, or <0 with an error string in out) */
+#define QOS_SYS_LOADQA 4
 
 /* ---- the HAL table --------------------------------------------------
  * The entries mirror the obligations runtime/posix's co-compiled HAL
@@ -92,6 +106,12 @@ typedef struct {
    * the thread; it joins them all after the entry returns (every hart
    * loop exits through fpr_process_done, so the joins are prompt). */
   int (*start_hart)(uint64_t idx, void (*fn)(uint64_t idx));
+
+  /* ---- v3 additions (appended: earlier offsets unchanged) -----------
+   * gfx_dims: the FBO size gfx_init settled on -- the AUTO-RESOLUTION
+   * answer when the app passed 0 0 and the host sized the frame to the
+   * connected display's own mode.  NULL on GFX-less hosts. */
+  void (*gfx_dims)(int *w, int *h);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

@@ -6,6 +6,9 @@
  * extern that hal.c (or any other module) satisfies at link time.
  */
 #include "fpr.h"
+#ifdef FPR_QOSAPP
+#include "qos_abi.h"
+#endif
 
 const hdr_t fpr_true = {T_BOOL, 1};
 const hdr_t fpr_false = {T_BOOL, 0};
@@ -100,6 +103,14 @@ void fpr_rt_init(void) {
 }
 
 int fpr_in_heap(V v) { /* the buddy span: heap + process regions */
+#ifdef FPR_QOSAPP
+  /* the PLUGIN slot sits inside the arena span but holds IMAGE data
+   * (a loaded library's code + rodata literals) -- immortal, never
+   * slab-backed; ARC must treat its values like the shell's own
+   * static literals (qos_abi.h) */
+  if ((uw)v >= QOS_PLUG_BASE && (uw)v < QOS_PLUG_BASE + QOS_PLUG_SIZE)
+    return 0;
+#endif
   return !ISINT(v) && (char *)v >= _heap_start && (char *)v < _proc_arena_end;
 }
 

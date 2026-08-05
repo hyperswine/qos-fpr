@@ -74,7 +74,11 @@ static fpr_elf_load_t load_segments(const unsigned char *bytes, uw len, seg_t *s
     uw end = segs[i].vaddr + segs[i].memsz;
     if (end > max_end) max_end = end;
     if ((segs[i].flags & PF_X) && end > exec_end) exec_end = end;
-    if ((segs[i].flags & PF_W) && segs[i].vaddr < rw_start) rw_start = segs[i].vaddr;
+    /* memsz==0: a degenerate empty segment (a data-less image emits
+     * one) -- no writable byte exists, so it must not constrain the
+     * W^X split */
+    if ((segs[i].flags & PF_W) && segs[i].memsz && segs[i].vaddr < rw_start)
+      rw_start = segs[i].vaddr;
   }
   if (max_end == 0) return fail("no PT_LOAD segments found");
   if (entry < sb || entry >= se) return fail("entry point falls outside the target slot");

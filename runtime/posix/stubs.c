@@ -105,3 +105,84 @@ static V h_store_req(V tagv, V payv) {
   return fpr_mkresult(1, "storage error");
 }
 FPR_FN(fpr_g_Sys_x2estoreReq, h_store_req, 2);
+
+
+/* Sys.attachQa on the co-compiled posix image: same contract as under
+ * qosp, host = ourselves.  Reads qos-apps/<name> (or ./<name>), parses
+ * the QAR1 container minimally (magic + manifest_len header), maps the
+ * plugin slot (qos_abi.h addresses; unmapped in a posix process, so a
+ * MAP_FIXED_NOREPLACE anonymous mapping first), elf-loads, applies the
+ * W^X split, and registers the module table. */
+#include <sys/mman.h>
+#define QOS_PLUG_BASE_P 0x408000000ul
+#define QOS_PLUG_SIZE_P (16ul << 20)
+int fpr_mod_attach(const uw *tab);
+static V h_attach_qa(V namev) {
+  if (ISINT(namev) || ((hdr_t *)namev)->tid != T_STR)
+    fpr_cpanic("Sys.attachQa: name must be a String");
+  /* v1 scope: plugins are linked against the QOSP shell image's
+   * addresses (build/qosapp.elf).  A co-compiled posix binary has its
+   * own layout, so loading that image here would call into the wrong
+   * addresses -- refuse honestly; the caller falls back.  (posix
+   * plugin support = the same recipe against posix.bin's nm, later.) */
+  if (1) return fpr_mkresult(1, "plugin loading is qosp-only (v1)");
+  static int loaded;
+  if (loaded) return fpr_mkresult(1, "plugin slot already occupied");
+  str_t *s = (str_t *)namev;
+  char path[256];
+  snprintf(path, sizeof path, "qos-apps/%.*s", (int)s->len, (const char *)s->bytes);
+  FILE *f = fopen(path, "rb");
+  if (!f) {
+    snprintf(path, sizeof path, "%.*s", (int)s->len, (const char *)s->bytes);
+    f = fopen(path, "rb");
+  }
+  if (!f) return fpr_mkresult(1, "no such plugin");
+  static unsigned char qab[8 << 20];
+  size_t qn = fread(qab, 1, sizeof qab, f);
+  fclose(f);
+  if (qn < 6 || memcmp(qab, "QAR1\n", 5) != 0)
+    return fpr_mkresult(1, "not a QAR1 container");
+  /* QAR1 is TEXT-framed (qa.c): "QAR1\n", then "NAME off len\n" lines,
+   * a blank line, then the payload bytes the offsets index into */
+  const char *q = (const char *)qab + 5, *qend = (const char *)qab + qn;
+  const unsigned char *elf = 0;
+  uw elflen = 0;
+  unsigned long eoff = 0, elen = 0;
+  int have = 0;
+  while (q < qend && *q != '\n') {
+    char nm[32];
+    unsigned long o, l;
+    if (sscanf(q, "%31s %lu %lu", nm, &o, &l) != 3)
+      return fpr_mkresult(1, "malformed QAR1 table");
+    if (!strcmp(nm, "ELF")) { eoff = o; elen = l; have = 1; }
+    while (q < qend && *q != '\n') q++;
+    q++;
+  }
+  if (q >= qend || !have) return fpr_mkresult(1, "no ELF section");
+  q++; /* the blank line */
+  uw pay0 = (uw)(q - (const char *)qab);
+  if (pay0 + eoff + elen > qn) return fpr_mkresult(1, "truncated container");
+  elf = qab + pay0 + eoff;
+  elflen = elen;
+  if (mmap((void *)QOS_PLUG_BASE_P, QOS_PLUG_SIZE_P, PROT_READ | PROT_WRITE,
+           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1,
+           0) == MAP_FAILED)
+    return fpr_mkresult(1, "plugin slot mmap failed");
+  fpr_elf_load_t ld =
+      fpr_elf_load(elf, elflen, (void *)QOS_PLUG_BASE_P, QOS_PLUG_SIZE_P);
+  if (!ld.ok) return fpr_mkresult(1, ld.err);
+  uintptr_t pg = 4096;
+  uintptr_t xend = ((uintptr_t)ld.exec_end + pg - 1) & ~(pg - 1);
+  if (ld.exec_end == 0 || (uintptr_t)ld.rw_start < xend)
+    return fpr_mkresult(1, "plugin not page-separated");
+  if (mprotect((void *)QOS_PLUG_BASE_P, xend - QOS_PLUG_BASE_P,
+               PROT_READ | PROT_EXEC))
+    return fpr_mkresult(1, "plugin mprotect failed");
+  __builtin___clear_cache((char *)QOS_PLUG_BASE_P, (char *)ld.image_end);
+  if (fpr_mod_attach((const uw *)ld.entry))
+    return fpr_mkresult(1, "module registry full");
+  fprintf(stderr, "[plug] %s: table at %p\n", path, ld.entry);
+  loaded = 1;
+  return fpr_mkresult(0, "");
+}
+FPR_FN(fpr_g_Sys_x2eattachQa, h_attach_qa, 1);

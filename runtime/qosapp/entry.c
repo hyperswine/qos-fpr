@@ -41,6 +41,27 @@ FPR_FN(fpr_g_Sys_x2ecaps, h_sys_caps, 1);
  * byte-compatible with the virt process model's channel */
 static int64_t (*g_syscall)(uint64_t, const char *, uint64_t, char *, uint64_t);
 static char g_sysout[256 * 1024];
+
+/* Sys.attachQa "name.qa" -> Ok "" | Err reason: ask the host to load a
+ * plugin .qa into the plugin slot (syscall tag 4), then register its
+ * module table (mod.c) so Mod.find resolves its exports.  The whole
+ * dance app-side so callers get one Result. */
+int fpr_mod_attach(const uw *tab);
+static V h_sys_attach_qa(V namev) {
+  if (ISINT(namev) || ((hdr_t *)namev)->tid != T_STR)
+    fpr_cpanic("Sys.attachQa: name must be a String");
+  if (!g_syscall) return fpr_mkresult(1, "no syscall channel (standalone run)");
+  str_t *s = (str_t *)namev;
+  g_sysout[0] = 0;
+  int64_t r = g_syscall(4, (const char *)s->bytes, s->len, g_sysout,
+                        sizeof g_sysout);
+  if (r <= 0) return fpr_mkresult(1, g_sysout[0] ? g_sysout : "plugin load failed");
+  if (fpr_mod_attach((const uw *)(uintptr_t)r))
+    return fpr_mkresult(1, "module registry full");
+  return fpr_mkresult(0, "");
+}
+FPR_FN(fpr_g_Sys_x2eattachQa, h_sys_attach_qa, 1);
+
 static V h_sys_store_req(V tagv, V payv) {
   if (!ISINT(tagv)) fpr_cpanic("Sys.storeReq: tag must be an Int");
   if (ISINT(payv) || ((hdr_t *)payv)->tid != T_STR)

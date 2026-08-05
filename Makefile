@@ -150,7 +150,7 @@ QOSP_PIE ?= -no-pie
 endif
 
 RT_POSIX_CORE = $(RT_CORE_DIR)/runtime.c $(RT_CORE_DIR)/actors.c $(RT_CORE_DIR)/bits.c $(RT_CORE_DIR)/vec.c $(RT_CORE_DIR)/mod.c \
-                $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c
+                $(RT_CORE_DIR)/sstr.c $(RT_CORE_DIR)/buddy.c $(RT_CORE_DIR)/elfload.c
 
 build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
@@ -278,6 +278,39 @@ portable-qa: build/qosapp.elf tools/mkqa.py
 
 portable-run: qosp portable-qa
 	./qosp --yes app.qa
+
+# ---- plugin .qa: a runtime-loadable LIBRARY image ---------------------------
+# Linked at the PLUGIN slot against the SHELL image's symbol addresses:
+# build/plug-syms.ld is a PROVIDE() script from `nm build/qosapp.elf`,
+# so the plugin's own definitions (its units, its code) win and every
+# runtime/builtin external resolves into the running shell.  Its module
+# table is renamed fpr_plugtab (the shell owns fpr_modtab) and becomes
+# the ELF entry point -- that is what Sys.attachQa registers.  Rebuild
+# the plugin whenever the shell image changes: the addresses moved.
+#   make plugin-qa PLUG=apps/pnotes.fpr PLUGOUT=qos-apps/pnotes.qa
+PLUG ?= apps/pnotes.fpr
+PLUGOUT ?= qos-apps/pnotes.qa
+# NOTE: deliberately NOT a dependency on build/qosapp.elf -- that rule
+# would REBUILD the shell image from the default PROG and silently
+# desynchronize the addresses this plugin links against.  The shell you
+# are targeting must already be built (make portable-qa PROG=...).
+plugin-qa: fprc tools/mkqa.py
+	@test -f build/qosapp.elf || { echo "plugin-qa: build the shell first (make portable-qa PROG=...)"; exit 1; }
+	@mkdir -p build qos-apps
+	LC_ALL=C.UTF-8 ./fprc --target=$(QOSFPRTGT) --prelude=programs/prelude.fpr $(PLUG) build/plug-prog.s
+	sed -i 's/fpr_modtab/fpr_plugtab/g' build/plug-prog.s
+	nm -g --defined-only build/qosapp.elf | awk '$$2 != "U" { printf "PROVIDE(%s = 0x%s);\n", $$3, $$1 }' > build/plug-syms.ld
+	$(QOSCC) $(QOSLDFLAGS) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
+	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic \
+	  $(QOSATOMICS) \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \
+	  -I$(RT_CORE_DIR) -I$(QOSAPP_DIR) \
+	  -T $(QOSLD) -Wl,--defsym=QOS_SLOT_BASE=0x408000000 \
+	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
+	  -Wl,--defsym=_proc_arena_end=$(PROC_ARENA_END) \
+	  -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-e,fpr_plugtab \
+	  build/plug-prog.s $$(cat build/plug-prog.s.units) build/plug-syms.ld -o build/plug.elf
+	ID=$$(basename $(PLUG) .fpr); 	printf 'name = "%s"\nid = "%s"\nentry = "n/a"\nversion = "1"\nloadMode = "plugin"\n' $$ID $$ID > build/plug-gen.toml; 	python3 tools/mkqa.py build/plug-gen.toml build/plug.elf -o $(PLUGOUT)
 
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs compiler/A64.hs compiler/X64.hs compiler/Infer.hs compiler/Struct.hs compiler/Precond.hs
 	cd compiler && cabal build -v0

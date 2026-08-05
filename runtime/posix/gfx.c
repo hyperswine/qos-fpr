@@ -258,6 +258,30 @@ static EGLDisplay egl_display(const char **how) {
 
 void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (G.inited) return;
+  /* AUTO RESOLUTION: w or h of 0 means "the display's own mode" --
+   * probe the scanout FIRST so the FBO is created at exactly the
+   * monitor's resolution (1:1 blit, whole screen, no scaling).  With
+   * no display (or FPR_DRM=0) the classic 640x480 stands, so headless
+   * runs and replay checks are unchanged. */
+  if (w <= 0 || h <= 0) {
+    drm_scanout_init(&G.drm, 0, 0);
+    if (G.drm.on) {
+      w = (int)G.drm.mw;
+      h = (int)G.drm.mh;
+      G.drm.gw = w;
+      G.drm.gh = h;
+      G.drm.rd = (unsigned char *)malloc((size_t)w * h * 4);
+      if (!G.drm.rd) G.drm.on = 0;
+    } else {
+      /* headless: FPR_GFX_SIZE=WxH forces a size (development aid for
+       * exercising the wide-layout path without a display) */
+      const char *e = getenv("FPR_GFX_SIZE");
+      w = 640;
+      h = 480;
+      if (e && sscanf(e, "%dx%d", &w, &h) != 2) { w = 640; h = 480; }
+      if (w < 64 || h < 64 || w > 8192 || h > 8192) { w = 640; h = 480; }
+    }
+  }
   const char *how = "?";
   G.dpy = egl_display(&how);
   if (G.dpy == EGL_NO_DISPLAY) fpr_cpanic("gfx: no EGL display (is Mesa installed?)");
@@ -306,9 +330,13 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
     fpr_cpanic("gfx: offscreen framebuffer incomplete");
   G.inited = 1;
-  /* the monitor link: auto-probe /dev/dri (FPR_DRM=0 disables); a miss
-   * means offscreen exactly as before */
-  drm_scanout_init(&G.drm, w, h);
+  /* the monitor link (explicit-size path; the auto path probed above) */
+  if (!G.drm.on && !G.drm.fd) drm_scanout_init(&G.drm, w, h);
+}
+
+void gfx_dims(int *w, int *h) { /* raw export: gfx_raw.h */
+  *w = G.inited ? G.w : 0;
+  *h = G.inited ? G.h : 0;
 }
 
 /* content-addressed upload: a MeshId is uploaded once, ever */

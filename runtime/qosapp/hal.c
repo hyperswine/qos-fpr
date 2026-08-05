@@ -143,11 +143,19 @@ static void need_gfx(void) {
   if (!qos_hal->gfx_init)
     fpr_cpanic("gfx: capability not granted by this host (build qosp with GFX=1)");
 }
+static V h_glInit_ret(void) {
+  int w = 0, h = 0;
+  if (qos_hal->gfx_dims) qos_hal->gfx_dims(&w, &h);
+  V *r = (V *)fpr_alloc(24);
+  ((hdr_t *)r)->tid = 4; ((hdr_t *)r)->var = 0;
+  r[1] = TAG(w); r[2] = TAG(h);
+  return (V)r;
+}
 static V h_glInit(V wv, V hv) {
   need_gfx();
   if (!ISINT(wv) || !ISINT(hv)) fpr_cpanic("glInit: w h must be Ints");
   qos_hal->gfx_init((int)UNTAG(wv), (int)UNTAG(hv));
-  return TAG(1);
+  return h_glInit_ret();
 }
 static V h_glRender(V scene) {
   need_gfx();

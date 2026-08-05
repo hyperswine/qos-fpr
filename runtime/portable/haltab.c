@@ -68,6 +68,7 @@ static qos_hal_t the_table = {
     .net_close = qos_netraw_close,
 #ifdef QOSP_GFX
     .gfx_init = gfx_init,
+    .gfx_dims = gfx_dims,
     .gfx_render = gfx_render_scene,
     .gfx_save_ppm = gfx_save_ppm,
     .gfx_input_poll = gfx_input_poll,

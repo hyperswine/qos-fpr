@@ -47,7 +47,7 @@ Sn = Type (Box attrs kids | Lbl attrs text | Slot attrs idx cap).
 # entity + scene shapes (the walker's positional contract; gfxdemo.fpr)
 Gfx = Type (Scene statics dynamics lights camera
           | Ent mesh pos yaw scale color
-          | Sl idx x y sc fg cap).
+          | Sl idx x y sc fg cap vw).
 
 # ---- attribute readers -----------------------------------------------------
 
@@ -135,11 +135,17 @@ imax a b = b.
 # Ctx threads (ents, slots) exactly like genview's Ctx threads
 # (statics, dyns).
 
-C2 = Type (C2 ents slots).
+C2 = Type (C2 ents slots vw).
 
-build root =
-  fin (node (C2 Nil Nil) root 0 0 0).
-fin (C2 es sl) = (rev Nil es, rev Nil sl).
+# AUTO RESOLUTION: the virtual space is vw x 240 -- vh is FIXED at 240
+# (the camera fov maps 240 world px onto the FBO height exactly), and
+# vw follows the display's aspect: the app computes vw = 240*w/h from
+# what glInit settled on and lays out to it.  `build` keeps the classic
+# 320 for existing callers; buildW takes the real width.
+build root = buildW 320 root.
+buildW vw root =
+  fin (node (C2 Nil Nil vw) root 0 0 0).
+fin (C2 es sl vw) = (rev Nil es, rev Nil sl).
 
 rev acc Nil = acc.
 rev acc (x :: r) = rev (x :: acc) r.
@@ -153,15 +159,16 @@ node c n x y d =
 
 body c (Lbl a t) x y w h d =
   emitText c t x y (scOf a) (fgCol a) (d + 2).
-body c (Slot a i cap) x y w h d = addSlot c (Sl i x y (scOf a) (fgCol a) cap).
+body c (Slot a i cap) x y w h d = addSlot c (Sl i x y (scOf a) (fgCol a) cap (vwOf c)).
 body c (Box a kids) x y w h d =
   p = padOf a;
   slack = grownSlack (isRow a) a kids w h p;
-  kidsGo c (isRow a) kids (x + p) (y + p) (gapOf a) slack (d + 1).
+  cross = case isRow a of True -> h - 2 * p | False -> w - 2 * p;
+  kidsGo c (isRow a) kids (x + p) (y + p) (gapOf a, slack, cross) (d + 1).
 
 fgCol a = (has, col) = fgOf a; case has of True -> col | False -> (900, 910, 930).
 
-addSlot (C2 es sl) s = C2 es (s :: sl).
+addSlot (C2 es sl vw) s = C2 es (s :: sl) vw.
 
 # leftover space along the axis, split among Grow children
 grownSlack row a kids w h p =
@@ -184,16 +191,26 @@ idiv a b | b == 0 = 0.
 idiv a b | a < 0 = 0.
 idiv a b = a / b.
 
-kidsGo c row Nil x y g slack d = c.
-kidsGo c row (k :: r) x y g slack d =
+# each child gets: Grow slack along the axis, and a CROSS-AXIS STRETCH
+# to the container's inner size unless it fixed that dimension itself
+# (the flexbox default; a row inside a column fills the column's width)
+kidsGo c row Nil x y p3 d = c.
+kidsGo c row (k :: r) x y p3 d =
+  (g, slack, cross) = p3;
   (kw, kh) = measure k;
   extra = case grows (attrsOf k) of True -> slack | False -> 0;
   c1 = case row of
-    True -> node c (widen k extra 0) x y d
-  | False -> node c (widen k 0 extra) x y d;
+    True -> node c (widen k extra (stretchD (hOf (attrsOf k)) kh cross)) x y d
+  | False -> node c (widen k (stretchD (wOf (attrsOf k)) kw cross) extra) x y d;
   case row of
-    True -> kidsGo c1 row r (x + kw + extra + g) y g slack d
-  | False -> kidsGo c1 row r x (y + kh + extra + g) g slack d.
+    True -> kidsGo c1 row r (x + kw + extra + g) y p3 d
+  | False -> kidsGo c1 row r x (y + kh + extra + g) p3 d.
+
+# stretch delta: only when the child did not fix the dimension, and
+# only outward (never shrink a child below its natural size)
+stretchD fixed nat cross | fixed >= 0 = 0.
+stretchD fixed nat cross | cross > nat = cross - nat.
+stretchD fixed nat cross = 0.
 
 # hand a grown child its final size by overriding W/H
 widen k 0 0 = k.
@@ -210,8 +227,8 @@ widen k dx dy =
 
 pxm = 25.
 
-exent x y w h d col =
-  wx = idiv2 ((2 * x + w - 320) * pxm);
+exent vw x y w h d col =
+  wx = idiv2 ((2 * x + w - vw) * pxm);
   wy = idiv2 ((240 - 2 * y - h) * pxm);
   Ent "cube" (wx, wy, d * 5) 0 (w * pxm, h * pxm, 2) col.
 
@@ -222,19 +239,20 @@ idiv2 n = n / 2.
 boxBg c a x y w h d =
   (has, col) = bgOf a;
   case has of
-    True -> addEnt c (exent x y w h d col)
+    True -> addEnt c (exent (vwOf c) x y w h d col)
   | False -> c.
 
-addEnt (C2 es sl) e = C2 (e :: es) sl.
+addEnt (C2 es sl vw) e = C2 (e :: es) sl vw.
+vwOf (C2 es sl vw) = vw.
 
 boxBord c a x y w h d =
   (has, col) = bordOf a;
   case has of
     True ->
-      addEnt (addEnt (addEnt (addEnt c (exent x y w 1 (d + 1) col))
-                             (exent x (y + h - 1) w 1 (d + 1) col))
-                     (exent x y 1 h (d + 1) col))
-             (exent (x + w - 1) y 1 h (d + 1) col)
+      addEnt (addEnt (addEnt (addEnt c (exent (vwOf c) x y w 1 (d + 1) col))
+                             (exent (vwOf c) x (y + h - 1) w 1 (d + 1) col))
+                     (exent (vwOf c) x y 1 h (d + 1) col))
+             (exent (vwOf c) (x + w - 1) y 1 h (d + 1) col)
   | False -> c.
 
 # ---- the 3x5 font ----------------------------------------------------------
@@ -253,18 +271,19 @@ glCell c bits b x y sc col d | b == 15 = c.
 glCell c 0 b x y sc col d = c.
 glCell c bits b x y sc col d =
   c1 = case band bits 1 == 1 of
-    True -> addEnt c (exent (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
+    True -> addEnt c (exent (vwOf c) (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
   | False -> c;
   glCell c1 (bits / 2) (b + 1) x y sc col d.
 
 imod a b = a - (a / b) * b.
 
 # dynamics: current text for every slot, clipped to its reservation
-dyns slots vals = dynGo (C2 Nil Nil) slots vals.
-dynGo (C2 es sl) Nil vals = rev Nil es.
-dynGo c (Sl i x y sc col cap :: r) vals =
+dyns slots vals = dynGo (C2 Nil Nil 0) slots vals.   # vw comes from each Sl
+dynGo (C2 es sl vw) Nil vals = rev Nil es.
+dynGo c (Sl i x y sc col cap vw :: r) vals =
   s = clip (nth vals i) cap;
-  dynGo (emitText c s x y sc col 9) r vals.
+  dynGo (emitText (setVw c vw) s x y sc col 9) r vals.
+setVw (C2 es sl old) vw = C2 es sl vw.
 
 nth Nil i = "".
 nth (v :: r) 0 = v.
@@ -336,7 +355,7 @@ font 90 = 29351.                # Z
 font c = 21845.                       # unknown: checker
 
 # debug helpers (harmless exports)
-entCount (C2 es sl) = dbgLen es.
+entCount (C2 es sl vw) = dbgLen es.
 dbgLen Nil = 0.
 dbgLen (x :: r) = 1 + dbgLen r.
 
@@ -362,34 +381,36 @@ fbNew cap = cvec2 (cap * 10) 0.
 
 dynsInto fb slots vals = diGo fb slots vals 0.
 diGo fb Nil vals n = (fb, n).
-diGo fb (Sl i x y sc col cap :: r) vals n =
+diGo fb (Sl i x y sc col cap vw :: r) vals n =
   s = clip (nth vals i) cap;
-  (fb2, n2) = textInto fb s x y (sc, col, 9) n;
+  (fb2, n2) = textInto fb s (x, y) vw (sc, col, 9) n;
   diGo fb2 r vals n2.
 
-textInto fb t x y st n = tiGo fb t 1 (strlen t) x y st n.
-tiGo fb t i m x y st n | i > m = (fb, n).
-tiGo fb t i m x y st n =
+textInto fb t pos vw st n = tiGo fb t 1 (strlen t) pos vw st n.
+tiGo fb t i m pos vw st n | i > m = (fb, n).
+tiGo fb t i m pos vw st n =
   (sc, col, d) = st;
-  (fb2, n2) = glyphInto fb (font (charAt t i)) x y st n;
-  tiGo fb2 t (i + 1) m (x + 4 * sc) y st n2.
+  (x, y) = pos;
+  (fb2, n2) = glyphInto fb (font (charAt t i)) pos vw st n;
+  tiGo fb2 t (i + 1) m (x + 4 * sc, y) vw st n2.
 
-glyphInto fb 0 x y st n = (fb, n).
-glyphInto fb bits x y st n = giCell fb bits 0 x y st n.
-giCell fb bits b x y st n | b == 15 = (fb, n).
-giCell fb 0 b x y st n = (fb, n).
-giCell fb bits b x y st n =
+glyphInto fb 0 pos vw st n = (fb, n).
+glyphInto fb bits pos vw st n = giCell fb bits 0 pos vw st n.
+giCell fb bits b pos vw st n | b == 15 = (fb, n).
+giCell fb 0 b pos vw st n = (fb, n).
+giCell fb bits b pos vw st n =
   (sc, col, d) = st;
+  (x, y) = pos;
   (fb2, n2) = case band bits 1 == 1 of
-    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d n, n + 1)
+    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d vw n, n + 1)
   | False -> (fb, n);
-  giCell fb2 (bits / 2) (b + 1) x y st n2.
+  giCell fb2 (bits / 2) (b + 1) pos vw st n2.
 
 # one cube instance at virtual-pixel rect (x, y, sc, sc), depth d
-cellInto fb x y sc col d n =
+cellInto fb x y sc col d vw n =
   (r, g, bl) = col;
   base = n * 10;
-  f1 = Vec.set (base + 1) (idiv2 ((2 * x + sc - 320) * pxm)) fb;
+  f1 = Vec.set (base + 1) (idiv2 ((2 * x + sc - vw) * pxm)) fb;
   f2 = Vec.set (base + 2) (idiv2 ((240 - 2 * y - sc) * pxm)) f1;
   f3 = Vec.set (base + 3) (d * 5) f2;
   f4 = Vec.set (base + 4) 0 f3;

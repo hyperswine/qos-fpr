@@ -447,6 +447,8 @@ builtinEnv =
       -- Mod runtime resolution (remote calling)
       ("Mod.resolve", scheme [0] (TFn tStr (TFn tStr (sv 0)))),
       ("Mod.fn", scheme [0] (TFn tStr (TFn tStr (sv 0)))),
+      ("Mod.find", scheme [0] (TFn tStr (sv 0))),
+      ("Sys.attachQa", scheme [0] (TFn tStr (sv 0))),
       ("Mod.has", mono (TFn tStr tBool)),
       -- Apps registry + Sys binding seam
       ("Apps.list", scheme [0] (TFn tUnit (sv 0))),

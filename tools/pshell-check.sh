@@ -75,4 +75,17 @@ out=$(FPR_HARTS=4 FPR_EVDEV=/tmp/pshell-quit.evd timeout 90 ./qosp --yes app.qa 
 echo "$out" | tr -d '\r' | grep -q "2 notes replayed" || fail "qosp relaunch replay"
 echo "  qosp kv trampoline + relaunch replay (4 harts): PASS"
 
+echo "== plugin: pnotes.qa under qosp =="
+make -s plugin-qa >/dev/null || fail "plugin build"
+rm -rf qos-store
+out=$(FPR_HARTS=4 FPR_EVDEV=$EVD timeout 180 ./qosp --yes app.qa </dev/null 2>&1 | tr -d '\r')
+echo "$out" | grep -q "notes plugin attached" || fail "plugin did not attach"
+echo "$out" | grep -q "7 frames" || fail "plugin session frames"
+echo "$out" | grep -q "2 notes" || fail "plugin session notes"
+grep -q "abc 123" qos-store/pshell.kv || fail "plugin kv"
+echo "  qosp: attach + full session through the plugin screen: PASS"
+out=$(FPR_STORE=/tmp/pshell-check.kv FPR_EVDEV=/tmp/pshell-quit.evd timeout 60 ./posix.bin </dev/null 2>&1 | tr -d '\r')
+echo "$out" | grep -q "builtin notes" || fail "posix should fall back to builtin"
+echo "  posix: honest qosp-only refusal + builtin fallback: PASS"
+
 echo "pshell-check: ALL PASS"

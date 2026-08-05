@@ -29,8 +29,20 @@ void qosp_store_bind(const char *app_id) {
 static pthread_mutex_t store_mu = PTHREAD_MUTEX_INITIALIZER;
 static int64_t store_call_locked(uint64_t tag, const char *pay,
                                  uint64_t plen, char *out, uint64_t outcap);
+int64_t qosp_load_plugin(const char *name, char *err, uint64_t errcap);
+
 int64_t qosp_store_call(uint64_t tag, const char *pay, uint64_t plen,
                         char *out, uint64_t outcap) {
+  if (tag == 4) { /* load-plugin (qos_abi.h QOS_SYS_LOADQA) */
+    char name[128];
+    uint64_t n = plen < sizeof name - 1 ? plen : sizeof name - 1;
+    memcpy(name, pay, n);
+    name[n] = 0;
+    pthread_mutex_lock(&store_mu);
+    int64_t r = qosp_load_plugin(name, out, outcap);
+    pthread_mutex_unlock(&store_mu);
+    return r;
+  }
   /* v2: any hart thread may persist; the kv file wants one writer */
   pthread_mutex_lock(&store_mu);
   int64_t r = store_call_locked(tag, pay, plen, out, outcap);

@@ -64,6 +64,55 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
 /* the growth callback wired into the boot record: buddy grants from
  * the arena past the slot -- the Memory.qa analogue, one caller so no
  * linearization needed (the design's single-core bootstrap rule) */
+/* ---- runtime plugin loader (syscall tag 4, qos_abi.h) ---------------
+ * Load a plugin .qa into the reserved plugin slot: parse the same QAR1
+ * container, place its segments (they must all lie inside the slot --
+ * the image was linked for QOS_PLUG_BASE), enforce the identical W^X
+ * discipline as the shell image, and hand back the module-table
+ * address (the plugin's e_entry -- it is linked with -e fpr_plugtab).
+ * One plugin slot, first-load-wins re-load refused (v1: no unload). */
+static int plug_loaded;
+int64_t qosp_load_plugin(const char *name, char *err, uint64_t errcap) {
+  if (plug_loaded) {
+    snprintf(err, errcap, "plugin slot already occupied");
+    return -1;
+  }
+  char path[256];
+  qa_t qa;
+  snprintf(path, sizeof path, "qos-apps/%s", name);
+  if (qa_load(path, &qa)) {
+    snprintf(path, sizeof path, "%s", name);
+    if (qa_load(path, &qa)) {
+      snprintf(err, errcap, "no such plugin: qos-apps/%s (or ./%s)", name, name);
+      return -1;
+    }
+  }
+  fpr_elf_load_t ld =
+      fpr_elf_load(qa.elf, qa.elf_len, (void *)QOS_PLUG_BASE, QOS_PLUG_SIZE);
+  if (!ld.ok) {
+    snprintf(err, errcap, "plugin elf: %s", ld.err);
+    return -1;
+  }
+  uintptr_t pg = (uintptr_t)getpagesize();
+  uintptr_t xend = ((uintptr_t)ld.exec_end + pg - 1) & ~(pg - 1);
+  if (ld.exec_end == 0 || xend <= (uintptr_t)QOS_PLUG_BASE ||
+      (uintptr_t)ld.rw_start < xend) {
+    snprintf(err, errcap, "plugin not page-separated (exec_end=%p rw=%p)",
+             ld.exec_end, ld.rw_start);
+    return -1;
+  }
+  if (mprotect((void *)QOS_PLUG_BASE, xend - QOS_PLUG_BASE,
+               PROT_READ | PROT_EXEC)) {
+    snprintf(err, errcap, "plugin mprotect: %s", strerror(errno));
+    return -1;
+  }
+  __builtin___clear_cache((char *)QOS_PLUG_BASE, (char *)ld.image_end);
+  plug_loaded = 1;
+  fprintf(stderr, "[qosp] plugin %s: table at %p, code r-x to %#lx\n", path,
+          ld.entry, (unsigned long)xend);
+  return (int64_t)(uintptr_t)ld.entry;
+}
+
 static pthread_mutex_t grow_mu = PTHREAD_MUTEX_INITIALIZER;
 static qos_grant_t grow_cb(uint64_t want) {
   /* v2: every app hart thread grows through here -- buddy is the
@@ -223,6 +272,12 @@ int main(int argc, char **argv) {
   buddy_init(arena, QOS_ARENA_SIZE);
   if (!buddy_reserve_range(arena, QOS_SLOT_SIZE)) {
     fprintf(stderr, "qosp: slot reservation failed (arena misconfigured)\n");
+    return 1;
+  }
+  /* the PLUGIN slot: reserved unconditionally so heap grants can never
+   * land where a runtime-loaded library will (qos_abi.h) */
+  if (!buddy_reserve_range((void *)QOS_PLUG_BASE, QOS_PLUG_SIZE)) {
+    fprintf(stderr, "qosp: plugin slot reservation failed\n");
     return 1;
   }
 
