@@ -90,6 +90,34 @@ echo "$out" | grep -q "PANIC" && fail "relaunch: panicked"
 grep -q "/home/notes.txt" qos-store/pshell.kv || fail "relaunch: kv lost"
 echo "  qosp relaunch: PASS"
 
+echo "== integer UI scale (the Pi's 1024x600 panel) =="
+# 600/240 = 2.5 was the old mapping: a one-virtual-pixel stem landed on
+# 2 real pixels here and 3 there.  Assert the scale is integral AND
+# that every lit run really is a multiple of it.
+rm -rf qos-store pshell*.ppm
+out=$(FPR_GFX_SIZE=1024x600 FPR_HARTS=4 FPR_EVDEV=$EVD timeout 180 ./qosp --yes app.qa </dev/null 2>&1 | tr -d '\r')
+echo "$out" | grep -q "virtual 512x300 at 2x" || fail "scale: expected 512x300 at 2x, got: $(echo "$out" | grep virtual)"
+python3 - <<'PYEOF' || exit 1
+from PIL import Image
+import glob
+f = sorted(glob.glob('pshell*.ppm'), key=lambda n: int(n[6:-4]))[-1]
+im = Image.open(f).convert('RGB')
+w, h = im.size
+odd = 0
+for y in range(50, 260):
+    x = 0
+    while x < w:
+        if sum(im.getpixel((x, y))) > 300:
+            n = 0
+            while x < w and sum(im.getpixel((x, y))) > 300:
+                n += 1; x += 1
+            if n % 2: odd += 1
+        else:
+            x += 1
+assert odd == 0, f"{f}: {odd} lit runs are not a multiple of the 2x cell"
+print(f"  {f}: every glyph cell exactly 2x2 real px: PASS")
+PYEOF
+
 echo "== reclamation soak (25s idle, 4 harts) =="
 rm -rf qos-store
 rm -f /tmp/pshell-soak.fifo && mkfifo /tmp/pshell-soak.fifo

@@ -49,7 +49,7 @@ Md = Type (Md screen focus sts frame lastR lastKey scomp).
 Fd = Type (Fd screen frame lastR lastKey scomp av fb env).
 Av = Type (AvHome | AvApp vlsF st).
 Cm = Type (CQuit | CSnap).
-Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vw, env)
+Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vp, env)
 # a discovered app: metas + the four resolved contract functions
 Ap = Type (Ap nm sb ini upd tre vls).   # loop roots: statics cache + the
                                      # two packed framebuffers + which
@@ -402,10 +402,11 @@ splitN n (x :: r) =
   (hd, tl) = splitN (n - 1) r;
   (x :: hd, tl).
 
-homeTree apps vw f =
+homeTree apps vp f =
+  (vw, vh) = vp;
   n = appN apps;
   ts = homeTiles apps n;
-  Box [Col, Pad 8, Gap 6, W vw, H 240, Bg (62, 70, 88)]
+  Box [Col, Pad 8, Gap 6, W vw, H vh, Bg (62, 70, 88)]
     (cat
       ( Box [Row, Gap 8]
           [ Lbl [Sc 3, Fg (930, 940, 960)] "QOS"
@@ -420,9 +421,9 @@ homeTree apps vw f =
 appN Nil = 0.
 appN (a :: r) = 1 + appN r.
 
-treeFor apps vw 0 f = homeTree apps vw f.
-treeFor apps vw s f = apTree (nthAp apps (s - 1)) vw.
-apTree (Ap nm sb ini upd tre vls) vw = tre vw.
+treeFor apps vp 0 f = homeTree apps vp f.
+treeFor apps vp s f = apTree (nthAp apps (s - 1)) vp.
+apTree (Ap nm sb ini upd tre vls) vp = tre vp.
 nthAp (a :: r) 0 = a.
 nthAp (a :: r) i = nthAp r (i - 1).
 
@@ -496,11 +497,12 @@ subs (Ap nm sb ini upd tre vls :: r) = sb :: subs r.
 # (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
 # the frame being written is never the one the walker just consumed.
 frameWorker parent gfx st sl fdw self =
-  (apps, fd) = fdw;
+  (apps, fd, vp) = fdw;
+  (vww, vh) = vp;
   Fd sN fr lr lk sc av fb env = fd;
   vs = wvals apps fd self;
   (fb2, n) = S2.dynsInto fb sl vs;
-  r = svcCall self gfx (Render (S2.scene st (fb2, n)));
+  r = svcCall self gfx (Render (S2.sceneAt vh st (fb2, n)));
   _ = send parent r;
   drop r.                # forward then release OUR ref: the reply's
                          # ARC entry dies when the shell drops its own
@@ -633,13 +635,13 @@ waitTick mt t0 = waitTick mt t0.
 
 skeyOf (Md s f sts fr lr lk sc) = s * 100 + f.
 
-ensure apps vw cache key =
+ensure apps vp cache key =
   (k, st, sl) = cache;
   case k == key of
     True -> (cache, 0)
-  | False -> (rebuildTree apps vw key, 1).
-rebuildTree apps vw key =
-  (st2, sl2) = S2.buildW vw (treeFor apps vw (key / 100) (imod2 key 100));
+  | False -> (rebuildTree apps vp key, 1).
+rebuildTree apps vp key =
+  (st2, sl2) = S2.buildW vp (treeFor apps vp (key / 100) (imod2 key 100));
   (key, st2, sl2).
 
 # av for the worker: home = 0, app screen = (that app's vals fn, state)
@@ -667,20 +669,23 @@ frame me gfx dsp inp mt rt m2 t0 =
   (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3));
+  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3, vpOfRt rt));
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
   loop me gfx dsp inp mt (swapRt rt cache2) m4.
 
 ensureRt (Rt cache a b bk cfg apps) key =
-  (vw, env) = cfg;
-  ensure apps vw cache key.
+  (vp, env) = cfg;
+  ensure apps vp cache key.
 backFb (Rt cache a b bk cfg apps) = case bk == 0 of True -> a | False -> b.
 appsOf (Rt cache a b bk cfg apps) = apps.
 envOf (Rt cache a b bk cfg apps) =
-  (vw, env) = cfg;
+  (vp, env) = cfg;
   env.
+vpOfRt (Rt cache a b bk cfg apps) =
+  (vp, env) = cfg;
+  vp.
 swapRt (Rt cache a b bk cfg apps) cache2 = Rt cache2 a b (1 - bk) cfg apps.
 
 bumpS m 0 = m.
@@ -727,8 +732,15 @@ main =
   fbA = S2.fbNew 4096;
   fbB = S2.fbNew 4096;
   (gw, gh) = svcCall me g (Dims 0);
-  vw = clampVw (240 * gw / imax1 gh);
-  _ = print "pshell: display {gw}x{gh} -> virtual {vw}x240";
+  # INTEGER UI SCALE: the largest s that still leaves >= 240 virtual
+  # rows.  vp = (gw/s, gh/s) means one virtual pixel is exactly s by s
+  # real pixels -- no half-covered glyph cells, and a bigger panel buys
+  # more virtual area rather than chunkier text.
+  s = uiScale gh;
+  vw = gw / s;
+  vh = gh / s;
+  vp = (vw, vh);
+  _ = print "pshell: display {gw}x{gh} -> virtual {vw}x{vh} at {s}x";
   # attach every app .qa present, discover contracts per table, init
   # each app (inits run HERE -- an app may spawn its own actors now)
   _ = tryAttach "pnotes.qa";
@@ -765,7 +777,7 @@ main =
   env = (log, mt, (titles apps, vfs));
   sts = initAll me apps env;
   m0 = Md 0 0 sts 0 (0, 0) 0 0;
-  loop me g d i mt (Rt cache0 fbA fbB 0 (vw, env) apps) m0.
+  loop me g d i mt (Rt cache0 fbA fbB 0 (vp, env) apps) m0.
 
 tryAttach nm =
   case Sys.attachQa nm of
@@ -796,8 +808,5 @@ discovered ok meta ini upd tre vls i n =
 initAll me Nil env = Nil.
 initAll me (Ap nm sb ini upd tre vls :: r) env = ini me env :: initAll me r env.
 
-imax1 h | h < 1 = 1.
-imax1 h = h.
-clampVw v | v < 320 = 320.
-clampVw v | v > 720 = 720.
-clampVw v = v.
+uiScale h | h < 240 = 1.
+uiScale h = h / 240.

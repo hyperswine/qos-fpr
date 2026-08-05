@@ -55,8 +55,9 @@ pnSplit s i st acc = pnSplit s (i + 1) st acc.
 pnLine i =
   Box [Row, Pad 2] [ Slot [Fg (930, 940, 960)] i 40 ].
 
-appTree vw =
-  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
+appTree vp =
+  (vw, vh) = vp;
+  Box [Col, Pad 8, Gap 4, W vw, H vh, Bg (62, 70, 88)]
     [ Box [Row, Gap 6]
         [ Lbl [Sc 2, Fg (420, 900, 560)] "PNOTES"
         , Lbl [Fg (560, 590, 650)] "loaded .qa"

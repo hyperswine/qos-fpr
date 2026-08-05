@@ -16,7 +16,8 @@
 # focus/screen change hands the walker a NEW statics value, which is
 # exactly its recompile trigger.  gen_view's discipline, on VBOs.
 #
-# GEOMETRY.  Virtual screen 320x240 px, top-left origin, y down.  One
+# GEOMETRY.  Virtual screen vw x vh px (see buildW), top-left origin,
+# y down.  One
 # entity per box / border strip / lit font cell, all "cube" instances
 # scaled thin (the front face is what you see).  World mapping: 1 px =
 # 25 milli-units; camera on +Z at 6.0 units with fovMilli 927
@@ -47,7 +48,7 @@ Sn = Type (Box attrs kids | Lbl attrs text | Slot attrs idx cap).
 # entity + scene shapes (the walker's positional contract; gfxdemo.fpr)
 Gfx = Type (Scene statics dynamics lights camera
           | Ent mesh pos yaw scale color
-          | Sl idx x y sc fg cap vw).
+          | Sl idx x y sc fg cap vp).
 
 # ---- attribute readers -----------------------------------------------------
 
@@ -137,15 +138,20 @@ imax a b = b.
 
 C2 = Type (C2 ents slots vw).
 
-# AUTO RESOLUTION: the virtual space is vw x 240 -- vh is FIXED at 240
-# (the camera fov maps 240 world px onto the FBO height exactly), and
-# vw follows the display's aspect: the app computes vw = 240*w/h from
-# what glInit settled on and lays out to it.  `build` keeps the classic
-# 320 for existing callers; buildW takes the real width.
-build root = buildW 320 root.
-buildW vw root =
-  fin (node (C2 Nil Nil vw) root 0 0 0).
-fin (C2 es sl vw) = (rev Nil es, rev Nil sl).
+# AUTO RESOLUTION, integer-scaled: the virtual space is vp = (vw, vh),
+# BOTH derived from the display as displayW/s, displayH/s for an
+# INTEGER s.  That is the whole point -- when the ratio is fractional
+# (600/240 = 2.5) a one-virtual-pixel stem lands on 2 real pixels here
+# and 3 there, which is what makes small text look unstable.  With an
+# integer s every glyph cell is exactly s*s real pixels, and a bigger
+# display buys more virtual AREA instead of just bigger blocks.
+# The camera follows vh (see camAt): world height = vh * pxm milli,
+# and for this fov the camera distance in milli IS that world height.
+# `build` keeps the classic 320x240 for existing callers.
+build root = buildW (320, 240) root.
+buildW vp root =
+  fin (node (C2 Nil Nil vp) root 0 0 0).
+fin (C2 es sl vp) = (rev Nil es, rev Nil sl).
 
 rev acc Nil = acc.
 rev acc (x :: r) = rev (x :: acc) r.
@@ -159,7 +165,7 @@ node c n x y d =
 
 body c (Lbl a t) x y w h d =
   emitText c t x y (scOf a) (fgCol a) (d + 2).
-body c (Slot a i cap) x y w h d = addSlot c (Sl i x y (scOf a) (fgCol a) cap (vwOf c)).
+body c (Slot a i cap) x y w h d = addSlot c (Sl i x y (scOf a) (fgCol a) cap (vpOf c)).
 body c (Box a kids) x y w h d =
   p = padOf a;
   slack = grownSlack (isRow a) a kids w h p;
@@ -168,7 +174,7 @@ body c (Box a kids) x y w h d =
 
 fgCol a = (has, col) = fgOf a; case has of True -> col | False -> (900, 910, 930).
 
-addSlot (C2 es sl vw) s = C2 es (s :: sl) vw.
+addSlot (C2 es sl vp) s = C2 es (s :: sl) vp.
 
 # leftover space along the axis, split among Grow children
 grownSlack row a kids w h p =
@@ -227,9 +233,10 @@ widen k dx dy =
 
 pxm = 25.
 
-exent vw x y w h d col =
+exent vp x y w h d col =
+  (vw, vh) = vp;
   wx = idiv2 ((2 * x + w - vw) * pxm);
-  wy = idiv2 ((240 - 2 * y - h) * pxm);
+  wy = idiv2 ((vh - 2 * y - h) * pxm);
   Ent "cube" (wx, wy, d * 5) 0 (w * pxm, h * pxm, 2) col.
 
 # floor-divide by 2 for negatives too (integer / truncates toward 0)
@@ -239,20 +246,20 @@ idiv2 n = n / 2.
 boxBg c a x y w h d =
   (has, col) = bgOf a;
   case has of
-    True -> addEnt c (exent (vwOf c) x y w h d col)
+    True -> addEnt c (exent (vpOf c) x y w h d col)
   | False -> c.
 
-addEnt (C2 es sl vw) e = C2 (e :: es) sl vw.
-vwOf (C2 es sl vw) = vw.
+addEnt (C2 es sl vp) e = C2 (e :: es) sl vp.
+vpOf (C2 es sl vp) = vp.
 
 boxBord c a x y w h d =
   (has, col) = bordOf a;
   case has of
     True ->
-      addEnt (addEnt (addEnt (addEnt c (exent (vwOf c) x y w 1 (d + 1) col))
-                             (exent (vwOf c) x (y + h - 1) w 1 (d + 1) col))
-                     (exent (vwOf c) x y 1 h (d + 1) col))
-             (exent (vwOf c) (x + w - 1) y 1 h (d + 1) col)
+      addEnt (addEnt (addEnt (addEnt c (exent (vpOf c) x y w 1 (d + 1) col))
+                             (exent (vpOf c) x (y + h - 1) w 1 (d + 1) col))
+                     (exent (vpOf c) x y 1 h (d + 1) col))
+             (exent (vpOf c) (x + w - 1) y 1 h (d + 1) col)
   | False -> c.
 
 # ---- the 3x5 font ----------------------------------------------------------
@@ -271,19 +278,19 @@ glCell c bits b x y sc col d | b == 15 = c.
 glCell c 0 b x y sc col d = c.
 glCell c bits b x y sc col d =
   c1 = case band bits 1 == 1 of
-    True -> addEnt c (exent (vwOf c) (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
+    True -> addEnt c (exent (vpOf c) (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
   | False -> c;
   glCell c1 (bits / 2) (b + 1) x y sc col d.
 
 imod a b = a - (a / b) * b.
 
 # dynamics: current text for every slot, clipped to its reservation
-dyns slots vals = dynGo (C2 Nil Nil 0) slots vals.   # vw comes from each Sl
-dynGo (C2 es sl vw) Nil vals = rev Nil es.
-dynGo c (Sl i x y sc col cap vw :: r) vals =
+dyns slots vals = dynGo (C2 Nil Nil (320, 240)) slots vals.  # vp comes from each Sl
+dynGo (C2 es sl vp) Nil vals = rev Nil es.
+dynGo c (Sl i x y sc col cap vp :: r) vals =
   s = clip (nth vals i) cap;
-  dynGo (emitText (setVw c vw) s x y sc col 9) r vals.
-setVw (C2 es sl old) vw = C2 es sl vw.
+  dynGo (emitText (setVp c vp) s x y sc col 9) r vals.
+setVp (C2 es sl old) vp = C2 es sl vp.
 
 nth Nil i = "".
 nth (v :: r) 0 = v.
@@ -295,8 +302,12 @@ clip s cap = s.
 # ---- the fixed frame -------------------------------------------------------
 
 lights2d = ((0, 0, 240000), (1000, 1000, 1000)) :: Nil.
-camera2d = ((0, 0, 6000), (0, 0, 0), 927).
+camera2d = camAt 240.
+# for fovMilli 927 the half-angle tangent is 1/2, so the distance that
+# fits a world height H is exactly H -- camera z in milli IS vh * pxm
+camAt vh = ((0, 0, vh * pxm), (0, 0, 0), 927).
 scene st dy = Scene st dy lights2d camera2d.
+sceneAt vh st dy = Scene st dy lights2d (camAt vh).
 
 # ---- glyphs ----------------------------------------------------------------
 # uppercase-fold, then a clause per code.  Layout literals are decimal
@@ -418,37 +429,38 @@ fbNew cap = cvec2 (cap * 10) 0.
 
 dynsInto fb slots vals = diGo fb slots vals 0.
 diGo fb Nil vals n = (fb, n).
-diGo fb (Sl i x y sc col cap vw :: r) vals n =
+diGo fb (Sl i x y sc col cap vp :: r) vals n =
   s = clip (nth vals i) cap;
-  (fb2, n2) = textInto fb s (x, y) vw (sc, col, 9) n;
+  (fb2, n2) = textInto fb s (x, y) vp (sc, col, 9) n;
   diGo fb2 r vals n2.
 
-textInto fb t pos vw st n = tiGo fb t 1 (strlen t) pos vw st n.
-tiGo fb t i m pos vw st n | i > m = (fb, n).
-tiGo fb t i m pos vw st n =
+textInto fb t pos vp st n = tiGo fb t 1 (strlen t) pos vp st n.
+tiGo fb t i m pos vp st n | i > m = (fb, n).
+tiGo fb t i m pos vp st n =
   (sc, col, d) = st;
   (x, y) = pos;
-  (fb2, n2) = glyphInto fb (font (charAt t i)) pos vw st n;
-  tiGo fb2 t (i + 1) m (x + 4 * sc, y) vw st n2.
+  (fb2, n2) = glyphInto fb (font (charAt t i)) pos vp st n;
+  tiGo fb2 t (i + 1) m (x + 4 * sc, y) vp st n2.
 
-glyphInto fb 0 pos vw st n = (fb, n).
-glyphInto fb bits pos vw st n = giCell fb bits 0 pos vw st n.
-giCell fb bits b pos vw st n | b == 15 = (fb, n).
-giCell fb 0 b pos vw st n = (fb, n).
-giCell fb bits b pos vw st n =
+glyphInto fb 0 pos vp st n = (fb, n).
+glyphInto fb bits pos vp st n = giCell fb bits 0 pos vp st n.
+giCell fb bits b pos vp st n | b == 15 = (fb, n).
+giCell fb 0 b pos vp st n = (fb, n).
+giCell fb bits b pos vp st n =
   (sc, col, d) = st;
   (x, y) = pos;
   (fb2, n2) = case band bits 1 == 1 of
-    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d vw n, n + 1)
+    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d vp n, n + 1)
   | False -> (fb, n);
-  giCell fb2 (bits / 2) (b + 1) pos vw st n2.
+  giCell fb2 (bits / 2) (b + 1) pos vp st n2.
 
 # one cube instance at virtual-pixel rect (x, y, sc, sc), depth d
-cellInto fb x y sc col d vw n =
+cellInto fb x y sc col d vp n =
   (r, g, bl) = col;
+  (vw, vh) = vp;
   base = n * 10;
   f1 = Vec.set (base + 1) (idiv2 ((2 * x + sc - vw) * pxm)) fb;
-  f2 = Vec.set (base + 2) (idiv2 ((240 - 2 * y - sc) * pxm)) f1;
+  f2 = Vec.set (base + 2) (idiv2 ((vh - 2 * y - sc) * pxm)) f1;
   f3 = Vec.set (base + 3) (d * 5) f2;
   f4 = Vec.set (base + 4) 0 f3;
   f5 = Vec.set (base + 5) (sc * pxm) f4;

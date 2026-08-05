@@ -134,8 +134,9 @@ clNth (v :: r) i = clNth r (i - 1).
 clRow i =
   Box [Row, Pad 1] [ Slot [Fg (930, 940, 960)] i 46 ].
 
-appTree vw =
-  Box [Col, Pad 8, Gap 4, W vw, H 240, Bg (62, 70, 88)]
+appTree vp =
+  (vw, vh) = vp;
+  Box [Col, Pad 8, Gap 4, W vw, H vh, Bg (62, 70, 88)]
     [ Box [Row, Gap 6]
         [ Lbl [Sc 2, Fg (420, 900, 560)] "CLI"
         , Lbl [Fg (560, 590, 650)] "everything is a URL"

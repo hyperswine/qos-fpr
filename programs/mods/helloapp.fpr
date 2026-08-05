@@ -38,8 +38,9 @@ helloWarn self log i = 0.
 
 appUpdate self env k n = n + 1.
 
-appTree vw =
-  Box [Col, Pad 8, Gap 8, W vw, H 240, Bg (62, 70, 88)]
+appTree vp =
+  (vw, vh) = vp;
+  Box [Col, Pad 8, Gap 8, W vw, H vh, Bg (62, 70, 88)]
     [ Box [Row, Gap 6]
         [ Lbl [Sc 2, Fg (420, 900, 560)] "HELLO"
         , Lbl [Fg (560, 590, 650)] "hello.qa" ]
