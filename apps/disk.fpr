@@ -1,0 +1,3 @@
+# disk root: module-table carrier only
+A = use "../programs/mods/diskapp".
+main = A.appMeta 0.

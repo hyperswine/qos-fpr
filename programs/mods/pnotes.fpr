@@ -14,20 +14,23 @@ Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
 appMeta u = ("NOTES", "PNOTES.QA").
 
-appInit env = (pnLoad 0, "").
+# the notes file is not ours: it belongs to an actor inside System.qa.
+# We ask the namespace for it, exactly like any other client would.
+notesPath = "/home/notes.txt".
+appInit self env = (pnLoad self env, "").
 
-appUpdate k st | k == 14 =
+appUpdate self env k st | k == 14 =
   (notes, inp) = st;
   (notes, pnDropLast inp).
-appUpdate k st | k == 28 = pnCommit st.
-appUpdate k st =
+appUpdate self env k st | k == 28 = pnCommit self env st.
+appUpdate self env k st =
   (notes, inp) = st;
   (notes, pnType inp k).
 
-pnCommit (notes, inp) | strlen inp > 0 =
-  _ = Sys.storeReq 2 "{inp}\n";
+pnCommit self env (notes, inp) | strlen inp > 0 =
+  _ = AK.vfsWrite self (AK.envVfs env) notesPath "{inp}\n";
   (inp :: notes, "").
-pnCommit st = st.
+pnCommit self env st = st.
 
 pnType inp k | strlen inp > 29 = inp.
 pnType inp k = strcat inp (AK.keyChar k).
@@ -35,10 +38,11 @@ pnType inp k = strcat inp (AK.keyChar k).
 pnDropLast s | strlen s < 2 = "".
 pnDropLast s = substr s 1 (strlen s - 1).
 
-pnLoad u =
-  case Sys.storeReq 3 "" of
-    Ok s -> pnSplit s 1 1 Nil
-  | Err e -> Nil.
+pnLoad self env =
+  txt = AK.vfsRead self (AK.envVfs env) notesPath;
+  ls = pnSplit txt 1 1 Nil;
+  _ = drop txt;
+  ls.
 pnSplit s i st acc | i > strlen s = acc.
 pnSplit s i st acc | charAt s i == 10 =
   case i > st of

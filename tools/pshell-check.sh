@@ -10,12 +10,17 @@
 set -u
 cd "$(dirname "$0")/.."
 
-# home nav -> clock (3 keys) -> snap -> esc -> logs -> snap -> esc ->
-# notes -> "hi" -> commit -> esc -> clock again -> snap -> esc -> quit
-SPEC="right z z z z z z z  enter a b c z z z z  z z z z z z z p  esc z z z z z z z  down right z z z z z  enter z z z z z z z  z z z z z z z p  esc up left z z z z  z enter h i z z z z  enter z z z z z z z  esc right z z z z z  enter z z z z z z p  esc q z z z z z z"
+# eight apps in a 4-column grid: NOTES 0 CLOCK 1 HELLO 2 LOGS 3
+# MONITOR 4 FILES 5 DISK 6 CLI 7 (+RENDER 8, HARTS 9).  Route: notes
+# commit (through the file actor) -> clock -> files (list + RESOLVE)
+# -> monitor -> logs(n) -> disk -> CLI (ls, write a file, cat it back)
+# -> clock again (suspend/resume).  F12 is the snapshot key: inside an
+# app every letter belongs to the app, which a CLI needs.  Filler is
+# `tab` (maps to no character) for the same reason.
+SPEC="enter h i enter tab tab tab  esc right tab tab tab tab tab  enter a b c tab tab tab  tab tab tab tab tab tab tab f12  esc right right tab tab tab tab  enter n tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc down tab tab tab tab tab  enter tab tab tab tab tab tab  l s enter tab tab tab tab  tab tab tab tab tab tab tab f12  w r i t e space slash t  m p slash s c r a  t c h dot t x t space  o k enter tab tab tab tab tab  c a t space slash t m  p slash s c r a t  c h dot t x t enter tab  tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  down down down down tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  backspace esc left tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc up right tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc q tab tab tab tab tab"
 EVD=/tmp/pshell-check.evd
 python3 tools/kbdsim.py "$EVD" "$SPEC" >/dev/null || exit 1
-python3 tools/kbdsim.py /tmp/pshell-quit.evd "p z z z z z z z  q" >/dev/null || exit 1
+python3 tools/kbdsim.py /tmp/pshell-quit.evd "f12 tab tab tab tab tab tab tab  q" >/dev/null || exit 1
 
 fail() { echo "pshell-check: FAIL: $*"; exit 1; }
 
@@ -36,35 +41,50 @@ echo "  posix: 0 apps, clean session: PASS"
 echo "== qosp: 4 apps, full multi-app session (4 harts) =="
 rm -rf qos-store pshell*.ppm
 out=$(FPR_HARTS=4 FPR_EVDEV=$EVD timeout 180 ./qosp --yes app.qa </dev/null 2>&1 | tr -d '\r')
-echo "$out" | grep -q "4 apps loaded" || fail "qosp: 4 apps did not attach"
+echo "$out" | grep -q "8 apps loaded" || fail "qosp: 8 apps did not attach"
 echo "$out" | grep -q "app 0: NOTES" || fail "qosp: NOTES not discovered"
-echo "$out" | grep -q "app 3: LOGS" || fail "qosp: LOGS not discovered"
+echo "$out" | grep -q "app 4: MONITOR" || fail "qosp: MONITOR not discovered"
+echo "$out" | grep -q "app 5: FILES" || fail "qosp: FILES not discovered"
+echo "$out" | grep -q "app 6: DISK" || fail "qosp: DISK not discovered"
+echo "$out" | grep -q "app 7: CLI" || fail "qosp: CLI not discovered"
+echo "$out" | grep -q "system: opening /home/notes.txt" || fail "qosp: notes file actor never spawned"
+echo "$out" | grep -q "system: opening /tmp/scratch.txt" || fail "qosp: CLI write did not reach a file actor"
 echo "$out" | grep -q "\[log\] HELLO 5 FROM CHILD ACTOR" || fail "qosp: child actor's logs missing"
-echo "$out" | grep -q "pshell:.*4 apps" || fail "qosp: result string"
+echo "$out" | grep -q "\[warn\] HELLO 3 WAS A WARNING" || fail "qosp: warn severity missing"
+echo "$out" | grep -q "\[ERR\] HELLO 5 WAS AN ERROR" || fail "qosp: error severity missing"
+echo "$out" | grep -q "pshell:.*8 apps" || fail "qosp: result string"
 echo "$out" | grep -q "PANIC" && fail "qosp: panicked"
-grep -q "hi" qos-store/pshell.kv || fail "qosp: note not persisted"
+grep -q "/home/notes.txt" qos-store/pshell.kv || fail "qosp: notes record not written"
+grep -q "/tmp/scratch.txt" qos-store/pshell.kv || fail "qosp: CLI write not on the log"
 ls pshell*.ppm >/dev/null 2>&1 || fail "qosp: no snapshots"
 python3 - <<'EOF' || exit 1
 from PIL import Image
 import glob
 def near(p,t,tol=40): return all(abs(a-b)<=tol for a,b in zip(p,t))
 snaps = sorted(glob.glob('pshell*.ppm'), key=lambda f:int(f[6:-4]))
-assert len(snaps) == 3, f"expected 3 snapshots, got {snaps}"
-# middle snapshot = the LOGS screen: green title block + text rows in
-# the top-left region (the ring lines)
-im = Image.open(snaps[1]).convert('RGB')
-text = sum(1 for y in range(40,140,2) for x in range(16,400,2)
-           if near(im.getpixel((x,y)),(237,240,245)))
-assert text > 60, f"{snaps[1]}: no log lines rendered ({text})"
-print(f"  {snaps[1]}: log lines rendered: PASS")
+assert len(snaps) == 9, f"expected 9 snapshots, got {snaps}"
+def textin(f, y0, y1):
+    im = Image.open(f).convert('RGB')
+    return sum(1 for y in range(y0,y1,2) for x in range(16,420,2)
+               if near(im.getpixel((x,y)),(237,240,245)))
+# snaps: clock, logs, cli-ls, cli-cat, disk, files-list,
+# files-resolved, monitor, clock-resumed
+assert textin(snaps[1],40,140) > 60, f"{snaps[1]}: no log lines"
+assert textin(snaps[2],40,240) > 80, f"{snaps[2]}: no cli ls output"
+assert textin(snaps[3],40,240) > 80, f"{snaps[3]}: no cli cat output"
+assert textin(snaps[4],55,110) > 10, f"{snaps[4]}: no disk records"
+assert textin(snaps[5],40,240) > 90, f"{snaps[5]}: no namespace rows"
+assert textin(snaps[6],40,140) > 60, f"{snaps[6]}: path did not resolve"
+assert textin(snaps[7],40,240) > 80, f"{snaps[7]}: no actor tree rows"
+print("  logs / cli ls+cat / disk / namespace / resolved / monitor: PASS")
 EOF
 echo "  qosp: session + child-actor log routing + kv: PASS"
 
 echo "== qosp: relaunch replays the note =="
 out=$(FPR_HARTS=4 FPR_EVDEV=/tmp/pshell-quit.evd timeout 120 ./qosp --yes app.qa </dev/null 2>&1 | tr -d '\r')
-echo "$out" | grep -q "4 apps loaded" || fail "relaunch: apps"
+echo "$out" | grep -q "8 apps loaded" || fail "relaunch: apps"
 echo "$out" | grep -q "PANIC" && fail "relaunch: panicked"
-grep -q "hi" qos-store/pshell.kv || fail "relaunch: kv lost"
+grep -q "/home/notes.txt" qos-store/pshell.kv || fail "relaunch: kv lost"
 echo "  qosp relaunch: PASS"
 
 echo "== reclamation soak (25s idle, 4 harts) =="

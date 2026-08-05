@@ -76,5 +76,31 @@ static int64_t store_call_locked(uint64_t tag, const char *pay, uint64_t plen, c
     fclose(f);
     return (int64_t)n;
   }
+  if (tag == 5) {
+  /* tag 5: the record INDEX -- one "seq off len" line per record, the
+   * append log's own structure rather than its flattened payloads
+   * (tag 3).  This is what makes the disk visible AS a delta log:
+   * every append is a record at a byte offset that never moves. */
+    FILE *f = fopen(g_path, "rb");
+    if (!f) return 0;
+    uint64_t n = 0, off = 0, seq = 0;
+    char line[32];
+    while (fgets(line, sizeof line, f)) {
+      unsigned long long rl = strtoull(line, 0, 10);
+      uint64_t hdr = (uint64_t)strlen(line);
+      char rec[64];
+      int rn = snprintf(rec, sizeof rec, "%llu %llu %llu\n",
+                        (unsigned long long)seq, (unsigned long long)(off + hdr),
+                        rl);
+      if (n + (uint64_t)rn > outcap) break;
+      memcpy(out + n, rec, (size_t)rn);
+      n += (uint64_t)rn;
+      if (fseek(f, (long)rl + 1, SEEK_CUR)) break;
+      off += hdr + rl + 1;
+      seq++;
+    }
+    fclose(f);
+    return (int64_t)n;
+  }
   return -3;
 }

@@ -12,20 +12,31 @@ Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
 appMeta u = ("HELLO", "SPAWNS ACTOR").
 
-appInit env =
+appInit self env =
   _ = spawn (helloChild env);
   0.
 
 helloChild env self =
-  (log, mt) = env;
-  helloGo self log mt 1.
-helloGo self log mt i | i > 5 = 0.
+  helloGo self (AK.envLog env) (AK.envMt env) 1.
+# after the five lines: PARK (receive with no senders) -- the actor
+# stays alive and BLOCKED, which is exactly what the monitor should
+# attribute to hello.qa's sub-slot.  A real app actor would serve
+# requests here; the parked state is the honest minimum of that.
+helloGo self log mt i | i > 5 = receive self.
 helloGo self log mt i =
   _ = AK.logAdd self log "HELLO {i} FROM CHILD ACTOR";
+  _ = helloWarn self log i;
   _ = AK.waitTicks mt (read mt) 4000;
   helloGo self log mt (i + 1).
+# one warn and one error through the same capability: the severity
+# axis exists to be exercised, not admired
+helloWarn self log i | i == 3 =
+  AK.logAddAt self log 1 "HELLO 3 WAS A WARNING".
+helloWarn self log i | i == 5 =
+  AK.logAddAt self log 2 "HELLO 5 WAS AN ERROR".
+helloWarn self log i = 0.
 
-appUpdate k n = n + 1.
+appUpdate self env k n = n + 1.
 
 appTree vw =
   Box [Col, Pad 8, Gap 8, W vw, H 240, Bg (62, 70, 88)]

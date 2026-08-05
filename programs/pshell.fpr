@@ -116,48 +116,216 @@ inputActor me =
 # also echoes to the console ("[log] ...") -- the simple log itself.
 # Received roots are dropped (immortal actor, the law); a line falling
 # off the ring is dropped too (its writer's slab pin ends here).
-logActor me = logServe me Nil 0.
-logServe me lines n =
+# the log service: /logs (aliases /logs/errors|warns|normal).  Now a
+# STATELESS façade over the runtime's severity rings: LogAdd copies
+# into C-owned storage (Sys.logAt), snapshots come out as fresh copies
+# in whoever asks -- the cross-actor lifetime problems this actor used
+# to have are designed away, not defended against.
+logActor me =
   m = receive me;
   (replyTo, q) = m;
-  logMsg me lines n replyTo q m.
-logMsg me lines n replyTo (LogAdd line) m =
-  _ = print "[log] {line}";
-  # COPY the line into OUR pool before dropping the request: promotion
-  # pinned only the message ROOT -- the nested string rides that pin,
-  # and dropping the root frees the sender's slab out from under
-  # anything nested we kept.  Retention beyond the root's life = copy.
-  # NOTE "{line}" is NOT a copy -- one-segment interpolation desugars
-  # to `str line`, identity on a string.  substr always mkstr's.
-  own = substr line 1 (strlen line);
-  (l2, n2) = logPush lines n own;
+  logMsg me replyTo q m.
+logMsg me replyTo (LogAdd sev line) m =
+  _ = Sys.logAt sev line;
   _ = send replyTo 0;
   _ = drop m;
-  logServe me l2 n2.
-logMsg me lines n replyTo (LogSnap u) m =
-  # NEVER send live state: the caller rightly drops what it received,
-  # and dropping OUR ring root would free it under us.  Fresh cells
-  # (the strings inside are ours and immortal-pooled; sharing them is
-  # fine -- it is the SPINE that must be disposable).
-  _ = send replyTo (snapCopy lines);
+  logActor me.
+logMsg me replyTo (LogSnap sev) m =
+  _ = send replyTo (Sys.logSnap sev);
   _ = drop m;
-  logServe me lines n.
-snapCopy Nil = Nil.
-snapCopy (x :: r) = x :: snapCopy r.
-logPush lines n line | n < 12 = (line :: lines, n + 1).
-logPush lines n line =
-  (kept, old) = logSplit lines 11 Nil;
-  _ = drop old;
-  (line :: logRev kept Nil, n).
-logSplit (x :: r) 0 acc = (logRev acc Nil, x).
-logSplit (x :: r) k acc = logSplit r (k - 1) (x :: acc).
-logRev Nil acc = acc.
-logRev (x :: r) acc = logRev r (x :: acc).
+  logActor me.
+# the log actor SERVES its paths: resolution reached it, so it is the
+# one that knows what /logs/warns contains
+logMsg me replyTo (Read path) m =
+  _ = send replyTo (logText (sevOfPath path));
+  _ = drop m;
+  logActor me.
+sevOfPath p | strEq p "/logs/warns" = 1.
+sevOfPath p | strEq p "/logs/errors" = 2.
+sevOfPath p = 0.
+logText sev = joinNl (Sys.logSnap sev).
+joinNl Nil = "(empty)".
+joinNl (x :: r) = joinGo x r.
+joinGo acc Nil = acc.
+joinGo acc (x :: r) = joinGo "{acc}\n{x}" r.
 LogAdd = AK.LogAdd.
 LogSnap = AK.LogSnap.
 
+# the STORE server: the two paths whose bytes are really on disk.
+# /store/notes is the replayed content; /disk/records is the append
+# log's own index -- offsets and lengths of every delta ever written.
+storeActor me =
+  m = receive me;
+  (replyTo, Read path) = m;
+  _ = send replyTo (storeText path);
+  _ = drop m;
+  storeActor me.
+storeText path | strEq path "/disk/records" = diskIndex 0.
+storeText path = replayText 0.
+replayText u =
+  case Sys.storeReq 3 "" of
+    Ok s -> emptyAs s "(no records)"
+  | Err e -> "unreadable: {e}".
+diskIndex u =
+  case Sys.storeReq 5 "" of
+    Ok s -> emptyAs s "(no records)"
+  | Err e -> "unreadable: {e}".
+emptyAs s alt | strlen s == 0 = alt.
+emptyAs s alt = s.
+
+# ---- files: one actor per real file, inside System.qa ------------------
+# A path that names bytes on disk gets its OWN actor, spawned lazily on
+# first use and kept in an active set.  That actor is the file: it
+# holds the content cached in memory (so reads never touch the disk
+# after the first replay), and because a mailbox is a queue, access to
+# the file is serialized without a lock existing anywhere.  Writes
+# append a DELTA to the one append-only log and update the cache --
+# the file's content IS the replay of its own records.
+#
+# The manager keeps [(path, actor)] and threads the set through its
+# loop; spawning is the only thing it does that the file actors don't.
+filesActor me = filesServe me Nil.
+filesServe me act =
+  m = receive me;
+  (replyTo, q) = m;
+  filesMsg me act replyTo q m.
+filesMsg me act replyTo (Read path) m =
+  (a, act2) = fileOf me act path;
+  _ = relay me a replyTo (Read path);
+  _ = drop m;
+  filesServe me act2.
+filesMsg me act replyTo (Write path text) m =
+  (a, act2) = fileOf me act path;
+  _ = relay me a replyTo (Write path text);
+  _ = drop m;
+  filesServe me act2.
+relay me a replyTo q =
+  r = svcCall me a q;
+  _ = send replyTo r;
+  drop r.
+# find-or-spawn: the lazy part
+fileOf me act path =
+  a0 = findAct act path;
+  fileOf2 me act path a0.
+fileOf2 me act path a0 | a0 != 0 = (a0, act).
+fileOf2 me act path a0 =
+  _ = Sys.logAt 0 "system: opening {path}";
+  a = spawn (fileActor path);
+  (a, (path, a) :: act).
+findAct Nil path = 0.
+findAct ((p, a) :: r) path | strEq p path = a.
+findAct ((p, a) :: r) path = findAct r path.
+
+# the file itself: content cached after the first replay
+fileActor path me = fileServe path me (fileReplay path) 0.
+fileServe path me body dirty =
+  m = receive me;
+  (replyTo, q) = m;
+  fileMsg path me body replyTo q m.
+fileMsg path me body replyTo (Read p) m =
+  _ = send replyTo (emptyAs body "(empty file)");
+  _ = drop m;
+  fileServe path me body 0.
+fileMsg path me body replyTo (Write p text) m =
+  ok = fileAppend path text;
+  _ = send replyTo ok;
+  _ = drop m;
+  fileServe path me "{body}{text}" 0.
+
+# a record is "path\npayload"; the file's content is the concatenation
+# of ITS records' payloads, in log order -- writes are appends, which
+# is the only thing an append-only log can honestly offer (replacing
+# content would need a tombstone record; not implemented)
+fileAppend path text =
+  case Sys.storeReq 2 "{path}\n{text}" of
+    Ok u -> "wrote {strlen text} bytes to {path}"
+  | Err e -> "write failed: {e}".
+fileReplay path =
+  blob = replayText 0;
+  idx = diskIndex 0;
+  recAt path blob idx 1 "".
+# walk the index lines ("seq off len") in step with the flat payload
+# blob: tag 5 gives the framing tag 3 flattened away
+recAt path blob idx pos acc | pos > strlen blob = acc.
+recAt path blob idx pos acc =
+  (len, idx2) = nextLen idx;
+  recAt2 path blob idx2 pos acc len.
+recAt2 path blob idx pos acc 0 = acc.
+recAt2 path blob idx pos acc len =
+  rec = substr blob pos len;
+  recAt path blob idx (pos + len) (accIf path rec acc).
+accIf path rec acc =
+  n = strlen path;
+  case recIsFor path rec n of
+    True -> "{acc}{substr rec (n + 2) (strlen rec - n - 1)}"
+  | False -> acc.
+recIsFor path rec n | strlen rec <= n = False.
+recIsFor path rec n | charAt rec (n + 1) != 10 = False.
+recIsFor path rec n = strEq (substr rec 1 n) path.
+# "seq off len\n" lines -> the len of each record, in order
+nextLen idx | strlen idx == 0 = (0, "").
+nextLen idx = nlGo idx 1 0 0.
+nlGo idx i sp v | i > strlen idx = (v, "").
+nlGo idx i sp v | charAt idx i == 10 = (v, substr idx (i + 1) (strlen idx - i)).
+nlGo idx i sp v | charAt idx i == 32 = nlGo idx (i + 1) (sp + 1) 0.
+nlGo idx i sp v | sp == 2 = nlGo idx (i + 1) sp (v * 10 + charAt idx i - 48).
+nlGo idx i sp v = nlGo idx (i + 1) sp v.
+
+# the APPS server: /apps/<name> -- a loaded app is a resource in the
+# namespace exactly like a service is
+appsActor me = appsServe me.
+appsServe me =
+  m = receive me;
+  (replyTo, Read path) = m;
+  _ = send replyTo "loaded app plugin\npath resolves to its module table\nsub-slot image in the plugin window";
+  _ = drop m;
+  appsServe me.
+
+# ---- the resolver: the root, such as it is ------------------------------
+# entries = [(path, kind, owner)]; kind 0 = a service endpoint (an
+# actor you send to), 1 = readable bytes.  There is no directory
+# structure stored anywhere -- prefixes are a display idea.
+vfsActor ents me = vfsServe ents me.
+vfsServe ents me =
+  m = receive me;
+  (replyTo, q) = m;
+  vfsMsg ents me replyTo q m.
+vfsMsg ents me replyTo (VfsList u) m =
+  _ = send replyTo (listCopy ents);
+  _ = drop m;
+  vfsServe ents me.
+vfsMsg ents me replyTo (Read path) m =
+  _ = vfsRead ents me replyTo path;
+  _ = drop m;
+  vfsServe ents me.
+vfsMsg ents me replyTo (Write path text) m =
+  _ = vfsWrite ents me replyTo path text;
+  _ = drop m;
+  vfsServe ents me.
+vfsWrite Nil me replyTo path text = send replyTo "no such path".
+vfsWrite ((p, k, o) :: r) me replyTo path text | strEq p path =
+  vfsWriteOne k o me replyTo path text.
+vfsWrite (e :: r) me replyTo path text = vfsWrite r me replyTo path text.
+vfsWriteOne 2 o me replyTo path text = relay me o replyTo (Write path text).
+vfsWriteOne k o me replyTo path text =
+  send replyTo "not writable (kind {k})".
+listCopy Nil = Nil.
+listCopy ((p, k, o) :: r) = (p, k) :: listCopy r.
+# resolution = walk to the owner and relay; a kind-0 path has no bytes
+# to give, and says so rather than pretending
+vfsRead Nil me replyTo path = send replyTo "no such path".
+vfsRead ((p, k, o) :: r) me replyTo path | strEq p path =
+  vfsServeOne k o me replyTo path.
+vfsRead (e :: r) me replyTo path = vfsRead r me replyTo path.
+vfsServeOne 0 o me replyTo path =
+  send replyTo "service endpoint (an actor)\nsend it a message; it has no bytes".
+vfsServeOne k o me replyTo path = relay me o replyTo (Read path).
+
 svcCall me a q = _ = send a (me, q); receive me.
 svcLookup me sys url = svcCall me sys (Lookup url).
+VfsList = AK.VfsList.
+Read = AK.Read.
+Write = AK.Write.
 
 # ---- colors ----------------------------------------------------------------
 
@@ -184,20 +352,35 @@ tile f i title si cap =
     [ Lbl [Sc 2, Fg (930, 940, 960)] title
     , Slot [Fg (999, 800, 300)] si cap ].
 
-# app tiles two to a row; slot i = tile i's subtitle (see homeVals)
-tileRows apps f i =
-  case apps of
-    Nil -> Nil
-  | (a :: r) -> tileRowsGo a r f i.
-tileRowsGo a Nil f i =
-  Box [Row, Gap 6] [ apTile a f i, Box [Grow] Nil ] :: Nil.
-tileRowsGo a (b :: r) f i =
-  Box [Row, Gap 6] [ apTile a f i, apTile b f (i + 1) ]
-    :: tileRows r f (i + 2).
-apTile (Ap nm sb ini upd tre vls) f i = tile f i nm i 14.
+# The home grid: one descriptor (title, focusIdx, slotIdx) per tile --
+# the apps, then RENDER and HARTS -- chunked into rows.  Two columns
+# while they fit, three once the app list outgrows them; nothing about
+# the layout is written down twice.
+homeTiles apps n =
+  cat (appTs apps 0)
+      (("RENDER", n, n + 1) :: ("HARTS", n + 1, n + 2) :: Nil).
+appTs Nil i = Nil.
+appTs (Ap nm sb ini upd tre vls :: r) i = (nm, i, i) :: appTs r (i + 1).
+
+colsFor t | t > 9 = 4.
+colsFor t | t > 6 = 3.
+colsFor t = 2.
+
+rowsOf Nil f cols = Nil.
+rowsOf ts f cols =
+  (hd, tl) = splitN cols ts;
+  Box [Row, Gap 6] (tileList hd f) :: rowsOf tl f cols.
+tileList Nil f = Nil.
+tileList ((nm, fi, si) :: r) f = tile f fi nm si 14 :: tileList r f.
+splitN 0 l = (Nil, l).
+splitN n Nil = (Nil, Nil).
+splitN n (x :: r) =
+  (hd, tl) = splitN (n - 1) r;
+  (x :: hd, tl).
 
 homeTree apps vw f =
   n = appN apps;
+  ts = homeTiles apps n;
   Box [Col, Pad 8, Gap 6, W vw, H 240, Bg (62, 70, 88)]
     (cat
       ( Box [Row, Gap 8]
@@ -205,11 +388,8 @@ homeTree apps vw f =
           , Box [Grow] Nil
           , Lbl [Fg (560, 590, 650)] "T"
           , Slot [Fg (930, 940, 960)] n 6 ]
-        :: tileRows apps f 0)
-      ( Box [Row, Gap 6]
-          [ tile f n "RENDER" (n + 1) 12
-          , tile f (n + 1) "HARTS" (n + 2) 12 ]
-        :: Box [Grow] Nil
+        :: rowsOf ts f (colsFor (appN apps + 2)) )
+      ( Box [Grow] Nil
         :: Box [Row, Pad 4, Bg (92, 104, 130)]
              [ Slot [Fg (999, 800, 300)] (n + 3) 60 ]
         :: Nil )).
@@ -256,8 +436,20 @@ imod2 a b = a - (a / b) * b.
 # home: slot 0..n-1 = tile subtitles, n = clock, n+1 = render,
 # n+2 = harts, n+3 = status.  App screens: the app's own appVals, run
 # HERE in the frame worker with self (it may svcCall services).
+titles Nil = Nil.
+titles (Ap nm sb ini upd tre vls :: r) = nm :: titles r.
+
+appEnts Nil appsA = Nil.
+appEnts (t :: r) appsA = ("/apps/{lower t}", 1, appsA) :: appEnts r appsA.
+# titles are display-cased; paths are not
+lower s = lowerGo s 1 (strlen s) "".
+lowerGo s i n acc | i > n = acc.
+lowerGo s i n acc = lowerGo s (i + 1) n "{acc}{lowerC (charAt s i)}".
+lowerC c | c >= 65 = case c <= 90 of True -> chr (c + 32) | False -> chr c.
+lowerC c = chr c.
+
 wvals apps (Fd 0 frame lastR lastKey scomp av fb env) self =
-  (log, mt) = env;
+  mt = AK.envMt env;
   (draws, dynB) = lastR;
   cat (subs apps)
       ( AK.clockStr mt
@@ -342,11 +534,11 @@ clampF t f | f < 0 = 0.
 clampF t f | f > t - 1 = t - 1.
 clampF t f = f.
 
-moveF t f 105 | imod2 f 2 == 1 = f - 1.
-moveF t f 106 | imod2 f 2 == 0 = clampF t (f + 1).
-moveF t f 103 = clampF t (f - 2).
-moveF t f 108 = clampF t (f + 2).
-moveF t f k = f.
+moveF cols t f 105 | imod2 f cols != 0 = f - 1.
+moveF cols t f 106 | imod2 f cols != cols - 1 = clampF t (f + 1).
+moveF cols t f 103 = clampF t (f - cols).
+moveF cols t f 108 = clampF t (f + cols).
+moveF cols t f k = f.
 
 # home screen
 # The launcher's key protocol: esc = suspend (back to home, state
@@ -354,22 +546,27 @@ moveF t f k = f.
 # is focused goes to THAT app's appUpdate, which returns its new state
 # value -- setNth into the state list and carry on.  Suspension is
 # nothing but this list.
-update apps k (Md 0 f sts fr lr lk sc) | k == 16 =
+update me env apps k (Md 0 f sts fr lr lk sc) | k == 16 =
   (Md 0 f sts fr lr k sc, [CQuit]).
-update apps k (Md 0 f sts fr lr lk sc) | k == 25 =
-  (Md 0 f sts fr lr k sc, [CSnap]).
-update apps k (Md 0 f sts fr lr lk sc) | k == 28 =
+update me env apps k (Md 0 f sts fr lr lk sc) | k == 25 = homeSnap f sts fr lr k sc.
+update me env apps k (Md 0 f sts fr lr lk sc) | k == 88 = homeSnap f sts fr lr k sc.
+update me env apps k (Md 0 f sts fr lr lk sc) | k == 28 =
   (homeEnter (appN apps) f (Md 0 f sts fr lr k sc), Nil).
-update apps k (Md 0 f sts fr lr lk sc) =
-  (Md 0 (moveF (appN apps + 2) f k) sts fr lr k sc, Nil).
-update apps k (Md sN f sts fr lr lk sc) | k == 1 =
+update me env apps k (Md 0 f sts fr lr lk sc) =
+  (Md 0 (moveF (colsFor (appN apps + 2)) (appN apps + 2) f k) sts fr lr k sc, Nil).
+update me env apps k (Md sN f sts fr lr lk sc) | k == 1 =
   (Md 0 f sts fr lr k sc, Nil).
-update apps k (Md sN f sts fr lr lk sc) | k == 25 =
+# INSIDE an app only F12 is the shell's: an app with a text field must
+# be able to type every letter, so p and q belong to it like any other
+# key.  esc (suspend) is the one universal reservation.
+update me env apps k (Md sN f sts fr lr lk sc) | k == 88 =
   (Md sN f sts fr lr k sc, [CSnap]).
-update apps k (Md sN f sts fr lr lk sc) =
-  st2 = apUpd (nthAp apps (sN - 1)) k (nthSt sts (sN - 1));
+update me env apps k (Md sN f sts fr lr lk sc) =
+  st2 = apUpd (nthAp apps (sN - 1)) me env k (nthSt sts (sN - 1));
   (Md sN f (setNth sts (sN - 1) st2) fr lr k sc, Nil).
-apUpd (Ap nm sb ini upd tre vls) k st = upd k st.
+apUpd (Ap nm sb ini upd tre vls) me env k st = upd me env k st.
+
+homeSnap f sts fr lr k sc = (Md 0 f sts fr lr k sc, [CSnap]).
 
 homeEnter n f m | f < n = openApp (f + 1) m.
 homeEnter n f m = m.
@@ -380,10 +577,10 @@ nthSt (x :: r) i = nthSt r (i - 1).
 setNth (x :: r) 0 v = v :: r.
 setNth (x :: r) i v = x :: setNth r (i - 1) v.
 
-applyKeys apps Nil mc = mc.
-applyKeys apps (k :: r) (m, cs) =
-  (m2, c2) = update apps k m;
-  applyKeys apps r (m2, cat cs c2).
+applyKeys me env apps Nil mc = mc.
+applyKeys me env apps (k :: r) (m, cs) =
+  (m2, c2) = update me env apps k m;
+  applyKeys me env apps r (m2, cat cs c2).
 cat Nil b = b.
 cat (a :: r) b = a :: cat r b.
 
@@ -433,7 +630,7 @@ result apps (Md s f sts fr lr lk sc) =
 loop me gfx dsp inp mt rt model =
   t0 = read mt;
   ks = drain me inp 16 Nil;
-  (m2, cmds) = applyKeys (appsOf rt) ks (model, Nil);
+  (m2, cmds) = applyKeys me (envOf rt) (appsOf rt) ks (model, Nil);
   _ = doCmds me dsp (frOf m2) cmds;
   case wantsQuit cmds of
     True -> result (appsOf rt) m2
@@ -491,10 +688,13 @@ main =
   mt = reg32 clint 49144;
   # /services/log: the ring every app actor writes through
   logA = spawn logActor;
-  _ = send sys (me, Reg (("/services/log", logA) :: Nil));
+  _ = send sys (me, Reg ( ("/services/log", logA)
+                       :: ("/logs", logA)
+                       :: ("/logs/normal", logA)
+                       :: ("/logs/warns", logA)
+                       :: ("/logs/errors", logA) :: Nil));
   _ = receive me;
-  log = svcLookup me sys "/services/log";
-  env = (log, mt);
+  log = svcLookup me sys "/logs";
   cache0 = (0 - 1, Nil, Nil);
   # the two packed framebuffers, allocated ONCE here (immortal pool --
   # handle addresses stay put, the voxel-interactive discipline); 4096
@@ -510,9 +710,35 @@ main =
   _ = tryAttach "clock.qa";
   _ = tryAttach "hello.qa";
   _ = tryAttach "logs.qa";
+  _ = tryAttach "monitor.qa";
+  _ = tryAttach "browser.qa";
+  _ = tryAttach "disk.qa";
+  _ = tryAttach "cli.qa";
   apps = discover 0 (Mod.plugs 0);
-  _ = print "pshell: {appN apps} apps loaded; q quits (home), p snapshots, esc suspends";
-  sts = initAll apps env;
+  _ = print "pshell: {appN apps} apps loaded; q quits (home), F12 snapshots, esc suspends";
+  # the root namespace: what the system KNOWS how to name.  Service
+  # endpoints, the log paths, one entry per loaded app, and the two
+  # paths whose bytes are genuinely on disk.
+  storeA = spawn storeActor;
+  appsA = spawn appsActor;
+  filesA = spawn filesActor;
+  ents = cat ( ("/services/graphics", 0, g)
+            :: ("/services/display", 0, d)
+            :: ("/services/input", 0, i)
+            :: ("/services/log", 0, log)
+            :: ("/logs/normal", 1, log)
+            :: ("/logs/warns", 1, log)
+            :: ("/logs/errors", 1, log)
+            :: ("/store/notes", 1, storeA)
+            :: ("/disk/records", 1, storeA)
+            :: ("/home/notes.txt", 2, filesA)
+            :: ("/tmp/scratch.txt", 2, filesA) :: Nil)
+            (appEnts (titles apps) appsA);
+  vfs = spawn (vfsActor ents);
+  _ = send sys (me, Reg (("/services/vfs", vfs) :: Nil));
+  _ = receive me;
+  env = (log, mt, (titles apps, vfs));
+  sts = initAll me apps env;
   m0 = Md 0 0 sts 0 (0, 0) 0 0;
   loop me g d i mt (Rt cache0 fbA fbB 0 (vw, env) apps) m0.
 
@@ -542,8 +768,8 @@ discovered ok meta ini upd tre vls i n =
   _ = print "pshell: table {i}: not an app (skipped)";
   discover (i + 1) n.
 
-initAll Nil env = Nil.
-initAll (Ap nm sb ini upd tre vls :: r) env = ini env :: initAll r env.
+initAll me Nil env = Nil.
+initAll me (Ap nm sb ini upd tre vls :: r) env = ini me env :: initAll me r env.
 
 imax1 h | h < 1 = 1.
 imax1 h = h.

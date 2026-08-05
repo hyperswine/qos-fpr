@@ -318,6 +318,10 @@ apps-qa:
 	$(MAKE) -s plugin-qa PLUG=apps/clock.fpr  PLUGOUT=qos-apps/clock.qa  PLUGBASE=0x408400000
 	$(MAKE) -s plugin-qa PLUG=apps/hello.fpr  PLUGOUT=qos-apps/hello.qa  PLUGBASE=0x408800000
 	$(MAKE) -s plugin-qa PLUG=apps/logs.fpr   PLUGOUT=qos-apps/logs.qa   PLUGBASE=0x408c00000
+	$(MAKE) -s plugin-qa PLUG=apps/monitor.fpr PLUGOUT=qos-apps/monitor.qa PLUGBASE=0x409000000
+	$(MAKE) -s plugin-qa PLUG=apps/browser.fpr PLUGOUT=qos-apps/browser.qa PLUGBASE=0x409400000
+	$(MAKE) -s plugin-qa PLUG=apps/disk.fpr    PLUGOUT=qos-apps/disk.qa    PLUGBASE=0x409800000
+	$(MAKE) -s plugin-qa PLUG=apps/cli.fpr     PLUGOUT=qos-apps/cli.qa     PLUGBASE=0x409c00000
 
 fprc: compiler/Main.hs compiler/FPRISC.hs compiler/Codegen.hs compiler/Modules.hs compiler/A64.hs compiler/X64.hs compiler/Infer.hs compiler/Struct.hs compiler/Precond.hs
 	cd compiler && cabal build -v0

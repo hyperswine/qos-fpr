@@ -1,0 +1,3 @@
+# monitor root: module-table carrier only
+A = use "../programs/mods/monitorapp".
+main = A.appMeta 0.

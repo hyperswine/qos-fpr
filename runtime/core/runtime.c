@@ -449,7 +449,15 @@ static void pdec(uw u) {
   while (u) { b[i--] = '0' + (u % 10); u /= 10; }
   for (int j = i + 1; j <= 23; j++) hal_putc(b[j]);
 }
+void fpr_logput(int sev, const char *b, uw n);
 void fpr_cpanic(const char *m) {
+  static int in_panic;
+  if (!in_panic) {
+    in_panic = 1;
+    uw n = 0;
+    while (m[n]) n++;
+    fpr_logput(2, m, n); /* the error ring keeps the last words */
+  }
   praw("\n*** FPRISC PANIC [actor ");
   pdec(fpr_current_id());
   praw("]: ");
@@ -739,6 +747,91 @@ V fpr_prim_fn_str(V v) {
 }
 
 fpr_lock_t fpr_con_lock; /* console: one LINE at a time across harts */
+
+/* ---- the /logs substrate: three severity rings ----------------------
+ * The `log` family lands HERE, in C-owned storage: LOG_N lines of
+ * LOG_W bytes per severity (0 normal, 1 warn, 2 error), copied at
+ * write.  C ownership is the point -- snapshots hand out fresh copies
+ * in the CALLER's pool, so no cross-actor lifetime exists at all (the
+ * copy-on-retain and live-state lessons, designed away).  fpr_cpanic
+ * appends the panic text to the error ring first, so a post-mortem
+ * Logs screen -- or gdb -- can read the last words. */
+#define LOG_SEVS 3
+#define LOG_N 16
+#define LOG_W 96
+static char log_ring[LOG_SEVS][LOG_N][LOG_W];
+static uw log_seq[LOG_SEVS]; /* total ever; head = seq % LOG_N */
+static fpr_lock_t log_lock;
+
+void fpr_logput(int sev, const char *b, uw n) {
+  if (sev < 0) sev = 0;
+  if (sev >= LOG_SEVS) sev = LOG_SEVS - 1;
+  if (n >= LOG_W) n = LOG_W - 1;
+  fpr_lock(&log_lock);
+  char *dst = log_ring[sev][log_seq[sev] % LOG_N];
+  for (uw i = 0; i < n; i++) dst[i] = b[i];
+  dst[n] = 0;
+  log_seq[sev]++;
+  fpr_unlock(&log_lock);
+  /* echo, prefixed -- the console remains the zeroth debugging tool */
+  static const char *pre[LOG_SEVS] = {"[log] ", "[warn] ", "[ERR] "};
+  fpr_lock(&fpr_con_lock);
+  for (const char *c = pre[sev]; *c; c++) hal_putc(*c);
+  for (uw i = 0; i < n; i++) {
+    if (b[i] == '\n') hal_putc('\r');
+    hal_putc(b[i]);
+  }
+  hal_putc('\r');
+  hal_putc('\n');
+  fpr_unlock(&fpr_con_lock);
+}
+
+static V g_logAt(V sevv, V sv) {
+  if (ISINT(sv) || TID(sv) != T_STR) fpr_cpanic("log: not a string");
+  str_t *t = (str_t *)sv;
+  fpr_logput((int)UNTAG(sevv), (const char *)t->bytes, t->len);
+  return (V)&fpr_unit;
+}
+static V g_log(V sv) { return g_logAt(TAG(0), sv); }
+static V g_logW(V sv) { return g_logAt(TAG(1), sv); }
+static V g_logE(V sv) { return g_logAt(TAG(2), sv); }
+static V g_logSeq(V sevv) {
+  sw sev = UNTAG(sevv);
+  if (sev < 0 || sev >= LOG_SEVS) return TAG(0);
+  return TAG((sw)log_seq[sev]);
+}
+/* newest-first list of fresh string COPIES in the caller's pool */
+static V g_logSnap(V sevv) {
+  sw sev = UNTAG(sevv);
+  if (sev < 0 || sev >= LOG_SEVS) sev = 0;
+  fpr_lock(&log_lock);
+  uw have = log_seq[sev] < LOG_N ? log_seq[sev] : LOG_N;
+  hdr_t *nil = (hdr_t *)fpr_alloc(8);
+  nil->tid = T_LIST;
+  nil->var = 0;
+  V list = (V)nil;
+  /* build oldest -> newest by consing, so the head is newest */
+  for (uw i = 0; i < have; i++) {
+    const char *line = log_ring[sev][(log_seq[sev] - have + i) % LOG_N];
+    uw n = 0;
+    while (line[n]) n++;
+    V str = (V)fpr_mkstr((const uint8_t *)line, n);
+    V *cell = (V *)fpr_alloc(24);
+    ((hdr_t *)cell)->tid = T_LIST;
+    ((hdr_t *)cell)->var = 1;
+    cell[1] = str;
+    cell[2] = list;
+    list = (V)cell;
+  }
+  fpr_unlock(&log_lock);
+  return list;
+}
+FPR_FN(fpr_g_log, g_log, 1);
+FPR_FN(fpr_g_logWarn, g_logW, 1);
+FPR_FN(fpr_g_logErr, g_logE, 1);
+FPR_FN(fpr_g_Sys_x2elogAt, g_logAt, 2);
+FPR_FN(fpr_g_Sys_x2elogSeq, g_logSeq, 1);
+FPR_FN(fpr_g_Sys_x2elogSnap, g_logSnap, 1);
 
 V fpr_prim_fn_print(V v) {
   rpos = 0;

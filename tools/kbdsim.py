@@ -46,7 +46,10 @@ KEY = {**{chr(ord('a')+i): c for i, c in enumerate(
         [30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,20,22,47,17,45,21,44])},
        **{str(d): c for d, c in zip(range(10), [11,2,3,4,5,6,7,8,9,10])},
        'space': 57, 'esc': 1, 'up': 103, 'down': 108, 'left': 105, 'right': 106,
-       'enter': 28, 'backspace': 14, 'tab': 15}
+       'enter': 28, 'backspace': 14, 'tab': 15,
+       # punctuation a URL needs: paths are typed, so these are not optional
+       'slash': 53, 'dot': 52, 'dash': 12, 'colon': 39, 'under': 13,
+       'f12': 88}
 
 def ev(etype, code, value):
     # 64-bit struct input_event: timeval (2x u64) + type,code (u16) + value (s32)

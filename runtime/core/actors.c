@@ -99,6 +99,8 @@ typedef struct fpr_acb {
                     * actors -- explicit placement is an affinity
                     * contract (a graphics actor's EGL context is bound
                     * to its hart's thread on hosted targets) */
+  uw parent;              /* spawner's actor id (0 = the boot actor) */
+  struct fpr_acb *all_nx; /* the all-actors ledger (monitor's walk) */
   fpr_pool_t pool; /* this actor's slabs + recycle buckets (slab refactor) */
 } acb_t;
 
@@ -297,6 +299,18 @@ void hal_wfi(void);
 
 /* ---- shared counters (the deadlock detector's whole world) ----------- */
 static uw next_id;                 /* atomic fetch_add */
+/* every acb ever, newest first (acbs are immortal, so the walk is
+ * always safe; readers tolerate concurrent pushes -- push is a single
+ * release store of the head) */
+static acb_t *g_all;
+static void ledger_push(acb_t *a) {
+  acb_t *h;
+  do {
+    h = __atomic_load_n(&g_all, __ATOMIC_ACQUIRE);
+    a->all_nx = h;
+  } while (!__atomic_compare_exchange_n(&g_all, &h, a, 0, __ATOMIC_RELEASE,
+                                        __ATOMIC_ACQUIRE));
+}
 static volatile uw g_blocked;      /* actors currently parked */
 static volatile uw g_activity;     /* bumped on every ship/spawn */
 
@@ -754,6 +768,8 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   main_acb.id = 0;
   main_acb.hart = 0;
   main_acb.pin = 1; /* the result carrier never migrates */
+  main_acb.parent = 0;
+  ledger_push(&main_acb);
   char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
   main_acb.pool.cur = 0;
@@ -801,6 +817,11 @@ static V spawn_on(uw hart, V f, uw pin) {
   a->id = __atomic_add_fetch(&next_id, 1, __ATOMIC_RELAXED);
   a->hart = hart;
   a->pin = pin;
+  {
+    acb_t *cur = fpr_hart()->current;
+    a->parent = cur ? cur->id : 0;
+  }
+  ledger_push(a);
   for (int i = 0; i < 16; i++) a->ctx[i] = 0;
   /* first-activation state is machine-specific (x86 needs a stack-
    * alignment bias; rv needs tp) -- the ctx layer owns fabrication */
@@ -1006,3 +1027,59 @@ uw fpr_current_id(void) {
 }
 
 V fpr_process_result_get(void) { return fpr_process_result; }
+
+
+/* ---- introspection: the monitor's window ----------------------------
+ * Sys.actLive ()      -> live (non-DEAD) actor count
+ * Sys.actInfo i       -> the i-th live actor (ledger order = newest
+ *                        first) as [id, status, parent, code]:
+ *                        status 0 ready / 1 blocked; parent = the
+ *                        spawner's id; code = the entry closure's
+ *                        function address, which is ATTRIBUTION: an
+ *                        address inside a plugin sub-slot names the
+ *                        app that owns the actor.  Out of range -> [].
+ * The ledger is append-only over immortal acbs, so walking it is
+ * always safe; counts are a snapshot, racing spawns tolerated. */
+static V mklist4(uw a, uw b, uw c, uw d) {
+  hdr_t *nil = (hdr_t *)fpr_alloc(8);
+  nil->tid = T_LIST;
+  nil->var = 0;
+  V list = (V)nil;
+  uw vals[4] = {d, c, b, a};
+  for (int i = 0; i < 4; i++) {
+    V *cell = (V *)fpr_alloc(24);
+    ((hdr_t *)cell)->tid = T_LIST;
+    ((hdr_t *)cell)->var = 1;
+    cell[1] = TAG((sw)vals[i]);
+    cell[2] = list;
+    list = (V)cell;
+  }
+  return list;
+}
+
+static V g_actLive(V u) {
+  (void)u;
+  uw n = 0;
+  for (acb_t *a = __atomic_load_n(&g_all, __ATOMIC_ACQUIRE); a; a = a->all_nx)
+    if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) != ST_DEAD) n++;
+  return TAG((sw)n);
+}
+
+static V g_actInfo(V iv) {
+  sw want = UNTAG(iv);
+  for (acb_t *a = __atomic_load_n(&g_all, __ATOMIC_ACQUIRE); a; a = a->all_nx) {
+    uint32_t st = __atomic_load_n(&a->var, __ATOMIC_ACQUIRE);
+    if (st == ST_DEAD) continue;
+    if (want-- == 0) {
+      uw code = 0;
+      if (a->entry && !ISINT(a->entry)) code = ((uw *)a->entry)[1];
+      return mklist4(a->id, st == ST_BLOCKED ? 1 : 0, a->parent, code);
+    }
+  }
+  hdr_t *nil = (hdr_t *)fpr_alloc(8);
+  nil->tid = T_LIST;
+  nil->var = 0;
+  return (V)nil;
+}
+FPR_FN(fpr_g_Sys_x2eactLive, g_actLive, 1);
+FPR_FN(fpr_g_Sys_x2eactInfo, g_actInfo, 1);

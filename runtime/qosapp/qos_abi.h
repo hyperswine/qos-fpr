@@ -42,7 +42,7 @@
  * runtime EXCLUDES this range from fpr_in_heap (plugin rodata is
  * immortal literal data, not slab-backed heap). */
 #define QOS_PLUG_BASE (QOS_ARENA_BASE + (128ul << 20))
-#define QOS_PLUG_SIZE (16ul << 20)
+#define QOS_PLUG_SIZE (32ul << 20) /* 8 sub-slots of 4 MiB */
 /* syscall channel tags (boot->syscall_fn): 2 kv-append, 3 kv-replay,
  * 4 load-plugin (payload = filename; returns the module-table address
  * as the int64, or <0 with an error string in out) */

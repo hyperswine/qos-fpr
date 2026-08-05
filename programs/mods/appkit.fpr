@@ -24,12 +24,53 @@
 # capabilities are PASSED, never ambient.
 # ============================================================================
 
-Ak = Type (LogAdd line | LogSnap u).
+# sev: 0 normal, 1 warn, 2 error -- the /logs/{normal,warns,errors} axis
+#
+# Read/VfsList are the ROOT NAMESPACE protocol.  There is no root
+# filesystem: the root is what the registry KNOWS -- a flat set of URL
+# paths, most naming virtual resources (a service, an actor inside
+# one, an app), a few naming stored bytes.  "Directories" are just
+# shared path prefixes, computed by whoever displays them.  Resolution
+# is a walk to the path's OWNER: the vfs actor forwards Read to it and
+# relays what comes back, so serving a path is a capability an actor
+# holds, never a table of file contents.
+# Write is the same walk as Read: the resolver hands it to the path's
+# OWNER, and what "writing" means is that actor's business -- for a
+# file it is a delta appended to the log and a cache updated; for
+# something else it could be an ordinary message.  The namespace is a
+# VIEW; writability is a property of the owner, not of the path.
+Ak = Type (LogAdd sev line | LogSnap sev | VfsList u | Read path
+         | Write path text).
 
 # ---- service call (one request, one reply) ---------------------------------
 call me a q = _ = send a (me, q); receive me.
 
-logAdd me log line = call me log (LogAdd line).
+# capability-routed logging (through /services -- an app actor's print)
+logAdd me log line = call me log (LogAdd 0 line).
+logAddAt me log sev line = call me log (LogAdd sev line).
+
+# env = (log, mt, (titles, vfs)): the log capability, the mtime handle,
+# the launcher's app-title list (attach order == sub-slot order by
+# construction of apps-qa; the monitor leans on that), and the root
+# namespace resolver.  ALWAYS go through these accessors -- the shape
+# is packed to stay inside the tuple arities.
+envLog (log, mt, rest) = log.
+envMt (log, mt, rest) = mt.
+envTitles (log, mt, rest) =
+  (ts, vfs) = rest;
+  ts.
+envVfs (log, mt, rest) =
+  (ts, vfs) = rest;
+  vfs.
+
+# the root namespace, through the resolver capability
+vfsList me vfs = call me vfs (VfsList 0).
+vfsRead me vfs path = call me vfs (Read path).
+vfsWrite me vfs path text = call me vfs (Write path text).
+
+# the plugin window: sub-slot attribution for entry-code addresses
+plugBase u = 17314086912.            # 0x408000000
+plugSlot u = 4194304.                # 4 MiB
 
 # ---- keys ------------------------------------------------------------------
 keyChar 57 = " ".
@@ -43,6 +84,9 @@ keyChar 21 = "y". keyChar 44 = "z".
 keyChar 11 = "0". keyChar 2 = "1". keyChar 3 = "2". keyChar 4 = "3".
 keyChar 5 = "4". keyChar 6 = "5". keyChar 7 = "6". keyChar 8 = "7".
 keyChar 9 = "8". keyChar 10 = "9".
+# a namespace is typed, so the URL punctuation is part of the alphabet
+keyChar 53 = "/". keyChar 52 = ".". keyChar 12 = "-".
+keyChar 39 = ";". keyChar 13 = "=".
 keyChar c | c < 0 = chr (0 - c).    # stdin literal
 keyChar c = "".
 

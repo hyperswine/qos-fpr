@@ -9,8 +9,8 @@ W = S2.W. H = S2.H. Grow = S2.Grow. Sc = S2.Sc.
 Bg = S2.Bg. Fg = S2.Fg. Bord = S2.Bord.
 
 appMeta u = ("CLOCK", "CLOCK.QA").
-appInit env = 0.
-appUpdate k n = n + 1.
+appInit self env = 0.
+appUpdate self env k n = n + 1.
 
 appTree vw =
   Box [Col, Pad 8, Gap 8, W vw, H 240, Bg (62, 70, 88)]
@@ -29,5 +29,4 @@ appTree vw =
         , Lbl [Fg (560, 590, 650)] "ESC BACK" ] ].
 
 appVals self env n =
-  (log, mt) = env;
-  [ AK.clockStr mt, "{n} KEYS SEEN" ].
+  [ AK.clockStr (AK.envMt env), "{n} KEYS SEEN" ].

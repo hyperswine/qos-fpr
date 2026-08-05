@@ -102,6 +102,29 @@ static V h_store_req(V tagv, V payv) {
     }
     return fpr_mkresultn(0, out, n);
   }
+  if (tag == 5) { /* record index: "seq off len" per record (see store.c) */
+    static char out[64 * 1024];
+    FILE *f = fopen(path, "rb");
+    uw n = 0;
+    if (f) {
+      char line[32];
+      unsigned long long off = 0, seq = 0;
+      while (fgets(line, sizeof line, f)) {
+        unsigned long long rl = strtoull(line, 0, 10);
+        unsigned long long hdr = (unsigned long long)strlen(line);
+        char rec[64];
+        int rn = snprintf(rec, sizeof rec, "%llu %llu %llu\n", seq, off + hdr, rl);
+        if (n + (uw)rn > sizeof out) break;
+        memcpy(out + n, rec, (size_t)rn);
+        n += (uw)rn;
+        if (fseek(f, (long)rl + 1, SEEK_CUR)) break;
+        off += hdr + rl + 1;
+        seq++;
+      }
+      fclose(f);
+    }
+    return fpr_mkresultn(0, out, n);
+  }
   return fpr_mkresult(1, "storage error");
 }
 FPR_FN(fpr_g_Sys_x2estoreReq, h_store_req, 2);
