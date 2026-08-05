@@ -302,6 +302,9 @@ scene st dy = Scene st dy lights2d camera2d.
 # uppercase-fold, then a clause per code.  Layout literals are decimal
 # renderings of the 15-bit patterns (LSB = top-left).
 
+# a-z fold, but ONLY a-z: 123-126 ({|}~) would otherwise fold onto
+# [\]^ and print the wrong glyph entirely
+font c | c > 122 = font2 c.
 font c | c > 96 = font (c - 32).      # a-z -> A-Z
 font 32 = 0.                    # space
 font 46 = 8192.                 # .
@@ -352,7 +355,41 @@ font 87 = 24557.                # W
 font 88 = 23213.                # X
 font 89 = 9389.                 # Y
 font 90 = 29351.                # Z
+# the punctuation a keyboard can actually produce -- typing a symbol
+# and getting the missing-glyph checker is the same bug as not being
+# able to type it at all
+font 34 = 45.         # "
+font 35 = 24445.      # #
+font 36 = 31903.      # $
+font 37 = 21157.      # %
+font 38 = 31707.      # &
+font 42 = 2728.       # *
+font 43 = 1488.       # +
+font 44 = 5120.       # ,
+font 59 = 5136.       # ;
+font 61 = 3640.       # =
+font 64 = 29679.      # @
+font 91 = 12875.      # [
+font 92 = 18569.      # \
+font 93 = 26918.      # ]
+font 94 = 42.         # ^
+font 96 = 17.         # `
+font 123 = 25686.     # {
+font 124 = 9362.      # |
+font 125 = 13587.     # }
+font 126 = 1904.      # ~
+
 font c = 21845.                       # unknown: checker
+
+# {|}~ live above the a-z fold, so they get their own lookup (a helper
+# defined HERE, after the group -- a definition in the middle of a
+# clause group silently ends it, which cost the whole font once)
+font2 123 = 25686.
+font2 124 = 9362.
+font2 125 = 13587.
+font2 126 = 1904.
+font2 c = 21845.
+
 
 # debug helpers (harmless exports)
 entCount (C2 es sl vw) = dbgLen es.

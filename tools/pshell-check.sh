@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 # -> clock again (suspend/resume).  F12 is the snapshot key: inside an
 # app every letter belongs to the app, which a CLI needs.  Filler is
 # `tab` (maps to no character) for the same reason.
-SPEC="enter h i enter tab tab tab  esc right tab tab tab tab tab  enter a b c tab tab tab  tab tab tab tab tab tab tab f12  esc right right tab tab tab tab  enter n tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc down tab tab tab tab tab  enter tab tab tab tab tab tab  l s enter tab tab tab tab  tab tab tab tab tab tab tab f12  w r i t e space slash t  m p slash s c r a  t c h dot t x t space  o k enter tab tab tab tab tab  c a t space slash t m  p slash s c r a t  c h dot t x t enter tab  tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  down down down down tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  backspace esc left tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc up right tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc q tab tab tab tab tab"
+SPEC="enter h i enter tab tab tab  esc right tab tab tab tab tab  enter a b c tab tab tab  tab tab tab tab tab tab tab f12  esc right right tab tab tab tab  enter n tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc down tab tab tab tab tab  enter tab tab tab tab tab tab  l s enter tab tab tab tab  tab tab tab tab tab tab tab f12  type:write space type:/tmp/Scratch-1.txt space tab  type:\"ok!\" tab tab tab tab tab tab  enter tab tab tab tab tab tab  type:cat space type:/tmp/Scratch-1.txt tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc left tab tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  down down down down tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  backspace esc left tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc up right tab tab tab tab  enter tab tab tab tab tab tab  tab tab tab tab tab tab tab f12  esc q tab tab tab tab tab"
 EVD=/tmp/pshell-check.evd
 python3 tools/kbdsim.py "$EVD" "$SPEC" >/dev/null || exit 1
 python3 tools/kbdsim.py /tmp/pshell-quit.evd "f12 tab tab tab tab tab tab tab  q" >/dev/null || exit 1
@@ -48,14 +48,17 @@ echo "$out" | grep -q "app 5: FILES" || fail "qosp: FILES not discovered"
 echo "$out" | grep -q "app 6: DISK" || fail "qosp: DISK not discovered"
 echo "$out" | grep -q "app 7: CLI" || fail "qosp: CLI not discovered"
 echo "$out" | grep -q "system: opening /home/notes.txt" || fail "qosp: notes file actor never spawned"
-echo "$out" | grep -q "system: opening /tmp/scratch.txt" || fail "qosp: CLI write did not reach a file actor"
+echo "$out" | grep -q "system: creating /tmp/Scratch-1.txt" || fail "qosp: CLI write did not create a file"
 echo "$out" | grep -q "\[log\] HELLO 5 FROM CHILD ACTOR" || fail "qosp: child actor's logs missing"
 echo "$out" | grep -q "\[warn\] HELLO 3 WAS A WARNING" || fail "qosp: warn severity missing"
 echo "$out" | grep -q "\[ERR\] HELLO 5 WAS AN ERROR" || fail "qosp: error severity missing"
 echo "$out" | grep -q "pshell:.*8 apps" || fail "qosp: result string"
 echo "$out" | grep -q "PANIC" && fail "qosp: panicked"
 grep -q "/home/notes.txt" qos-store/pshell.kv || fail "qosp: notes record not written"
-grep -q "/tmp/scratch.txt" qos-store/pshell.kv || fail "qosp: CLI write not on the log"
+grep -q "/tmp/Scratch-1.txt" qos-store/pshell.kv || fail "qosp: CLI write not on the log"
+# the exact bytes: uppercase, digits, punctuation and a SHIFTED quote
+# all survived keyboard -> keymap -> file actor -> append log
+grep -q '"ok!"' qos-store/pshell.kv || fail "qosp: shifted characters lost on the way to disk"
 ls pshell*.ppm >/dev/null 2>&1 || fail "qosp: no snapshots"
 python3 - <<'EOF' || exit 1
 from PIL import Image

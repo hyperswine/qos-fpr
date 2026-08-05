@@ -73,6 +73,11 @@ plugBase u = 17314086912.            # 0x408000000
 plugSlot u = 4194304.                # 4 MiB
 
 # ---- keys ------------------------------------------------------------------
+# The full US layout, unshifted and shifted.  The input tier reports a
+# held shift by BIASING the keycode (+1000), so this stays two plain
+# tables and nothing upstream carries modifier state.  Ctrl (+4000)
+# and alt (+8000) arrive the same way and fall through to "" here --
+# an app that wants chords matches those codes itself.
 keyChar 57 = " ".
 keyChar 30 = "a". keyChar 48 = "b". keyChar 46 = "c". keyChar 32 = "d".
 keyChar 18 = "e". keyChar 33 = "f". keyChar 34 = "g". keyChar 35 = "h".
@@ -84,11 +89,39 @@ keyChar 21 = "y". keyChar 44 = "z".
 keyChar 11 = "0". keyChar 2 = "1". keyChar 3 = "2". keyChar 4 = "3".
 keyChar 5 = "4". keyChar 6 = "5". keyChar 7 = "6". keyChar 8 = "7".
 keyChar 9 = "8". keyChar 10 = "9".
-# a namespace is typed, so the URL punctuation is part of the alphabet
-keyChar 53 = "/". keyChar 52 = ".". keyChar 12 = "-".
-keyChar 39 = ";". keyChar 13 = "=".
-keyChar c | c < 0 = chr (0 - c).    # stdin literal
+# the punctuation block, in keycode order
+keyChar 12 = "-". keyChar 13 = "=". keyChar 26 = "[". keyChar 27 = "]".
+keyChar 39 = ";". keyChar 40 = "'". keyChar 41 = "`". keyChar 43 = "\\".
+keyChar 51 = ",". keyChar 52 = ".". keyChar 53 = "/".
+# keypad, for the numeric block
+keyChar 55 = "*". keyChar 74 = "-". keyChar 78 = "+". keyChar 98 = "/".
+keyChar 71 = "7". keyChar 72 = "8". keyChar 73 = "9".
+keyChar 75 = "4". keyChar 76 = "5". keyChar 77 = "6".
+keyChar 79 = "1". keyChar 80 = "2". keyChar 81 = "3".
+keyChar 82 = "0". keyChar 83 = ".".
+# ---- shifted (code + 1000) -------------------------------------------------
+keyChar 1057 = " ".
+keyChar 1030 = "A". keyChar 1048 = "B". keyChar 1046 = "C". keyChar 1032 = "D".
+keyChar 1018 = "E". keyChar 1033 = "F". keyChar 1034 = "G". keyChar 1035 = "H".
+keyChar 1023 = "I". keyChar 1036 = "J". keyChar 1037 = "K". keyChar 1038 = "L".
+keyChar 1050 = "M". keyChar 1049 = "N". keyChar 1024 = "O". keyChar 1025 = "P".
+keyChar 1016 = "Q". keyChar 1019 = "R". keyChar 1031 = "S". keyChar 1020 = "T".
+keyChar 1022 = "U". keyChar 1047 = "V". keyChar 1017 = "W". keyChar 1045 = "X".
+keyChar 1021 = "Y". keyChar 1044 = "Z".
+keyChar 1011 = ")". keyChar 1002 = "!". keyChar 1003 = "@". keyChar 1004 = "#".
+keyChar 1005 = "$". keyChar 1006 = "%". keyChar 1007 = "^". keyChar 1008 = "&".
+keyChar 1009 = "*". keyChar 1010 = "(".
+keyChar 1012 = "_". keyChar 1013 = "+". keyChar 1026 = "{". keyChar 1027 = "}".
+keyChar 1039 = ":". keyChar 1040 = "\"". keyChar 1041 = "~". keyChar 1043 = "|".
+keyChar 1051 = "<". keyChar 1052 = ">". keyChar 1053 = "?".
+keyChar c | c < 0 = chr (0 - c).    # stdin literal (the tty tier)
 keyChar c = "".
+
+# the shift bias, for apps that want to know
+keyBase c | c >= 8000 = c - 8000.
+keyBase c | c >= 4000 = c - 4000.
+keyBase c | c >= 1000 = c - 1000.
+keyBase c = c.
 
 # ---- time ------------------------------------------------------------------
 imodK a b = a - (a / b) * b.

@@ -47,6 +47,13 @@ static int ev_nfds;
 static int ev_tried;
 static unsigned char buf[sizeof(struct input_event) * 32];
 static size_t buflen;
+static int shift_held, ctrl_held, alt_held, caps_on;
+
+/* the letter block, in keycode order: q..p, a..l, z..m */
+static int is_letter_code(unsigned code) {
+  return (code >= KEY_Q && code <= KEY_P) || (code >= KEY_A && code <= KEY_L) ||
+         (code >= KEY_Z && code <= KEY_M);
+}
 
 #ifdef __linux__
 static int is_keyboard(int fd) {
@@ -129,8 +136,40 @@ int qos_evdev_poll(int64_t *kind, int64_t *a, int64_t *c) {
         fprintf(stderr, "[input] first key event: code %u value %d\n",
                 (unsigned)ev.code, (int)ev.value);
       }
+      /* MODIFIER STATE lives here, in the one place that sees every
+       * event of every source.  A keyboard reports shift as its own
+       * press/release around the key, so a stateless decoder can
+       * never produce '?' or '"' -- and the app layer would have to
+       * carry modifier state through its model to do it instead.
+       * Held modifiers are reported by BIASING the keycode: shifted
+       * keys arrive as code + KEYBIAS_SHIFT, so a keymap stays a
+       * plain table lookup and unshifted codes are untouched.
+       * Caps lock toggles and applies to letters only (it is a lock,
+       * not a shift -- caps+2 is still '2'). */
+      if (ev.code == KEY_LEFTSHIFT || ev.code == KEY_RIGHTSHIFT) {
+        if (ev.value != 2) shift_held = ev.value ? 1 : 0;
+        continue; /* the modifier itself is not a keypress */
+      }
+      if (ev.code == KEY_LEFTCTRL || ev.code == KEY_RIGHTCTRL) {
+        if (ev.value != 2) ctrl_held = ev.value ? 1 : 0;
+        continue;
+      }
+      if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+        if (ev.value != 2) alt_held = ev.value ? 1 : 0;
+        continue;
+      }
+      if (ev.code == KEY_CAPSLOCK) {
+        if (ev.value == 1) caps_on = !caps_on;
+        continue;
+      }
+      int bias = 0;
+      if (shift_held) bias += 1000;
+      if (ctrl_held) bias += 4000;
+      if (alt_held) bias += 8000;
+      if (caps_on && !shift_held && is_letter_code(ev.code)) bias += 1000;
+      if (caps_on && shift_held && is_letter_code(ev.code)) bias -= 1000;
       *kind = 4;
-      *a = ev.code;
+      *a = ev.code + bias;
       *c = ev.value;
       return 1;
     }

@@ -298,10 +298,34 @@ vfsMsg ents me replyTo (Read path) m =
   _ = vfsRead ents me replyTo path;
   _ = drop m;
   vfsServe ents me.
+# Writing to a path nobody has named yet CREATES it, if it sits in a
+# namespace that holds files: the entry is added here and its actor
+# spawns on first touch, which is what "System.qa maps known URLs and
+# some of them are files" means when the set of files can grow.
 vfsMsg ents me replyTo (Write path text) m =
-  _ = vfsWrite ents me replyTo path text;
+  ents2 = vfsEnsure ents path;
+  _ = vfsWrite ents2 me replyTo path text;
   _ = drop m;
-  vfsServe ents me.
+  vfsServe ents2 me.
+vfsEnsure ents path | hasPath ents path = ents.
+vfsEnsure ents path | fileSpace path = mkEntry ents path.
+vfsEnsure ents path = ents.
+hasPath Nil path = False.
+hasPath ((p, k, o) :: r) path | strEq p path = True.
+hasPath ((p, k, o) :: r) path = hasPath r path.
+# the file namespaces; everything else is served by whoever owns it
+fileSpace path | hasPrefix path "/tmp/" = True.
+fileSpace path | hasPrefix path "/home/" = True.
+fileSpace path = False.
+hasPrefix s pre | strlen s < strlen pre = False.
+hasPrefix s pre = strEq (substr s 1 (strlen pre)) pre.
+mkEntry ents path =
+  _ = Sys.logAt 0 "system: creating {path}";
+  cat ents ((path, 2, filesOf ents) :: Nil).
+# the files manager is whoever already owns the file entries
+filesOf Nil = 0.
+filesOf ((p, k, o) :: r) | k == 2 = o.
+filesOf ((p, k, o) :: r) = filesOf r.
 vfsWrite Nil me replyTo path text = send replyTo "no such path".
 vfsWrite ((p, k, o) :: r) me replyTo path text | strEq p path =
   vfsWriteOne k o me replyTo path text.
@@ -546,22 +570,23 @@ moveF cols t f k = f.
 # is focused goes to THAT app's appUpdate, which returns its new state
 # value -- setNth into the state list and carry on.  Suspension is
 # nothing but this list.
-update me env apps k (Md 0 f sts fr lr lk sc) | k == 16 =
+update me env apps k m = updateK me env apps (AK.keyBase k) k m.
+updateK me env apps kb k (Md 0 f sts fr lr lk sc) | kb == 16 =
   (Md 0 f sts fr lr k sc, [CQuit]).
-update me env apps k (Md 0 f sts fr lr lk sc) | k == 25 = homeSnap f sts fr lr k sc.
-update me env apps k (Md 0 f sts fr lr lk sc) | k == 88 = homeSnap f sts fr lr k sc.
-update me env apps k (Md 0 f sts fr lr lk sc) | k == 28 =
+updateK me env apps kb k (Md 0 f sts fr lr lk sc) | kb == 25 = homeSnap f sts fr lr k sc.
+updateK me env apps kb k (Md 0 f sts fr lr lk sc) | kb == 88 = homeSnap f sts fr lr k sc.
+updateK me env apps kb k (Md 0 f sts fr lr lk sc) | kb == 28 =
   (homeEnter (appN apps) f (Md 0 f sts fr lr k sc), Nil).
-update me env apps k (Md 0 f sts fr lr lk sc) =
-  (Md 0 (moveF (colsFor (appN apps + 2)) (appN apps + 2) f k) sts fr lr k sc, Nil).
-update me env apps k (Md sN f sts fr lr lk sc) | k == 1 =
+updateK me env apps kb k (Md 0 f sts fr lr lk sc) =
+  (Md 0 (moveF (colsFor (appN apps + 2)) (appN apps + 2) f kb) sts fr lr k sc, Nil).
+updateK me env apps kb k (Md sN f sts fr lr lk sc) | kb == 1 =
   (Md 0 f sts fr lr k sc, Nil).
 # INSIDE an app only F12 is the shell's: an app with a text field must
 # be able to type every letter, so p and q belong to it like any other
 # key.  esc (suspend) is the one universal reservation.
-update me env apps k (Md sN f sts fr lr lk sc) | k == 88 =
+updateK me env apps kb k (Md sN f sts fr lr lk sc) | kb == 88 =
   (Md sN f sts fr lr k sc, [CSnap]).
-update me env apps k (Md sN f sts fr lr lk sc) =
+updateK me env apps kb k (Md sN f sts fr lr lk sc) =
   st2 = apUpd (nthAp apps (sN - 1)) me env k (nthSt sts (sN - 1));
   (Md sN f (setNth sts (sN - 1) st2) fr lr k sc, Nil).
 apUpd (Ap nm sb ini upd tre vls) me env k st = upd me env k st.

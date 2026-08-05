@@ -49,18 +49,56 @@ KEY = {**{chr(ord('a')+i): c for i, c in enumerate(
        'enter': 28, 'backspace': 14, 'tab': 15,
        # punctuation a URL needs: paths are typed, so these are not optional
        'slash': 53, 'dot': 52, 'dash': 12, 'colon': 39, 'under': 13,
-       'f12': 88}
+       'f12': 88, 'shift': 42, 'ctrl': 29, 'alt': 56, 'capslock': 58,
+       'minus': 12, 'equal': 13, 'lbrack': 26, 'rbrack': 27,
+       'semi': 39, 'quote': 40, 'grave': 41, 'bslash': 43, 'comma': 51,
+       'home': 102, 'end': 107, 'pgup': 104, 'pgdn': 109, 'del': 111,
+       'f1': 59, 'f2': 60, 'f3': 61, 'f4': 62, 'f5': 63, 'f6': 64,
+       'f7': 65, 'f8': 66, 'f9': 67, 'f10': 68, 'f11': 87}
+
+# The US layout as the keyboard actually reports it: every character
+# is a keycode plus whether shift is held.  One table drives typing in
+# BOTH modes (scripted specs and live --tty), so anything you can type
+# over ssh a script can reproduce exactly.
+UNSHIFTED = {**{chr(ord('a') + i): c for i, c in enumerate(
+                 [30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,
+                  20,22,47,17,45,21,44])},
+             **{str(d): c for d, c in zip(range(10), [11,2,3,4,5,6,7,8,9,10])},
+             ' ': 57, '-': 12, '=': 13, '[': 26, ']': 27, ';': 39,
+             "'": 40, '`': 41, '\\': 43, ',': 51, '.': 52, '/': 53,
+             '\n': 28, '\r': 28, '\t': 15, '\x7f': 14, '\x08': 14}
+SHIFTED = {**{chr(ord('A') + i): c for i, c in enumerate(
+                [30,48,46,32,18,33,34,35,23,36,37,38,50,49,24,25,16,19,31,
+                 20,22,47,17,45,21,44])},
+           '!': 2, '@': 3, '#': 4, '$': 5, '%': 6, '^': 7, '&': 8,
+           '*': 9, '(': 10, ')': 11, '_': 12, '+': 13, '{': 26, '}': 27,
+           ':': 39, '"': 40, '~': 41, '|': 43, '<': 51, '>': 52, '?': 53}
+SHIFT_CODE = 42
+
+def char_units(ch):
+    """the evdev units that type one character, shift and all"""
+    if ch in UNSHIFTED:
+        return [(UNSHIFTED[ch], 0)]
+    if ch in SHIFTED:
+        return [(SHIFTED[ch], 1)]
+    return []
 
 def ev(etype, code, value):
     # 64-bit struct input_event: timeval (2x u64) + type,code (u16) + value (s32)
     t = time.time()
     return struct.pack("qqHHi", int(t), int((t % 1) * 1e6), etype, code, value)
 
-def key_unit(code):
-    return (ev(EV_KEY, code, 1) + ev(EV_SYN, 0, 0) +
-            ev(EV_KEY, code, 0) + ev(EV_SYN, 0, 0))
+def key_unit(unit):
+    code, shift = unit if isinstance(unit, tuple) else (unit, 0)
+    b = b""
+    if shift:
+        b += ev(EV_KEY, SHIFT_CODE, 1) + ev(EV_SYN, 0, 0)
+    b += (ev(EV_KEY, code, 1) + ev(EV_SYN, 0, 0) +
+          ev(EV_KEY, code, 0) + ev(EV_SYN, 0, 0))
+    if shift:
+        b += ev(EV_KEY, SHIFT_CODE, 0) + ev(EV_SYN, 0, 0)
+    return b
 
-ASCII_EXTRA = {'\n': 28, '\r': 28, ' ': 57, '\x7f': 14, '\x08': 14, '\t': 15}
 def tty_mode(path):
     import termios, tty as ttymod, select
     out = open(path, 'wb', buffering=0)
@@ -82,23 +120,40 @@ def tty_mode(path):
                     code = {b'A': 103, b'B': 108, b'D': 105, b'C': 106}.get(a)
                 else:
                     code = 1
-            elif ch in ASCII_EXTRA:
-                code = ASCII_EXTRA[ch]
-            elif ch.lower() in KEY:
-                code = KEY[ch.lower()]
+            else:
+                u = char_units(ch)
+                if u:
+                    out.write(key_unit(u[0]))
+                continue
             if code:
-                out.write(key_unit(code))
+                out.write(key_unit((code, 0)))
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def parse_spec(spec):
+    """A token is a KEY NAME (esc, f12, enter, a, 1, ...), a name*N
+    repeat, or -- anything else -- LITERAL TEXT typed character by
+    character with shift synthesized: type:  qsh> cat /tmp/a.txt
+    becomes exactly the units a keyboard would send.  Use type:TEXT to
+    force literal reading of something that is also a key name, and
+    `space` for a space (tokens are whitespace-separated)."""
     units = []
     for tok in spec.split():
+        if tok.startswith("type:"):
+            for ch in tok[5:]:
+                units += char_units(ch)
+            continue
         name, _, n = tok.partition('*')
-        if name not in KEY:
-            sys.exit(f"kbdsim: unknown key {name!r} (have: {' '.join(sorted(KEY))})")
-        units += [KEY[name]] * (int(n) if n else 1)
+        if name in KEY:
+            units += [(KEY[name], 0)] * (int(n) if n else 1)
+            continue
+        bad = [c for c in tok if not char_units(c)]
+        if bad:
+            sys.exit(f"kbdsim: unknown key {tok!r} (untypable: {bad!r}; "
+                     f"names: {' '.join(sorted(KEY))})")
+        for ch in tok:
+            units += char_units(ch)
     return units
 
 def run_uinput(units, rate):
@@ -107,7 +162,8 @@ def run_uinput(units, rate):
     UI_DEV_CREATE, UI_DEV_DESTROY = 0x5501, 0x5502
     fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
     fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
-    for c in set(units): fcntl.ioctl(fd, UI_SET_KEYBIT, c)
+    codes = {u[0] for u in units} | {SHIFT_CODE}
+    for c in codes: fcntl.ioctl(fd, UI_SET_KEYBIT, c)
     # struct uinput_user_dev: name[80] + input_id (4x u16) + ff + 4x abs arrays
     dev = struct.pack("80sHHHHi", b"kbdsim virtual keyboard", 0x03, 0x1, 0x1, 1, 0)
     dev += b"\0" * (4 * 64 * 4)
