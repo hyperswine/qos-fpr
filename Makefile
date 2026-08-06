@@ -255,8 +255,9 @@ build/qosapp-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
 	LC_ALL=C.UTF-8 ./fprc --target=$(QOSFPRTGT) --prelude=programs/prelude.fpr $(PROG) $@
 
+QOSEXTRA ?=
 build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOSLD)
-	$(QOSCC) $(QOSLDFLAGS) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
+	$(QOSCC) $(QOSLDFLAGS) $(QOSEXTRA) -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic \
 	  $(QOSATOMICS) \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \

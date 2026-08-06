@@ -156,8 +156,30 @@ static void *bucket_take(fpr_pool_t *pool, uw idx) {
  * a 256 MiB arena in fourteen seconds of idle shell on a Pi 4.
  * Own lock, taken while arc_lock may be held (never the reverse). */
 static fpr_slab_t *grant_pool;
+/* arena telemetry, always on: how many times and how much the process
+ * arena has grown.  Cheap (two adds under the existing paths), and the
+ * difference between a healthy acb-floor drift and a leak is exactly
+ * these numbers over time -- the Pi should not need gdb to say which. */
+uw fpr_grow_count, fpr_grow_bytes;
 static fpr_lock_t grant_lock;
 
+static void praw(const char *s);
+static void pdec(uw u);
+extern uw fpr_current_id(void);
+#ifdef FPR_GROWTRACE
+static uw grant_pool_len(void);
+/* one line per arena grow, whichever site asked -- the slab-only trace
+ * hid three other growers and cost a day of wrong conclusions */
+void fpr_growlog(const char *site, uw want) {
+  praw("[grow] ");
+  praw(site);
+  praw(" actor ");
+  pdec(fpr_current_id());
+  praw(" want ");
+  pdec(want);
+  praw("\n");
+}
+#endif
 static fpr_slab_t *grant_take(uw total) {
   fpr_lock(&grant_lock);
   fpr_slab_t **pp = &grant_pool, *sl = grant_pool;
@@ -172,6 +194,14 @@ static fpr_slab_t *grant_take(uw total) {
   fpr_unlock(&grant_lock);
   return sl;
 }
+
+#ifdef FPR_GROWTRACE
+static uw grant_pool_len(void) {
+  uw n = 0;
+  for (fpr_slab_t *p = grant_pool; p; p = p->next) n++;
+  return n;
+}
+#endif
 
 static void grant_put(fpr_slab_t *sl) {
   fpr_lock(&grant_lock);
@@ -192,6 +222,9 @@ void **fpr_bkt_take(void) {
   fpr_unlock(&bkt_lock);
   if (!k) {
     if (fpr_is_process && fpr_grow_memory) {
+#ifdef FPR_GROWTRACE
+      fpr_growlog("bkt", sizeof(bktblk_t));
+#endif
       fpr_grant_t g = fpr_grow_memory(sizeof(bktblk_t));
       k = (g.ptr && g.size >= sizeof(bktblk_t)) ? (bktblk_t *)g.ptr : 0;
     } else
@@ -233,8 +266,33 @@ V fpr_alloc(V raw_bytes) {
         uw want = total + sizeof(fpr_slab_t);
         if (want < SLAB_SZ) want = SLAB_SZ;
         fpr_grant_t g = fpr_grow_memory(want);
-        if (!g.ptr || g.size < total + sizeof(fpr_slab_t))
+        if (g.ptr) {
+          fpr_grow_count++;
+          fpr_grow_bytes += g.size;
+        }
+#ifdef FPR_GROWTRACE
+        { /* which actor, and is the recycler empty? */
+          praw("[grow] slab actor ");
+          pdec(fpr_current_id());
+          praw(" want ");
+          pdec(want);
+          praw(" recycled ");
+          pdec(grant_pool_len());
+          praw("\n");
+        }
+#endif
+        if (!g.ptr || g.size < total + sizeof(fpr_slab_t)) {
+          /* the post-mortem journal should carry the numbers: how much
+           * the arena had grown and what was being asked when it died */
+          praw("[mem] exhausted: want ");
+          pdec(want);
+          praw(" after ");
+          pdec(fpr_grow_count);
+          praw(" grows / ");
+          pdec(fpr_grow_bytes >> 20);
+          praw(" MiB granted\n");
           fpr_cpanic("heap exhausted (process arena growth denied)");
+        }
         sl = (fpr_slab_t *)g.ptr;
         sl->end = (char *)g.ptr + g.size;
       }
@@ -832,6 +890,18 @@ FPR_FN(fpr_g_logErr, g_logE, 1);
 FPR_FN(fpr_g_Sys_x2elogAt, g_logAt, 2);
 FPR_FN(fpr_g_Sys_x2elogSeq, g_logSeq, 1);
 FPR_FN(fpr_g_Sys_x2elogSnap, g_logSnap, 1);
+
+/* Sys.memStats () -> (grows, mib): the arena growth ledger */
+static V g_memstats(V u) {
+  (void)u;
+  V *t = (V *)fpr_alloc(24);
+  ((hdr_t *)t)->tid = 4; /* Tup2 */
+  ((hdr_t *)t)->var = 0;
+  t[1] = TAG((sw)fpr_grow_count);
+  t[2] = TAG((sw)(fpr_grow_bytes >> 20));
+  return (V)t;
+}
+FPR_FN(fpr_g_Sys_x2ememStats, g_memstats, 1);
 
 V fpr_prim_fn_print(V v) {
   rpos = 0;

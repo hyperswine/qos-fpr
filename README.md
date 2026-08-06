@@ -271,18 +271,3 @@ Can use script to rebuild, reinstall
 
 Github/qos-fpr/tools/kbdsim.py --tty /run/qos/kbd
 ```
-
-For New QA arch:
-
-```
-make qosp GFX=1
-sudo install -m755 qosp /opt/qos/qosp
-
-make portable-qa PROG=programs/pshell.fpr QOSARCH=a64
-make apps-qa QOSARCH=a64          # all eight, each at its own sub-slot
-sudo install -m644 app.qa /opt/qos/pshell.qa
-sudo install -m644 qos-apps/*.qa /var/lib/qos/qos-apps/
-sudo systemctl restart qos-pshell
-
-tools/kbdsim.py --tty /run/qos/kbd
-```

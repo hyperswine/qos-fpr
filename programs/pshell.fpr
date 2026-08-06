@@ -49,7 +49,7 @@ Md = Type (Md screen focus sts frame lastR lastKey scomp).
 Fd = Type (Fd screen frame lastR lastKey scomp av fb env).
 Av = Type (AvHome | AvApp vlsF st).
 Cm = Type (CQuit | CSnap).
-Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vp, env)
+Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vp, env, cam)
 # a discovered app: metas + the four resolved contract functions
 Ap = Type (Ap nm sb ini upd tre vls).   # loop roots: statics cache + the
                                      # two packed framebuffers + which
@@ -479,12 +479,18 @@ wvals apps (Fd 0 frame lastR lastKey scomp av fb env) self =
   cat (subs apps)
       ( AK.clockStr mt
         :: "{draws}D {dynB}B"
-        :: "{harts 0} LIVE"
-        :: "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B"
+        :: hartsLine 0
+        :: "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B  {arenaLine 0}"
         :: Nil ).
 wvals apps (Fd s frame lastR lastKey scomp av fb env) self =
   AvApp vlsF st = av;
   vlsF self env st.
+hartsLine u =
+  (g, mb) = Sys.memStats 0;
+  "{harts 0} LIVE  {mb}MB".
+arenaLine u =
+  (g, mb) = Sys.memStats 0;
+  "ARENA {g}g/{mb}MB".
 subs Nil = Nil.
 subs (Ap nm sb ini upd tre vls :: r) = sb :: subs r.
 
@@ -497,12 +503,11 @@ subs (Ap nm sb ini upd tre vls :: r) = sb :: subs r.
 # (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
 # the frame being written is never the one the walker just consumed.
 frameWorker parent gfx st sl fdw self =
-  (apps, fd, vp) = fdw;
-  (vww, vh) = vp;
+  (apps, fd, cam) = fdw;
   Fd sN fr lr lk sc av fb env = fd;
   vs = wvals apps fd self;
   (fb2, n) = S2.dynsInto fb sl vs;
-  r = svcCall self gfx (Render (S2.sceneAt vh st (fb2, n)));
+  r = svcCall self gfx (Render (S2.sceneWith cam st (fb2, n)));
   _ = send parent r;
   drop r.                # forward then release OUR ref: the reply's
                          # ARC entry dies when the shell drops its own
@@ -669,23 +674,24 @@ frame me gfx dsp inp mt rt m2 t0 =
   (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3, vpOfRt rt));
+  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3, camOfRt rt));
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
   loop me gfx dsp inp mt (swapRt rt cache2) m4.
 
 ensureRt (Rt cache a b bk cfg apps) key =
-  (vp, env) = cfg;
+  (vp, env, cam) = cfg;
   ensure apps vp cache key.
 backFb (Rt cache a b bk cfg apps) = case bk == 0 of True -> a | False -> b.
 appsOf (Rt cache a b bk cfg apps) = apps.
 envOf (Rt cache a b bk cfg apps) =
-  (vp, env) = cfg;
+  (vp, env, cam) = cfg;
   env.
-vpOfRt (Rt cache a b bk cfg apps) =
-  (vp, env) = cfg;
-  vp.
+# the camera, built once at boot: nothing in the frame path allocates it
+camOfRt (Rt cache a b bk cfg apps) =
+  (vp, env, cam) = cfg;
+  cam.
 swapRt (Rt cache a b bk cfg apps) cache2 = Rt cache2 a b (1 - bk) cfg apps.
 
 bumpS m 0 = m.
@@ -729,8 +735,8 @@ main =
   # the two packed framebuffers, allocated ONCE here (immortal pool --
   # handle addresses stay put, the voxel-interactive discipline); 4096
   # instances each = the walker's MAX_INST
-  fbA = S2.fbNew 4096;
-  fbB = S2.fbNew 4096;
+  fbA = S2.fbNew 16384;
+  fbB = S2.fbNew 16384;
   (gw, gh) = svcCall me g (Dims 0);
   # INTEGER UI SCALE: the largest s that still leaves >= 240 virtual
   # rows.  vp = (gw/s, gh/s) means one virtual pixel is exactly s by s
@@ -777,7 +783,7 @@ main =
   env = (log, mt, (titles apps, vfs));
   sts = initAll me apps env;
   m0 = Md 0 0 sts 0 (0, 0) 0 0;
-  loop me g d i mt (Rt cache0 fbA fbB 0 (vp, env) apps) m0.
+  loop me g d i mt (Rt cache0 fbA fbB 0 (vp, env, S2.camAt vh) apps) m0.
 
 tryAttach nm =
   case Sys.attachQa nm of

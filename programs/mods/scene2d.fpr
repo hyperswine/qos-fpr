@@ -99,8 +99,8 @@ attrsOf (Slot a i c) = a.
 
 # ---- measure: natural (w, h) -----------------------------------------------
 
-textW n sc = (4 * n - 1) * sc.
-textH sc = 5 * sc.
+textW n sc = (6 * n - 1) * sc.
+textH sc = 8 * sc.
 
 # override natural size with W/H when given
 sized a (nw, nh) =
@@ -270,15 +270,15 @@ etGo c t i n x y st | i > n = c.
 etGo c t i n x y st =
   (sc, col, d) = st;
   c1 = glyph c (font (charAt t i)) x y sc col d;
-  etGo c1 t (i + 1) n (x + 4 * sc) y st.
+  etGo c1 t (i + 1) n (x + 6 * sc) y st.
 
 glyph c 0 x y sc col d = c.
 glyph c bits x y sc col d = glCell c bits 0 x y sc col d.
-glCell c bits b x y sc col d | b == 15 = c.
+glCell c bits b x y sc col d | b == 40 = c.
 glCell c 0 b x y sc col d = c.
 glCell c bits b x y sc col d =
   c1 = case band bits 1 == 1 of
-    True -> addEnt c (exent (vpOf c) (x + imod b 3 * sc) (y + b / 3 * sc) sc sc d col)
+    True -> addEnt c (exent (vpOf c) (x + imod b 5 * sc) (y + b / 5 * sc) sc sc d col)
   | False -> c;
   glCell c1 (bits / 2) (b + 1) x y sc col d.
 
@@ -303,103 +303,125 @@ clip s cap = s.
 
 lights2d = ((0, 0, 240000), (1000, 1000, 1000)) :: Nil.
 camera2d = camAt 240.
-# for fovMilli 927 the half-angle tangent is 1/2, so the distance that
-# fits a world height H is exactly H -- camera z in milli IS vh * pxm
-camAt vh = ((0, 0, vh * pxm), (0, 0, 0), 927).
+# The camera is an INT: the eye distance in milli (gfx.c takes an Int
+# as the 2D case).  For fovMilli 927 the half-angle tangent is 1/2, so
+# the distance that fits a world height H is exactly H -- camera z in
+# milli IS vh * pxm.  It must stay an Int: a tuple here is a heap value
+# nested in every frame's message, and that leaks a slab per ~30 frames.
+camAt vh = vh * pxm.
 scene st dy = Scene st dy lights2d camera2d.
+# Build the camera ONCE (camAt) and pass it in.  sceneAt vh is kept for
+# callers that have no better place to keep it, but the per-frame path
+# must NOT use it: the camera is constant for a resolution, and
+# allocating it inside the frame worker leaked a slab every ~30 frames
+# on a Pi -- a 20-minute fuse to "heap exhausted".
+sceneWith cam st dy = Scene st dy lights2d cam.
 sceneAt vh st dy = Scene st dy lights2d (camAt vh).
 
 # ---- glyphs ----------------------------------------------------------------
-# uppercase-fold, then a clause per code.  Layout literals are decimal
-# renderings of the 15-bit patterns (LSB = top-left).
-
-# a-z fold, but ONLY a-z: 123-126 ({|}~) would otherwise fold onto
-# [\]^ and print the wrong glyph entirely
-font c | c > 122 = font2 c.
-font c | c > 96 = font (c - 32).      # a-z -> A-Z
-font 32 = 0.                    # space
-font 46 = 8192.                 # .
-font 58 = 1040.                 # :
-font 45 = 448.                  # -
-font 47 = 4772.                 # /
-font 62 = 5393.                 # >
-font 60 = 17492.                # <
-font 95 = 28672.                # _
-font 39 = 18.                   # '
-font 33 = 8338.                 # !
-font 63 = 8359.                 # ?
-font 40 = 8778.                 # (
-font 41 = 10530.                # )
-font 48 = 31599.                # 0
-font 49 = 29850.                # 1
-font 50 = 29671.                # 2
-font 51 = 31207.                # 3
-font 52 = 18925.                # 4
-font 53 = 31183.                # 5
-font 54 = 31695.                # 6
-font 55 = 9511.                 # 7
-font 56 = 31727.                # 8
-font 57 = 31215.                # 9
-font 65 = 23530.                # A
-font 66 = 15083.                # B
-font 67 = 25166.                # C
-font 68 = 15211.                # D
-font 69 = 29391.                # E
-font 70 = 4815.                 # F
-font 71 = 27470.                # G
-font 72 = 23533.                # H
-font 73 = 29847.                # I
-font 74 = 11044.                # J
-font 75 = 23277.                # K
-font 76 = 29257.                # L
-font 77 = 23549.                # M
-font 78 = 24573.                # N
-font 79 = 11114.                # O
-font 80 = 4843.                 # P
-font 81 = 26474.                # Q
-font 82 = 23275.                # R
-font 83 = 14478.                # S
-font 84 = 9367.                 # T
-font 85 = 31597.                # U
-font 86 = 11117.                # V
-font 87 = 24557.                # W
-font 88 = 23213.                # X
-font 89 = 9389.                 # Y
-font 90 = 29351.                # Z
-# the punctuation a keyboard can actually produce -- typing a symbol
-# and getting the missing-glyph checker is the same bug as not being
-# able to type it at all
-font 34 = 45.         # "
-font 35 = 24445.      # #
-font 36 = 31903.      # $
-font 37 = 21157.      # %
-font 38 = 31707.      # &
-font 42 = 2728.       # *
-font 43 = 1488.       # +
-font 44 = 5120.       # ,
-font 59 = 5136.       # ;
-font 61 = 3640.       # =
-font 64 = 29679.      # @
-font 91 = 12875.      # [
-font 92 = 18569.      # \
-font 93 = 26918.      # ]
-font 94 = 42.         # ^
-font 96 = 17.         # `
-font 123 = 25686.     # {
-font 124 = 9362.      # |
-font 125 = 13587.     # }
-font 126 = 1904.      # ~
-
-font c = 21845.                       # unknown: checker
-
-# {|}~ live above the a-z fold, so they get their own lookup (a helper
-# defined HERE, after the group -- a definition in the middle of a
-# clause group silently ends it, which cost the whole font once)
-font2 123 = 25686.
-font2 124 = 9362.
-font2 125 = 13587.
-font2 126 = 1904.
-font2 c = 21845.
+# A 5x8 CELL: caps occupy rows 0-6 with the baseline at row 6, x-height
+# lowercase rows 2-6, and row 7 exists solely so g/j/p/q/y can descend.
+# That last row is why the cell is 8 and not 7 -- with only seven rows
+# you must choose between full-height capitals and honest descenders,
+# and faking it makes lowercase look subscripted.  Advance is 6 (5 plus
+# a column of gap); the literals are the 40-bit patterns, LSB = the
+# top-left cell.  No case folding any more: every letter has a glyph.
+font 32 = 0.              # space
+font 33 = 4299296900.     # !
+font 34 = 330.            # dquote
+font 35 = 11105828170.    # #
+font 36 = 4819720132.     # $
+font 37 = 26610901603.    # %
+font 38 = 23946401062.    # &
+font 39 = 132.            # quote
+font 40 = 8726317192.     # (
+font 41 = 2290360450.     # )
+font 42 = 156718208.      # *
+font 43 = 139432064.      # +
+font 44 = 73014444032.    # ,
+font 45 = 1015808.        # -
+font 46 = 6643777536.     # .
+font 47 = 1109533200.     # /
+font 48 = 15623448110.    # 0
+font 49 = 15170932932.    # 1
+font 50 = 33357578798.    # 2
+font 51 = 15619854623.    # 3
+font 52 = 8891181448.     # 4
+font 53 = 15620127807.    # 5
+font 54 = 15621129292.    # 6
+font 55 = 2216829471.     # 7
+font 56 = 15621113390.    # 8
+font 57 = 6728664622.     # 9
+font 58 = 207624384.      # :
+font 59 = 73215776768.    # ;
+font 60 = 8726284424.     # <
+font 61 = 32537600.       # =
+font 62 = 2290622594.     # >
+font 63 = 4299440686.     # ?
+font 64 = 15097067054.    # @
+font 65 = 18857116996.    # A
+font 66 = 16694887983.    # B
+font 67 = 15603893806.    # C
+font 68 = 7836583207.     # D
+font 69 = 33321092159.    # E
+font 70 = 1108837439.     # F
+font 71 = 32801457710.    # G
+font 72 = 18842895921.    # H
+font 73 = 15170932878.    # I
+font 74 = 6753100060.     # J
+font 75 = 18560947505.    # K
+font 76 = 33320633377.    # L
+font 77 = 18842572657.    # M
+font 78 = 18850958897.    # N
+font 79 = 15621211694.    # O
+font 80 = 1108854319.     # P
+font 81 = 23946905134.    # Q
+font 82 = 18561353263.    # R
+font 83 = 16660235326.    # S
+font 84 = 4433514655.     # T
+font 85 = 15621211697.    # U
+font 86 = 4648912433.     # V
+font 87 = 19182306865.    # W
+font 88 = 18834663985.    # X
+font 89 = 4433521201.     # Y
+font 90 = 33321787935.    # Z
+font 91 = 15101659214.    # [
+font 92 = 17725261857.    # backslash
+font 93 = 15309480206.    # ]
+font 94 = 17732.          # ^
+font 95 = 33285996544.    # _
+font 96 = 130.            # `
+font 97 = 32814675968.    # a
+font 98 = 16694950945.    # b
+font 99 = 32246921216.    # c
+font 100 = 32801094160.   # d
+font 101 = 15099017216.   # e
+font 102 = 2217183820.    # f
+font 103 = 499241252864.  # g
+font 104 = 18842434593.   # h
+font 105 = 15170934788.   # i
+font 106 = 216099205128.  # j
+font 107 = 9834767393.    # k
+font 108 = 15170932870.   # l
+font 109 = 18846755840.   # m
+font 110 = 18842434560.   # n
+font 111 = 15621208064.   # o
+font 112 = 35955194880.   # p
+font 113 = 567960729600.  # q
+font 114 = 1108456448.    # r
+font 115 = 16657741824.   # s
+font 116 = 13491059778.   # t
+font 117 = 24479581184.   # u
+font 118 = 4648911872.    # v
+font 119 = 11464655872.   # w
+font 120 = 18593694720.   # x
+font 121 = 499241239552.  # y
+font 122 = 33357593600.   # z
+font 123 = 12954208332.   # {
+font 124 = 4433514628.    # |
+font 125 = 6720069894.    # }
+font 126 = 825344.        # ~
+font c = 366041554261.               # unknown: checker
 
 
 # debug helpers (harmless exports)
@@ -440,17 +462,17 @@ tiGo fb t i m pos vp st n =
   (sc, col, d) = st;
   (x, y) = pos;
   (fb2, n2) = glyphInto fb (font (charAt t i)) pos vp st n;
-  tiGo fb2 t (i + 1) m (x + 4 * sc, y) vp st n2.
+  tiGo fb2 t (i + 1) m (x + 6 * sc, y) vp st n2.
 
 glyphInto fb 0 pos vp st n = (fb, n).
 glyphInto fb bits pos vp st n = giCell fb bits 0 pos vp st n.
-giCell fb bits b pos vp st n | b == 15 = (fb, n).
+giCell fb bits b pos vp st n | b == 40 = (fb, n).
 giCell fb 0 b pos vp st n = (fb, n).
 giCell fb bits b pos vp st n =
   (sc, col, d) = st;
   (x, y) = pos;
   (fb2, n2) = case band bits 1 == 1 of
-    True -> (cellInto fb (x + imod b 3 * sc) (y + b / 3 * sc) sc col d vp n, n + 1)
+    True -> (cellInto fb (x + imod b 5 * sc) (y + b / 5 * sc) sc col d vp n, n + 1)
   | False -> (fb, n);
   giCell fb2 (bits / 2) (b + 1) pos vp st n2.
 

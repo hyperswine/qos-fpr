@@ -26,7 +26,8 @@
  *   entity = (mesh, pos, yawMilli, scale, color)     5-tuple
  *   pos/scale/color = (x, y, z)                      triple
  *   light  = (pos, color)                            pair
- *   camera = (eye, target, fovMilli)                 triple
+ *   camera = (eye, target, fovMilli) triple, OR an Int = the
+ *            2D case: eye distance in milli on +Z, origin target
  *   statics/dynamics/lights = lists of the above
  *
  * Input: keyboard is nonblocking stdin bytes; mouse is /dev/input/mice
@@ -162,7 +163,10 @@ static void mesh_sphere(rawmesh_t *m) { /* UV sphere r=0.5, 16x24 */
 typedef struct { float model[16]; float color[3]; float pad; } inst_t;
 
 #define MAX_MESHES 16
-#define MAX_INST 4096 /* per mesh per tier */
+#define MAX_INST 16384 /* per mesh per tier: a 5x8 glyph is up to 40
+                            * cube instances, and a text-heavy screen
+                            * (the CLI, the browser listing) runs to
+                            * thousands -- 4096 was sized for 3x5 */
 typedef struct {
   char name[32];
   GLuint vao, vbo, ebo;
@@ -575,10 +579,24 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
     dynBytes += (sw)((size_t)m->nstage * sizeof(inst_t));
   }
 
-  /* camera + first light out of the value */
-  V *cam = fields(f[3], 5, "gfx: camera must be (eye, target, fovMilli)");
-  m4 view = m4lookAt(walk_v3(cam[0]), walk_v3(cam[1]), (v3){0, 1, 0});
-  m4 proj = m4persp(fmilli(cam[2]), (float)G.w / (float)G.h, 0.1f, 100.0f);
+  /* Camera: an INT is the 2D case -- the eye distance in milli, looking
+   * at the origin with the standard fov.  That form exists because a
+   * TUPLE here is a heap value nested in a per-frame message, and a
+   * nested heap value gets no ARC entry of its own: its slab is either
+   * pinned with the root or reclaimed while the walker still needs it.
+   * An Int is immediate, so the frame path allocates nothing at all --
+   * this is what a 20-minute "heap exhausted" fuse on a Pi cost.
+   * The tuple form stays for the 3D scenes that move the camera. */
+  m4 view, proj;
+  if (ISINT(f[3])) {
+    float z = (float)UNTAG(f[3]) / 1000.0f;
+    view = m4lookAt((v3){0, 0, z}, (v3){0, 0, 0}, (v3){0, 1, 0});
+    proj = m4persp(0.927f, (float)G.w / (float)G.h, 0.1f, 100.0f);
+  } else {
+    V *cam = fields(f[3], 5, "gfx: camera must be (eye, target, fovMilli)");
+    view = m4lookAt(walk_v3(cam[0]), walk_v3(cam[1]), (v3){0, 1, 0});
+    proj = m4persp(fmilli(cam[2]), (float)G.w / (float)G.h, 0.1f, 100.0f);
+  }
   v3 lp = {5, 5, 5}, lc = {1, 1, 1};
   V lv = f[2];
   if (!ISINT(lv) && TID(lv) == T_LIST && ((hdr_t *)lv)->var == 1) {

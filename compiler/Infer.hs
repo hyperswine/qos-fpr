@@ -456,6 +456,7 @@ builtinEnv =
       ("Sys.logAt", scheme [0] (TFn tInt (TFn tStr tUnit))),
       ("Sys.logSeq", scheme [0] (TFn tInt tInt)),
       ("Sys.logSnap", scheme [0] (TFn tInt (sv 0))),
+      ("Sys.memStats", scheme [0] (TFn tInt (sv 0))),
       ("log", scheme [0] (TFn tStr tUnit)),
       ("logWarn", scheme [0] (TFn tStr tUnit)),
       ("logErr", scheme [0] (TFn tStr tUnit)),

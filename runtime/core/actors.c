@@ -109,8 +109,14 @@ fpr_pool_t *fpr_acb_pool(struct fpr_acb *a) { return &a->pool; }
 /* big raw blocks (stacks, acbs): buddy on a machine boot; inside a
  * loaded process, a grant from the loader (the process has no buddy).
  * Process-mode blocks are reclaimed wholesale at process exit. */
+#ifdef FPR_GROWTRACE
+void fpr_growlog(const char *site, uw want);
+#endif
 static void *big_block(uw n) {
   if (!fpr_is_process) return buddy_alloc(n);
+#ifdef FPR_GROWTRACE
+  fpr_growlog("big", n);
+#endif
   fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(n) : (fpr_grant_t){0, 0};
   return (g.ptr && g.size >= n) ? g.ptr : 0;
 }
@@ -159,6 +165,9 @@ static acb_t *acb_block(void) {
     char *p;
     uw got;
     if (fpr_is_process && fpr_grow_memory) {
+#ifdef FPR_GROWTRACE
+      fpr_growlog("acb", want);
+#endif
       fpr_grant_t g = fpr_grow_memory(want);
       p = (char *)g.ptr;
       got = g.size;

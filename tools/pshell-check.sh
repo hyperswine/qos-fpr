@@ -126,7 +126,19 @@ sleep 1; exec 8>/tmp/pshell-soak.fifo; sleep 25
 cat /tmp/pshell-quit.evd >&8; exec 8>&-; sleep 2
 grep -q "PANIC" /tmp/pshell-soak.txt && fail "soak panicked: $(grep PANIC /tmp/pshell-soak.txt | head -1)"
 grows=$(grep -c 'grow(' /tmp/pshell-soak.txt)
-[ "$grows" -lt 120 ] || fail "soak leaking: $grows grows in 25s (expect a few dozen)"
+# Budget: boot warms ~15 grants.  Steady state MEASURED (growtrace, all
+# four sites) is ~0.5 grows/s: acb carves (permanent by contract) plus
+# stack-recycler misses whose prime suspect is reap latency on harts
+# that park in wfi with a dead actor unreaped -- the OPEN leak item.
+# The old threshold (120) tolerated 0.84 grows/s = a 15-minute Pi fuse;
+# this gate pins the current measured rate so any regression past it
+# fails loudly, and it TIGHTENS to ~20 once dead-actor reaping is
+# spawn-side and the stack pool stops missing.
+# A 25s window is warmup-dominated (~49 measured: boot grants + early
+# recycler misses before the pools fill); the long-run steady rate is
+# ~0.5/s.  Gate at 60 catches the 0.84/s class of regression that
+# killed the Pi while tolerating warmup; tighten alongside the reap fix.
+[ "$grows" -lt 60 ] || fail "soak leaking: $grows grows in 25s (warmup budget is ~49)"
 echo "  soak: $grows grows, no panic: PASS"
 
 echo "pshell-check: ALL PASS"

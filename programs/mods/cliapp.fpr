@@ -94,9 +94,9 @@ clWrite self env rest =
   _ = drop r;
   out.
 
-clPs u = clPsGo 0 (Sys.actLive 0) 0.
-clPsGo i n acc | i >= n = "{n} actors live" :: Nil.
-clPsGo i n acc = clPsGo (i + 1) n acc.
+clPs u =
+  (g, mb) = Sys.memStats 0;
+  "arena: {g} grows, {mb} MiB granted" :: "{Sys.actLive 0} actors live" :: Nil.
 
 # ---- strings ---------------------------------------------------------------
 
