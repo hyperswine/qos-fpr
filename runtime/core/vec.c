@@ -380,6 +380,12 @@ __attribute__((weak)) int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw a, sw b
   return 0;
 }
 
+__attribute__((weak)) int fpr_gpu_vec_fold_pair_sum(void *col0, void *col1,
+                                                     uw len, sw seed, sw *out) {
+  (void)col0; (void)col1; (void)len; (void)seed; (void)out;
+  return 0;
+}
+
 static int gpu_axpb_exact(vec_t *x, sw a, sw b) {
   if (x->len < 65536 || a < INT32_MIN || a > INT32_MAX ||
       b < INT32_MIN || b > INT32_MAX)
