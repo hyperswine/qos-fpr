@@ -62,6 +62,15 @@ Discovery is the same table-by-name contract as virt hal.c:
   GFX=1 links dynamic (-no-pie): Mesa is the one boundary the static
   philosophy concedes, the way the kernel is for syscalls.
       make posix-run GFX=1 PROG=programs/gfxdemo.fpr
+    - **desktop gpu** (DESKTOPGL=1) — desktopgl.c keeps the same raw scene
+      API and FPR bridge, but creates a GLFW window and requests an OpenGL
+      3.3 core context.  It blits the renderer's FBO to the window and
+      takes keyboard and mouse iGnput from GLFW.  This is separate from the
+      Linux EGL/GLES backend:
+        make desktopgl-run PROG=programs/gfxdemo.fpr
+      GLFW/Cocoa requires window calls on the process main thread, so this
+      build uses one POSIX hart.  On macOS, install GLFW with Homebrew if
+      `pkg-config --modversion glfw3` cannot find it.
 
 The capability story is build-time, as designed: the image's
 unresolved `fpr_g_` imports ARE its capability manifest.  A program
@@ -95,7 +104,7 @@ share one socket/pseudo-bus and one renderer implementation.
 
 ## macOS (Apple Silicon)
 
-`make posix-run POSIXARCH=a64` on a Darwin host builds and runs
+`make posix-run` on an Apple Silicon Darwin host builds and runs
 NATIVELY: the Makefile detects Darwin and switches fprc to
 `--target=a64mac` — the promised syntax layer over the same a64
 lowering.  Four differences, all in A64.hs:
@@ -122,7 +131,8 @@ symbol through a `SYM()` cpp guard, and evdev_raw.c defines the
 `input_event` wire struct locally off-Linux so the FPR_EVDEV
 simulated-keyboard/replay tier stays portable.  Linking is dynamic —
 Mach-O has no `-static`; libSystem is the concession, the way Mesa is
-for GFX.  GFX=1 stays Linux-only (EGL/evdev hardware tier).
+for GFX.  GFX=1 stays Linux-only (EGL/evdev hardware tier), while
+DESKTOPGL=1 supplies GLFW/OpenGL window support on desktop hosts.
 
 First boot on a Mac: `sh tools/mac-smoke.sh` (verifies the heap symbol
 layout with nm, then runs the actor, typed-layer, svc-funnel, and
@@ -139,7 +149,6 @@ what the smoke script is for.
   tier (gfxdemo.fpr's registry actor is the shape; net still goes via
   the device table).  The `mods/svc.fpr` URL funnel is the front half
   of this: net joins as one more route behind `Svc.read`/`Svc.write`.
-- Windowed presentation (a swap of displayActor's body + an EGL window
-  surface) and the GBM render-node path for Pi hardware drivers.
+- The GBM render-node path for Pi hardware drivers.
 - Blocking service actors parked on real syscalls (today: polling,
   like virt).

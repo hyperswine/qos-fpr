@@ -9,6 +9,7 @@
  * manifest, and the posix HAL simply doesn't export the bus tier.
  */
 #include "fpr.h"
+#include <string.h>
 
 /* the register tier, backed by net.c's pseudo-address dispatch: the
  * SAME reg_t/T_REGISTER values as virt, a different "bus" behind them */
@@ -137,6 +138,9 @@ FPR_FN(fpr_g_Sys_x2estoreReq, h_store_req, 2);
  * MAP_FIXED_NOREPLACE anonymous mapping first), elf-loads, applies the
  * W^X split, and registers the module table. */
 #include <sys/mman.h>
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE MAP_FIXED
+#endif
 #define QOS_PLUG_BASE_P 0x408000000ul
 #define QOS_PLUG_SIZE_P (16ul << 20)
 int fpr_mod_attach(const uw *tab);

@@ -77,13 +77,17 @@ all: image.elf
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
 # default the posix target to the HOST's arch: x64 on x86-64, a64 on
-# native aarch64 (a Pi 4 says `make posix-run` and gets itself)
-ifeq ($(UNAME_M),aarch64)
+# native aarch64/arm64 (a Pi or Apple Silicon Mac gets itself)
+ifneq ($(filter aarch64 arm64,$(UNAME_M)),)
 POSIXARCH ?= a64
 else
 POSIXARCH ?= x64
 endif
+ifeq ($(DESKTOPGL),1)
+POSIXHARTS ?= 1
+else
 POSIXHARTS ?= 2
+endif
 # QOS Portable hart cap: the app image's compile-time FPR_NHARTS (the
 # static array size).  The LIVE count is resolved at qosp boot: env
 # FPR_HARTS, else the host's online-core count, clamped to this cap.
@@ -116,7 +120,19 @@ RT_POSIX = $(RT_POSIX_DIR)/hal.c $(RT_POSIX_DIR)/main.c $(RT_POSIX_DIR)/stubs.c 
 # via Mesa, keyboard/mouse polling.  The GL stack cannot be statically
 # linked, so a gfx image links dynamic -- the display driver is the one
 # boundary the static philosophy concedes, the same way the kernel is.
+ifeq ($(DESKTOPGL),1)
 ifeq ($(GFX),1)
+$(error GFX=1 and DESKTOPGL=1 select different graphics backends)
+endif
+RT_POSIX += $(RT_POSIX_DIR)/desktopgl.c $(RT_POSIX_DIR)/desktopgl_fpr.c
+POSIXGFXFLAGS = $(shell pkg-config --cflags glfw3)
+ifeq ($(UNAME_S),Darwin)
+POSIXLIBS = $(shell pkg-config --libs glfw3) -framework OpenGL -lm
+else
+POSIXLIBS = $(shell pkg-config --libs glfw3) -lGL -lm
+endif
+POSIXSTATIC = -no-pie
+else ifeq ($(GFX),1)
 RT_POSIX += $(RT_POSIX_DIR)/gfx.c $(RT_POSIX_DIR)/gfx_fpr.c $(RT_POSIX_DIR)/evdev_raw.c
 POSIXLIBS = -lEGL -lGLESv2 -lm
 # generated code uses absolute .quad relocations in .rodata (fine when
@@ -156,12 +172,20 @@ build/posix-prog.s: fprc $(PROG) programs/prelude.fpr FORCE
 	@mkdir -p build
 	LC_ALL=C.UTF-8 ./fprc --target=$(POSIXFPRTGT) --prelude=programs/prelude.fpr $(PROG) $@
 
-posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE)
-	$(POSIXCC) $(POSIXSTATIC) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) -I$(RT_CORE_DIR) \
+POSIX_STAMP = build/.posix-gfx$(GFX)-desktopgl$(DESKTOPGL)
+$(POSIX_STAMP):
+	@mkdir -p build && rm -f build/.posix-gfx*-desktopgl* && touch $@
+
+posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE) $(POSIX_STAMP)
+	$(POSIXCC) $(POSIXSTATIC) -O2 -Wall -Wextra -DFPR_POSIX -DFPR_NHARTS=$(POSIXHARTS) $(POSIXGFXFLAGS) -I$(RT_CORE_DIR) \
 	  build/posix-prog.s $$(cat build/posix-prog.s.units) $(RT_POSIX_CORE) $(RT_POSIX) -lpthread $(POSIXLIBS) -o $@
 
 posix-run: posix.bin
 	$(POSIXRUN) ./posix.bin
+
+desktopgl-run: DESKTOPGL=1
+desktopgl-run: POSIXHARTS=1
+desktopgl-run: posix-run
 
 # ---- QOS Portable: host + QOS (x64 or a64) apps -----------------------
 # QOS Portable is NOT an OS: qosp is a hosting runtime that runs ONE

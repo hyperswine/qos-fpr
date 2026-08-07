@@ -37,10 +37,15 @@
  *   (1, byte, 0)  key    (2, dx, dy)  mouse move    (3, buttons, 0)
  */
 #include "fpr.h"
+#ifdef FPR_DESKTOP_GL
+#define GLFW_INCLUDE_GLCOREARB
+#include <GLFW/glfw3.h>
+#else
 #include "evdev_raw.h"
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 #include <GLES3/gl31.h>
+#endif
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
@@ -48,7 +53,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#ifndef FPR_DESKTOP_GL
 #include "drm_scanout.h"
+#endif
 
 /* ==== small math (vecmath.hpp, column-major, ported verbatim) ======== */
 typedef struct { float x, y, z; } v3;
@@ -179,7 +186,11 @@ typedef struct {
 
 static struct {
   int inited;
+#ifdef FPR_DESKTOP_GL
+  GLFWwindow *window;
+#else
   EGLDisplay dpy; EGLContext ctx;
+#endif
   GLuint prog; GLint uProj, uView, uLightPos, uLightColor;
   GLuint fbo, fboColor, fboDepth;
   int w, h;
@@ -187,8 +198,52 @@ static struct {
   int staticCompiled;
   uint64_t lastStatics; /* value identity of the compiled statics list */
   pthread_t boundTid; int haveTid; /* thread the context is current on */
+#ifndef FPR_DESKTOP_GL
   drm_out_t drm; /* the monitor link (drm_scanout.h); .on = 0 offscreen */
+#endif
 } G;
+
+#ifdef FPR_DESKTOP_GL
+#define GFX_EVENT_CAP 64
+typedef struct { int64_t kind, a, c; } gfx_event_t;
+static gfx_event_t gfx_events[GFX_EVENT_CAP];
+static unsigned gfx_event_read, gfx_event_write;
+static double gfx_cursor_x, gfx_cursor_y;
+static int gfx_have_cursor;
+static int gfx_mouse_buttons;
+
+static void gfx_event_push(int64_t kind, int64_t a, int64_t c) {
+  unsigned next = (gfx_event_write + 1) % GFX_EVENT_CAP;
+  if (next == gfx_event_read) gfx_event_read = (gfx_event_read + 1) % GFX_EVENT_CAP;
+  gfx_events[gfx_event_write] = (gfx_event_t){kind, a, c};
+  gfx_event_write = next;
+}
+
+static void gfx_key_cb(GLFWwindow *window, int key, int scancode, int action, int mods) {
+  (void)window; (void)scancode; (void)mods;
+  if (action != GLFW_REPEAT) gfx_event_push(4, key, action != GLFW_RELEASE);
+}
+
+static void gfx_char_cb(GLFWwindow *window, unsigned int codepoint) {
+  (void)window;
+  gfx_event_push(1, codepoint, 0);
+}
+
+static void gfx_cursor_cb(GLFWwindow *window, double x, double y) {
+  (void)window;
+  if (gfx_have_cursor) gfx_event_push(2, (int64_t)(x - gfx_cursor_x), (int64_t)(gfx_cursor_y - y));
+  gfx_cursor_x = x; gfx_cursor_y = y; gfx_have_cursor = 1;
+}
+
+static void gfx_mouse_cb(GLFWwindow *window, int button, int action, int mods) {
+  (void)window; (void)mods;
+  if (button >= 0 && button < 31) {
+    if (action == GLFW_PRESS) gfx_mouse_buttons |= 1 << button;
+    else if (action == GLFW_RELEASE) gfx_mouse_buttons &= ~(1 << button);
+    gfx_event_push(3, gfx_mouse_buttons, 0);
+  }
+}
+#endif
 
 /* EGL contexts are thread-bound.  The graphics service actor's mailbox
  * is the intended serialization, but the multi-hart scheduler may
@@ -198,14 +253,22 @@ static struct {
 static void gfx_bind_thread(void) {
   pthread_t self = pthread_self();
   if (G.haveTid && pthread_equal(G.boundTid, self)) return;
+#ifdef FPR_DESKTOP_GL
+  glfwMakeContextCurrent(G.window);
+#else
   if (!eglMakeCurrent(G.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, G.ctx))
     fpr_cpanic("gfx: eglMakeCurrent (thread rebind) failed");
+#endif
   G.boundTid = self; G.haveTid = 1;
 }
 
 static const char *kVS =
+#ifdef FPR_DESKTOP_GL
+    "#version 330 core\n"
+#else
     "#version 310 es\n"
     "precision highp float;\n"
+#endif
     "layout(location=0) in vec3 inPos;\n"
     "layout(location=1) in vec3 inNormal;\n"
     "layout(location=2) in vec4 iM0;\n"
@@ -220,8 +283,12 @@ static const char *kVS =
     "  vN = mat3(model)*inNormal; vC = iColor;\n"
     "  gl_Position = uProj*uView*world; }\n";
 static const char *kFS =
+#ifdef FPR_DESKTOP_GL
+  "#version 330 core\n"
+#else
     "#version 310 es\n"
     "precision highp float;\n"
+#endif
     "in vec3 vN; in vec3 vW; in vec3 vC;\n"
     "uniform vec3 uLightPos; uniform vec3 uLightColor;\n"
     "out vec4 fragColor;\n"
@@ -248,6 +315,7 @@ static GLuint gfx_shader(GLenum type, const char *src) {
 /* egl_headless.cpp, C'd: surfaceless via the platform-display
  * extension, falling back to the default display.  PREFER_GBM and the
  * render-node path are the Pi-hardware upgrade, not ported yet. */
+#ifndef FPR_DESKTOP_GL
 static EGLDisplay egl_display(const char **how) {
   PFNEGLGETPLATFORMDISPLAYEXTPROC getPlat =
       (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
@@ -259,9 +327,32 @@ static EGLDisplay egl_display(const char **how) {
   *how = "default";
   return eglGetDisplay(EGL_DEFAULT_DISPLAY);
 }
+#endif
 
 void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (G.inited) return;
+#ifdef FPR_DESKTOP_GL
+  if (w <= 0) w = 1280;
+  if (h <= 0) h = 720;
+  if (!glfwInit()) fpr_cpanic("desktopgl: glfwInit failed");
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+#ifdef __APPLE__
+  glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
+#endif
+  G.window = glfwCreateWindow(w, h, "FPRISC Desktop GL", 0, 0);
+  if (!G.window) fpr_cpanic("desktopgl: glfwCreateWindow failed");
+  glfwMakeContextCurrent(G.window);
+  glfwSetKeyCallback(G.window, gfx_key_cb);
+  glfwSetCharCallback(G.window, gfx_char_cb);
+  glfwSetCursorPosCallback(G.window, gfx_cursor_cb);
+  glfwSetMouseButtonCallback(G.window, gfx_mouse_cb);
+  glfwSwapInterval(1);
+  G.boundTid = pthread_self(); G.haveTid = 1;
+  fprintf(stderr, "[desktopgl] GLFW  OpenGL %s  %s\n",
+          glGetString(GL_VERSION), glGetString(GL_RENDERER));
+#else
   /* AUTO RESOLUTION: w or h of 0 means "the display's own mode" --
    * probe the scanout FIRST so the FBO is created at exactly the
    * monitor's resolution (1:1 blit, whole screen, no scaling).  With
@@ -305,6 +396,7 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   G.boundTid = pthread_self(); G.haveTid = 1;
   fprintf(stderr, "[gfx] EGL %d.%d (%s)  %s / %s\n", maj, min, how,
           glGetString(GL_RENDERER), glGetString(GL_VERSION));
+#endif
 
   GLuint vs = gfx_shader(GL_VERTEX_SHADER, kVS), fs = gfx_shader(GL_FRAGMENT_SHADER, kFS);
   G.prog = glCreateProgram();
@@ -323,7 +415,7 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   G.w = w; G.h = h;
   glGenTextures(1, &G.fboColor);
   glBindTexture(GL_TEXTURE_2D, G.fboColor);
-  glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, w, h);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, 0);
   glGenRenderbuffers(1, &G.fboDepth);
   glBindRenderbuffer(GL_RENDERBUFFER, G.fboDepth);
   glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
@@ -334,8 +426,10 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
     fpr_cpanic("gfx: offscreen framebuffer incomplete");
   G.inited = 1;
+#ifndef FPR_DESKTOP_GL
   /* the monitor link (explicit-size path; the auto path probed above) */
   if (!G.drm.on && !G.drm.fd) drm_scanout_init(&G.drm, w, h);
+#endif
 }
 
 void gfx_dims(int *w, int *h) { /* raw export: gfx_raw.h */
@@ -633,11 +727,23 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
   }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
+#ifdef FPR_DESKTOP_GL
+  {
+    int fbw, fbh;
+    glfwGetFramebufferSize(G.window, &fbw, &fbh);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, G.fbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glBlitFramebuffer(0, 0, G.w, G.h, 0, 0, fbw, fbh, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glfwSwapBuffers(G.window);
+    glfwPollEvents();
+  }
+#else
   /* scanout present: FBO -> dumb buffer, every rendered frame */
   if (G.drm.on) {
     glReadPixels(0, 0, G.w, G.h, GL_RGBA, GL_UNSIGNED_BYTE, G.drm.rd);
     drm_scanout_present(&G.drm);
   }
+#endif
   return 0;
 }
 
@@ -664,6 +770,20 @@ int gfx_save_ppm(const char *path) {
 }
 
 /* ==== input ========================================================== */
+#ifdef FPR_DESKTOP_GL
+int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
+  gfx_bind_thread();
+  glfwPollEvents();
+  if (gfx_event_read == gfx_event_write) {
+    *kind_out = 0; *a_out = 0; *c_out = 0;
+    return 0;
+  }
+  gfx_event_t event = gfx_events[gfx_event_read];
+  gfx_event_read = (gfx_event_read + 1) % GFX_EVENT_CAP;
+  *kind_out = event.kind; *a_out = event.a; *c_out = event.c;
+  return 1;
+}
+#else
 #include <termios.h>
 static struct termios gfx_tty_orig;
 static int gfx_tty_restore_armed;
@@ -722,3 +842,4 @@ int gfx_input_poll(int64_t *kind_out, int64_t *a_out, int64_t *c_out) {
   *kind_out = kind; *a_out = a; *c_out = c;
   return kind != 0;
 }
+#endif
