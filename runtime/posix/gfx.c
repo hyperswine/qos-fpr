@@ -372,6 +372,85 @@ int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw av, sw bv) {
   fprintf(stderr, "[vec-gpu] axpb GLES lanes=%llu\n", (unsigned long long)len);
   return 1;
 }
+
+typedef struct {
+  uw nblk;
+  uw *blk[24];
+} gfx_gpu_col_t;
+
+int fpr_gpu_vec_fold_pair_sum(void *col0v, void *col1v, uw len, sw seed, sw *out) {
+  static GLuint program, input[2], output;
+  if (len < 65536 || !G.inited || !G.haveTid ||
+      !pthread_equal(G.boundTid, pthread_self()) || len > UINT32_MAX)
+    return 0;
+  if (!program) {
+    static const char *source =
+        "#version 310 es\n"
+        "layout(local_size_x=256) in;\n"
+        "layout(std430, binding=0) readonly buffer Left { int left[]; };\n"
+        "layout(std430, binding=1) readonly buffer Right { int right[]; };\n"
+        "layout(std430, binding=2) writeonly buffer Sums { int sums[]; };\n"
+        "uniform uint uN;\n"
+        "void main(){ uint i=gl_GlobalInvocationID.x; if(i<uN) sums[i]=left[i]+right[i]; }\n";
+    GLuint shader = gfx_shader(GL_COMPUTE_SHADER, source);
+    program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glDeleteShader(shader);
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(program); program = 0; return 0; }
+    glGenBuffers(2, input);
+    glGenBuffers(1, &output);
+  }
+  gfx_gpu_col_t *cols[2] = {(gfx_gpu_col_t *)col0v, (gfx_gpu_col_t *)col1v};
+  size_t bytes = (size_t)len * sizeof(int32_t);
+  int32_t *values[2] = {malloc(bytes), malloc(bytes)};
+  if (!values[0] || !values[1]) { free(values[0]); free(values[1]); return 0; }
+  for (int k = 0; k < 2; k++) {
+    uw rem = len, at = 0;
+    for (uw j = 0; rem; j++) {
+      uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
+      sw *block = (sw *)cols[k]->blk[j];
+      for (uw i = 0; i < n; i++) {
+        if (block[i] < INT32_MIN || block[i] > INT32_MAX) {
+          free(values[0]); free(values[1]); return 0;
+        }
+        values[k][at++] = (int32_t)block[i];
+      }
+      rem -= n;
+    }
+  }
+  for (uw i = 0; i < len; i++) {
+    int64_t pair = (int64_t)values[0][i] + values[1][i];
+    if (pair < INT32_MIN || pair > INT32_MAX) {
+      free(values[0]); free(values[1]); return 0;
+    }
+  }
+  for (int k = 0; k < 2; k++) {
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, input[k]);
+    glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, values[k], GL_STREAM_COPY);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, (GLuint)k, input[k]);
+  }
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, output);
+  glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, 0, GL_STREAM_READ);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, output);
+  glUseProgram(program);
+  glUniform1ui(glGetUniformLocation(program, "uN"), (GLuint)len);
+  glDispatchCompute((GLuint)((len + 255) / 256), 1, 1);
+  glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+  void *mapped = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+  if (!mapped) { free(values[0]); free(values[1]); return 0; }
+  int32_t *lane_sums = mapped;
+  uw acc = (uw)seed;
+  for (uw i = 0; i < len; i++) acc += (uw)(sw)lane_sums[i];
+  glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+  free(values[0]); free(values[1]);
+  *out = (sw)acc;
+  fprintf(stderr, "[vec-gpu] fold pair-sum GLES rows=%llu\n",
+          (unsigned long long)len);
+  return 1;
+}
 #endif
 
 /* egl_headless.cpp, C'd: surfaceless via the platform-display
