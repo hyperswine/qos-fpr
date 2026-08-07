@@ -82,6 +82,12 @@ Discovery is the same table-by-name contract as virt hal.c:
   to CPU.  `tests/vecgpu.fpr` checks both GPU selection and wide-Int
   fallback:
       make posix-run DESKTOPGL=1 PROG=tests/vecgpu.fpr
+    A specialized fold of `acc + pair.first + pair.second` over two
+    unboxed SoA columns uses the same selector.  The GPU computes row
+    sums and the host finishes the machine-Int reduction, preserving wide
+    totals.  This target generates 70,000 CSV tuples, reads and parses the
+    file in FP-RISC, then verifies the Metal result:
+      make vecgpu-soa-run
 
 The capability story is build-time, as designed: the image's
 unresolved `fpr_g_` imports ARE its capability manifest.  A program

@@ -185,9 +185,15 @@ posix.bin: build/posix-prog.s $(RT_POSIX) $(RT_POSIX_CORE) $(POSIX_STAMP)
 posix-run: posix.bin
 	$(POSIXRUN) ./posix.bin
 
-desktopgl-run: DESKTOPGL=1
-desktopgl-run: POSIXHARTS=1
-desktopgl-run: posix-run
+desktopgl-run:
+	$(MAKE) posix-run DESKTOPGL=1 POSIXHARTS=1 PROG=$(PROG)
+
+build/vec-tuples.csv:
+	@mkdir -p build
+	@awk 'BEGIN { for (i=1; i<=70000; i++) printf "1, %d\n", 2*i }' > $@
+
+vecgpu-soa-run: build/vec-tuples.csv
+	$(MAKE) posix-run DESKTOPGL=1 POSIXHARTS=1 PROG=tests/vecgpu-soa-file.fpr
 
 # ---- QOS Portable: host + QOS (x64 or a64) apps -----------------------
 # QOS Portable is NOT an OS: qosp is a hosting runtime that runs ONE
