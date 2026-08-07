@@ -1363,6 +1363,7 @@ emitFoldSpec tgt rvv sym p = do
       regs = ["ra"] ++ ["s" ++ show i | i <- [0 .. 7 :: Int]]
       (_, pro, epi) = specFrame tgt regs nSlots
       doRvvSum = rvv && spRvv p == Just RvvFoldSum && spScalar p
+      doGpuPairSum = isGpuPairSum p
       e = rvvE tgt
   ~[fb, ldis, lscal, lsoa, ldone] <- mapM freshL ["vfb", "vdis", "vscal", "vsoa", "vdone"]
   -- scalar loop labels
@@ -1477,6 +1478,18 @@ emitFoldSpec tgt rvv sym p = do
             -- all columns share block structure; cols[0] drives the count
             "    " ++ ld ++ " s4, " ++ show (vCols0 tgt) ++ "(s0)"
           ]
+            ++ (if doGpuPairSum
+                  then [ "    " ++ ld ++ " a0, " ++ show (vCols0 tgt) ++ "(s0)",
+                         "    " ++ ld ++ " a1, " ++ show (vCols0 tgt + w) ++ "(s0)",
+                         "    mv a2, s1",
+                         "    mv a3, s7",
+                         "    mv a4, sp",
+                         "    call fpr_gpu_vec_fold_pair_sum",
+                         "    beqz a0, " ++ ao,
+                         "    " ++ ld ++ " s7, 0(sp)",
+                         "    j " ++ ldone
+                       ]
+                  else [])
             ++ [ao ++ ":", "    bgeu s2, s1, " ++ ldone]
             ++ fuel2
             ++ blk2' -- like specBlock but per-column cursors, no s5
@@ -1535,6 +1548,7 @@ emitFoldSpec tgt rvv sym p = do
   pure $
     [ "# Vec.fold specialized on " ++ f
         ++ (if doRvvSum then "  [RVV vredsum]" else "")
+      ++ (if doGpuPairSum then "  [GPU pair sum]" else "")
         ++ (if spSoa p /= Nothing then "  [SoA dualized]" else ""),
       "    .globl " ++ sym,
       sym ++ ":"
@@ -1544,3 +1558,23 @@ emitFoldSpec tgt rvv sym p = do
       ++ scalPath
       ++ soaPath
       ++ finish
+
+isGpuPairSum :: SpecPlan -> Bool
+isGpuPairSum p = case spSoa p of
+  Just ([0, 1], [acc, c0, c1], body, _) ->
+    sort (addTerms (strip body)) == sort [acc, c0, c1]
+  _ -> False
+  where
+    strip (CLet x a b) = substGpu x (strip a) (strip b)
+    strip (CIf (CMk 1 1 []) t _) = strip t
+    strip e = e
+    addTerms (CApp (CApp (CVar "+") a) b) = addTerms a ++ addTerms b
+    addTerms (CVar x) = [x]
+    addTerms _ = ["<not-add>"]
+    substGpu x a = go
+      where
+        go (CVar y) | y == x = a
+        go (CApp f y) = CApp (go f) (go y)
+        go (CLet y v b) | y /= x = CLet y (go v) (go b)
+        go (CIf c t e) = CIf (go c) (go t) (go e)
+        go e = e
