@@ -9,7 +9,35 @@
  * manifest, and the posix HAL simply doesn't export the bus tier.
  */
 #include "fpr.h"
+#include <stdio.h>
 #include <string.h>
+
+static V h_file_read(V pathv) {
+  if (ISINT(pathv) || ((hdr_t *)pathv)->tid != T_STR)
+    fpr_cpanic("fileRead: path must be a String");
+  str_t *pathstr = (str_t *)pathv;
+  char path[1024];
+  if (pathstr->len >= sizeof path) fpr_cpanic("fileRead: path too long");
+  memcpy(path, pathstr->bytes, pathstr->len);
+  path[pathstr->len] = 0;
+  FILE *file = fopen(path, "rb");
+  if (!file) fpr_cpanic("fileRead: open failed");
+  if (fseek(file, 0, SEEK_END) || ftell(file) < 0) {
+    fclose(file);
+    fpr_cpanic("fileRead: seek failed");
+  }
+  long size = ftell(file);
+  rewind(file);
+  str_t *result = (str_t *)fpr_alloc(sizeof(str_t) + (uw)size);
+  result->tid = T_STR; result->var = 0; result->len = (uw)size;
+  if (fread(result->bytes, 1, (size_t)size, file) != (size_t)size) {
+    fclose(file);
+    fpr_cpanic("fileRead: read failed");
+  }
+  fclose(file);
+  return (V)result;
+}
+FPR_FN(fpr_g_fileRead, h_file_read, 1);
 
 /* the register tier, backed by net.c's pseudo-address dispatch: the
  * SAME reg_t/T_REGISTER values as virt, a different "bus" behind them */
@@ -67,7 +95,6 @@ FPR_FN(fpr_g_Pin_x2ewire, h_pin_wire, 2);
  * named by FPR_STORE, or the standalone "no disk" Result when unset --
  * matching entry.c's no-channel behavior, so a program like pshell
  * runs identically both ways. */
-#include <stdio.h>
 #include <stdlib.h>
 static V h_store_req(V tagv, V payv) {
   if (ISINT(tagv) == 0) fpr_cpanic("Sys.storeReq: tag must be an Int");

@@ -332,6 +332,7 @@ builtinEnv =
       ("charAt", mono (TFn tStr (TFn tInt tInt))), -- returns the char CODE
       ("chr", mono (TFn tInt tStr)),
       ("parseInt", mono (TFn tStr tInt)),
+      ("fileRead", mono (TFn tStr tStr)),
       ("print", scheme [0] (TFn (sv 0) tUnit)),
       ("error", scheme [0] (TFn tStr (sv 0))),
       -- raw MMIO (registers are Ints): read/write a device word
