@@ -109,15 +109,9 @@ fpr_pool_t *fpr_acb_pool(struct fpr_acb *a) { return &a->pool; }
 /* big raw blocks (stacks, acbs): buddy on a machine boot; inside a
  * loaded process, a grant from the loader (the process has no buddy).
  * Process-mode blocks are reclaimed wholesale at process exit. */
-#ifdef FPR_GROWTRACE
-void fpr_growlog(const char *site, uw want);
-#endif
 static void *big_block(uw n) {
   if (!fpr_is_process) return buddy_alloc(n);
-#ifdef FPR_GROWTRACE
-  fpr_growlog("big", n);
-#endif
-  fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(n) : (fpr_grant_t){0, 0};
+  fpr_grant_t g = fpr_grow_counted(n);
   return (g.ptr && g.size >= n) ? g.ptr : 0;
 }
 
@@ -136,19 +130,34 @@ static void *stack_pool;
 static fpr_lock_t stack_lock;
 static char *acb_hp, *acb_end;
 
+/* pool telemetry, always on, PULL-based (Sys.memStats reads them):
+ * a print at an allocation site is a syscall inside the allocator */
+uw fpr_stk_pushes, fpr_stk_misses, fpr_spawns, fpr_chb_carves;
+static void stack_recycle(void *p);
 static void *stack_block(void) {
   if (!fpr_is_process) return buddy_alloc(STACK_SZ);
   fpr_lock(&stack_lock);
   void *p = stack_pool;
   if (p) stack_pool = *(void **)p;
+  else fpr_stk_misses++;
   fpr_unlock(&stack_lock);
-  return p ? p : big_block(STACK_SZ);
+  if (p) return p;
+  /* SELF-TOPPING on a miss: take two, keep one warm.  A miss means
+   * live+in-flight actors exceeded pool depth, so depth converges to
+   * the real concurrency and each level is paid for at most once --
+   * without this the boot immortals consume any fixed pre-warm and
+   * the spawn-vs-death-epilogue race keeps finding an empty pool
+   * (measured: 13 misses/8k spawns, ~12KB/s of permanent stacks). */
+  void *spare = big_block(STACK_SZ);
+  if (spare) stack_recycle(spare);
+  return big_block(STACK_SZ);
 }
 
 static void stack_recycle(void *p) {
   fpr_lock(&stack_lock);
   *(void **)p = stack_pool;
   stack_pool = p;
+  fpr_stk_pushes++;
   fpr_unlock(&stack_lock);
 }
 
@@ -165,10 +174,11 @@ static acb_t *acb_block(void) {
     char *p;
     uw got;
     if (fpr_is_process && fpr_grow_memory) {
-#ifdef FPR_GROWTRACE
-      fpr_growlog("acb", want);
-#endif
-      fpr_grant_t g = fpr_grow_memory(want);
+      /* no growlog here: this runs under stack_lock, and the trace
+       * print is a uart SYSCALL under qosp -- printing inside an
+       * allocator lock stalls the world and poisons the very numbers
+       * the trace exists to collect (a lesson measured the hard way) */
+      fpr_grant_t g = fpr_grow_counted(want);
       p = (char *)g.ptr;
       got = g.size;
     } else {
@@ -244,6 +254,7 @@ static chan_t *chb_take(void) {
      * blocks; the extras seed the free list (type-stable forever) */
     uw sz = (sizeof(chblk_t) + 15) & ~(uw)15;
     uw want = sz * 4;
+    fpr_chb_carves++;
     char *p = (char *)big_block(want);
     if (!p) return 0;
     uw got = fpr_is_process ? want : buddy_block_usable_size(p);
@@ -805,6 +816,7 @@ void fpr_hart_secondary(int id) {
 /* ---- FPRISC-facing API ------------------------------------------------ */
 
 static V spawn_on(uw hart, V f, uw pin) {
+  fpr_spawns++;
   if (hart >= fpr_live_harts) fpr_cpanic("spawnOn: no such hart (Sys.harts is the live count)");
   if (ISINT(f) || TID(f) != T_PAP) fpr_cpanic("spawn: argument must be a function");
   acb_t *a = (acb_t *)acb_block();
@@ -1065,6 +1077,15 @@ static V mklist4(uw a, uw b, uw c, uw d) {
   }
   return list;
 }
+
+/* Sys.stkStats () -> [spawns, stackPushes, stackMisses, chbCarves]:
+ * the pool ledger, PULL-based -- reading a counter is the only safe
+ * telemetry an allocation path gets (see the growlog lesson above) */
+static V g_stkStats(V u) {
+  (void)u;
+  return mklist4(fpr_spawns, fpr_stk_pushes, fpr_stk_misses, fpr_chb_carves);
+}
+FPR_FN(fpr_g_Sys_x2estkStats, g_stkStats, 1);
 
 static V g_actLive(V u) {
   (void)u;

@@ -161,6 +161,17 @@ static fpr_slab_t *grant_pool;
  * difference between a healthy acb-floor drift and a leak is exactly
  * these numbers over time -- the Pi should not need gdb to say which. */
 uw fpr_grow_count, fpr_grow_bytes;
+/* THE one gateway to arena growth: every site calls this so the
+ * ledger the UI shows is the whole truth.  (Its first version counted
+ * only the slab site -- the on-screen number read 4x low.) */
+fpr_grant_t fpr_grow_counted(uw want) {
+  fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(want) : (fpr_grant_t){0, 0};
+  if (g.ptr) {
+    __atomic_add_fetch(&fpr_grow_count, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&fpr_grow_bytes, g.size, __ATOMIC_RELAXED);
+  }
+  return g;
+}
 static fpr_lock_t grant_lock;
 
 static void praw(const char *s);
@@ -225,7 +236,7 @@ void **fpr_bkt_take(void) {
 #ifdef FPR_GROWTRACE
       fpr_growlog("bkt", sizeof(bktblk_t));
 #endif
-      fpr_grant_t g = fpr_grow_memory(sizeof(bktblk_t));
+      fpr_grant_t g = fpr_grow_counted(sizeof(bktblk_t));
       k = (g.ptr && g.size >= sizeof(bktblk_t)) ? (bktblk_t *)g.ptr : 0;
     } else
       k = (bktblk_t *)buddy_alloc(sizeof(bktblk_t));
@@ -265,11 +276,22 @@ V fpr_alloc(V raw_bytes) {
       if (!sl) {
         uw want = total + sizeof(fpr_slab_t);
         if (want < SLAB_SZ) want = SLAB_SZ;
-        fpr_grant_t g = fpr_grow_memory(want);
-        if (g.ptr) {
-          fpr_grow_count++;
-          fpr_grow_bytes += g.size;
+        /* SELF-TOPPING, same reasoning as the stack pool: a miss here
+         * is the spawn-vs-reap epilogue race finding the grant
+         * recycler empty (a dying worker's slab returns microseconds
+         * after the next worker's first alloc shops for it).  Take a
+         * spare so recycler depth converges to real concurrency and
+         * each level is a one-time cost, not a permanent 256KB/N-frames
+         * drip. */
+        if (want == SLAB_SZ) {
+          fpr_grant_t sp = fpr_grow_counted(SLAB_SZ);
+          if (sp.ptr) {
+            fpr_slab_t *ss = (fpr_slab_t *)sp.ptr;
+            ss->end = (char *)sp.ptr + sp.size;
+            grant_put(ss);
+          }
         }
+        fpr_grant_t g = fpr_grow_counted(want);
 #ifdef FPR_GROWTRACE
         { /* which actor, and is the recycler empty? */
           praw("[grow] slab actor ");
@@ -460,6 +482,41 @@ void fpr_arc_teardown_pool(fpr_pool_t *pool) {
   }
   fpr_unlock(&arc_lock);
 }
+
+/* SOFT DEATH: reclaim the CURRENT actor's pool in place -- the same
+ * walk as death teardown (clean slabs to the recycler, escaped slabs
+ * orphaned so the last drop frees them), but the actor lives on with
+ * an empty pool.  This is what makes a PERSISTENT frame worker have
+ * frame-per-actor memory semantics without paying an acb + stack +
+ * chblk per frame: the pool is the frame arena, and this is the end
+ * of the frame.  CONTRACT: call only when the actor holds no live
+ * local values -- everything it still needs must be owned elsewhere
+ * (the spawner's pool, C-owned rings, or the message it will receive
+ * next).  The bucket index is CLEARED, not returned: every recorded
+ * free cell lives in a slab this walk just recycled or orphaned. */
+static V g_poolReset(V u) {
+  (void)u;
+  fpr_hart_t *h = fpr_hart();
+  fpr_pool_t *pool = cur_pool(h);
+  fpr_lock(&arc_lock);
+  fpr_slab_t *sl = pool->cur;
+  while (sl) {
+    fpr_slab_t *nx = sl->next;
+    if (sl->escaped == 0) {
+      if (fpr_is_process) grant_put(sl);
+      else buddy_free(sl);
+    } else
+      sl->owner = 0;
+    sl = nx;
+  }
+  pool->cur = 0;
+  pool->allocated = 0;
+  if (pool->buckets)
+    for (int i = 0; i < FPR_NBUCKETS; i++) pool->buckets[i] = 0;
+  fpr_unlock(&arc_lock);
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_Sys_x2epoolReset, g_poolReset, 1);
 
 uw fpr_arc_live(void) { return arc_live; }
 

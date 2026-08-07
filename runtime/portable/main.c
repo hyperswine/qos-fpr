@@ -138,7 +138,17 @@ static qos_grant_t grow_cb(uint64_t want) {
   void *p = buddy_alloc(want);
   qos_grant_t g = {p, p ? buddy_block_usable_size(p) : 0};
   pthread_mutex_unlock(&grow_mu);
-  TRACE("grow(%" PRIu64 ") -> %p (+%" PRIu64 ")\n", want, p, g.size);
+  /* host-side print: safe (libc in the host, no app-scheduler paths).
+   * The elapsed stamp turns a soak log into a rate/phase timeline. */
+  if (g_trace) {
+    static struct timespec t0;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    if (!t0.tv_sec) t0 = t;
+    fprintf(stderr, "qosp: [%6ld ms] grow(%" PRIu64 ") -> %p (+%" PRIu64 ")\n",
+            (t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000,
+            want, p, g.size);
+  }
   return g;
 }
 

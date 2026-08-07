@@ -210,6 +210,7 @@ extern char _proc_arena_start[], _proc_arena_end[];
  * callback into System.qa's buddy allocator. */
 typedef struct { void *ptr; uw size; } fpr_grant_t;
 extern fpr_grant_t (*fpr_grow_memory)(uw want_bytes);
+fpr_grant_t fpr_grow_counted(uw want_bytes); /* the counted gateway */
 
 /* elfload.c: a minimal ELF32/ELF64 PT_LOAD segment loader. FIXED-SLOT
  * ONLY -- p_vaddr must already equal the intended physical load

@@ -134,11 +134,12 @@ grows=$(grep -c 'grow(' /tmp/pshell-soak.txt)
 # this gate pins the current measured rate so any regression past it
 # fails loudly, and it TIGHTENS to ~20 once dead-actor reaping is
 # spawn-side and the stack pool stops missing.
-# A 25s window is warmup-dominated (~49 measured: boot grants + early
-# recycler misses before the pools fill); the long-run steady rate is
-# ~0.5/s.  Gate at 60 catches the 0.84/s class of regression that
-# killed the Pi while tolerating warmup; tighten alongside the reap fix.
-[ "$grows" -lt 60 ] || fail "soak leaking: $grows grows in 25s (warmup budget is ~49)"
+# PERSISTENT-WORKER arithmetic: boot + warmup is ~47 grows and steady
+# state is ~ZERO (no spawn per frame -> no acb ledger; the worker's
+# Sys.poolReset reclaims each frame's pool wholesale).  Measured 195s:
+# 47 boot / 0 / 2.  Gate 55 = warmup + a couple of late depth records;
+# any per-frame leak class blows straight past it.
+[ "$grows" -lt 55 ] || fail "soak leaking: $grows grows in 25s (boot budget is ~47)"
 echo "  soak: $grows grows, no panic: PASS"
 
 echo "pshell-check: ALL PASS"

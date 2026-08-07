@@ -48,8 +48,14 @@ Msg = Type (Lookup url | Reg reg | Render scene | Present path | Poll a | Dims a
 Md = Type (Md screen focus sts frame lastR lastKey scomp).
 Fd = Type (Fd screen frame lastR lastKey scomp av fb env).
 Av = Type (AvHome | AvApp vlsF st).
+# the frame REQUEST: one flat root of Ints and boot-persistent refs, so
+# the worker's drop frees the single cell back into main's buckets and
+# main allocates NET ZERO per frame.  lksc packs lastKey (< 16384 with
+# modifier bias) and the statics-compile counter into one Int to stay
+# inside eight fields.
+Rq = Type (Rq st sl sts back sN fr lr lksc).
 Cm = Type (CQuit | CSnap).
-Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vp, env, cam)
+Rt = Type (Rt cache fbA fbB back cfg apps).  # cfg = (vp, env, (cam, rw))
 # a discovered app: metas + the four resolved contract functions
 Ap = Type (Ap nm sb ini upd tre vls).   # loop roots: statics cache + the
                                      # two packed framebuffers + which
@@ -480,7 +486,7 @@ wvals apps (Fd 0 frame lastR lastKey scomp av fb env) self =
       ( AK.clockStr mt
         :: "{draws}D {dynB}B"
         :: hartsLine 0
-        :: "F{frame}  K{lastKey}  S{scomp}  DYN {dynB}B  {arenaLine 0}"
+        :: "F{imod2 frame 10000}  K{lastKey}  S{scomp}  DYN {dynB}B  {arenaLine 0}"
         :: Nil ).
 wvals apps (Fd s frame lastR lastKey scomp av fb env) self =
   AvApp vlsF st = av;
@@ -502,15 +508,35 @@ subs (Ap nm sb ini upd tre vls :: r) = sb :: subs r.
 # a linear handle, zero per-frame list allocation -- and Render takes
 # (fb, n).  The buffers swap every frame (Fb a b in the loop state), so
 # the frame being written is never the one the walker just consumed.
-frameWorker parent gfx st sl fdw self =
-  (apps, fd, cam) = fdw;
-  Fd sN fr lr lk sc av fb env = fd;
+# ---- the persistent render worker -----------------------------------------
+# ONE actor for the life of the shell, spawned at boot: the frame loop
+# SENDS it a request instead of spawning.  This removes the per-frame
+# acb (272B, permanent by contract -- the arena's dominant fuse at
+# 40fps), the stack take, and the chblk cycle.  Frame-per-actor MEMORY
+# semantics are kept by Sys.poolReset -- the soft death: at the end of
+# each frame the worker reclaims its whole pool exactly as its death
+# would have, and lives on empty.  Everything the worker still needs
+# across frames is owned elsewhere (curried boot refs, main's model,
+# C rings), which is the poolReset contract.  A dropped discipline
+# lapse inside a frame is SELF-HEALING here: whatever leaks, the reset
+# takes at the frame boundary.
+renderWorker parent gfx env apps fbA fbB cam self =
+  m = receive self;
+  Rq st sl sts back sN fr lr lksc = m;
+  fb = pickFb back fbA fbB;
+  av = avFor apps sN sts;
+  fd = Fd sN fr lr (imod2 lksc 16384) (lksc / 16384) av fb env;
   vs = wvals apps fd self;
   (fb2, n) = S2.dynsInto fb sl vs;
   r = svcCall self gfx (Render (S2.sceneWith cam st (fb2, n)));
   _ = send parent r;
-  drop r.                # forward then release OUR ref: the reply's
+  _ = drop r;            # forward then release OUR ref: the reply's
                          # ARC entry dies when the shell drops its own
+  _ = drop m;            # the request root, back into main's buckets
+  _ = Sys.poolReset 0;   # the end of the frame: soft death
+  renderWorker parent gfx env apps fbA fbB cam self.
+pickFb 0 fbA fbB = fbA.
+pickFb b fbA fbB = fbB.
 
 # ---- input -----------------------------------------------------------------
 # evdev (kind 4): Linux keycodes, presses only.  stdin (kind 1): ascii
@@ -650,14 +676,16 @@ rebuildTree apps vp key =
   (key, st2, sl2).
 
 # av for the worker: home = 0, app screen = (that app's vals fn, state)
-fdOf fb env apps (Md sN f sts fr lr lk sc) =
-  Fd sN fr lr lk sc (avFor apps sN sts) fb env.
+rqOf st sl back (Md sN f sts fr lr lk sc) =
+  Rq st sl sts back sN fr lr (sc * 16384 + lk).
 avFor apps 0 sts = AvHome.
 avFor apps sN sts = AvApp (apVls (nthAp apps (sN - 1))) (nthSt sts (sN - 1)).
 apVls (Ap nm sb ini upd tre vls) = vls.
 
 result apps (Md s f sts fr lr lk sc) =
-  "pshell: {fr} frames, {sc} statics compiles, {appN apps} apps".
+  (g, mb) = Sys.memStats 0;
+  (sp :: pu :: mi :: cc :: e) = Sys.stkStats 0;
+  "pshell: {fr} frames, {sc} statics compiles, {appN apps} apps, arena {g}g/{mb}MB, stk {sp}sp/{pu}pu/{mi}mi/{cc}cc".
 
 loop me gfx dsp inp mt rt model =
   t0 = read mt;
@@ -674,24 +702,25 @@ frame me gfx dsp inp mt rt m2 t0 =
   (cache2, rebuilt) = ensureRt rt (skeyOf m2);
   m3 = bumpS m2 rebuilt;
   (k, st, sl) = cache2;
-  _ = spawn (frameWorker me gfx st sl (appsOf rt, fdOf (backFb rt) (envOf rt) (appsOf rt) m3, camOfRt rt));
+  _ = send (rwOf rt) (rqOf st sl (backOf rt) m3);
   r = receive me;
   m4 = advance m3 r;
   _ = waitTick mt t0;
   loop me gfx dsp inp mt (swapRt rt cache2) m4.
 
 ensureRt (Rt cache a b bk cfg apps) key =
-  (vp, env, cam) = cfg;
+  (vp, env, rest) = cfg;
   ensure apps vp cache key.
 backFb (Rt cache a b bk cfg apps) = case bk == 0 of True -> a | False -> b.
 appsOf (Rt cache a b bk cfg apps) = apps.
 envOf (Rt cache a b bk cfg apps) =
-  (vp, env, cam) = cfg;
+  (vp, env, rest) = cfg;
   env.
-# the camera, built once at boot: nothing in the frame path allocates it
-camOfRt (Rt cache a b bk cfg apps) =
-  (vp, env, cam) = cfg;
-  cam.
+rwOf (Rt cache a b bk cfg apps) =
+  (vp, env, rest) = cfg;
+  (cam, rw) = rest;
+  rw.
+backOf (Rt cache a b bk cfg apps) = bk.
 swapRt (Rt cache a b bk cfg apps) cache2 = Rt cache2 a b (1 - bk) cfg apps.
 
 bumpS m 0 = m.
@@ -783,7 +812,8 @@ main =
   env = (log, mt, (titles apps, vfs));
   sts = initAll me apps env;
   m0 = Md 0 0 sts 0 (0, 0) 0 0;
-  loop me g d i mt (Rt cache0 fbA fbB 0 (vp, env, S2.camAt vh) apps) m0.
+  rw = spawn (renderWorker me g env apps fbA fbB (S2.camAt vh));
+  loop me g d i mt (Rt cache0 fbA fbB 0 (vp, env, (S2.camAt vh, rw)) apps) m0.
 
 tryAttach nm =
   case Sys.attachQa nm of
