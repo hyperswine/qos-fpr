@@ -71,6 +71,17 @@ Discovery is the same table-by-name contract as virt hal.c:
   GLFW/Cocoa requires window calls on the process main thread, so this
   build uses one POSIX hart.  On macOS, install GLFW with Homebrew if
   `pkg-config --modversion glfw3` cannot find it.
+- **gpu vector optimization** — the numeric vector tier may offload
+  `Vec.axpb a b` for an unboxed Int column of at least 65536 elements.
+  The runtime first proves every input, multiply, and result fits signed
+  32-bit; all other shapes and values use the existing machine-Int CPU
+  loop unchanged.  Desktop macOS builds use a Metal compute pipeline.
+  The EGL/GLES 3.1 backend carries the same operation as a compute shader
+  and selects it when the graphics context is initialized and current on
+  the calling thread.  Backend failure is transactional and falls back
+  to CPU.  `tests/vecgpu.fpr` checks both GPU selection and wide-Int
+  fallback:
+      make posix-run DESKTOPGL=1 PROG=tests/vecgpu.fpr
 
 The capability story is build-time, as designed: the image's
 unresolved `fpr_g_` imports ARE its capability manifest.  A program

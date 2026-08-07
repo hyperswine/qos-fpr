@@ -312,6 +312,68 @@ static GLuint gfx_shader(GLenum type, const char *src) {
   return s;
 }
 
+#ifndef FPR_DESKTOP_GL
+int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw av, sw bv) {
+  static GLuint program, buffer;
+  static GLint uA, uB, uN;
+  if (!G.inited || !G.haveTid || !pthread_equal(G.boundTid, pthread_self()) || len > UINT32_MAX)
+    return 0;
+  if (!program) {
+    static const char *source =
+        "#version 310 es\n"
+        "layout(local_size_x=256) in;\n"
+        "layout(std430, binding=0) buffer Data { int values[]; };\n"
+        "uniform int uA; uniform int uB; uniform uint uN;\n"
+        "void main(){ uint i=gl_GlobalInvocationID.x; if(i<uN) values[i]=uA*values[i]+uB; }\n";
+    GLuint shader = gfx_shader(GL_COMPUTE_SHADER, source);
+    program = glCreateProgram();
+    glAttachShader(program, shader);
+    glLinkProgram(program);
+    glDeleteShader(shader);
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) { glDeleteProgram(program); program = 0; return 0; }
+    uA = glGetUniformLocation(program, "uA");
+    uB = glGetUniformLocation(program, "uB");
+    uN = glGetUniformLocation(program, "uN");
+    glGenBuffers(1, &buffer);
+  }
+  size_t bytes = (size_t)len * sizeof(int32_t);
+  int32_t *values = malloc(bytes);
+  if (!values) return 0;
+  uw rem = len, at = 0;
+  for (uw j = 0; rem; j++) {
+    uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
+    sw *block = (sw *)blocks[j];
+    for (uw i = 0; i < n; i++) values[at++] = (int32_t)block[i];
+    rem -= n;
+  }
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
+  glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, values, GL_STREAM_COPY);
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
+  glUseProgram(program);
+  glUniform1i(uA, (GLint)av);
+  glUniform1i(uB, (GLint)bv);
+  glUniform1ui(uN, (GLuint)len);
+  glDispatchCompute((GLuint)((len + 255) / 256), 1, 1);
+  glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+  void *mapped = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)bytes, GL_MAP_READ_BIT);
+  if (!mapped) { free(values); return 0; }
+  memcpy(values, mapped, bytes);
+  glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+  rem = len; at = 0;
+  for (uw j = 0; rem; j++) {
+    uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
+    sw *block = (sw *)blocks[j];
+    for (uw i = 0; i < n; i++) block[i] = values[at++];
+    rem -= n;
+  }
+  free(values);
+  fprintf(stderr, "[vec-gpu] axpb GLES lanes=%llu\n", (unsigned long long)len);
+  return 1;
+}
+#endif
+
 /* egl_headless.cpp, C'd: surfaceless via the platform-display
  * extension, falling back to the default display.  PREFER_GBM and the
  * render-node path are the Pi-hardware upgrade, not ported yet. */

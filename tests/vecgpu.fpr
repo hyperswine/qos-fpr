@@ -1,0 +1,16 @@
+# vecgpu.fpr -- large numeric lanes select GPU when a backend is linked.
+
+main =
+  v = Vec.iota 70000 |> Vec.axpb 3 1;
+  (a, v2) = Vec.get 1 v;
+  (b, v3) = Vec.get 65537 v2;
+  (c, v4) = Vec.get 70000 v3;
+  _ = print "gpu-safe axpb: {a} {b} {c}";
+  _ = Vec.free v4;
+
+  # Result exceeds int32, so this must retain machine-Int CPU semantics.
+  w = Vec.iota 70000 |> Vec.axpb 100000 0;
+  (d, w2) = Vec.get 70000 w;
+  _ = print "cpu-wide axpb: {d}";
+  _ = Vec.free w2;
+  print "vecgpu done".

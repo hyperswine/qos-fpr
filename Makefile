@@ -127,7 +127,9 @@ endif
 RT_POSIX += $(RT_POSIX_DIR)/desktopgl.c $(RT_POSIX_DIR)/desktopgl_fpr.c
 POSIXGFXFLAGS = $(shell pkg-config --cflags glfw3)
 ifeq ($(UNAME_S),Darwin)
-POSIXLIBS = $(shell pkg-config --libs glfw3) -framework OpenGL -lm
+RT_POSIX += $(RT_POSIX_DIR)/metal_vec.m
+POSIXGFXFLAGS += -fobjc-arc
+POSIXLIBS = $(shell pkg-config --libs glfw3) -framework OpenGL -framework Metal -framework Foundation -lm
 else
 POSIXLIBS = $(shell pkg-config --libs glfw3) -lGL -lm
 endif

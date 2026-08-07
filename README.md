@@ -284,3 +284,8 @@ sudo systemctl restart qos-pshell
 
 tools/kbdsim.py --tty /run/qos/kbd
 ```
+
+```
+make desktopgl-run PROG=programs/gfxdemo.fpr
+make posix-run DESKTOPGL=1 PROG=programs/gfxdemo.fpr=programs/gfxdemo.fpr
+```
