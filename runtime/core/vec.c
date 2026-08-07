@@ -29,6 +29,7 @@
  * documents); tuples' arities are known from their typeids.
  */
 #include "fpr.h"
+#include <limits.h>
 
 #define VL_B0 16 /* words in block 0; block j holds VL_B0 << j */
 #define VL_DIR 24
@@ -372,6 +373,33 @@ static vec_t *vnum(V v, const char *who) {
   return x;
 }
 
+/* Optional hosted GPU tier.  A strong backend definition may replace
+ * this default.  It must leave blocks untouched when returning zero. */
+__attribute__((weak)) int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw a, sw b) {
+  (void)blocks; (void)len; (void)a; (void)b;
+  return 0;
+}
+
+static int gpu_axpb_exact(vec_t *x, sw a, sw b) {
+  if (x->len < 65536 || a < INT32_MIN || a > INT32_MAX ||
+      b < INT32_MIN || b > INT32_MAX)
+    return 0;
+  uw rem = x->len;
+  for (uw j = 0; rem; j++) {
+    uw n = ((uw)VL_B0 << j) < rem ? ((uw)VL_B0 << j) : rem;
+    sw *p = (sw *)x->cols[0]->blk[j];
+    for (uw i = 0; i < n; i++) {
+      if (p[i] < INT32_MIN || p[i] > INT32_MAX) return 0;
+      int64_t product = (int64_t)(int32_t)a * (int64_t)(int32_t)p[i];
+      if (product < INT32_MIN || product > INT32_MAX) return 0;
+      int64_t result = product + (int64_t)(int32_t)b;
+      if (result < INT32_MIN || result > INT32_MAX) return 0;
+    }
+    rem -= n;
+  }
+  return fpr_gpu_vec_axpb(x->cols[0]->blk, x->len, a, b);
+}
+
 /* iterate one column's blocks: sw *p over contiguous runs of n words,
  * block index in j (VL_B0<<j words at base vl_cap(j)) */
 #define VS_BLOCKS(x, BODY)                                           \
@@ -404,6 +432,7 @@ static V h_dup(V vec) {
 static V h_axpb(V av, V bv, V vec) {
   vec_t *x = vnum(vec, "Vec.axpb: not a Vector");
   sw a = UNTAG(av), b = UNTAG(bv);
+  if (gpu_axpb_exact(x, a, b)) return (V)x;
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = a * p[i] + b; });
   return (V)x;
 }
