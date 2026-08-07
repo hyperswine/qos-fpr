@@ -62,15 +62,15 @@ Discovery is the same table-by-name contract as virt hal.c:
   GFX=1 links dynamic (-no-pie): Mesa is the one boundary the static
   philosophy concedes, the way the kernel is for syscalls.
       make posix-run GFX=1 PROG=programs/gfxdemo.fpr
-    - **desktop gpu** (DESKTOPGL=1) — desktopgl.c keeps the same raw scene
-      API and FPR bridge, but creates a GLFW window and requests an OpenGL
-      3.3 core context.  It blits the renderer's FBO to the window and
-      takes keyboard and mouse iGnput from GLFW.  This is separate from the
-      Linux EGL/GLES backend:
-        make desktopgl-run PROG=programs/gfxdemo.fpr
-      GLFW/Cocoa requires window calls on the process main thread, so this
-      build uses one POSIX hart.  On macOS, install GLFW with Homebrew if
-      `pkg-config --modversion glfw3` cannot find it.
+- **desktop gpu** (DESKTOPGL=1) — desktopgl.c keeps the same raw scene
+  API and FPR bridge, but creates a GLFW window and requests an OpenGL
+  3.3 core context.  It blits the renderer's FBO to the window and
+  takes keyboard and mouse input from GLFW.  This is separate from the
+  Linux EGL/GLES backend:
+      make desktopgl-run PROG=programs/gfxdemo.fpr
+  GLFW/Cocoa requires window calls on the process main thread, so this
+  build uses one POSIX hart.  On macOS, install GLFW with Homebrew if
+  `pkg-config --modversion glfw3` cannot find it.
 
 The capability story is build-time, as designed: the image's
 unresolved `fpr_g_` imports ARE its capability manifest.  A program
