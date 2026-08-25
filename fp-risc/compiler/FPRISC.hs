@@ -680,37 +680,65 @@ aritySpill tops = (map top tops, notes)
 -- inside case arms, conditional drops) stays manual: conservative and
 -- reported, never silently wrong.
 autoDrop :: [STop] -> ([STop], [String])
-autoDrop tops = (map top tops, concat [notes n b | TBind n _ _ b <- tops])
+autoDrop tops = (tops', concat notess)
   where
-    top (TBind n ps gs b) = TBind n ps gs (goE n b)
-    top t = t
+    (tops', notess) = unzip (map top tops)
+    top (TBind n ps gs b) = let (b', ns) = goE n b in (TBind n ps gs b', ns)
+    top t = (t, [])
     goE n e = case e of
-      SBlock ss fin -> SBlock (goStmts n ss fin) fin
-      _ -> e
+      SBlock ss fin -> let (ss', fin', ns) = goStmts n ss fin in (SBlock ss' fin', ns)
+      _ -> (e, [])
+    -- shape 1: destructure-next-statement.  The inserted drop precedes
+    -- later uses of the pattern's children -- SOUND because the runtime
+    -- defers the slab's release to this actor's next receive
+    -- (fpr_drop_park), where copy-on-retain says every borrow is dead.
     goStmts n (SBind m [] rhs : rest) fin
       | isReceive rhs,
         (SBindPat p (SVar m') : after) <- rest,
         m' == m,
         not (refStmts m after || refE m fin),
         not (droppedIn m rest fin) =
-          SBind m [] rhs
-            : SBindPat p (SVar m)
-            : SBind ("_autodrop_" ++ m) [] (SApp (SVar "drop") (SVar m))
-            : goStmts n after fin
-    goStmts n (st : rest) fin = st : goStmts n rest fin
-    goStmts _ [] _ = []
-    notes n b = case b of
-      SBlock ss fin -> note1 n ss fin
-      _ -> []
-    note1 n (SBind m [] rhs : rest) fin
+          let (after', fin', ns) = goStmts n after fin
+           in ( SBind m [] rhs
+                  : SBindPat p (SVar m)
+                  : SBind ("_autodrop_" ++ m) [] (SApp (SVar "drop") (SVar m))
+                  : after',
+                fin',
+                ("autodrop: " ++ n ++ ": inserted `drop " ++ m ++ "` after destructure") : ns )
+    -- shape 2: the case-scrutinee actor loop --
+    --     m = receive me;            m = receive me;
+    --     case m of              =>  case m of
+    --       C a b -> body              C a b -> _autodrop_m = drop m; body
+    -- -- the storage-actor shape (mods/qlog's aLoop), which leaked one
+    -- Arc entry per request when the drop stayed manual and forgotten.
+    -- Same deferral argument as shape 1; an arm whose pattern rebinds m
+    -- (shadowing) or whose body still references m blocks insertion.
+    goStmts n (SBind m [] rhs : rest) fin
       | isReceive rhs,
-        (SBindPat _ (SVar m') : after) <- rest,
+        not (refStmts m rest),
+        SCase (SVar m') arms <- fin,
         m' == m,
-        not (refStmts m after || refE m fin),
+        not (any (\(pt, b) -> m `elem` patVars pt || refE m b) arms),
         not (droppedIn m rest fin) =
-          ("autodrop: " ++ n ++ ": inserted `drop " ++ m ++ "` after destructure") : note1 n after fin
-    note1 n (_ : rest) fin = note1 n rest fin
-    note1 _ [] _ = []
+          ( SBind m [] rhs : rest,
+            SCase (SVar m) [(pt, dropInto m b) | (pt, b) <- arms],
+            [ "autodrop: " ++ n ++ ": inserted `drop " ++ m ++ "` into "
+                ++ show (length arms) ++ " case arm(s)" ] )
+    goStmts n (st : rest) fin =
+      let (rest', fin', ns) = goStmts n rest fin in (st : rest', fin', ns)
+    goStmts _ [] fin = ([], fin, [])
+    dropInto m b =
+      let d = SBind ("_autodrop_" ++ m) [] (SApp (SVar "drop") (SVar m))
+       in case b of
+            SBlock ss f -> SBlock (d : ss) f
+            e -> SBlock [d] e
+    patVars pt = case pt of
+      PVar v -> [v]
+      PCon _ ps -> concatMap patVars ps
+      PTup ps -> concatMap patVars ps
+      PRec ns -> ns
+      PSig v _ -> [v]
+      _ -> []
     isReceive e = case headName e of
       Just n -> n `elem` ["receive", "receiveFrom", "receiveRes", "ask", "svcCall"]
       Nothing -> False

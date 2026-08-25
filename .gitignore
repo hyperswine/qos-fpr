@@ -20,3 +20,11 @@ fp-risc/build/units/*-rv64.s
 qos/build/
 qos/disk.img
 qos/qos-native.elf
+fp-risc/build/prog.s
+fp-risc/build/prog.s.abirev
+fp-risc/build/*.elf
+fp-risc/build/alpha.s*
+fp-risc/build/beta.s*
+fp-risc/image.elf
+qos/qos-store/*.kv
+!qos/qos-store/qsys.kv

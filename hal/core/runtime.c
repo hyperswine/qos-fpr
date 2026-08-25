@@ -18,8 +18,11 @@ const hdr_t fpr_unit = {T_UNIT, 0};
  * Every allocation carries its total size in a hidden 16-byte header
  * (16 to preserve alignment), which is what makes fpr_free -- and
  * therefore ARC reclamation -- possible at all. Freed blocks go into
- * exact-fit free lists by size class (16..4096 bytes, 16-byte step);
- * larger blocks (actor stacks) leak by design in this PoC. */
+ * exact-fit free lists by size class (16-byte steps up to the bucket
+ * ceiling); blocks ABOVE the ceiling recycle through the pool's
+ * exact-fit bigfree LIFO (the "larger blocks leak by design" PoC rule
+ * is retired -- Vec.free of a big column block comes back).  Actor
+ * stacks were never the leak: they ride the stack pool. */
 extern char _heap_start[], _heap_end[];
 
 /* per-hart control blocks; tp points at ours (see fpr.h essay) */
@@ -59,6 +62,7 @@ static void hart_init(int id) {
   fpr_hart_t *h = &fpr_harts[id];
   h->id = (uw)id;
   h->pool.cur = 0;
+  h->pool.bigfree = 0;
   h->pool.allocated = 0;
   h->pool.buckets = hart_bkts[id];
   for (int i = 0; i < FPR_NBUCKETS; i++) h->pool.buckets[i] = 0;
@@ -253,6 +257,15 @@ static fpr_slab_t *grant_take(uw total) {
   return sl;
 }
 
+static void grant_put(fpr_slab_t *sl); /* fwd: defined just below */
+/* the actual release of an ownerless (message) slab: recycler in
+ * process mode, buddy on a machine boot.  Split out so actors.c's
+ * deferred-drop list can call it at drain time. */
+void fpr_slab_release(fpr_slab_t *sl) {
+  if (fpr_is_process) grant_put(sl);
+  else buddy_free(sl);
+}
+
 #ifdef FPR_GROWTRACE
 static uw grant_pool_len(void) {
   uw n = 0;
@@ -316,6 +329,35 @@ V fpr_alloc(V raw_bytes) {
         if (pad) __builtin_memset((char *)p + 16 + raw_bytes, 0, pad);
       }
       return (V)((char *)p + 16);
+    }
+  }
+  if (total > (uw)16 * FPR_NBUCKETS && pool->bigfree) {
+    /* exact-fit reuse of a freed big block: owner-only, so swap the
+     * whole LIFO out, take one match, CAS the rest back (frees may
+     * race in meanwhile -- prepending is safe) */
+    void *lst = __atomic_exchange_n(&pool->bigfree, 0, __ATOMIC_ACQUIRE);
+    void *take = 0, *keep = 0;
+    while (lst) {
+      void *nx = *(void **)((char *)lst + 16);
+      if (!take && *(uw *)lst == total) take = lst;
+      else { *(void **)((char *)lst + 16) = keep; keep = lst; }
+      lst = nx;
+    }
+    while (keep) {
+      void *nx = *(void **)((char *)keep + 16), *old;
+      do {
+        old = __atomic_load_n(&pool->bigfree, __ATOMIC_RELAXED);
+        *(void **)((char *)keep + 16) = old;
+      } while (!__atomic_compare_exchange_n(&pool->bigfree, &old, keep, 0,
+                                            __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+      keep = nx;
+    }
+    if (take) {
+      char *p = (char *)take;         /* header ([0] total, [1] slab) intact */
+      *(uw *)(p + 16) = 0;            /* the link word: payload must start benign */
+      uw pad = (total - 16) - raw_bytes;
+      if (pad) __builtin_memset(p + 16 + raw_bytes, 0, pad);
+      return (V)(p + 16);
     }
   }
   fpr_slab_t *sl = pool->cur;
@@ -403,8 +445,21 @@ void fpr_free(V v) {
   char *p = (char *)v - 16;
   uw total = *(uw *)p;
   fpr_slab_t *sl = *(fpr_slab_t **)(p + 8);
-  if (total == 0 || total > (uw)16 * FPR_NBUCKETS) return; /* huge or corrupt: stays in slab */
+  if (total == 0) return; /* corrupt or double-freed: stays in slab */
   if (!sl || !sl->owner) return;
+  if (total > (uw)16 * FPR_NBUCKETS) {
+    /* above the bucket ceiling: exact-fit bigfree LIFO.  The header
+     * stays intact (reuse needs total + slab), the link rides the
+     * first payload word -- so no poison tripwire here. */
+    fpr_pool_t *bpool = sl->owner;
+    void *old;
+    do {
+      old = __atomic_load_n(&bpool->bigfree, __ATOMIC_RELAXED);
+      *(void **)(p + 16) = old;
+    } while (!__atomic_compare_exchange_n(&bpool->bigfree, &old, p, 0,
+                                          __ATOMIC_RELEASE, __ATOMIC_RELAXED));
+    return;
+  }
   fpr_pool_t *pool = sl->owner;
   uw idx = total / 16 - 1;
   *(uw *)p = 0; /* poison size: crude double-free tripwire */
@@ -850,9 +905,11 @@ void fpr_arc_decref(V v) {
       sl->escaped--;
       if (!sl->owner && sl->escaped == 0) {
         /* last escapee of an orphaned slab: the whole slab goes home
-         * (machine boot: to buddy; process: to the grant recycler) */
-        if (fpr_is_process) grant_put(sl);
-        else buddy_free(sl);
+         * -- DEFERRED to the dropping actor's next receive, so the
+         * compiler may insert `drop m` right after the destructure
+         * while the arm still reads m's children (borrows are dead by
+         * the next receive: the copy-on-retain law). */
+        fpr_drop_park(sl);
       } else {
         fpr_free(v); /* under arc_lock: owner read is death-race-free */
       }
@@ -879,6 +936,7 @@ void fpr_arc_teardown_pool(fpr_pool_t *pool) {
     sl = nx;
   }
   pool->cur = 0;
+  pool->bigfree = 0; /* big free blocks die with their slabs */
   if (pool->buckets) {
     fpr_bkt_put(pool->buckets); /* type-stable reuse; see fpr.h */
     pool->buckets = 0;
@@ -901,6 +959,7 @@ static V g_poolReset(V u) {
   (void)u;
   fpr_hart_t *h = fpr_hart();
   fpr_pool_t *pool = cur_pool(h);
+  fpr_drop_drain_current(); /* soft death = end of frame: borrows are done */
   fpr_lock(&arc_lock);
   fpr_slab_t *sl = pool->cur;
   while (sl) {
@@ -914,6 +973,7 @@ static V g_poolReset(V u) {
   }
   pool->cur = 0;
   pool->allocated = 0;
+  pool->bigfree = 0; /* big free blocks die with their slabs */
   if (pool->buckets)
     for (int i = 0; i < FPR_NBUCKETS; i++) pool->buckets[i] = 0;
   fpr_unlock(&arc_lock);
@@ -1689,6 +1749,138 @@ V fpr_prim_fn_F32_x2e_x21_x3d(V a, V b) { return BOOL(fbits(a) != fbits(b)); }
  * second instruction-vs-libm question for fsqrt.s. */
 V fpr_prim_fn_F32_x2esqrt(V a) { return bitsf((float)fsqrt_((double)fbits(a))); }
 V fpr_prim_fn_F32_x2eofInt(V a) { return bitsf((float)UNTAG(a)); }
+
+/* ---- transcendentals: freestanding, double path -----------------------
+ * No libm in any of these links, so log/exp/pow/sin/cos are here whole:
+ * classic Cody-Waite reductions + Taylor/atanh polynomials, ~1 ulp on
+ * the primary ranges.  v1 honesty: pow is exp(y*ln x) (error grows
+ * with |y ln x|), and sin/cos reduce with a two-word pi/2, exact to
+ * |x| ~ 2^30 and degrading beyond (no Payne-Hanek).  F32 variants
+ * compute in double and round once, like F32.sqrt above. */
+static const double LN2HI_ = 6.93147180369123816490e-01,
+                    LN2LO_ = 1.90821492927058770002e-10,
+                    INVLN2_ = 1.44269504088896338700e+00;
+static uint64_t draw_(double d) { union { double d; uint64_t u; } c; c.d = d; return c.u; }
+static double draw2d_(uint64_t u) { union { double d; uint64_t u; } c; c.u = u; return c.d; }
+
+/* x = 2^e * m, m in [~0.7071, 1.4142); returns atanh((m-1)/(m+1)),
+ * i.e. ln(m)/2, and the exponent through ep */
+static double logcore_(double x, int *ep) {
+  uint64_t u = draw_(x);
+  int e = 0;
+  if (u < (1ull << 52)) { x *= 9007199254740992.0; u = draw_(x); e -= 53; }
+  e += (int)((u >> 52) & 0x7ff) - 1023;
+  double m = draw2d_((u & 0xfffffffffffffull) | (1023ull << 52));
+  if (m > 1.4142135623730951) { m *= 0.5; e += 1; }
+  double t = (m - 1.0) / (m + 1.0), t2 = t * t;
+  *ep = e;
+  return t * (1.0 + t2 * (1.0 / 3 + t2 * (1.0 / 5 + t2 * (1.0 / 7 + t2 * (1.0 / 9
+       + t2 * (1.0 / 11 + t2 * (1.0 / 13 + t2 * (1.0 / 15 + t2 * (1.0 / 17
+       + t2 * (1.0 / 19 + t2 * (1.0 / 21 + t2 * (1.0 / 23))))))))))));
+}
+static int fspec_(double x) { return ((draw_(x) >> 52) & 0x7ff) == 0x7ff; } /* inf|nan */
+static double flog_(double x) {
+  if (x != x || fspec_(x)) return (x != x || x > 0.0) ? x : 0.0 / 0.0;
+  if (x < 0.0) return 0.0 / 0.0;
+  if (x == 0.0) return -1.0 / 0.0;
+  int e; double s = logcore_(x, &e);
+  return 2.0 * s + (double)e * LN2HI_ + (double)e * LN2LO_;
+}
+static double flog2_(double x) {
+  if (x != x || fspec_(x)) return (x != x || x > 0.0) ? x : 0.0 / 0.0;
+  if (x < 0.0) return 0.0 / 0.0;
+  if (x == 0.0) return -1.0 / 0.0;
+  int e; double s = logcore_(x, &e);
+  return (double)e + 2.0 * s * INVLN2_; /* integer part exact */
+}
+static double fexp_(double x) {
+  if (x != x) return x;
+  if (x > 709.782712893384) return 1.0 / 0.0;
+  if (x < -745.133219101941) return 0.0;
+  double kd = x * INVLN2_;
+  int k = (int)(kd + (kd >= 0.0 ? 0.5 : -0.5));
+  double r = (x - (double)k * LN2HI_) - (double)k * LN2LO_;
+  double s = 1.0 + r * (1.0 + r * (1.0 / 2 + r * (1.0 / 6 + r * (1.0 / 24
+           + r * (1.0 / 120 + r * (1.0 / 720 + r * (1.0 / 5040 + r * (1.0 / 40320
+           + r * (1.0 / 362880 + r * (1.0 / 3628800 + r * (1.0 / 39916800
+           + r * (1.0 / 479001600 + r * (1.0 / 6227020800.0)))))))))))));
+  if (k >= -1021) return s * draw2d_((uint64_t)(k + 1023) << 52);
+  return s * draw2d_((uint64_t)(k + 1023 + 64) << 52) * draw2d_((uint64_t)(1023 - 64) << 52);
+}
+static double fpow_(double x, double y) {
+  if (y == 0.0) return 1.0;
+  if (x != x || y != y) return 0.0 / 0.0;
+  if (x == 1.0) return 1.0;
+  if (x == 0.0) return y > 0.0 ? 0.0 : 1.0 / 0.0;
+  if (x < 0.0) {
+    double yi = (double)(long long)y;
+    if (yi != y) return 0.0 / 0.0; /* v1: no complex results */
+    double r = fexp_(y * flog_(-x));
+    return (((long long)y) & 1) ? -r : r;
+  }
+  return fexp_(y * flog_(x));
+}
+/* two-word Cody-Waite pi/2 reduction -> r in [-pi/4, pi/4], quadrant */
+static int rempio2_(double x, double *rp, int *okp) {
+  const double P1 = 1.57079632673412561417e+00, P1T = 6.07710050650619224932e-11;
+  *okp = 1;
+  if (x > 1.0e15 || x < -1.0e15) { *okp = 0; return 0; } /* v1 range end */
+  if (x > 1.073741824e9 || x < -1.073741824e9) {
+    /* coarse 2pi spin-down first so the quadrant cast stays in range
+     * (accuracy here is already ~ulp(x)-limited; documented v1) */
+    x -= (double)(long long)(x * 1.59154943091895345608e-01) * 6.28318530717958647693e+00;
+  }
+  double nd = x * 6.36619772367581382433e-01; /* 2/pi */
+  double n = (double)(long long)(nd + (nd >= 0.0 ? 0.5 : -0.5));
+  *rp = (x - n * P1) - n * P1T;
+  return ((long long)n) & 3;
+}
+static double ksin_(double r) {
+  double r2 = r * r;
+  return r * (1.0 + r2 * (-1.0 / 6 + r2 * (1.0 / 120 + r2 * (-1.0 / 5040
+       + r2 * (1.0 / 362880 + r2 * (-1.0 / 39916800 + r2 * (1.0 / 6227020800.0
+       + r2 * (-1.0 / 1307674368000.0 + r2 * (1.0 / 355687428096000.0)))))))));
+}
+static double kcos_(double r) {
+  double r2 = r * r;
+  return 1.0 + r2 * (-1.0 / 2 + r2 * (1.0 / 24 + r2 * (-1.0 / 720
+       + r2 * (1.0 / 40320 + r2 * (-1.0 / 3628800 + r2 * (1.0 / 479001600.0
+       + r2 * (-1.0 / 87178291200.0 + r2 * (1.0 / 20922789888000.0))))))));
+}
+static double fsin_(double x) {
+  if (x != x || fspec_(x)) return 0.0 / 0.0;
+  double r; int ok; int q = rempio2_(x, &r, &ok);
+  if (!ok) return 0.0 / 0.0;
+  switch (q) {
+    case 0: return ksin_(r);
+    case 1: return kcos_(r);
+    case 2: return -ksin_(r);
+    default: return -kcos_(r);
+  }
+}
+static double fcos_(double x) {
+  if (x != x || fspec_(x)) return 0.0 / 0.0;
+  double r; int ok; int q = rempio2_(x, &r, &ok);
+  if (!ok) return 0.0 / 0.0;
+  switch (q) {
+    case 0: return kcos_(r);
+    case 1: return -ksin_(r);
+    case 2: return -kcos_(r);
+    default: return ksin_(r);
+  }
+}
+V fpr_prim_fn_F64_x2elog(V a) { return bitsd(flog_(dbits(a))); }
+V fpr_prim_fn_F64_x2elog2(V a) { return bitsd(flog2_(dbits(a))); }
+V fpr_prim_fn_F64_x2eexp(V a) { return bitsd(fexp_(dbits(a))); }
+V fpr_prim_fn_F64_x2epow(V a, V b) { return bitsd(fpow_(dbits(a), dbits(b))); }
+V fpr_prim_fn_F64_x2esin(V a) { return bitsd(fsin_(dbits(a))); }
+V fpr_prim_fn_F64_x2ecos(V a) { return bitsd(fcos_(dbits(a))); }
+V fpr_prim_fn_F32_x2elog(V a) { return bitsf((float)flog_((double)fbits(a))); }
+V fpr_prim_fn_F32_x2elog2(V a) { return bitsf((float)flog2_((double)fbits(a))); }
+V fpr_prim_fn_F32_x2eexp(V a) { return bitsf((float)fexp_((double)fbits(a))); }
+V fpr_prim_fn_F32_x2epow(V a, V b) { return bitsf((float)fpow_((double)fbits(a), (double)fbits(b))); }
+V fpr_prim_fn_F32_x2esin(V a) { return bitsf((float)fsin_((double)fbits(a))); }
+V fpr_prim_fn_F32_x2ecos(V a) { return bitsf((float)fcos_((double)fbits(a))); }
 V fpr_prim_fn_F32_x2etoInt(V a) { return TAG((sw)fbits(a)); }
 V fpr_prim_fn_F32_x2eofF64(V a) { return bitsf((float)dbits(a)); }
 

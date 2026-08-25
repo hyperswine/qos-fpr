@@ -1,8 +1,16 @@
 # autodrop.fpr — the drop-what-you-receive LAW discharged by the
-# compiler.  NEITHER actor below writes a manual drop; the autodrop
-# pass inserts it after the destructure (see the compile-time notes),
-# and arcLive stays flat over 200 round trips.  loop's reply handling
-# is the same shape, so main's own receives are covered too.
+# compiler.  NO actor below writes a manual drop; the autodrop pass
+# inserts them (see the compile-time notes) and arcLive stays flat:
+#   echo   the destructure shape: m = receive; (a, b) = m
+#   nsvc   the CASE-SCRUTINEE shape: m = receive; case m of Ask r s ->
+#          — the storage-actor loop.  The drop lands at the ARM's
+#          START while the arm still reads the STRING s out of the
+#          message; that borrow survives because the runtime defers
+#          the slab release to this actor's next receive
+#          (fpr_drop_park), which is the whole deferred-drop contract
+#          proved end to end here.
+# loop's reply handling is the destructure shape too, so main's own
+# receives are covered.
 uart = device "uart" .
 lsrReady = v = read (reg8 uart 5); BITTEST v 5 .
 putc : unsafe Int -> Unit .
@@ -18,12 +26,30 @@ putsFrom s i = putc (charAt s i) >> putsFrom s (i + 1) .
 nl : unsafe Unit .
 nl = putc 13 >> putc 10 .
 
+Ask = Type (Ask replyTo s).
+
 # no manual drop anywhere in this file
 echo : unsafe Int -> i36 .
 echo me =
   m = receive me;
   (replyTo, n) = m;
   send replyTo (n * 2, 0) >> echo me .
+
+# the case-scrutinee shape, with a HEAP payload: strlen s runs after
+# the compiler-inserted drop
+nsvc : unsafe Int -> a1 .
+nsvc me =
+  m = receive me;
+  case m of
+    Ask replyTo s -> send replyTo (strlen s, 0) >> nsvc me .
+
+nloop : unsafe Int -> Int -> Int -> Int -> Int -> Int .
+nloop me v n stop acc | n > stop = acc.
+nloop me v n stop acc =
+  _ = send v (Ask me "payload-{n}");
+  r = receive me;
+  (ln, z) = r;
+  nloop me v (n + 1) stop (acc + ln) .
 
 loop : unsafe Int -> Int -> Int -> Int -> Int -> Int .
 loop me e n stop acc | n > stop = acc.
@@ -43,8 +69,12 @@ main =
   s = loop me e 2 200 s1;
   lv = arcLive 0;
   _ = puts "after round 200:  arcLive = {lv}   (sum = {s})" >> nl;
-  verdict (lv == base) .
+  v = spawn nsvc;
+  s2 = nloop me v 1 200 0;
+  lv2 = arcLive 0;
+  _ = puts "case-shape 200:   arcLive = {lv2}  (lensum = {s2})" >> nl;
+  verdict2 (lv == base) (lv2 == base) (s2 == 2092) .
 
-verdict : unsafe Bool -> Unit .
-verdict True = puts "AUTODROP HOLDS: 200 undropped-by-hand round trips, zero Arc growth" >> nl.
-verdict _ = puts "AUTODROP FAILED: Arc grew" >> nl.
+verdict2 : unsafe Bool -> Bool -> Bool -> Unit .
+verdict2 True True True = puts "AUTODROP HOLDS: 400 undropped-by-hand round trips (destructure + case shapes), zero Arc growth" >> nl.
+verdict2 a b c = puts "AUTODROP FAILED: flat1={a} flat2={b} sum={c}" >> nl.

@@ -73,7 +73,18 @@ is small, audited, and owned by one service.
 Buys: no pauses, no discovery phase, WCET stays compositional (free is
 attributed to the operation that caused it), and the fpr-scheduler /
 fuel model never has to model a collector. Costs: the five laws above
-are LAWS — the compiler's linearity checker enforces tier 4, drop
-discipline on message roots is enforced today by ARC.qa audits in CI
-(the soak legs), and the honest next step is compiler-inserted drops
-on receive paths so law 1 stops being manual at all.
+are LAWS — the compiler's linearity checker enforces tier 4, and law 1
+(drop what you receive) is now COMPILER-DISCHARGED on the two common
+shapes (autodrop in FPRISC.hs): the destructure-next-statement shape
+and the case-scrutinee actor loop, with the runtime holding up the
+other half — a dropped message slab is parked on the dropping actor's
+pending list and released at its NEXT RECEIVE (fpr_drop_park), so the
+inserted drop may precede the arm's reads of the message's children;
+the borrow window closes exactly where copy-on-retain says it must.
+Shapes autodrop cannot prove (a root that escapes, conditional drops)
+stay manual and reported, and ARC.qa audits still backstop them in CI.
+
+Two allocator rules retired with it: blocks above the bucket ceiling
+recycle through a per-pool exact-fit bigfree LIFO (tests/bigfree.fpr —
+an immortal actor's big Vec columns no longer bleed), and the generic
+Vec.fold tier frees its per-element intermediate PAP.
