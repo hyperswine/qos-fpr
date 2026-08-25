@@ -26,3 +26,5 @@ fp-risc/build/*.elf
 fp-risc/build/alpha.s*
 fp-risc/build/beta.s*
 fp-risc/image.elf
+qos/qos-store/*.kv
+!qos/qos-store/qsys.kv
