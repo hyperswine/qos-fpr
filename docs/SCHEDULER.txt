@@ -1,0 +1,12 @@
+Generate an index of the ready slots
+Ready slots and backlog and runqueue
+
+Choose two randomly, then choose higher priority of the two for basic scheduling
+
+Otherwise use the WCET when there is at least one ACB with threshold exceeded
+
+All cooperative, no preemptive
+Except timer interrupts, but those are meant to be mostly on auxiliary harts
+For prime harts not meant to be used often
+
+Device interrupts mostly on auxiliary harts, no prime hart interrupts if only one core
