@@ -26,9 +26,60 @@
 # TWO ACTORS, not three (the settled design): dispatch/input + update
 # live in the CALLER's actor; drawing is a RENDER SERVICE -- any actor
 # answering the Rv protocol.  textRender below is the reference
-# implementation (headless); pshell's GLES walker is another.  A third
-# actor appears only when rendering needs its own frame clock,
-# independent of model updates -- not this module's v1.
+# implementation (headless); pshell's GLES walker is another, and a
+# voxel-class software renderer holding its world batch is a third.
+#
+# ---------------------------------------------------------------------------
+# THE ELM SURFACE (v2).  An app is FOUR functions over its own Model --
+#
+#   App init update subs view
+#     init env             -> model
+#     update env ev model  -> (model, List MC)     ev : Ev
+#     subs model           -> List Sub             re-read EVERY frame
+#     view model           -> scene                whatever the render
+#                                                  service draws
+#
+# -- and events are DATA, not ints:
+#
+#   Ev  = ETick | EKey k | EMsg m a | EResize w h
+#   Sub = STick ms | SKeys
+#
+# Subscriptions are elm's: update hears ONLY what subs(model) asks for.
+# STick ms delivers ETick when ms milliseconds elapsed (event pacing,
+# decoupled from the frame rate -- drop it from the list and time
+# stops, which is how an app pauses); SKeys turns the input drain on.
+# EResize arrives unsubscribed (kind-5 input events, plus once at
+# start with the render service's dims) -- a viewport is a fact, not a
+# subscription.  EMsg is the external-message arm: the LiveView driver
+# (programs/mods/liveview.fpr) feeds browser events through it, and a
+# game feeding update from its own service actors uses the same arm.
+#
+#   MVU.game me cfg app      the gfx/game driver: this module's frame
+#                            loop, view computed per frame IN THE
+#                            WORKER (it may svcCall), whole scene as
+#                            dynamics, no statics rebuilds
+#   LV.server app            the browser driver, same App value --
+#                            see programs/mods/liveview.fpr
+#
+# The POWERED surface underneath (MApp) adds what the formal four
+# leave out -- a statics split (skey/view vs vals), a custom result
+# (done) -- and the drivers are adapters onto it:
+#
+#   MApp ini upd sk vw vl dn sbs
+#     ini env                  -> model
+#     upd me env ev model      -> (model, List MC)   ev : Ev
+#     sk model                 -> Int                statics identity
+#     vw vp model              -> statics            rebuilt on sk change
+#     vl self env vp model     -> vals               per frame, IN THE
+#                                 WORKER (may svcCall services)
+#     dn model                 -> String             the run's result
+#     sbs model                -> List Sub
+#
+# cfg is a RECORD, not a constructor: { env, mt, tick, input, render }.
+# tick is the FRAME budget (mt ticks: pacing, a runtime setting);
+# STick is whether update HEARS time (a subscription).  Consumers
+# project the fields they use; apps may add fields freely (rows are
+# open) -- adding a capability never breaks arity again.
 #
 # THE std PLACEMENT, honestly: std's charter is "no unbounded worst
 # case", and an MVU loop is unbounded BY DESIGN.  The contract here is
@@ -37,32 +88,20 @@
 # bounded-step-loop scheme is named future work, as is the registry
 # hook (tick/vp addressable live, the snake-CLI pattern).
 #
-# The app contract (MApp):
-#   init env                 -> model
-#   update me env k model    -> (model, List MC)   k=0 is the TICK,
-#                               delivered once per frame after real
-#                               keys; MQuit ends the run, MLog s logs
-#   skey model               -> Int                statics identity
-#   view vp model            -> statics            rebuilt on skey change
-#   vals self env vp model   -> vals               per frame, IN THE
-#                               WORKER (may svcCall services)
-#   done model               -> String             the run's result
-#
 # The render protocol (Rv): Dims u -> (w, h); Render st vs sc fr ->
 # (draws, bytes).  The input protocol: Poll u -> (kind, a, b) with
-# kind 0 none / 1 ascii / 4 evdev-press; input actor 0 = no input
-# (tick-driven apps).
+# kind 0 none / 1 ascii / 4 evdev-press / 5 resize; input actor 0 =
+# no input (tick-driven apps).
 # ============================================================================
 
 MC   = Type (MQuit | MLog s).
-MApp = Type (MApp ini upd sk vw vl dn).
-# cfg is a RECORD, not a constructor: { env, mt, tick, input, render }.
-# Consumers project the fields they use; apps may add fields freely
-# (rows are open) -- adding a capability never breaks arity again.
-# (MCfg the positional Type is GONE: build cfg with a record literal.)
+Ev   = Type (ETick | EKey k | EMsg m a | EResize w h).
+Sub  = Type (STick ms | SKeys).
+App  = Type (App ini upd sbs vw).
+MApp = Type (MApp ini upd sk vw vl dn sbs).
 Rv   = Type (Render st vs sc fr | Dims u | Poll u).
 Rq   = Type (Rq st model vw vh sc fr).
-Ms   = Type (Ms model fr sc lastR).
+Ms   = Type (Ms model fr sc lastR ltt).
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -76,7 +115,21 @@ revK : unsafe List a -> List a -> List a .
 revK acc l = case l of Nil -> acc | x :: r -> revK (x :: acc) r.
 imod a b = a - (a / b) * b.
 
-# ---- input: drain the poll service, presses only, ARRIVAL order -------------
+# ---- subscriptions: the list, folded to (tickMs, keysOn) --------------------
+
+subsOf app m =
+  MApp ini upd sk vw vl dn sbs = app;
+  subFold (sbs m) (0, 0).
+subFold : unsafe List Sub -> (Int, Int) -> (Int, Int) .
+subFold l acc = case l of Nil -> acc | s :: r -> subOne r acc s.
+subOne : unsafe List Sub -> (Int, Int) -> Sub -> (Int, Int) .
+subOne r acc s =
+  (t, k) = acc;
+  case s of
+    STick ms -> subFold r (ms, k)
+  | SKeys -> subFold r (t, 1).
+
+# ---- input: drain the poll service, ARRIVAL order ---------------------------
 # (prepend-built, reversed before applying -- the voxel-interactive law)
 
 ascii2code c = case c == 27 of
@@ -91,45 +144,51 @@ ascii2code c = case c == 27 of
             True -> 14
           | False -> 0 - c.        # negative = literal ascii
 
-drain : unsafe Int -> Int -> Int -> List Int -> List Int .
+drain : unsafe Int -> Int -> Int -> List Ev -> List Ev .
 drain me inp n acc = case n == 0 of
     True -> revK Nil acc
   | False -> drainOne me inp n acc.
-drainOne : unsafe Int -> Int -> Int -> List Int -> List Int .
+drainOne : unsafe Int -> Int -> Int -> List Ev -> List Ev .
 drainOne me inp n acc =
   ev = svcCall me inp (Poll 0);
   (kind, a, b) = ev;
   _ = drop ev;                     # every received message, once read
   drainEv me inp n acc kind a b.
-drainEv : unsafe Int -> Int -> Int -> List Int -> Int -> Int -> Int -> List Int .
+drainEv : unsafe Int -> Int -> Int -> List Ev -> Int -> Int -> Int -> List Ev .
 drainEv me inp n acc kind a b = case kind == 0 of
     True -> revK Nil acc
   | False -> case kind == 4 of
       True -> drainKey me inp n acc a b
     | False -> case kind == 1 of
-        True -> drain me inp (n - 1) (ascii2code a :: acc)
-      | False -> drain me inp (n - 1) acc.
-drainKey : unsafe Int -> Int -> Int -> List Int -> Int -> Int -> List Int .
+        True -> drain me inp (n - 1) (EKey (ascii2code a) :: acc)
+      | False -> case kind == 5 of
+          True -> drain me inp (n - 1) (EResize a b :: acc)
+        | False -> drain me inp (n - 1) acc.
+drainKey : unsafe Int -> Int -> Int -> List Ev -> Int -> Int -> List Ev .
 drainKey me inp n acc a b = case b == 1 of
-    True -> drain me inp (n - 1) (a :: acc)
+    True -> drain me inp (n - 1) (EKey a :: acc)
   | False -> drain me inp (n - 1) acc.
 
-keysOf me inp = case inp == 0 of
-    True -> 0 :: Nil                       # tick only
-  | False -> apnd (drain me inp 16 Nil) 0. # real keys, then the tick
+# keys only when subscribed AND an input service exists
+evsOf me inp keysOn = case keysOn == 0 of
+    True -> Nil
+  | False -> evsIn me inp.
+evsIn me inp = case inp == 0 of
+    True -> Nil
+  | False -> drain me inp 16 Nil.
 
 # ---- update + commands ------------------------------------------------------
 
-applyKeys : unsafe Int -> a -> MApp -> List Int -> (b, Int) -> (b, Int) .
-applyKeys me env app ks mq = case ks of
+applyEvs : unsafe Int -> a -> MApp -> List Ev -> (b, Int) -> (b, Int) .
+applyEvs me env app evs mq = case evs of
     Nil -> mq
-  | k :: r -> applyOne me env app r k mq.
-applyOne : unsafe Int -> a -> MApp -> List Int -> Int -> (b, Int) -> (b, Int) .
-applyOne me env app r k mq =
+  | e :: r -> applyOne me env app r e mq.
+applyOne : unsafe Int -> a -> MApp -> List Ev -> Ev -> (b, Int) -> (b, Int) .
+applyOne me env app r e mq =
   (m, q) = mq;
-  MApp ini upd sk vw vl dn = app;
-  (m2, cs) = upd me env k m;
-  applyKeys me env app r (m2, doCmds cs q).
+  MApp ini upd sk vw vl dn sbs = app;
+  (m2, cs) = upd me env e m;
+  applyEvs me env app r (m2, doCmds cs q).
 doCmds : unsafe List MC -> Int -> Int .
 doCmds cs q = case cs of
     Nil -> q
@@ -153,7 +212,7 @@ ensure app vp cache key model =
     True -> (cache, 0)
   | False -> rebuild app vp key model.
 rebuild app vp key model =
-  MApp ini upd sk vw vl dn = app;
+  MApp ini upd sk vw vl dn sbs = app;
   ((key, vw vp model), 1).
 
 # ---- the persistent render worker -------------------------------------------
@@ -190,20 +249,30 @@ tickWait mt t0 tick = case tick == 0 of
     True -> 0
   | False -> waitTick mt t0 tick.
 
+# STick ms: deliver ETick when ms elapsed since the LAST delivery --
+# event pacing rides the subscription, frame pacing rides cfg.tick
+dueTick evs t0 ltt tickMs = case tickMs == 0 of
+    True -> (evs, ltt)
+  | False -> dueTick2 evs t0 ltt tickMs.
+dueTick2 evs t0 ltt tickMs = case t0 - ltt >= tickMs * 10000 of
+    True -> (apnd evs ETick, t0)
+  | False -> (evs, ltt).
+
 loopM : unsafe Int -> _ -> MApp -> Int -> (Int, Int) -> (Int, c) -> Ms -> String .
 loopM me cfg app rw vp cache ms =
   env = cfg.env; mt = cfg.mt; input = cfg.input;
-  Ms model fr sc lastR = ms;
+  Ms model fr sc lastR ltt = ms;
   t0 = read mt;
-  ks = keysOf me input;
-  (m2, quit) = applyKeys me env app ks (model, 0);
+  (tickMs, keysOn) = subsOf app model;
+  (evs, ltt2) = dueTick (evsOf me input keysOn) t0 ltt tickMs;
+  (m2, quit) = applyEvs me env app evs (model, 0);
   case quit == 1 of
     True -> finish app m2 fr sc lastR
-  | False -> frame me cfg app rw vp cache (Ms m2 fr sc lastR) t0.
+  | False -> frame me cfg app rw vp cache (Ms m2 fr sc lastR ltt2) t0.
 frame : unsafe Int -> _ -> MApp -> Int -> (Int, Int) -> (Int, c) -> Ms -> Int -> String .
 frame me cfg app rw vp cache ms t0 =
   mt = cfg.mt; tick = cfg.tick;
-  Ms m2 fr sc lastR = ms;
+  Ms m2 fr sc lastR ltt = ms;
   (vw, vh) = vp;
   key = skeyOf app m2;
   (cache2, rebuilt) = ensure app vp cache key m2;
@@ -212,29 +281,53 @@ frame me cfg app rw vp cache ms t0 =
   r = receiveFrom me rw;
   _ = drop lastR;                  # the PREVIOUS reply's ARC entry
   _ = tickWait mt t0 tick;
-  loopM me cfg app rw vp cache2 (Ms m2 (fr + 1) (sc + rebuilt) r).
+  loopM me cfg app rw vp cache2 (Ms m2 (fr + 1) (sc + rebuilt) r ltt).
 skeyOf app m =
-  MApp ini upd sk vw vl dn = app;
+  MApp ini upd sk vw vl dn sbs = app;
   sk m.
 finish app m fr sc lastR =
-  MApp ini upd sk vw vl dn = app;
+  MApp ini upd sk vw vl dn sbs = app;
   _ = drop lastR;
   "{dn m} [mvu: {fr} frames, {sc} statics builds]".
 
 # run me cfg app -> the result string.  Spawns the worker, asks the
-# render service for its dimensions, initializes, loops.
+# render service for its dimensions, initializes, delivers the first
+# EResize (the viewport is a fact the model may record), loops.
 run me cfg app =
-  MApp ini upd sk vw vl dn = app;
+  MApp ini upd sk vw vl dn sbs = app;
   vp = svcCall me cfg.render (Dims 0);
   rw = spawn (renderWorker me cfg.render cfg.env vl);
   run2 me cfg app rw vp (ini cfg.env).
 run2 me cfg app rw vp m0 =
-  MApp ini upd sk vw vl dn = app;
+  (w0, h0) = vp;
+  (m1, quit) = applyEvs me cfg.env app (EResize w0 h0 :: Nil) (m0, 0);
+  case quit == 1 of
+    True -> finish app m1 0 0 (0, 0)
+  | False -> run3 me cfg app rw vp m1.
+run3 me cfg app rw vp m1 =
+  MApp ini upd sk vw vl dn sbs = app;
   # seed the cache with a throwaway build (key -1 forces a real rebuild
   # on frame 1): keeps the statics type fully polymorphic -- a Nil seed
   # would force every app's statics to be a List, and the GLES walker's
   # statics is a scene value
-  loopM me cfg app rw vp (0 - 1, vw vp m0) (Ms m0 0 0 (0, 0)).
+  loopM me cfg app rw vp (0 - 1, vw vp m1) (Ms m1 0 0 (0, 0) (read cfg.mt)).
+
+# ---- the elm façade: MVU.game -----------------------------------------------
+# The formal four run on the engine: view is computed per frame IN THE
+# WORKER (so a scene's per-frame allocation dies at the pool reset,
+# and view may svcCall the services it reads), the whole scene rides
+# the dynamics slot of the Render protocol, statics are the unit value
+# built once (a voxel-class render service owns its own world batch;
+# a service that does want a statics split uses MApp directly).
+
+game me cfg app =
+  App ini upd sbs vw = app;
+  run me cfg (MApp ini (gUpd upd) gSk gVw (gVl vw) gDn sbs).
+gUpd upd me env ev m = upd env ev m.
+gSk m = 0.
+gVw vp m = 0.
+gVl vw self env vp m = vw m.
+gDn m = "game over".
 
 # ---- textRender: the reference render service (headless) --------------------
 # statics = List String, vals = List String.  Prints the statics on

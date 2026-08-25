@@ -16,6 +16,8 @@ echo "== Literal suffixes: 2f / 1.5f F32, 1.5 / 1.5d / 1e3 F64 ==" && (cd fp-ris
 echo "== Floats: F64/F32 raw-bits, IEEE, dtoa, refusal guard ==" && (cd fp-risc && make -s bare-metal-run PROG=tests/float.fpr 2>/dev/null | grep -a "FLOATS HOLD" && printf 'main = print (1.5, 2.5).\n' > /tmp/ck-fneg.fpr && LC_ALL=C.UTF-8 ./fprc --profile=bare-metal --prelude=core/prelude.fpr /tmp/ck-fneg.fpr /tmp/ck-fneg.s 2>&1 | grep -q "render is tid-directed" && echo "float-in-structure print: refused with the restriction named")
 echo "== QOSPortable app =="     && (cd fp-risc && make -s qos-app PROG=tests/hello.fpr >/dev/null 2>&1)
 echo "== QOSPortable host+run ==" && (cd qos && make -s portable 2>/dev/null && ./qosp --yes ../fp-risc/app.qa | grep "=>")
+echo "== MVU: the elm surface (App / Ev / subs) on the engine ==" && (cd fp-risc && make -s qos-app PROG=tests/mvutick.fpr >/dev/null 2>&1 && cd ../qos && timeout 60 ./qosp --yes ../fp-risc/app.qa 2>/dev/null | grep -q "final count=31.*4 statics builds" && cd ../fp-risc && make -s qos-app PROG=tests/mvugame.fpr >/dev/null 2>&1 && cd ../qos && timeout 60 ./qosp --yes ../fp-risc/app.qa 2>/dev/null | tr -d '\r' > /tmp/ck-mvug.out; grep -q "gr f2: x=1 vp=32x8" /tmp/ck-mvug.out && grep -aq "game over \[mvu: 3 frames, 1 statics builds\]" /tmp/ck-mvug.out && echo "mvutick: STick-only ticks; mvugame: scripted SKeys -> exact 3-frame run on a custom render service")
+echo "== MVU: LV.server -- the LiveView wire over the socket tier ==" && qos/tests-host/mvuweb-check.sh 2>/dev/null | tail -1
 echo "== QAR2 integrity: flipped byte refused before copy ==" && (cd qos && python3 - <<'PY'
 b = bytearray(open('../fp-risc/app.qa','rb').read()); b[-100] ^= 0xFF
 open('/tmp/ck-tamper.qa','wb').write(bytes(b))
