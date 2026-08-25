@@ -7,3 +7,16 @@ qosp-gl
 hal/.DS_Store
 *.project.local
 ROUNDS.md
+
+# local build outputs (only the a64 prebuilts in fp-risc/build are tracked)
+fp-risc/build/.fpr-host-Linux-*
+fp-risc/build/ck-proc.*
+fp-risc/build/qosapp-gen.toml
+fp-risc/build/qosapp-prog.s
+fp-risc/build/qosapp-prog.s.abirev
+fp-risc/build/qosapp.elf
+fp-risc/build/units/*qx64r*.s
+fp-risc/build/units/*-rv64.s
+qos/build/
+qos/disk.img
+qos/qos-native.elf

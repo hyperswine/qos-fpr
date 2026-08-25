@@ -83,7 +83,7 @@ IInt = SVCM.IInt.
 IStr = SVCM.IStr.
 IFn  = SVCM.IFn.
 IErr = SVCM.IErr.
-QLog    = use "mods/qlog#7909d1a494a78ef2".
+QLog    = use "mods/qlog#6bd23126a476871f".
 MK      = use "mods/matrixkpd".
 TUI     = use "mods/tui#28388960a8f6aa26".
 
