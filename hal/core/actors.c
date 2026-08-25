@@ -101,8 +101,35 @@ typedef struct fpr_acb {
                     * to its hart's thread on hosted targets) */
   uw parent;              /* spawner's actor id (0 = the boot actor) */
   struct fpr_acb *all_nx; /* the all-actors ledger (monitor's walk) */
+  fpr_slab_t *drop_pending; /* dropped-message slabs awaiting the next
+                             * receive (fpr_drop_park in fpr.h): the
+                             * borrow window the compiler's autodrop
+                             * leans on ends there, so that's where
+                             * the batch is released */
   fpr_pool_t pool; /* this actor's slabs + recycle buckets (slab refactor) */
 } acb_t;
+
+/* ---- deferred message-slab release (see fpr.h) ---------------------- */
+void fpr_drop_park(fpr_slab_t *sl) {
+  acb_t *a = fpr_hart()->current;
+  if (!a) { fpr_slab_release(sl); return; } /* hart-loop context: no borrower */
+  sl->next = a->drop_pending;
+  a->drop_pending = sl;
+}
+static void drop_drain(acb_t *a) {
+  fpr_slab_t *sl = a->drop_pending;
+  if (!sl) return;
+  a->drop_pending = 0;
+  while (sl) {
+    fpr_slab_t *nx = sl->next;
+    fpr_slab_release(sl);
+    sl = nx;
+  }
+}
+void fpr_drop_drain_current(void) {
+  acb_t *a = fpr_hart()->current;
+  if (a) drop_drain(a);
+}
 
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a) { return &a->pool; }
 
@@ -289,6 +316,7 @@ static void chb_limbo_put(chan_t *ch) {
  * cannot escape -- straight back to buddy.  Idempotent via stack=0. */
 static void reap(acb_t *a) {
   if (!a->stack) return;
+  drop_drain(a); /* dropped-message slabs the dead actor never received after */
   fpr_pool_reclaim(a);
   if (fpr_is_process) stack_recycle(a->stack);
   else buddy_free(a->stack);
@@ -793,6 +821,8 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
   main_acb.pool.cur = 0;
+  main_acb.pool.bigfree = 0;
+  main_acb.drop_pending = 0;
   main_acb.pool.allocated = 0;
   static void *main_bkts[FPR_NBUCKETS]; /* actor 0 lives forever */
   main_acb.pool.buckets = main_bkts;
@@ -823,6 +853,8 @@ static V spawn_on(uw hart, V f, uw pin) {
   char *stk = (char *)stack_block();
   if (!a || !stk) fpr_cpanic("spawn: buddy has no free block");
   a->pool.cur = 0;
+  a->pool.bigfree = 0;
+  a->drop_pending = 0;
   a->pool.allocated = 0;
   a->pool.buckets = fpr_bkt_take(); /* zeroed; teardown returns it */
   if (!a->pool.buckets) fpr_cpanic("spawn: no memory for a bucket array");
@@ -932,6 +964,7 @@ static V a_receive(V me) {
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("receive: not the current actor's handle");
   acb_t *a = h->current;
+  drop_drain(a); /* the previous activation's borrows are dead here */
   for (;;) {
     for (int n = 0; n < MAXSND; n++) {
       chan_t *c = &a->ch[(a->scan + n) % MAXSND];
@@ -952,6 +985,7 @@ static V a_receive_from(V me, V fromv) {
   if (ISINT(fromv) || TID(fromv) != T_ACTOR)
     fpr_cpanic("receiveFrom: sender is not an actor");
   acb_t *a = h->current;
+  drop_drain(a); /* the previous activation's borrows are dead here */
   uw sid = (uw)fromv; /* the key IS the sender's acb */
   for (;;) {
     chan_t *c = chan_for(a, sid, 0);
@@ -966,6 +1000,7 @@ static V a_receive_res(V me) {
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("receiveRes: not the current actor's handle");
   acb_t *a = h->current;
+  drop_drain(a); /* the previous activation's borrows are dead here */
   for (;;) {
     for (int n = 0; n < MAXSND; n++) {
       chan_t *c = &a->ch[(a->scan + n) % MAXSND];

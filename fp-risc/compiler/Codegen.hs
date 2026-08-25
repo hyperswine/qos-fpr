@@ -598,7 +598,10 @@ primArities =
   ++ [ ("F" ++ w ++ "." ++ op, 2)
        | w <- ["64", "32"], op <- ["+", "-", "*", "/", "<", ">", "<=", ">=", "==", "!="] ]
   ++ [ ("F" ++ w ++ "." ++ f, 1)
-       | w <- ["64", "32"], f <- ["str", "sqrt", "ofInt", "toInt"] ]
+       | w <- ["64", "32"],
+         f <- ["str", "sqrt", "ofInt", "toInt",
+               "log", "log2", "exp", "sin", "cos"] ]
+  ++ [ ("F" ++ w ++ ".pow", 2) | w <- ["64", "32"] ]
   ++ [("F64.ofF32", 1), ("F32.ofF64", 1)]
 
 -- the full application spine: (head expr, args left-to-right)

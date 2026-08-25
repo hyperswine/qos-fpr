@@ -91,7 +91,7 @@ static col_t *col_new(void) {
 }
 
 static void col_free(col_t *c) {
-  for (uw j = 0; j < c->nblk; j++) fpr_free((V)c->blk[j]); /* >8KiB: leaks, by policy */
+  for (uw j = 0; j < c->nblk; j++) fpr_free((V)c->blk[j]); /* >8KiB: bigfree LIFO */
   fpr_free((V)c);
 }
 
@@ -448,7 +448,14 @@ V fpr_vec_filter(V f, V vec) {
 V fpr_vec_fold(V f, V z, V vec) {
   vec_t *x = vchk(vec, "Vec.fold: not a Vector");
   V acc = z;
-  for (uw i = 0; i < x->len; i++) acc = fpr_apply(fpr_apply(f, acc), row_at(x, i));
+  for (uw i = 0; i < x->len; i++) {
+    V pf = fpr_apply(f, acc);
+    acc = fpr_apply(pf, row_at(x, i));
+    /* the intermediate PAP is churn: release it, or an immortal
+     * actor's generic-tier fold bleeds one pap per element (the
+     * saturating apply copies args out; nothing retains pf) */
+    if (!ISINT(pf) && TID(pf) == T_PAP && pf != f) fpr_free(pf);
+  }
   return mktup2(acc, (V)x);
 }
 

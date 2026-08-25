@@ -104,9 +104,25 @@ typedef struct fpr_pool {
                      * orphans escaped slabs first).  runtime.c owns
                      * the recycler (bkt_take/bkt_put). */
   uw allocated;     /* gauge: bytes ever bumped by this owner */
+  void *bigfree;    /* freed blocks ABOVE the bucket ceiling: an
+                     * exact-fit LIFO (CAS push any hart, owner
+                     * swaps out on alloc).  Headers stay intact --
+                     * [0] total, [1] slab -- link rides the first
+                     * payload word.  Cleared at teardown/reset:
+                     * the blocks die with their slabs. */
 } fpr_pool_t;
 void **fpr_bkt_take(void);   /* runtime.c: bucket-array recycler */
 void fpr_bkt_put(void **b);
+
+/* deferred message-slab release (the drop-what-you-receive law's
+ * runtime half): dropping a received root parks its ownerless slab on
+ * the DROPPING actor's pending list instead of freeing it mid-borrow;
+ * the next receive -- the boundary where copy-on-retain says every
+ * borrow is dead -- returns the batch.  actors.c owns the list;
+ * runtime.c owns the actual release. */
+void fpr_drop_park(fpr_slab_t *sl);      /* actors.c (arc_lock held) */
+void fpr_drop_drain_current(void);       /* actors.c: drain now */
+void fpr_slab_release(fpr_slab_t *sl);   /* runtime.c: grant/buddy */
 
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a); /* actors.c: &a->pool */
 void fpr_pool_reclaim(struct fpr_acb *a);    /* runtime.c: death teardown */
