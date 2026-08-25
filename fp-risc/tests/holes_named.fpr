@@ -1,0 +1,3 @@
+myfunction : Int -> Int -> Int.
+myfunction a b = ?res.
+main = print "{myfunction 1 2}".

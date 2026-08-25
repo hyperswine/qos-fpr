@@ -1,87 +1,84 @@
-# The `.qa` archive (QOS App Archive)
+# QA-FORMAT.md — the .qa app archive, revision QAR2
 
-A `.qa` is the QOS analogue of macOS `.app`, drastically simpler. It is a
-flat archive of a manifest plus a bundled executable, with a fixed
-section table. Design goals: (1) statically inspectable before anything
-runs, (2) the permission set is *in* the archive and cannot be separated
-from the code, (3) trivially parseable by the FPRISC launcher with only
-`charAt`/`String.len`/`strcat`.
+A `.qa` is the unit of app distribution and loading on both QOS
+Portable and QOS Native.  QAR2 removes ELF from the archive: the ELF
+that the toolchain links is consumed ONCE, at build time, by
+`tools/mkqa.py`, which extracts the loadable bytes into a flat image.
+What ships is a container a loader can consume with one copy, one
+zero-fill, and one protection flip — no header chasing, no program-
+header walking, no format written by someone else's linker.
 
-## On-disk layout (one contiguous byte string)
+The host binaries (qosp, the native kernel) remain ordinary build
+products of their platforms; QAR2 governs only what THEY load.
 
-    QAR1\n                       magic + format version, newline-terminated
-    <section-table>                one line per section, blank line ends the table
+## Container
+
+    QAR2\n
+    MANIFEST <off> <len>\n
+    LOAD <off> <len>\n
+    IMAGE <off> <len>\n
     \n
-    <section payloads back to back>
+    <payloads>
 
-Section-table line:  `NAME OFFSET LENGTH\n`  (decimal, space-separated).
-OFFSET is relative to the first payload byte (i.e. just past the blank
-line that ends the table). Two sections are defined in v1:
+Same table discipline as QAR1: `NAME OFFSET LENGTH` lines, offsets
+relative to the first payload byte (the byte after the blank line),
+unknown sections ignored by design.  Everything before the payloads is
+text — `xxd` a .qa and read it.
 
-    MANIFEST   the app manifest (see below)
-    ELF        the bundled QOS RISC-V ELF (the compiled app image)
+## MANIFEST
 
-Unknown sections are ignored by design, so v2 can add ICON, SIG, etc.
-without breaking a v1 launcher.
+Unchanged from QAR1: the minimal-TOML subset (`name`, `id`,
+`loadMode`, `[permissions.required]`, `[permissions.optional]`).
 
-## The manifest (a minimal TOML subset)
+## LOAD — the entire loader contract, as text
 
-Only what the launcher needs; a real TOML lib is overkill on bare metal.
+    base <decimal>\n         where the image was linked (absolute)
+    entry <decimal>\n        entry point, as an OFFSET from base
+    execsz <decimal>\n       bytes of the r-x prefix (text + rodata)
+    rwoff <decimal>\n        offset of the first writable byte
+    imagesz <decimal>\n      bytes of IMAGE to copy to base
+    memsz <decimal>\n        total span; [imagesz..memsz) is zero-filled
+    sha <64 hex>\n           sha256 of the IMAGE bytes (optional line)
 
-    name = "TUI Notes"
-    id = "TUINotes"
-    entry = "tuinotes_main"          # symbol the co-compiled app runs from
-    version = "1"
+Decimal, line-oriented, order-insensitive — parseable by the same
+string-walking code system.fpr already uses for the section table.
+`entry` is an offset, never an absolute address: an archive states
+where it goes and where it starts relative to that, nothing else.
 
-    [permissions.required]
-    "/services/keyboard" = "read"
-    "/services/display"  = "write"
+The linker script's ALIGN(0x10000) between the r-x and rw segments is
+what makes `execsz`/`rwoff` honest: a loader may round `execsz` up to
+its page size and must refuse if that round-up reaches `rwoff` (the
+W^X boundary check, previously derived by walking PT_LOAD flags).
 
-    [permissions.optional]
-    "/services/net" = "write"
+## IMAGE
 
-Rules the parser enforces:
-- lines are `key = value`, values are `"quoted"` or bare tokens
-- `[section.subsection]` opens a table; keys until the next `[` belong to it
-- a permission key is a service URL, its value is the requested mode
-  (`read` / `write` / `readwrite`); the launcher matches on (url, mode)
-- everything under `[permissions.required]` is COMPULSORY: if the user
-  denies any one, the app does not run and the launcher shows
-  "Cannot Run Application without all required compulsory Permissions"
-- `[permissions.optional]` grants are asked for too, but a denial there
-  does not block launch; the app simply won't be handed that capability
+The flat memory image: every PT_LOAD's file bytes laid out at
+(vaddr - base), gaps zero-filled at build time.  Loading is:
 
-## The launch contract
+    check   base/memsz inside the window, execsz page-round < rwoff
+    copy    IMAGE -> base            (imagesz bytes)
+    zero    [base+imagesz .. base+memsz)
+    verify  sha, if the host can (qosp does; bare metal may skip)
+    protect r-x over the execsz prefix (hosts with mprotect)
+    enter   base + entry
 
-1. System.qa's launcher reads `/apps/<Id>.qa`, parses the section table,
-   then the MANIFEST section.
-2. It presents every required + optional permission to the user.
-3. If all *required* permissions are granted -> the app is launched:
-   the launcher resolves `entry` to a capability-parameterized closure
-   and runs it inside the caller's process, passing ONLY the granted
-   capabilities (URL-addressed handles to System.qa services).
-4. If any required permission is denied -> refusal message, no launch.
-   Re-launching repeats the whole flow from step 2 (grants are not
-   remembered in this PoC -- a deliberate simplification; a real QOS
-   would persist a grant table per (app-id, permission)).
+That is `hal/core/qaimg.c` in its entirety, shared by qosp's slot
+loader, qosp's plugin loader, and the native kernel's process loader
+(`Sys.loadImageAt`).  `elfload.c` is retired from every load path.
 
-## Where the ELF fits (and why name-dispatch today)
+## Placeholders
 
-The ELF section carries the real compiled app. QOS does not yet have a
-runtime ELF-in-ELF loader (relocation + a per-FSProcess address space +
-an entry trampoline -- a separate build). Until it lands, the launcher
-resolves `entry` against apps CO-COMPILED into the System image and
-dispatched by name, exactly like the existing `Mod.fn hash name` path.
-The ELF bytes are still bundled, still hashed into the archive, and the
-seam where the loader plugs in is a single message (`LaunchElf`) in
-System.qa -- so the swap from name-dispatch to true loading touches one
-function, not the architecture or any app.
+`mkqa.py <manifest> - -o out.qa` (no ELF) emits a LOAD of all zeros
+and an empty IMAGE — the name-dispatch era's placeholder apps keep
+working; a loader sees `memsz 0` and knows there is nothing to load.
 
-## Status notes (post launch-path work)
+## Why not ELF
 
-`loadMode = "process"` marks a real dynamically loaded ELF; its
-`entry` field is vestigial (`"n/a"` by convention -- the ABI is
-`fpr_process_entry`, docs/PROCESS-LOADING.md, which now carries the
-serialized capability grant).  For name-dispatch apps `entry` still
-names the co-compiled symbol; that mode is deprecated and dies when
-the TUI apps finish converting.
+The loaders used none of ELF's machinery — no relocation, no dynamic
+linking, no symbols at load time.  What they consumed was "two byte
+ranges, an entry, and a W^X boundary", reconstructed each load by
+parsing headers written for a different purpose.  QAR2 states those
+five numbers directly, so the archive parses with the tokenizer the
+system already owns, and the failure modes are named refusals
+("image outside the window", "execsz reaches rwoff", "sha mismatch")
+instead of malformed-header surprises.

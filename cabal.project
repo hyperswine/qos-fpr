@@ -1,7 +1,0 @@
--- cabal.project -- builds/installs both Haskell executables in this
--- repo (the FPRISC compiler) alongside sol (../sol, a sibling repo)
--- from one place. `cabal install` reads this automatically when run
--- from this directory (or any subdirectory).
-packages:
-  compiler/
-  ../sol/

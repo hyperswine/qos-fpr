@@ -1,4 +1,0 @@
-prog=tests/actors.fpr
-target=a64-mac
-out=build/actor-test
-harts=2

@@ -1,0 +1,289 @@
+# ============================================================================
+# std/mvu.fpr -- std.MVU: the MVU driver as a library, extracted from
+# pshell's SECOND architecture (the one that survived the Pi soaks),
+# so no app hand-rolls these laws again:
+#
+#   PERSISTENT RENDER WORKER   one actor for the life of the app; the
+#                              frame loop SENDS a request instead of
+#                              spawning (no per-frame acb ledger)
+#   SOFT DEATH                 Sys.poolReset at every frame boundary:
+#                              frame-per-actor memory semantics without
+#                              the actor; a drop lapse inside a frame
+#                              self-heals at the reset
+#   STATICS CACHE              view is rebuilt ONLY when skey(model)
+#                              changes -- the rebuilt statics VALUE is
+#                              the renderer's recompile trigger
+#   DROP LAWS                  drain drops every poll reply; the worker
+#                              forwards the render reply then drops its
+#                              own ref; advance drops the PREVIOUS
+#                              frame's reply (one live ARC entry per
+#                              frame otherwise -- the ~50s idle fuse)
+#   SELECTIVE RECEIVE          receiveFrom on both sides of the frame
+#                              round trip: a driver that also holds
+#                              service conversations inside update can
+#                              never eat the worker's reply by mistake
+#
+# TWO ACTORS, not three (the settled design): dispatch/input + update
+# live in the CALLER's actor; drawing is a RENDER SERVICE -- any actor
+# answering the Rv protocol.  textRender below is the reference
+# implementation (headless); pshell's GLES walker is another.  A third
+# actor appears only when rendering needs its own frame clock,
+# independent of model updates -- not this module's v1.
+#
+# THE std PLACEMENT, honestly: std's charter is "no unbounded worst
+# case", and an MVU loop is unbounded BY DESIGN.  The contract here is
+# per-frame: one drain+update+render iteration is the WCET-carrying
+# unit (the loop itself is declared unsafe).  Teaching --stdcheck a
+# bounded-step-loop scheme is named future work, as is the registry
+# hook (tick/vp addressable live, the snake-CLI pattern).
+#
+# The app contract (MApp):
+#   init env                 -> model
+#   update me env k model    -> (model, List MC)   k=0 is the TICK,
+#                               delivered once per frame after real
+#                               keys; MQuit ends the run, MLog s logs
+#   skey model               -> Int                statics identity
+#   view vp model            -> statics            rebuilt on skey change
+#   vals self env vp model   -> vals               per frame, IN THE
+#                               WORKER (may svcCall services)
+#   done model               -> String             the run's result
+#
+# The render protocol (Rv): Dims u -> (w, h); Render st vs sc fr ->
+# (draws, bytes).  The input protocol: Poll u -> (kind, a, b) with
+# kind 0 none / 1 ascii / 4 evdev-press; input actor 0 = no input
+# (tick-driven apps).
+# ============================================================================
+
+MC   = Type (MQuit | MLog s).
+MApp = Type (MApp ini upd sk vw vl dn).
+# cfg is a RECORD, not a constructor: { env, mt, tick, input, render }.
+# Consumers project the fields they use; apps may add fields freely
+# (rows are open) -- adding a capability never breaks arity again.
+# (MCfg the positional Type is GONE: build cfg with a record literal.)
+Rv   = Type (Render st vs sc fr | Dims u | Poll u).
+Rq   = Type (Rq st model vw vh sc fr).
+Ms   = Type (Ms model fr sc lastR).
+
+# ---- helpers ----------------------------------------------------------------
+
+svcCall me a q = _ = send a (me, q); receiveFrom me a.
+
+lenL : unsafe List a -> Int .
+lenL l = case l of Nil -> 0 | x :: r -> 1 + lenL r.
+apnd : unsafe List a -> a -> List a .
+apnd l x = case l of Nil -> x :: Nil | h :: r -> h :: apnd r x.
+revK : unsafe List a -> List a -> List a .
+revK acc l = case l of Nil -> acc | x :: r -> revK (x :: acc) r.
+imod a b = a - (a / b) * b.
+
+# ---- input: drain the poll service, presses only, ARRIVAL order -------------
+# (prepend-built, reversed before applying -- the voxel-interactive law)
+
+ascii2code c = case c == 27 of
+    True -> 1
+  | False -> case c == 10 of
+      True -> 28
+    | False -> case c == 13 of
+        True -> 28
+      | False -> case c == 127 of
+          True -> 14
+        | False -> case c == 8 of
+            True -> 14
+          | False -> 0 - c.        # negative = literal ascii
+
+drain : unsafe Int -> Int -> Int -> List Int -> List Int .
+drain me inp n acc = case n == 0 of
+    True -> revK Nil acc
+  | False -> drainOne me inp n acc.
+drainOne : unsafe Int -> Int -> Int -> List Int -> List Int .
+drainOne me inp n acc =
+  ev = svcCall me inp (Poll 0);
+  (kind, a, b) = ev;
+  _ = drop ev;                     # every received message, once read
+  drainEv me inp n acc kind a b.
+drainEv : unsafe Int -> Int -> Int -> List Int -> Int -> Int -> Int -> List Int .
+drainEv me inp n acc kind a b = case kind == 0 of
+    True -> revK Nil acc
+  | False -> case kind == 4 of
+      True -> drainKey me inp n acc a b
+    | False -> case kind == 1 of
+        True -> drain me inp (n - 1) (ascii2code a :: acc)
+      | False -> drain me inp (n - 1) acc.
+drainKey : unsafe Int -> Int -> Int -> List Int -> Int -> Int -> List Int .
+drainKey me inp n acc a b = case b == 1 of
+    True -> drain me inp (n - 1) (a :: acc)
+  | False -> drain me inp (n - 1) acc.
+
+keysOf me inp = case inp == 0 of
+    True -> 0 :: Nil                       # tick only
+  | False -> apnd (drain me inp 16 Nil) 0. # real keys, then the tick
+
+# ---- update + commands ------------------------------------------------------
+
+applyKeys : unsafe Int -> a -> MApp -> List Int -> (b, Int) -> (b, Int) .
+applyKeys me env app ks mq = case ks of
+    Nil -> mq
+  | k :: r -> applyOne me env app r k mq.
+applyOne : unsafe Int -> a -> MApp -> List Int -> Int -> (b, Int) -> (b, Int) .
+applyOne me env app r k mq =
+  (m, q) = mq;
+  MApp ini upd sk vw vl dn = app;
+  (m2, cs) = upd me env k m;
+  applyKeys me env app r (m2, doCmds cs q).
+doCmds : unsafe List MC -> Int -> Int .
+doCmds cs q = case cs of
+    Nil -> q
+  | c :: r -> doCmd r q c.
+doCmd : unsafe List MC -> Int -> MC -> Int .
+doCmd r q c = case c of
+    MQuit -> doCmds r 1
+  | MLog s -> logGo r q s.
+logGo : unsafe List MC -> Int -> String -> Int .
+logGo r q s =
+  _ = Sys.logAt 0 s;
+  doCmds r q.
+
+# ---- the statics cache: skey is the identity --------------------------------
+# cache = (key, statics); the statics value is pointer-stable while
+# cached, which is the renderer's recompile trigger when it swaps.
+
+ensure app vp cache key model =
+  (k, st) = cache;
+  case k == key of
+    True -> (cache, 0)
+  | False -> rebuild app vp key model.
+rebuild app vp key model =
+  MApp ini upd sk vw vl dn = app;
+  ((key, vw vp model), 1).
+
+# ---- the persistent render worker -------------------------------------------
+# One actor, forever: request in, vals computed HERE (this is the actor
+# that may svcCall services from vals), one render call, reply
+# forwarded, everything released, pool reset -- the soft death.
+
+renderWorker : unsafe Int -> Int -> a -> b -> Int -> c .
+renderWorker parent render env vl self =
+  m = receiveFrom self parent;
+  Rq st model vw vh sc fr = m;
+  vs = vl self env (vw, vh) model;
+  r = svcCall self render (Render st vs sc fr);
+  _ = send parent r;
+  _ = drop r;                      # forward then release OUR ref
+  _ = drop m;                      # the request root
+  _ = Sys.poolReset 0;             # the frame boundary: soft death
+  renderWorker parent render env vl self.
+
+# ---- the loop ---------------------------------------------------------------
+
+waitTick : unsafe Int -> Int -> Int -> Int .
+waitTick mt t0 tick = case read mt - t0 >= tick of
+    True -> read mt
+  | False -> napTick mt t0 tick.
+# sleep the REMAINDER instead of pegging a core on mtime; the loop
+# re-checks because the hook may undershoot (and the bare-metal weak
+# default is a no-op, i.e. today's spin, unchanged)
+napTick : unsafe Int -> Int -> Int -> Int .
+napTick mt t0 tick =
+  _ = Sys.sleepUs ((tick - (read mt - t0)) / 10);   # 10MHz mt -> us
+  waitTick mt t0 tick.
+tickWait mt t0 tick = case tick == 0 of
+    True -> 0
+  | False -> waitTick mt t0 tick.
+
+loopM : unsafe Int -> _ -> MApp -> Int -> (Int, Int) -> (Int, c) -> Ms -> String .
+loopM me cfg app rw vp cache ms =
+  env = cfg.env; mt = cfg.mt; input = cfg.input;
+  Ms model fr sc lastR = ms;
+  t0 = read mt;
+  ks = keysOf me input;
+  (m2, quit) = applyKeys me env app ks (model, 0);
+  case quit == 1 of
+    True -> finish app m2 fr sc lastR
+  | False -> frame me cfg app rw vp cache (Ms m2 fr sc lastR) t0.
+frame : unsafe Int -> _ -> MApp -> Int -> (Int, Int) -> (Int, c) -> Ms -> Int -> String .
+frame me cfg app rw vp cache ms t0 =
+  mt = cfg.mt; tick = cfg.tick;
+  Ms m2 fr sc lastR = ms;
+  (vw, vh) = vp;
+  key = skeyOf app m2;
+  (cache2, rebuilt) = ensure app vp cache key m2;
+  (k2, st2) = cache2;
+  _ = send rw (Rq st2 m2 vw vh (sc + rebuilt) fr);
+  r = receiveFrom me rw;
+  _ = drop lastR;                  # the PREVIOUS reply's ARC entry
+  _ = tickWait mt t0 tick;
+  loopM me cfg app rw vp cache2 (Ms m2 (fr + 1) (sc + rebuilt) r).
+skeyOf app m =
+  MApp ini upd sk vw vl dn = app;
+  sk m.
+finish app m fr sc lastR =
+  MApp ini upd sk vw vl dn = app;
+  _ = drop lastR;
+  "{dn m} [mvu: {fr} frames, {sc} statics builds]".
+
+# run me cfg app -> the result string.  Spawns the worker, asks the
+# render service for its dimensions, initializes, loops.
+run me cfg app =
+  MApp ini upd sk vw vl dn = app;
+  vp = svcCall me cfg.render (Dims 0);
+  rw = spawn (renderWorker me cfg.render cfg.env vl);
+  run2 me cfg app rw vp (ini cfg.env).
+run2 me cfg app rw vp m0 =
+  MApp ini upd sk vw vl dn = app;
+  # seed the cache with a throwaway build (key -1 forces a real rebuild
+  # on frame 1): keeps the statics type fully polymorphic -- a Nil seed
+  # would force every app's statics to be a List, and the GLES walker's
+  # statics is a scene value
+  loopM me cfg app rw vp (0 - 1, vw vp m0) (Ms m0 0 0 (0, 0)).
+
+# ---- textRender: the reference render service (headless) --------------------
+# statics = List String, vals = List String.  Prints the statics on
+# every rebuild (the recompile trigger made visible) and a vals line
+# every 10th frame; replies (draws, bytes) like the GLES walker.
+
+textRender : unsafe Int -> a .
+textRender me = trLoop me (0 - 1).
+trLoop : unsafe Int -> Int -> a .
+trLoop me lastSc =
+  m = receive me;
+  (replyTo, q) = m;
+  trMsg me lastSc replyTo q.
+trMsg : unsafe Int -> Int -> Int -> Rv -> a .
+trMsg me lastSc replyTo q = case q of
+    Dims u -> send replyTo (80, 24) >> trLoop me lastSc
+  | Render st vs sc fr -> trFrame me lastSc replyTo st vs sc fr
+  | Poll u -> send replyTo (0, 0, 0) >> trLoop me lastSc.
+trFrame : unsafe Int -> Int -> Int -> List String -> List String -> Int -> Int -> a .
+trFrame me lastSc replyTo st vs sc fr =
+  _ = trStatics st sc lastSc;
+  _ = trVals vs sc fr;
+  _ = send replyTo (lenL vs, trBytes vs 0);
+  trLoop me sc.
+trStatics : unsafe List String -> Int -> Int -> Int .
+trStatics st sc lastSc = case sc == lastSc of
+    True -> 0
+  | False -> trBanner st sc.
+trBanner : unsafe List String -> Int -> Int .
+trBanner st sc =
+  _ = print "-- statics build #{sc} --";
+  trPrintAll st.
+trPrintAll : unsafe List String -> Int .
+trPrintAll l = case l of
+    Nil -> 0
+  | s :: r -> trP1 r s.
+trP1 : unsafe List String -> String -> Int .
+trP1 r s = _ = print "  | {s}"; trPrintAll r.
+trVals : unsafe List String -> Int -> Int -> Int .
+trVals vs sc fr = case imod fr 10 == 0 of
+    True -> trPrintVals vs fr
+  | False -> 0.
+trPrintVals : unsafe List String -> Int -> Int .
+trPrintVals vs fr = trPV vs fr "".
+trPV : unsafe List String -> Int -> String -> Int .
+trPV vs fr acc = case vs of
+  Nil -> print "f{fr}: {acc}" >> 0
+  | v :: r -> trPV r fr "{acc}{v}  ".
+trBytes : unsafe List String -> Int -> Int .
+trBytes vs n = case vs of
+    Nil -> n
+  | v :: r -> trBytes r (n + strlen v).

@@ -1,0 +1,4 @@
+make qos for macos
+then make portable
+then make plugin for the app to get .qa, and put on disk
+then ./qosp the disk

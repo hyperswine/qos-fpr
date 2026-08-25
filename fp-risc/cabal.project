@@ -1,0 +1,3 @@
+-- one package; sol/ is examples+lib sources for the LANGUAGE, not
+-- Haskell -- the fold put all the Haskell under compiler/
+packages: .

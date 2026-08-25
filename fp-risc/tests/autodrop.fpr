@@ -1,0 +1,50 @@
+# autodrop.fpr — the drop-what-you-receive LAW discharged by the
+# compiler.  NEITHER actor below writes a manual drop; the autodrop
+# pass inserts it after the destructure (see the compile-time notes),
+# and arcLive stays flat over 200 round trips.  loop's reply handling
+# is the same shape, so main's own receives are covered too.
+uart = device "uart" .
+lsrReady = v = read (reg8 uart 5); BITTEST v 5 .
+putc : unsafe Int -> Unit .
+putc c | lsrReady = write (reg8 uart 0) c.
+putc c = putc c .
+# console text over THIS file's putc (the prelude cannot host these:
+# putc is per-target device code, and the prelude is a cached unit)
+puts : unsafe String -> Unit .
+puts s = putsFrom s 1 .
+putsFrom : unsafe String -> Int -> Unit .
+putsFrom s i | i > strlen s = Unit.
+putsFrom s i = putc (charAt s i) >> putsFrom s (i + 1) .
+nl : unsafe Unit .
+nl = putc 13 >> putc 10 .
+
+# no manual drop anywhere in this file
+echo : unsafe Int -> i36 .
+echo me =
+  m = receive me;
+  (replyTo, n) = m;
+  send replyTo (n * 2, 0) >> echo me .
+
+loop : unsafe Int -> Int -> Int -> Int -> Int -> Int .
+loop me e n stop acc | n > stop = acc.
+loop me e n stop acc =
+  _ = send e (me, n);
+  r = receive me;
+  (v, z) = r;
+  loop me e (n + 1) stop (acc + v) .
+
+main =
+  me = myself 0;
+  _ = nl >> puts "autodrop: the drop law, discharged by the compiler" >> nl;
+  e = spawn echo;
+  s1 = loop me e 1 1 0;
+  base = arcLive 0;
+  _ = puts "after round 1:    arcLive = {base}" >> nl;
+  s = loop me e 2 200 s1;
+  lv = arcLive 0;
+  _ = puts "after round 200:  arcLive = {lv}   (sum = {s})" >> nl;
+  verdict (lv == base) .
+
+verdict : unsafe Bool -> Unit .
+verdict True = puts "AUTODROP HOLDS: 200 undropped-by-hand round trips, zero Arc growth" >> nl.
+verdict _ = puts "AUTODROP FAILED: Arc grew" >> nl.

@@ -1,9 +1,0 @@
-# mymod2.fpr — "the same module, one edit later": a different hash,
-# loadable ALONGSIDE the original. Immutable versioning by naming.
-
-T = Type (T Int).
-
-x = 100.
-
-double : Int -> Int.
-double n = n * 2 + 1.

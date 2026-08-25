@@ -40,6 +40,9 @@ EXCLUDES=(
   "disk.img"
   ".git/*"
   ".vscode/*"
+  "*.hi"
+  "*.o"
+  "cabal.project.local"
 )
 
 # Convert to -x arguments

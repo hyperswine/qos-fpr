@@ -1,0 +1,96 @@
+# frames.fpr — the memory model's steady-state pattern, demonstrated:
+# LINEAR double-buffered frames between actors, NO Arc growth per frame.
+#
+# The model (docs/MEMORY.md): bulk data lives in linear SoA Vectors; a
+# service owns ITS linear resource and is the only thing that touches
+# it; frames ping-pong between producer and renderer by linear handoff
+# (send consumes, receive re-owns); Arc exists only for the message
+# ROOTS, and drop discipline keeps that constant.  The proof is the
+# number printed at the end: arcLive after 200 frames == arcLive after
+# frame 1.  Nothing here is GC — everything is Rc/Arc + linear
+# ownership, and the steady state allocates NOTHING per frame in the
+# immortal actors.
+
+uart = device "uart" .
+lsrReady = v = read (reg8 uart 5); BITTEST v 5 .
+putc : unsafe Int -> Unit .
+putc c | lsrReady = write (reg8 uart 0) c.
+putc c = putc c .
+# console text over THIS file's putc (the prelude cannot host these:
+# putc is per-target device code, and the prelude is a cached unit)
+puts : unsafe String -> Unit .
+puts s = putsFrom s 1 .
+putsFrom : unsafe String -> Int -> Unit .
+putsFrom s i | i > strlen s = Unit.
+putsFrom s i = putc (charAt s i) >> putsFrom s (i + 1) .
+nl : unsafe Unit .
+nl = putc 13 >> putc 10 .
+
+wMax = 64.
+
+# ---- the renderer: a service owning NOTHING ----------------------------
+# It receives a frame LINEARLY, mutates it through the linear handle,
+# and hands it straight back.  It retains no reference: drop discipline
+# on the message root, linear handoff on the payload.  A renderer that
+# kept a frame would be a compile-time linearity error in its own code
+# and a visible arcLive climb here.
+
+# one recursive fn, one honest unsafe sig; the message stays a local
+# (drop discipline unchanged: destructure reads, drop frees the cell)
+render : unsafe Int -> a .
+render me =
+  m = receive me;
+  (replyTo, fb, frameNo) = m;
+  fb2 = paint fb frameNo 1;
+  _ = send replyTo (fb2, frameNo);
+  drop m >> render me .
+
+# paint: bulk mutation through the linear handle — in place, no
+# allocation, the same handle threads out.
+paint : unsafe Vector -> w38 -> Int -> Vector .
+paint fb v i | i > wMax = fb.
+paint fb v i = paint (Vec.set i v fb) v (i + 1) .
+
+# ---- the producer loop: double buffer ---------------------------------
+# TWO frames exist, ever.  While the renderer holds one, main owns the
+# other; each bounce swaps them.  This is the anti-GC design: frame
+# lifetime is the LOOP STRUCTURE, not a collector's discovery.
+
+loop : unsafe Int -> Int -> g39 -> g39 -> Int -> Int -> (g39, g39) .
+loop me r front back n stop | n > stop = (front, back).
+loop me r front back n stop =
+  _ = send r (me, back, n);
+  m = receive me;
+  (backPainted, k) = m;
+  _ = drop m;
+  loop me r backPainted front (n + 1) stop .
+
+main =
+  me = myself 0;
+  _ = nl >> puts "frames: linear double-buffered handoff, Arc-flat steady state" >> nl;
+  r = spawn render;
+  fbA = Vec.iota wMax;
+  fbB = Vec.iota wMax;
+  fbA1 = paint fbA 0 1;
+  fbB1 = paint fbB 0 1;
+  # one warm-up bounce, then measure: the baseline includes every
+  # immortal root (mailboxes, the two frames, the spawn pin).
+  fbs = loop me r fbA1 fbB1 1 1;
+  base = arcLive 0;
+  _ = puts "after frame 1:    arcLive = {base}" >> nl;
+  (f1, f2) = fbs;
+  fbs2 = loop me r f1 f2 2 200;
+  lv = arcLive 0;
+  _ = puts "after frame 200:  arcLive = {lv}" >> nl;
+  (g1, g2) = fbs2;
+  vr = Vec.get 7 g1;
+  (x, g1b) = vr;
+  _ = puts "spot check: frame cell 7 = {x} (painted by the last owner)" >> nl;
+  _ = verdict (lv == base);
+  _ = Vec.free g1b;
+  _ = Vec.free g2;
+  Unit .
+
+verdict : unsafe Bool -> Unit .
+verdict True = puts "ARC FLAT: 199 frames, zero Arc growth -- the linear double-buffer holds" >> nl.
+verdict _ = puts "ARC GREW: drop discipline broken somewhere" >> nl.

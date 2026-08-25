@@ -1,0 +1,9 @@
+-- per-machine knobs (copy to cabal.project.local):
+package fp-risc
+  -- where llvm-config --libdir points on THIS machine
+  -- on macos should be /opt/homebrew/opt/llvm@18
+  -- for the include llvm@18 it should be /opt/homebrew/opt/llvm@18/include
+  extra-lib-dirs: /opt/homebrew/opt/llvm@18/lib
+  extra-include-dirs: /opt/homebrew/opt/llvm@18/include
+  -- profiling build: uncomment
+  -- profiling: True

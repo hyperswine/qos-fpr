@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-	<dict>
-		<!-- Allow creating mappings that are simultaneously writable and executable.  Required on modern macOS for the QOS Portable arena (RWX anonymous mapping  at a fixed address that hosts both code and data for the loaded qa64 app). -->
-		<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-		<true />
-	</dict>
-</plist>

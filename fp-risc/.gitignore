@@ -1,0 +1,8 @@
+*.o
+*.hi
+dist-newstyle/
+fpr
+fprc
+*.s.units
+out.s
+*.disk

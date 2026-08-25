@@ -1,0 +1,6 @@
+name = "interactive_desktop_gl"
+id = "interactive_desktop_gl"
+entry = "n/a"
+version = "1"
+loadMode = "process"
+abi = "5.8"
