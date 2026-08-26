@@ -101,8 +101,17 @@ programmer at compile time.
 
 Known genuine declines today: element functions that pattern-match or
 otherwise reconstruct opaquely, nested record updates/construction inside
-an output field, lambda element functions on record FOLDS, AOT record-map
-outputs over 4 fields, and boxed records over 8 fields.
+an output field, record FOLDS (named element fns decline too, not just
+lambdas -- fold duals are scalar-only), AOT record-map outputs over 4
+fields, and boxed records over 8 fields.
+
+Target caveat: on x64 (qosp on x86-64) the ENTIRE specialization tier
+is off -- SysV has only 6 callee-saved registers and the spec loops
+need s6+ -- so every Vec site runs the generic apply tier there, and
+because the decline scan is gated on the same flag, x64 compiles emit
+NO vec notes at all: the fallback is silent on exactly the target
+where it is total.  a64 and rv64 keep the tier.  tests/fuse.fpr's
+in-place witnesses accordingly hold on bare-metal/a64, not on qosp-x64.
 
 ## 5. Fusion by default for adjacent passes
 
@@ -161,6 +170,16 @@ Using a Vec non-linearly is a compile error, not a silent copy.  This
 is deliberate: a silent deep copy of a compute-bound array is the
 single worst thing a "helpful" runtime could do here.
 
+Enforcement boundary, honestly stated (audit finding): the linearity
+counter takes a variable's linear shape from its DECLARED signature
+(and from linear PAP captures), not from inference.  A function with a
+`: Vector -> ...` sig gets the exactly-once check; an UNANNOTATED
+function -- `main` included -- can double-use or double-free a
+let-bound Vec and compile "linearity OK" (the misuse then runs
+silently).  Inference knows the type; the checker does not consult it
+yet.  Until that lands, a `: ... Vector ...` sig on anything touching
+a Vec is what buys the guarantee.
+
 ## 8. Tier structure
 
     declared float columns ('i'/'d'/'s'/'b')   -- widths chosen, not guessed
@@ -177,3 +196,21 @@ compile-time note or a declared choice.
 2. fusion fixpoint for 3+ chains
 3. record -> scalar projection maps (layout-changing: new 1-col output)
 4. lambda-fold duals (the main remaining genuine decline)
+
+## RVV status (audit, 2026-08)
+
+The `--rvv` lowering (strip-mined `vsetvli` loops, `vle64/vadd.vv`
+folds) is FUNCTIONALLY CORRECT: tests/fuse.fpr passes all seven
+witnesses under `qemu -cpu rv64,v=true` when built with it.  But the
+path is dormant and unshipped:
+
+  * no Makefile rule passes `--rvv`; the default QEMU cpu has no V
+    extension and ARCHFLAGS omits `v`, so the C prim tier compiles
+    scalar on rv64 too (its autovectorization is real only on hosted
+    x64/a64 baselines: adds/compares/blend take SSE2/NEON lanes,
+    64-bit multiplies stay scalar below AVX-512)
+  * `--rvv` emits a strong `fpr_rvv_enable` into the program AND into
+    every module unit compiled with the flag, so any program that uses
+    the prelude fails to link (multiple definition) -- the enable
+    shim needs to move to the runtime or become link-once before the
+    flag can ship
