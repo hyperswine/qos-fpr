@@ -85,16 +85,3 @@ the checkable fragment of real parsed .fpr into the StdCheck engine):
 * core_* names are ALWAYS opaque unsafe externs (cost ω(name)) even
   when defined — unsafety is infectious upward, and the WCET
   equations show exactly where ω enters and how it composes
-
-## Verified in this PoC
-
-    cd fp-risc && make fprc
-    make stdcheck FILE=std/checkdemo.fpr      # proof report, all green
-    make bare-metal-run PROG=tests/stduse.fpr # "std: clamp=10 backoff=800 fold=15"
-    make qos-app PROG=tests/hello.fpr
-    make sol && (cd sol/examples && LD_LIBRARY_PATH=/usr/lib/llvm-18/lib ../sol stddemo.sol)
-                                              # "std via sol: total=31 avg=3 …"
-    cd ../qos && make portable && ./qosp --yes ../fp-risc/app.qa
-                                              # "[qos] hello => hello from a .qa: fold(1..10)=55 clamp=55"
-    make native && make native-run            # kernel boots: disk online,
-                                              # permission gate, TUI launcher + live clock

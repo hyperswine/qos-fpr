@@ -2,3 +2,14 @@ make qos for macos
 then make portable
 then make plugin for the app to get .qa, and put on disk
 then ./qosp the disk
+
+cd fp-risc && make fprc
+make stdcheck FILE=std/checkdemo.fpr      # proof report, all green
+make bare-metal-run PROG=tests/stduse.fpr # "std: clamp=10 backoff=800 fold=15"
+make qos-app PROG=tests/hello.fpr
+make sol && (cd sol/examples && LD_LIBRARY_PATH=/usr/lib/llvm-18/lib ../sol stddemo.sol)
+                                          # "std via sol: total=31 avg=3 …"
+cd ../qos && make portable && ./qosp --yes ../fp-risc/app.qa
+                                          # "[qos] hello => hello from a .qa: fold(1..10)=55 clamp=55"
+make native && make native-run            # kernel boots: disk online,
+                                          # permission gate, TUI launcher + live clock
