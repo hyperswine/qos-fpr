@@ -33,6 +33,18 @@ CFLAGS = $(ARCHFLAGS) -DFPR_NHARTS=$(HARTS) \
          -fno-builtin -fno-stack-protector
 QEMU  = qemu-system-riscv64
 ACCEL = -accel tcg,thread=multi
+
+# ---- RVV: the vector tier, now shippable -------------------------------
+# `make bare-metal-run PROG=... RVV=1` compiles Vec loops with --rvv
+# (strip-mined vsetvli/vle/vadd), assembles with the V extension, and
+# boots QEMU with a V-capable cpu.  The enable shim is emitted link-once
+# (COMDAT), so multi-unit programs link cleanly.  Without RVV=1 nothing
+# changes: no unit touches mstatus.VS and the images run on V-less cores.
+ifeq ($(RVV),1)
+FPRC_FLAGS += --rvv
+ARCHFLAGS = -march=rv64imafdcv_zicsr -mabi=lp64 -mcmodel=medany
+ACCEL += -cpu rv64,v=true
+endif
 TIMEOUT := $(shell command -v timeout 2>/dev/null || echo "")
 
 all: fpr
@@ -94,7 +106,7 @@ stdcheck: fprc
 # ---- BareMetal profile -------------------------------------------------
 build/prog.s: fprc $(PROG) core/prelude.fpr FORCE
 	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --profile=bare-metal --prelude=core/prelude.fpr $(PROG) $@
+	LC_ALL=C.UTF-8 ./fprc --profile=bare-metal $(FPRC_FLAGS) --prelude=core/prelude.fpr $(PROG) $@
 
 bare-metal: build/prog.s $(RT_VIRT) $(RT_CORE) $(HAL)/virt/link.ld
 	$(CROSS)gcc $(CFLAGS) -T $(HAL)/virt/link.ld -I$(HAL)/core -I$(HAL)/virt \

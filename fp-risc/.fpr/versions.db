@@ -7,3 +7,6 @@ qlog v1.1 76ba27032712e60f
 timer v1.0 7a68b33b8a0de04e
 svc v1.2 a5233a24b14a1da7
 qlog v1.2 8e1c0cdaaa6f8a71
+uart v2.0 0fe2ebd63a9638fe
+svc v1.3 98bba41cabd0ee7c
+qlog v1.3 dc6467238bba8c3e
