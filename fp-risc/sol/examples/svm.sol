@@ -22,7 +22,14 @@ fill v s k = fill (Vec.push (mkRow (Rand.next (s + k * 100003))) v) s (k - 1).
 
 score w1 w2 b x1 x2 = w1 * x1 + w2 * x2 + b.
 
-# hinge subgradients: contribute only where the margin is violated
+# hinge subgradients: contribute only where the margin is violated.
+# JIT note: with the record rows in SoA columns ({x1,x2,y} = ddi -- the
+# label stays an exact Int), hW1/hW2 compile as typed duals with the
+# weights captured.  hB stays interpreted, HONESTLY: its margin-ok arm
+# yields exact-Int (0 - p.y) and its other arm an inexact 0, and the
+# typed tier refuses to double-ize exact-int arithmetic (JI join JD =
+# JW) -- store the label inexact at mkRow if you want all three folds
+# native.
 hW1 w1 w2 b acc p =
   acc + (case p.y * score w1 w2 b p.x1 p.x2 < 1 of
     True -> 0 - p.y * p.x1
