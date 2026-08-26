@@ -1,5 +1,0 @@
-name = "mathv2"
-id = "mathv2"
-entry = "fpr_modtab"
-version = "1"
-loadMode = "plugin"
