@@ -119,14 +119,54 @@ static V h_modfindat(V iv, V name) {
   return mktup2(TAG(0), TAG(0));
 }
 
-/* Mod.find name -> (1, fn) | (0, 0): name-only, ATTACHED tables only */
+/* Mod.find name -> (1, fn) | (0, 0): name-only, ATTACHED tables only.
+ * NEWEST ATTACHMENT WINS: the search runs newest-first, which is the
+ * whole live-reload story -- attach Math.v2 alongside Math.v1 and
+ * every actor that re-resolves after the LiveReload message binds the
+ * new code, while in-flight calls into v1 keep running v1 to
+ * completion (the old table and image stay mapped; no W^X, no GOT --
+ * a resolve is a table walk and a call is a PAP apply). */
 static V h_modfind(V name) {
   if (ISINT(name) || TID(name) != T_STR) fpr_cpanic("Mod.find: name not a String");
   const str_t *n = (const str_t *)name;
-  for (int t = 0; t < nxtabs; t++)
+  for (int t = nxtabs - 1; t >= 0; t--)
     for (const uw *p = xtabs[t]; p && p[0]; p += 3)
       if (str_eq((const str_t *)p[1], n)) return mktup2(TAG(1), (V)p[2]);
   return mktup2(TAG(0), TAG(0));
+}
+
+/* Mod.compatAt iOld iNew -> (1, "") | (0, why): the RUNTIME half of
+ * the live-reload compatibility gate.  Every export of table iOld
+ * must exist in iNew with the SAME ARITY (the pap carries it), so a
+ * re-resolving actor can never bind a function whose call shape
+ * changed under it.  The DEEP check -- row-polymorphic signature
+ * compatibility -- happens statically at `fpr commit` time, which is
+ * what mints a version into the store at all; this gate is the
+ * load-time seatbelt for name/arity drift between store and disk. */
+static V mkstr_c(const char *m) {
+  uw n = 0;
+  while (m[n]) n++;
+  return (V)fpr_mkstr((const unsigned char *)m, n);
+}
+static V h_modcompatat(V iov, V inv) {
+  if (!ISINT(iov) || !ISINT(inv)) fpr_cpanic("Mod.compatAt: indices must be Ints");
+  sw io = UNTAG(iov), in = UNTAG(inv);
+  if (io < 0 || io >= nxtabs || in < 0 || in >= nxtabs)
+    return mktup2(TAG(0), mkstr_c("no such attached table"));
+  for (const uw *p = xtabs[io]; p && p[0]; p += 3) {
+    const str_t *nm = (const str_t *)p[1];
+    uw want = ((const pap_t *)p[2])->arity;
+    int hit = 0;
+    for (const uw *q = xtabs[in]; q && q[0]; q += 3)
+      if (str_eq((const str_t *)q[1], nm)) {
+        if (((const pap_t *)q[2])->arity != want)
+          return mktup2(TAG(0), mkstr_c("arity changed for an export"));
+        hit = 1;
+        break;
+      }
+    if (!hit) return mktup2(TAG(0), mkstr_c("export missing in the new module"));
+  }
+  return mktup2(TAG(1), mkstr_c(""));
 }
 
 FPR_FN(fpr_g_Mod_x2efn, h_modfn, 2);
@@ -134,4 +174,16 @@ FPR_FN(fpr_g_Mod_x2efind, h_modfind, 1);
 FPR_FN(fpr_g_Mod_x2eplugs, h_modplugs, 1);
 FPR_FN(fpr_g_Mod_x2efindAt, h_modfindat, 2);
 FPR_FN(fpr_g_Mod_x2ehas, h_modhas, 1);
+/* Mod.detachLast: pop the NEWEST attachment out of the registry --
+ * the refuse path of the live-reload gate.  The plugin image stays
+ * mapped (no unload in v1; the sub-slot is spent), but resolution
+ * falls back to the previous version, which is the property that
+ * matters: a refused swap leaves every binding exactly as it was. */
+static V h_moddetachlast(V u) {
+  (void)u;
+  if (nxtabs > 0) nxtabs--;
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_Mod_x2ecompatAt, h_modcompatat, 2);
+FPR_FN(fpr_g_Mod_x2edetachLast, h_moddetachlast, 1);
 FPR_FN(fpr_g_Mod_x2eresolve, h_modresolve, 2);

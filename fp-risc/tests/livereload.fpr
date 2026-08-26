@@ -1,0 +1,84 @@
+# livereload.fpr -- std.livereload end to end: a running program hot-
+# swaps a module out of the DISK store without restarting its actors.
+#
+#   1. LR.load pulls mathv1 off the qlog store into a plugin slot; a
+#      WORKER actor binds its mathOp and starts folding requests into
+#      its own accumulator (the state that must survive)
+#   2. LR.load mathv2 (signature-compatible: same exports, same
+#      arities) + LiveReload broadcast: the SAME worker re-binds --
+#      next request computes with v2, accumulator intact
+#   3. LR.load mathbad (mathOp arity changed) is REFUSED by the
+#      compat gate, detached, and the worker keeps running v2
+#
+#   make qos-app PROG=tests/livereload.fpr && make plugsyms
+#   make plugin-qa PROG=tests/mathv1.fpr PLUGSLOT=0
+#   make plugin-qa PROG=tests/mathv2.fpr PLUGSLOT=1
+#   make plugin-qa PROG=tests/mathbad.fpr PLUGSLOT=2
+#   python3 tools/mkdisk.py /tmp/lr.img 8 mathv1.qa mathv2.qa mathbad.qa
+#   (cd ../qos && FPR_DISK=/tmp/lr.img ./qosp --yes ../fp-risc/app.qa)
+#
+# Expected:
+#   livereload: v1: 20 22 | v2 (same actor, acc kept): 30 | bad: refused
+#   | still v2: 36 | acc=108
+
+QL = use "../programs/mods/qlog".
+LR = use "../std/livereload".
+
+# ---- the worker: state in the loop args, code behind a bound fn ------------
+worker : unsafe _ -> Int -> a .
+worker f me = wloop f me 0.
+# the worker's protocol: a TUPLE is work; ANYTHING ELSE is the
+# supervisor's LiveReload nudge (the LRMsg value) -- matched by
+# fallthrough because a constructor pattern would pin the scrutinee
+# type and refuse the tuple arm (the uart actor's irq discrimination
+# is the same shape)
+wloop : unsafe _ -> Int -> Int -> a .
+wloop f me acc =
+  m = receive me;
+  case m of
+    (from, v) -> wcalc f me acc from v
+  | u -> wloop (LR.bind "mathOp") me acc.
+         # ^ re-bind; the ACCUMULATOR rides through
+wcalc : unsafe _ -> Int -> Int -> Int -> Int -> a .
+wcalc f me acc from v =
+  r = f v;
+  _ = send from (r, acc + r);
+  wloop f me (acc + r).
+
+askW : Int -> Int -> Int -> (Int, Int) .
+askW me w v =
+  _ = send w (me, v);
+  reply = receiveFrom me w;
+  (r, a) = reply;
+  _ = drop reply;
+  (r, a).
+
+expectOk what r = case r of
+    Ok i -> i
+  | Err e -> error "livereload {what}: {e}".
+
+main =
+  me = myself 0;
+  dsk = device "blk";
+  h0 = QL.ensure dsk;
+
+  # 1. v1 out of the store; worker binds and works
+  _ = expectOk "load v1" (LR.load dsk h0 "mathv1");
+  w = spawn (worker (LR.bind "mathOp"));
+  (r1, a1) = askW me w 10;
+  (r2, a2) = askW me w 11;
+
+  # 2. the hot swap: v2 alongside v1, broadcast, SAME actor re-binds
+  _ = expectOk "load v2" (LR.load dsk h0 "mathv2");
+  _ = LR.broadcast (w :: Nil) "mathv2";
+  (r3, a3) = askW me w 10;
+
+  # 3. the impostor: refused, detached, v2 stays bound
+  bad = LR.load dsk h0 "mathbad";
+  badS = case bad of
+      Ok i -> "ACCEPTED?!"
+    | Err e -> "refused";
+  (r4, a4) = askW me w 12;
+
+  _ = kill w;
+  "livereload: v1: {r1} {r2} | v2 (same actor, acc kept): {r3} | bad: {badS} | still v2: {r4} | acc={a4}".

@@ -64,7 +64,7 @@
 # ============================================================================
 
 # ---- small self-contained helpers (module units see only the prelude) ------
-SVC = use "svc#5bb5fae33c7ae0e9".
+SVC = use "svc#47b139af84410e49".
 Rpc = SVC.Rpc.
 
 # the parsed record header: Rec is the v1 shape kept for API compat,

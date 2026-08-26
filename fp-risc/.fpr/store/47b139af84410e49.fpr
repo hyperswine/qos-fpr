@@ -39,7 +39,7 @@
 
 IoV = Type (IUnit | IInt Int | IStr String | IFn Int | IErr String).
 
-UartM = use "uart#3865188589abf611".
+UartM = use "uart#76272128909340bd".
 UWrite = UartM.UWrite.
 UGet = UartM.UGet.
 UOkI = UartM.UOkI.
