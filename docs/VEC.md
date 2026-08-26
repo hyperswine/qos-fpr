@@ -99,19 +99,30 @@ emitted and never executed for ten rounds because nothing reported the
 fallback.  A declined site is a performance fact the compiler owes the
 programmer at compile time.
 
+Record FOLDS with a scalar accumulator now DUALIZE, named fns and
+capture-free lambdas alike (tests/recfold.fpr executes the column
+loop): a row-polymorphic body whose projections bound a UNIQUE shape
+carries no CTagEq dispatch, and the fold dualizer now accepts the
+zero-test body -- the dual is exactly as shape-checked as the generic
+tier it replaces, so the spec guard degrades to ncols/kinds only.
+
 Known genuine declines today: element functions that pattern-match or
-otherwise reconstruct opaquely, nested record updates/construction inside
-an output field, record FOLDS (named element fns decline too, not just
-lambdas -- fold duals are scalar-only), AOT record-map outputs over 4
+otherwise reconstruct opaquely, nested record updates/construction
+inside an output field, RECORD-accumulator folds (fold duals are
+scalar-acc; the note names them), AOT record-map outputs over 4
 fields, and boxed records over 8 fields.
 
 Target caveat: on x64 (qosp on x86-64) the ENTIRE specialization tier
 is off -- SysV has only 6 callee-saved registers and the spec loops
-need s6+ -- so every Vec site runs the generic apply tier there, and
-because the decline scan is gated on the same flag, x64 compiles emit
-NO vec notes at all: the fallback is silent on exactly the target
-where it is total.  a64 and rv64 keep the tier.  tests/fuse.fpr's
-in-place witnesses accordingly hold on bare-metal/a64, not on qosp-x64.
+need s6+ -- so every Vec site runs the generic apply tier there.  The
+decline scan is NO LONGER gated on the tier flag: an x64 compile now
+reports every named-fn site, and a site a column loop would accept
+says so explicitly ("the specialization tier is OFF on this target
+... rv64/a64 builds specialize it").  a64 and rv64 keep the tier.
+Fusion however runs on EVERY target (fewer generic passes is still a
+win, and linearity -- not the spec loops -- is what makes the rewrite
+sound); tests/fuse.fpr's in-place witnesses still hold on
+bare-metal/a64 only, because the x64 generic tier boxes per row.
 
 ## 5. Fusion by default for adjacent passes
 
@@ -126,11 +137,24 @@ passes mutate the same columns and return the same reference, so a
 fused single pass leaves byte-identical final state and the
 intermediate was never observable by anyone.
 
-Bounds, stated: one captured side per fused pair; a 3+ chain fuses its
-outer pair per compile (fixpoint is a follow-up); `Vec.fold` of a map
-does NOT fuse, because fold returns the vector it was given and the
-map's writes remain program-visible afterwards — that needs a
-write-back fold variant, not a rewrite.
+Fusion runs to a FIXPOINT: a 3+ chain collapses completely (round 1
+fuses the outer pair, round 2 the composite over the next map, and so
+on -- tests/vecfuse2.fpr's `_vfuse_1_*` asm names are the round-2
+witness).  Pair collection walks the same seeLet-transformed tree the
+rewriter walks, so pipeline-only pairs register too.
+
+`Vec.fold f z (Vec.map g v)` now fuses through the WRITE-BACK FOLD:
+one specialized pass stores g(el) back into the column AND folds f
+over the stored value, so the map's writes stay program-visible
+through the returned vector exactly as the two-pass program left them
+(re-folding the result is vecfuse2's witness).  Scalar int tier in
+v1; the runtime fallback is the honest two-pass sequence (generic
+map, then generic fold), so a rep mismatch loses only the fusion.
+
+Bounds, stated: one captured side per fused map pair; the write-back
+fold takes capture-free g and int columns only (anything else falls
+back to the plain fold plan, whose map argument then specializes on
+its own).
 
 ## 6. Filter is EAGER COMPACTION — decided, not defaulted
 
@@ -197,10 +221,15 @@ compile-time note or a declared choice.
 
 ## Open, in agreed order
 
-1. write-back fold (unlocks fold-of-map fusion)
-2. fusion fixpoint for 3+ chains
-3. record -> scalar projection maps (layout-changing: new 1-col output)
-4. lambda-fold duals (the main remaining genuine decline)
+1. record -> scalar projection maps (layout-changing: new 1-col output)
+2. record-ACCUMULATOR fold duals (per-field acc registers)
+3. write-back fold beyond scalar ints (float columns, captured g, SoA)
+4. x64 spec tier (needs register re-budgeting or spills: SysV has no
+   s6+ callee-saved; today the tier is off there and SAYS SO per site)
+
+Done since the audit: write-back fold (fold-of-map fuses), fusion
+fixpoint, scalar-acc record-fold duals (named fns and capture-free
+lambdas), loud x64 declines, RVV shipped behind `RVV=1`.
 
 ## RVV status (audit, 2026-08)
 
@@ -209,13 +238,18 @@ folds) is FUNCTIONALLY CORRECT: tests/fuse.fpr passes all seven
 witnesses under `qemu -cpu rv64,v=true` when built with it.  But the
 path is dormant and unshipped:
 
-  * no Makefile rule passes `--rvv`; the default QEMU cpu has no V
-    extension and ARCHFLAGS omits `v`, so the C prim tier compiles
-    scalar on rv64 too (its autovectorization is real only on hosted
+Both blockers are now closed and the path is SHIPPED behind a knob:
+
+  * `make bare-metal-run PROG=... RVV=1` passes `--rvv` to fprc,
+    assembles with `-march=rv64imafdcv_zicsr`, and boots QEMU with
+    `-cpu rv64,v=true`; the check-all RVV leg runs vecfuse2 this way
+  * the enable shim is emitted in a COMDAT group
+    (`.section .text.fpr_rvv_enable,"axG",...,comdat`): every --rvv
+    unit carries the identical definition, the linker keeps one, and
+    the surviving strong symbol overrides runtime.c's weak no-op --
+    multi-unit programs link cleanly, V-less builds never touch
+    mstatus.VS
+  * without RVV=1 nothing changes; the C prim tier still compiles
+    scalar on rv64 (its autovectorization is real only on hosted
     x64/a64 baselines: adds/compares/blend take SSE2/NEON lanes,
     64-bit multiplies stay scalar below AVX-512)
-  * `--rvv` emits a strong `fpr_rvv_enable` into the program AND into
-    every module unit compiled with the flag, so any program that uses
-    the prelude fails to link (multiple definition) -- the enable
-    shim needs to move to the runtime or become link-once before the
-    flag can ship

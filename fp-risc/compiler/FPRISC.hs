@@ -1748,6 +1748,7 @@ lcheck li tops = concatMap checkGroup groups
             Just (ps, _) | length ps == length pats -> ps
             _ -> replicate (length pats) LU
           binds = concat (zipWith (bindPat li) pats paramShapes)
+          wildErrs = ["in " ++ n ++ ": " ++ w | w <- concat (zipWith wildLinErrs pats paramShapes)]
           env = M.fromList binds
           linear = [v | (v, s) <- binds, isLin s]
           (genv, ge, gc) =
@@ -1768,9 +1769,22 @@ lcheck li tops = concatMap checkGroup groups
           useErrs = case bc of
             Nothing -> []
             Just c -> ["in " ++ n ++ ": linear variable '" ++ v ++ "' used " ++ show (M.findWithDefault 0 v c) ++ " time(s), expected exactly 1" | v <- linear, M.findWithDefault 0 v c /= 1]
-       in ge ++ be ++ guardErr ++ useErrs
+       in wildErrs ++ ge ++ be ++ guardErr ++ useErrs
       where
         lin' = linExpr li
+
+-- a WILDCARD that swallows a linear shape is a silent leak: the value
+-- is never counted, never consumed, never dropped.  Refuse it -- bind
+-- a name and consume it (or `drop` it) instead.  Distributes through
+-- tuple patterns so `(x, _) = Vec.get i v` (discarding the returned
+-- HANDLE) is caught too.
+wildLinErrs :: SPat -> LShape -> [String]
+wildLinErrs p s = case p of
+  PWild | isLin s -> ["a linear value is DISCARDED by `_` -- bind it and consume it (or drop it explicitly)"]
+  PTup ps -> case s of
+    LTupS ss | length ss == length ps -> concat (zipWith wildLinErrs ps ss)
+    _ -> []
+  _ -> []
 
 bindPat :: LinInfo -> SPat -> LShape -> [(Name, LShape)]
 bindPat li p s = case p of
@@ -1876,7 +1890,7 @@ linExpr li env0 = go env0
             Nothing -> []
             Just cc -> ["linear variable '" ++ v ++ "' bound in pattern used " ++ show (M.findWithDefault 0 v cc) ++ " time(s), expected 1" | v <- linear, M.findWithDefault 0 v cc /= 1]
           c' = fmap (\cc -> foldr M.delete cc (map fst binds)) c
-       in (es ++ errs, c', s)
+       in (wildLinErrs p sshape ++ es ++ errs, c', s)
 
     goBlock env [] final = go env final
     goBlock env (SBind n [] rhs : rest) final =
@@ -1896,6 +1910,7 @@ linExpr li env0 = go env0
        in (errs ++ e2, c2, shf)
     goBlock env (SBindPat p rhs : rest) final =
       let (e1, c1, sh) = go env rhs
+          e1w = e1 ++ wildLinErrs p sh
           binds = bindPat li p sh
           env' = M.union (M.fromList binds) env
           (e2, c2, shf) = goBlock env' rest final
@@ -1904,7 +1919,7 @@ linExpr li env0 = go env0
             Nothing -> []
             Just cc -> ["linear variable '" ++ v ++ "' used " ++ show (M.findWithDefault 0 v cc) ++ " time(s), expected exactly 1" | v <- linear, M.findWithDefault 0 v cc /= 1]
           c2' = fmap (\cc -> foldr M.delete cc (map fst binds)) c2
-       in (e1 ++ e2 ++ errs, plus c1 c2', shf)
+       in (e1w ++ e2 ++ errs, plus c1 c2', shf)
 
     appSpine env e =
       let (h, args) = flatten e []

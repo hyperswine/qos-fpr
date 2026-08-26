@@ -289,6 +289,10 @@ void hal_timer_arm(uw hart, uint64_t delta) {
   mtimecmp_write(hart, hal_mtime() + delta);
 }
 
+/* the CLINT is real here: Timer.qa gets the interrupt-driven bridge
+ * (actors.c tmr_drain) instead of sleeper-child fallbacks */
+int hal_timer_native(void) { return 1; }
+
 /* mie.MSIE (bit 3) | mie.MTIE (bit 7); mstatus.MIE stays 0 on purpose */
 void hal_wfi_enable(void) {
   /* MSIE | MTIE | MEIE: external interrupts join the wfi-wake set --

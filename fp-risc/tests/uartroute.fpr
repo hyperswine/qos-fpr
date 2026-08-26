@@ -38,7 +38,7 @@ main =
   _ = ucall me usvc (UM.UBuf 8192);
   _ = ucall me usvc UM.UShare;
   granted = ("/services/uart", "rw") :: Nil;
-  caps = Caps con me clk granted "uartroute" (True, 0, usvc);
+  caps = Caps con me clk granted "uartroute" { has = True, act = 0, uart = usvc, timer = 0 };
   r1 = Svc.write caps "/services/uart" (IStr "ROUTED-UART-TX\n");
   n = case r1 of IInt k -> k | e -> 0 - 1;
   rx = waitR caps clk (Mmio.read clk + 30000000);

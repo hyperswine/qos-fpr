@@ -83,8 +83,9 @@ IInt = SVCM.IInt.
 IStr = SVCM.IStr.
 IFn  = SVCM.IFn.
 IErr = SVCM.IErr.
-QLog    = use "mods/qlog#76ba27032712e60f".
+QLog    = use "mods/qlog#dc6467238bba8c3e".
 UartM   = use "mods/uart".
+TimerM  = use "mods/timer".
 MK      = use "mods/matrixkpd".
 TUI     = use "mods/tui#28388960a8f6aa26".
 
@@ -701,8 +702,10 @@ manMode (Man _ _ _ _ md) = md.
 ioMe (Io4 _ me _ _) = me.
 ioClk (Io4 _ _ k _) = k.
 ioSt  (Io4 _ _ _ st) = st.
-stHas st = case st of (h, _, _) -> h.
-stAct st = case st of (_, a, _) -> a.
+# st is the RECORD {has, act, uart, timer} (see mods/svc.fpr): field
+# projections, so adding a service never ripples an arity change
+stHas st = st.has.
+stAct st = st.act.
 
 # keep only the (url,mode) pairs whose parallel Bool is True
 keepGranted : unsafe List u293 -> List Bool -> List u293 .
@@ -880,14 +883,22 @@ appsListDisk caps r =
   | Err _ -> splitLines (Apps.list Unit).
 
 splitLines : unsafe String -> List String .
-splitLines s = slGo s 1 (strlen s) "" Nil.
-slGo : unsafe String -> Int -> Int -> String -> List String -> List String .
-slGo s i n cur acc =
+splitLines s = slGo s 1 1 (strlen s) Nil.
+# scan for '\n', slice each line WHOLE (one substr per line, not one
+# strcat per byte -- and the short body keeps the safepoint gaps small:
+# this function was the program's WCET ratchet peak)
+slGo : unsafe String -> Int -> Int -> Int -> List String -> List String .
+slGo s st i n acc =
   case i > n of
-    True -> rev (case strlen cur == 0 of True -> acc | False -> cur :: acc)
+    True -> rev (slPush s st (i - 1) acc)
   | False -> case charAt s i == 10 of
-      True -> slGo s (i + 1) n "" (case strlen cur == 0 of True -> acc | False -> cur :: acc)
-    | False -> slGo s (i + 1) n (strcat cur (chr (charAt s i))) acc.
+      True -> slGo s (i + 1) (i + 1) n (slPush s st (i - 1) acc)
+    | False -> slGo s st (i + 1) n acc.
+# push s[st..en] unless empty (blank lines are skipped, as before)
+slPush : String -> Int -> Int -> List String -> List String .
+slPush s st en acc = case en < st of
+    True -> acc
+  | False -> slice s st en :: acc.
 
 # Full-screen launcher on the TUI module: a cached cell buffer, diff
 # frames, a LIVE clock in the header (ticks between keystrokes via
@@ -1063,9 +1074,10 @@ main =
   # ---- storage: the default setup HAS a disk; boot degrades without one ----
   dsk = device "blk";
   usvc = spawnUart me;
+  tsvc = spawnTimer Unit;
   st = case blkPages dsk == 0 of
-         True  -> (False, 0, usvc)
-       | False -> (True, spawnStore dsk, usvc);
+         True  -> { has = False, act = 0, uart = usvc, timer = tsvc }
+       | False -> { has = True, act = spawnStore dsk, uart = usvc, timer = tsvc };
   io = Io4 con me clk st;
   _ = bootBeat io con;
   startup = configGet systemConfig "startup";
@@ -1101,6 +1113,15 @@ uartCall me a msg =
   _ = send a (me, msg);
   r = receiveFrom me a;
   drop r.
+
+# Timer.qa: the time service.  ALL the CLINT/interrupt work lives in
+# this one actor (the deadline interrupt itself is serviced by the
+# IRQ HART -- the last live hart, auxiliary by design); spawn it
+# THERE so the fire messages start life on the hart that drains them.
+spawnTimer u =
+  case Sys.harts Unit > 1 of
+    True -> spawnOn (Sys.harts Unit - 1) TimerM.actor
+  | False -> spawn TimerM.actor.
 
 spawnStore dsk =
   a = case Sys.harts Unit > 1 of

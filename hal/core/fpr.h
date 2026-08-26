@@ -231,6 +231,13 @@ extern fpr_hart_t fpr_harts[FPR_NHARTS];
  * scans, the deadlock detector, and spawnOn bounds all use this. */
 extern uw fpr_live_harts;
 
+/* the hart that drains device irqs and the timer bridge: the LAST live
+ * hart, so external interrupts land on an auxiliary hart and the prime
+ * hart (0) keeps the latency-sensitive work.  Equals 0 on single-hart
+ * machines.  Set once in fpr_actors_init, read by plic.c (context
+ * selection) and the hart loop (drain gating). */
+extern uw fpr_irq_hart;
+
 #if defined(FPR_QOSAPP_SINGLE)
 /* Darwin's TLV model has no stable displacement from TPIDR_EL0.  A
  * single-hart loaded image instead owns one plain hart cell. */

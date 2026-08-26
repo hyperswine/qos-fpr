@@ -320,7 +320,9 @@ strLabel s = do
 
 emitProgram :: Target -> Bool -> Bool -> [ModExport] -> M.Map String Int -> S.Set String -> Prog -> (String, [String])
 emitProgram tgt rvv spec exports ext exps prog0 =
-  let prog = if spec then fuseVec prog0 else prog0
+  let prog = fuseVecFix prog0 -- fusion is tier-independent: fewer passes
+      -- win in the generic apply tier too, and linearity (not the spec
+      -- loops) is what makes the rewrite sound
       (body, st) = runState (top prog) (CG 0 M.empty tgt rvv spec M.empty ext exps [])
    in (unlines body, reverse (cgVNotes st))
   where
@@ -332,9 +334,11 @@ emitProgram tgt rvv spec exports ext exps prog0 =
       -- silent fallback (emitted, grepped for, never run).  Lambdas /
       -- closures are not candidates (lifting gives them capture shapes
       -- beyond the plans) and stay quiet; a named fn that fails is
-      -- worth a line.
-      when spec $
-        modify (\st -> st {cgVNotes = concat [declines prog fn b | (fn, (_, b)) <- M.toList prog] ++ cgVNotes st})
+      -- worth a line.  The scan runs even where the tier itself is OFF
+      -- (x64): a target that runs EVERY site generic owes the loudest
+      -- notes of all, not silence -- there the note names the target
+      -- gate, and distinguishes sites that would specialize elsewhere.
+      modify (\st -> st {cgVNotes = concat [declines spec prog fn b | (fn, (_, b)) <- M.toList prog] ++ cgVNotes st})
       fns <- concat <$> mapM (uncurry (compileFn prog)) (M.toList prog)
       specs <- emitSpecs prog
       modtab <- if null exports then pure [] else modTable
@@ -381,11 +385,20 @@ emitProgram tgt rvv spec exports ext exps prog0 =
     rvvInit
       | not rvv = []
       | otherwise =
-          [ "    .globl fpr_rvv_enable",
+          -- COMDAT group: every --rvv unit carries this identical
+          -- definition and the linker keeps exactly ONE -- the fix for
+          -- the audit's multiple-definition failure (program + prelude
+          -- + every module unit each used to emit a strong copy).  The
+          -- surviving strong symbol still overrides runtime.c's weak
+          -- no-op, so V-less builds never touch mstatus.VS.
+          [ "    .section .text.fpr_rvv_enable,\"axG\",@progbits,fpr_rvv_enable,comdat",
+            "    .balign 4",
+            "    .globl fpr_rvv_enable",
             "fpr_rvv_enable:",
             "    li t0, 0x600", -- VS field, both bits: Dirty (safe superset)
             "    csrs mstatus, t0",
             "    ret",
+            "    .text",
             ""
           ]
     -- static PAP object per global with arity > 0: a "function value"
@@ -933,8 +946,8 @@ logW t = if tgtW t == 8 then 3 else 2
 -- it -- that one needs a write-back fold variant, not a rewrite.
 -- Vec.x sites that LOOK like specialization candidates (named global
 -- element fn) but no plan accepts -- reported per enclosing function
-declines :: Prog -> String -> Core -> [String]
-declines prog owner = goD S.empty
+declines :: Bool -> Prog -> String -> Core -> [String]
+declines spec prog owner = goD S.empty
   where
     goD bound e =
       here ++ case e of
@@ -955,20 +968,47 @@ declines prog owner = goD S.empty
               fe : _ <- args,
               Just f <- named fe,
               M.member f prog,
-              not (S.member f bound),
-              Nothing <- vecSpec prog (`S.member` bound) e ->
-                [ "vec note: " ++ op ++ " over `" ++ f ++ "` (in " ++ owner
-                    ++ ") runs in the GENERIC apply tier -- the element fn is"
-                    ++ " not a closed arithmetic/record dual, so no column loop"
-                    ++ " specializes this site"
-                ]
+              not (S.member f bound) ->
+                case vecSpec prog (`S.member` bound) e of
+                  Nothing ->
+                    [ "vec note: " ++ op ++ " over `" ++ f ++ "` (in " ++ owner
+                        ++ ") runs in the GENERIC apply tier -- the element fn is"
+                        ++ " not a closed arithmetic/record dual, so no column loop"
+                        ++ " specializes this site"
+                    ]
+                  Just _
+                    | not spec ->
+                        [ "vec note: " ++ op ++ " over `" ++ f ++ "` (in " ++ owner
+                            ++ ") runs in the GENERIC apply tier -- a column loop"
+                            ++ " accepts this site, but the specialization tier is"
+                            ++ " OFF on this target (x64: SysV has no s6+ callee-saved"
+                            ++ " registers); rv64/a64 builds specialize it"
+                        ]
+                    | otherwise -> []
           _ -> []
         named (CVar f) = Just f
         named (CApp (CVar f) _) = Just f
         named _ = Nothing
 
-fuseVec :: Prog -> Prog
-fuseVec prog0 = M.union extras (M.map (\(ps, b) -> (ps, rewrite b)) prog0)
+-- run fusion to a FIXPOINT: a 3+ chain's outer pair fuses in round 1,
+-- the composite-over-inner pair in round 2, and so on until no pair is
+-- left.  Each round's composites get a round-tagged name so rounds
+-- never collide; the plan-level machinery already composes through
+-- composites (soaDualMap0 recognizes the f(g el) body shape
+-- recursively), so a fully collapsed chain still dualizes.  The bound
+-- is a backstop, not a budget: a chain of length n needs n-1 rounds
+-- and real programs stop far short of it.
+fuseVecFix :: Prog -> Prog
+fuseVecFix = go (0 :: Int)
+  where
+    go r p
+      | r >= 16 = p
+      | otherwise =
+          let p' = fuseVec r p
+           in if M.size p' == M.size p then p' else go (r + 1) p'
+
+fuseVec :: Int -> Prog -> Prog
+fuseVec round' prog0 = M.union extras (M.map (\(ps, b) -> (ps, rewrite b)) prog0)
   where
     arity f = length . fst <$> M.lookup f prog0
 
@@ -995,8 +1035,15 @@ fuseVec prog0 = M.union extras (M.map (\(ps, b) -> (ps, rewrite b)) prog0)
 
     pairs = S.toList (S.unions [walk b | (_, (_, b)) <- M.toList prog0])
       where
-        walk e =
-          let here = maybe S.empty (\(k, _, _) -> S.singleton k) (fusedAt (seeLet e))
+        -- walk the SAME tree rewrite walks: seeLet first, THEN recurse
+        -- into the transformed node.  Recursing into the original
+        -- children instead missed pairs that only exist after the
+        -- let-pipeline substitution (a pipeline whose fn pair appears
+        -- nowhere as a nested spine), and rewrite then hit synth with
+        -- an unregistered key.
+        walk e0 =
+          let e = seeLet e0
+              here = maybe S.empty (\(k, _, _) -> S.singleton k) (fusedAt e)
            in here `S.union` kids e
         kids e = case e of
           CApp a b -> walk a `S.union` walk b
@@ -1008,7 +1055,7 @@ fuseVec prog0 = M.union extras (M.map (\(ps, b) -> (ps, rewrite b)) prog0)
           CLam _ b -> walk b
           _ -> S.empty
 
-    synth = M.fromList [(k, "_vfuse_" ++ show (i :: Int)) | (i, k) <- zip [0 ..] pairs]
+    synth = M.fromList [(k, "_vfuse_" ++ show round' ++ "_" ++ show (i :: Int)) | (i, k) <- zip [0 ..] pairs]
     extras =
       M.fromList
         [ (nm, comp k) | (k, nm) <- M.toList synth ]
@@ -1085,6 +1132,24 @@ vecSpec prog isLocal e = case spineOf e of
         Just (SpecPlan "mvmap" f False cl Nothing Nothing (Just mp) Nothing, [CInt 0, v])
   (CVar "Vec.map", [CVar f, v]) | okOp "Vec.map", okFn f 1 -> plan "map" f [v]
   (CVar "Vec.filter", [CVar f, v]) | okOp "Vec.filter", okFn f 1 -> plan "filter" f [v]
+  -- WRITE-BACK FOLD: Vec.fold f z (Vec.map g v) fuses into ONE pass
+  -- that stores g(el) back into the column AND folds f over it -- the
+  -- map's writes stay program-visible through the returned vector, so
+  -- this is the fusion the map/map rewrite could never express (VEC.md
+  -- open item 1).  Scalar int tier only in v1; anything else falls
+  -- through to the plain fold plan below, whose map argument then
+  -- specializes on its own.
+  (CVar "Vec.fold", [CVar f, z, me])
+    | (CVar "Vec.map", [CVar g, v]) <- spineOf me,
+      okOp "Vec.fold",
+      not (isLocal "Vec.map"),
+      okFn f 2,
+      okFn g 1,
+      Just clf <- arithClosure prog [f],
+      Just clg <- arithClosure prog [g],
+      floatWidthOf prog clf == Nothing,
+      floatWidthOf prog clg == Nothing ->
+        Just (SpecPlan ("wfold@" ++ g) f True (clf `S.union` clg) Nothing Nothing Nothing Nothing, [z, v])
   (CVar "Vec.fold", [CVar f, z, v]) | okOp "Vec.fold", okFn f 2 -> plan "fold" f [z, v]
   _ -> Nothing
   where
@@ -1278,7 +1343,14 @@ soaDual prog f = do
   (body', (ks, tvs)) <- runDual el (peelDeep body0)
   tv <- case S.toList (S.fromList tvs) of
     [one] -> Just one -- exactly one shape test: the required eltid/elvar
-    _ -> Nothing -- none (no column meaning) or conflicting: bail
+    -- NO shape test but real column reads: projField bound each field
+    -- against a UNIQUE candidate shape and emitted a bare CProj, no
+    -- CTagEq -- the generic body is exactly as unchecked, so the dual
+    -- may run guarded only by ncols/kinds ((-1,-1) = skip the
+    -- eltid/elvar compare).  This is what un-declines NAMED record
+    -- folds: their row-polymorphic bodies never carry a dispatch chain.
+    [] | not (null ks) -> Just (-1, -1)
+    _ -> Nothing -- conflicting shape tests: bail
   if null ks || any (>= 8) ks || acc == el
     then Nothing
     else do
@@ -1468,9 +1540,18 @@ peelDeepC e = case peel e of
 
 requestSpec :: SpecPlan -> G String
 requestSpec p = do
-  let sym = "fpr_vspec_" ++ spOp p ++ "_" ++ mangle (spFn p)
+  let sym = case wfoldG p of
+        Just g -> "fpr_vspec_wfold_" ++ mangle (spFn p) ++ "_" ++ mangle g
+        Nothing -> "fpr_vspec_" ++ spOp p ++ "_" ++ mangle (spFn p)
   modify (\s -> s {cgSpecs = M.insert (spOp p, spFn p) (sym, p) (cgSpecs s)})
   pure sym
+
+-- a write-back fold plan carries its map fn inside the op key (the
+-- cgSpecs key stays (op, foldFn), unique per (f, g) pair)
+wfoldG :: SpecPlan -> Maybe String
+wfoldG p = case splitAt 6 (spOp p) of
+  ("wfold@", g) -> Just g
+  _ -> Nothing
 
 --------------------------------------------------------------------------------
 -- genU: the unboxed twin of gen.  Same frame/slot discipline, same TCO,
@@ -1703,6 +1784,7 @@ emitSpec tgt rvv (sym, p) = case spOp p of
   "map" -> emitMapSpec tgt rvv sym p
   "mvmap" -> emitMvMapSpec tgt sym p
   "filter" -> emitFilterSpec tgt sym p
+  _ | Just g <- wfoldG p -> emitWFoldSpec tgt sym p g
   _ -> emitFoldSpec tgt rvv sym p
 
 -- RVV strip-mine wrapper: load -> body -> store, bump by vl
@@ -2088,14 +2170,23 @@ emitFoldSpec tgt rvv sym p = do
                  Nothing -> ["    j " ++ fb]
                  Just (_, _, _, (etid, evar)) ->
                    [ "    li t1, 3",
-                     "    bne t2, t1, " ++ fb,
-                     "    " ++ ld ++ " t0, " ++ show (8 + tgtW tgt) ++ "(a1)", -- eltid
-                     "    li t1, " ++ show etid,
-                     "    bne t0, t1, " ++ fb,
-                     "    " ++ ld ++ " t0, " ++ show (8 + 2 * tgtW tgt) ++ "(a1)", -- elvar
-                     "    li t1, " ++ show evar,
-                     "    bne t0, t1, " ++ fb,
-                     "    " ++ ld ++ " t0, " ++ show (vNcols tgt) ++ "(a1)",
+                     "    bne t2, t1, " ++ fb
+                   ]
+                   ++ ( if etid < 0
+                          then [] -- (-1,-1): body carried no shape test
+                          -- (unique-shape projections) -- the dual is
+                          -- exactly as shape-checked as the generic
+                          -- body, so only ncols/kinds gate below
+                          else
+                            [ "    " ++ ld ++ " t0, " ++ show (8 + tgtW tgt) ++ "(a1)", -- eltid
+                              "    li t1, " ++ show etid,
+                              "    bne t0, t1, " ++ fb,
+                              "    " ++ ld ++ " t0, " ++ show (8 + 2 * tgtW tgt) ++ "(a1)", -- elvar
+                              "    li t1, " ++ show evar,
+                              "    bne t0, t1, " ++ fb
+                            ]
+                      )
+                   ++ [ "    " ++ ld ++ " t0, " ++ show (vNcols tgt) ++ "(a1)",
                      "    li t1, " ++ show needCols,
                      "    bltu t0, t1, " ++ fb, -- enough columns
                      "    " ++ ld ++ " t0, " ++ show (vKinds tgt) ++ "(a1)",
@@ -2264,6 +2355,91 @@ emitFoldSpec tgt rvv sym p = do
       ++ scalPath
       ++ soaPath
       ++ finish
+
+-- WRITE-BACK FOLD: one pass that stores g(el) back into the column
+-- AND folds f over the stored value -- Vec.fold f z (Vec.map g v)
+-- with both writes and the fold visible exactly as the two-pass
+-- program left them.  Scalar int rep only (v1); the runtime fallback
+-- is the honest two-pass sequence (generic map, then generic fold),
+-- so a rep mismatch or an untagged z loses only the fusion, never
+-- correctness.
+emitWFoldSpec :: Target -> String -> SpecPlan -> String -> G [String]
+emitWFoldSpec tgt sym p g = do
+  let f = spFn p
+      ld = tgtLd tgt
+      st = tgtSt tgt
+      w = tgtW tgt
+      regs = ["ra"] ++ ["s" ++ show i | i <- [0 .. 7 :: Int]]
+      (_, pro, epi) = specFrame tgt regs 0
+  ~[fb, louter, linner, lnextb, ldone] <- mapM freshL ["wfb", "wouter", "winner", "wnextb", "wdone"]
+  fuel <- specFuel tgt
+  blk <- specBlock tgt
+  pure $
+    [ "# write-back fold: Vec.fold " ++ f ++ " z (Vec.map " ++ g ++ " v), one pass",
+      "    .globl " ++ sym,
+      sym ++ ":"
+    ]
+      ++ vecGuard tgt "a1" fb
+      ++ [ "    li t1, " ++ show (repOf p),
+           "    bne t0, t1, " ++ fb, -- int columns only in v1
+           "    andi t0, a0, 1",
+           "    beqz t0, " ++ fb -- z must be a tagged Int (raw acc)
+         ]
+      ++ pro
+      ++ [ "    mv s0, a1",
+           "    srai s7, a0, 1", -- acc, raw int
+           "    " ++ ld ++ " s1, " ++ show vLen ++ "(s0)",
+           "    li s2, 0",
+           "    li s3, 0",
+           "    " ++ ld ++ " s4, " ++ show (vCols0 tgt) ++ "(s0)"
+         ]
+      ++ [louter ++ ":", "    bgeu s2, s1, " ++ ldone]
+      ++ fuel
+      ++ blk
+      ++ [ linner ++ ":",
+           "    beqz s6, " ++ lnextb,
+           "    " ++ ld ++ " a0, 0(s5)",
+           "    call fpr_ufn_" ++ mangle g,
+           "    " ++ st ++ " a0, 0(s5)", -- the WRITE BACK: map's store
+           "    mv a1, a0",
+           "    mv a0, s7",
+           "    call fpr_ufn_" ++ mangle f,
+           "    mv s7, a0",
+           "    addi s5, s5, " ++ show w,
+           "    addi s2, s2, 1",
+           "    addi s6, s6, -1",
+           "    j " ++ linner
+         ]
+      ++ [lnextb ++ ":", "    addi s3, s3, 1", "    j " ++ louter]
+      ++ [ ldone ++ ":", -- (acc, vec), the fold return shape
+           "    li a0, " ++ show (8 + 2 * w),
+           "    call fpr_alloc",
+           "    li t0, 4", -- T_TUP2
+           "    sw t0, 0(a0)",
+           "    sw zero, 4(a0)",
+           "    slli t0, s7, 1",
+           "    ori t0, t0, 1",
+           "    " ++ st ++ " t0, 8(a0)",
+           "    " ++ st ++ " s0, " ++ show (8 + w) ++ "(a0)"
+         ]
+      ++ epi
+      ++ [ "    ret",
+           fb ++ ":",
+           -- the two-pass truth: generic map, then generic fold.  The
+           -- middle call means ra and z must survive it.
+           "    addi sp, sp, -16",
+           "    " ++ st ++ " ra, 0(sp)",
+           "    " ++ st ++ " a0, 8(sp)", -- z
+           "    la a0, fpr_obj_" ++ mangle g,
+           "    call fpr_vec_map",
+           "    mv a2, a0",
+           "    " ++ ld ++ " a1, 8(sp)",
+           "    " ++ ld ++ " ra, 0(sp)",
+           "    addi sp, sp, 16",
+           "    la a0, fpr_obj_" ++ mangle f,
+           "    j fpr_vec_fold",
+           ""
+         ]
 
 isGpuPairSum :: SpecPlan -> Bool
 isGpuPairSum p = case spSoa p of
