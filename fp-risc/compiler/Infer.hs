@@ -497,6 +497,12 @@ builtinEnv =
       -- Int messages); ack re-arms the claimed-and-masked source
       ("Sys.irqBind", mono (TFn tInt (TFn tInt tUnit))),
       ("Sys.irqAck", mono (TFn tInt tUnit)),
+      -- the CLINT timer bridge (actors.c tmr_drain): bind Timer.qa's
+      -- actor (answers 1 = hardware timer present, 0 = host fallback);
+      -- arm the ONE deadline, a DELTA in CLINT ticks -- once due, a
+      -- bare Int lands in the bound actor's mailbox
+      ("Sys.timerBind", mono (TFn tInt tInt)),
+      ("Sys.timerArm", mono (TFn tInt tUnit)),
       ("schedTau", mono (TFn tInt tInt)),
       ("schedSetTau", mono (TFn tInt tUnit)),
       ("schedMaxWait", mono (TFn tInt tInt)),

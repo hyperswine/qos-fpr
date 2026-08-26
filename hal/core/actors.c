@@ -570,13 +570,21 @@ static acb_t *deq(fpr_hart_t *h) {
 
 /* ---- device interrupts -> actor messages ----------------------------
  * The no-trap model's last mile: a device source bound with
- * Sys.irqBind is claimed-and-masked by hart 0's loop (hal_irq_claim,
- * plic.c on virt; weak no-ops on hosts, where "interrupts" are the
- * host tier's poll loops) and delivered to its actor as a PLAIN INT
- * message -- copy-free, allocation-free, safe from scheduler context.
- * The actor services the device and re-arms with Sys.irqAck.  Only
- * the BOUND actor is interrupted; everything downstream of it sees
- * ordinary messages it chooses to send. */
+ * Sys.irqBind is claimed-and-masked by the IRQ HART's loop
+ * (hal_irq_claim, plic.c on virt; weak no-ops on hosts, where
+ * "interrupts" are the host tier's poll loops) and delivered to its
+ * actor as a PLAIN INT message -- copy-free, allocation-free, safe
+ * from scheduler context.  The actor services the device and re-arms
+ * with Sys.irqAck.  Only the BOUND actor is interrupted; everything
+ * downstream of it sees ordinary messages it chooses to send.
+ *
+ * ALL interrupts land on an AUXILIARY hart: fpr_irq_hart is the last
+ * live hart (0 only when the machine has one), so MEIP/MTIP servicing
+ * never preempts the prime hart's latency-sensitive work -- the bound
+ * actor still runs wherever the scheduler puts it (deliveries are
+ * ordinary cross-hart sends). */
+uw fpr_irq_hart; /* set in fpr_actors_init, after fpr_live_harts is final */
+
 __attribute__((weak)) void hal_irq_open(uw src) { (void)src; }
 __attribute__((weak)) sw hal_irq_claim(void) { return 0; }
 __attribute__((weak)) void hal_irq_ack(uw src) { (void)src; }
@@ -605,7 +613,7 @@ FPR_FN(fpr_g_Sys_x2eirqBind, a_irq_bind, 2);
 FPR_FN(fpr_g_Sys_x2eirqAck, a_irq_ack, 1);
 
 static void irq_drain(fpr_hart_t *h) {
-  if (h->id != 0 || !__atomic_load_n(&irq_bound, __ATOMIC_ACQUIRE)) return;
+  if (h->id != fpr_irq_hart || !__atomic_load_n(&irq_bound, __ATOMIC_ACQUIRE)) return;
   for (;;) {
     sw s = hal_irq_claim(); /* claims AND masks: no same-source spin */
     if (!s) return;
@@ -613,6 +621,56 @@ static void irq_drain(fpr_hart_t *h) {
     if (a) fpr_send_as((uw)&irq_src_key, (V)a, TAG(s));
     /* unbound sources stay masked: nobody would ever ack them */
   }
+}
+
+/* ---- the CLINT timer -> actor messages ------------------------------
+ * The same bridge for TIME: Timer.qa binds itself (Sys.timerBind, which
+ * answers whether the machine HAS a hardware timer -- 0 on hosts, whose
+ * Timer.qa falls back to sleeper children) and arms ONE deadline at a
+ * time (Sys.timerArm, a DELTA in CLINT ticks; the service serializes
+ * its pending set and always arms the nearest).  The irq hart's loop
+ * compares mtime against the armed deadline and, once due, delivers a
+ * bare Int message -- the actor pops everything due, notifies the
+ * waiters' mailboxes (backlog -> ready under the scheduler's admission
+ * bounds), and re-arms.  mtimecmp is per-hart, so the detector's
+ * DETECT_TICKS pacing on hart 0 never collides with this unless the
+ * machine is single-hart -- there tmr_wfi_arm just refuses to arm
+ * LATER than the detector's next sample, and the due check runs every
+ * loop pass either way. */
+__attribute__((weak)) uint64_t hal_mtime(void) { return 0; }
+__attribute__((weak)) int hal_timer_native(void) { return 0; }
+
+static acb_t *tmr_act;
+static volatile uint64_t tmr_deadline; /* absolute mtime; 0 = unarmed */
+static volatile int tmr_bound;
+static uw tmr_src_key;
+
+static V a_timer_bind(V av) {
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("Sys.timerBind: target is not an actor");
+  tmr_act = (acb_t *)av;
+  __atomic_store_n(&tmr_bound, 1, __ATOMIC_RELEASE);
+  return TAG((sw)hal_timer_native());
+}
+static V a_timer_arm(V dv) {
+  if (!ISINT(dv)) fpr_cpanic("Sys.timerArm: delta must be an Int (CLINT ticks)");
+  sw d = UNTAG(dv);
+  if (d < 1) d = 1; /* already due: fire on the next drain pass */
+  __atomic_store_n(&tmr_deadline, hal_mtime() + (uint64_t)d, __ATOMIC_RELEASE);
+  if (fpr_hart()->id != fpr_irq_hart)
+    hal_ipi_send(fpr_irq_hart); /* wake it to re-arm its mtimecmp */
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_Sys_x2etimerBind, a_timer_bind, 1);
+FPR_FN(fpr_g_Sys_x2etimerArm, a_timer_arm, 1);
+
+static void tmr_drain(fpr_hart_t *h) {
+  if (h->id != fpr_irq_hart || !__atomic_load_n(&tmr_bound, __ATOMIC_ACQUIRE)) return;
+  uint64_t dl = __atomic_load_n(&tmr_deadline, __ATOMIC_ACQUIRE);
+  if (!dl || hal_mtime() < dl) return;
+  __atomic_store_n(&tmr_deadline, 0, __ATOMIC_RELEASE);
+  if (h->id != 0) hal_timer_park(h->id); /* else MTIP pends forever (hart
+                                          * 0's detector re-arms its own) */
+  fpr_send_as((uw)&tmr_src_key, (V)tmr_act, TAG((sw)(dl & 0x3FFFFFFFFFFFFFFFull)));
 }
 
 static void drain(fpr_hart_t *h) {
@@ -646,6 +704,20 @@ static void ship(acb_t *a) {
 #define DETECT_TICKS 300000 /* 30 ms of CLINT time between detector samples */
 #define DETECT_QUIET 8      /* consecutive silent samples before declaring */
 
+/* going to sleep on the irq hart: make mtimecmp pop the wfi AT the
+ * armed timer deadline.  When the irq hart is also hart 0 (single-hart
+ * machine) the detector just armed DETECT_TICKS ahead -- only arm over
+ * it for a SOONER deadline, so detector pacing is never stretched. */
+static void tmr_wfi_arm(fpr_hart_t *h) {
+  if (h->id != fpr_irq_hart || !__atomic_load_n(&tmr_bound, __ATOMIC_ACQUIRE)) return;
+  uint64_t dl = __atomic_load_n(&tmr_deadline, __ATOMIC_ACQUIRE);
+  if (!dl) return;
+  uint64_t now = hal_mtime();
+  uint64_t delta = dl > now ? dl - now : 1;
+  if (h->id == 0 && delta > DETECT_TICKS) return;
+  hal_timer_arm(h->id, delta);
+}
+
 /* process-loading (docs/PROCESS-LOADING.md): a dynamically loaded app
  * runs its OWN instance of this whole file (a separate compiled image,
  * fpr_process_entry.c calls fpr_hart_main directly instead of crt0
@@ -674,9 +746,12 @@ static void hart_loop(fpr_hart_t *h) {
     if (__atomic_load_n(&fpr_shutdown, __ATOMIC_ACQUIRE))
       for (;;) hal_wfi();
     /* hot path first, NO MMIO: fuel preempts and local yields bounce
-     * through here thousands of times a second (irq_drain is gated on
-     * irq_bound, so machines with no bound sources pay one flag read) */
+     * through here thousands of times a second (irq_drain/tmr_drain
+     * are gated on their bound flags AND on being the irq hart, so
+     * other harts pay one comparison and machines with no bound
+     * sources one flag read) */
     irq_drain(h);
+    tmr_drain(h);
     drain(h);
     acb_t *n = deq(h);
     if (!n) {
@@ -685,7 +760,8 @@ static void hart_loop(fpr_hart_t *h) {
        * re-raises msip and the wfi below falls straight through. */
       hal_ipi_clear(h->id);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
-      irq_drain(h); /* MEIP wakes ride the same doorbell protocol */
+      irq_drain(h); /* MEIP/MTIP wakes ride the same doorbell protocol */
+      tmr_drain(h);
       drain(h);
       n = deq(h);
     }
@@ -731,6 +807,7 @@ static void hart_loop(fpr_hart_t *h) {
       }
       hal_timer_arm(0, DETECT_TICKS); /* re-arm clears MTIP until then */
     }
+    tmr_wfi_arm(h); /* a sooner timer deadline overrides on the irq hart */
     hal_wfi(); /* sleeps unless msip/mtip is already pending again */
   }
 }
@@ -894,6 +971,7 @@ static V take_at(chan_t *c, uint32_t k) {
 static acb_t main_acb; /* actor 0 */
 
 void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
+  fpr_irq_hart = fpr_live_harts - 1; /* interrupts belong to the last hart */
   for (uw i = 0; i < fpr_live_harts; i++) hal_timer_park(i);
   main_acb.tid = T_ACTOR;
   main_acb.var = ST_READY;
