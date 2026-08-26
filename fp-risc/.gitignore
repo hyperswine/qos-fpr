@@ -6,3 +6,4 @@ fprc
 *.s.units
 out.s
 *.disk
+build/
