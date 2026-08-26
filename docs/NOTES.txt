@@ -14,6 +14,12 @@ cd ../qos && make portable && ./qosp --yes ../fp-risc/app.qa
 make native && make native-run            # kernel boots: disk online,
                                           # permission gate, TUI launcher + live clock
 
+================
+
 DATA can be kept on GPU memory for large Vecs
 and transferred back to CPU memory when needed
 Otherwise it can be partitioned so 75/25
+
+=================
+
+Sol should be done a bit better

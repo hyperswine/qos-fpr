@@ -1,8 +1,6 @@
-# The merged FP-RISC project — PoC
+# FP-RISC and QOS
 
 ONE language, ONE frontend, FOUR execution profiles, and a provable std.
-This tree is the proof-of-concept merge of the previously separate
-qos-fpr and sol repos.
 
 ## One entry point
 
