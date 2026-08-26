@@ -32,3 +32,4 @@ qos/qos-store/*.kv
 fp-risc/build/tp.*
 fp-risc/build/tpar.*
 fp-risc/build/ck-par.*
+fp-risc/build/units/*-rvv.s
