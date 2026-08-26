@@ -37,6 +37,33 @@
 #
 # State survives BY CONSTRUCTION: the worker's accumulator is its own
 # loop argument; only the fn value it calls through changes.
+#
+# WHAT THE COMPILER DOES AND DOES NOT DO ACROSS THIS BOUNDARY (the
+# reload-safety rules, verified against Compile.hs/Codegen.hs):
+#
+#   * NO cross-module inlining of plain functions: units compile
+#     separately, the emitter's inliner and the Vec dualizer only see
+#     the unit's own binds, and a static `use` call is a direct
+#     symbol call bound at LINK time.  Corollary: statically-used
+#     modules are NOT reloadable at all, by design -- only calls that
+#     go through Mod.find's PAP dispatch re-bind, and the compiler
+#     cannot inline or specialize through that edge because plugin
+#     code is invisible to it.
+#   * Sig/struct GENERICS are monomorphized whole-program: the clones
+#     ride with the ROOT image, so a generic export's body is baked
+#     into its callers.  Export MONOMORPHIC functions as the swap
+#     surface (the mathOp shape), not struct-generics.
+#   * Nominal ADT tids are content-addressed PER UNIT VERSION
+#     (tidFor unitHash name): a type re-declared in v2 will not match
+#     v1-compiled patterns.  RECORDS are version-stable -- shape ids
+#     hash the sorted FIELD NAMES only -- so the reload boundary
+#     should speak builtins, tuples, and records (row polymorphism
+#     survives the swap by construction); any shared nominal type
+#     must come from ONE pinned unit both sides use, never
+#     re-declared per version.
+#   * A plugin .qa embeds its whole dependency closure (its own
+#     prelude copy included): a swap replaces the closure atomically,
+#     and versions share nothing but the registry.
 # ============================================================================
 
 QL = use "../programs/mods/qlog".
