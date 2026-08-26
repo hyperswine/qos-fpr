@@ -33,7 +33,7 @@ int qos_evdev_poll(int64_t *kind, int64_t *a, int64_t *c);
 #ifndef QOSP_GFX
 static int size_hook_state; /* 0 unchecked, 1 pending, 2 done */
 static int64_t size_hook_c, size_hook_r;
-static void t_input_poll(int64_t *kind, int64_t *a, int64_t *c) {
+static int t_input_poll(int64_t *kind, int64_t *a, int64_t *c) {
   *kind = 0; *a = 0; *c = 0;
   if (!size_hook_state) {
     const char *s = getenv("FPR_TTY_SIZE");
@@ -43,10 +43,10 @@ static void t_input_poll(int64_t *kind, int64_t *a, int64_t *c) {
   if (size_hook_state == 1) { /* one kind-5 before any key */
     size_hook_state = 2;
     *kind = 5; *a = size_hook_c; *c = size_hook_r;
-    return;
+    return 1;
   }
-  if (getenv("FPR_EVDEV")) qos_evdev_poll(kind, a, c);
-  else qos_tty_poll(kind, a, c);
+  if (getenv("FPR_EVDEV")) return qos_evdev_poll(kind, a, c);
+  return qos_tty_poll(kind, a, c);
 }
 #endif
 

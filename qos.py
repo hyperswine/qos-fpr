@@ -119,7 +119,8 @@ def build_native():
 
 def build_app(prog, harts=None):
     say(f"qos-app {prog}")
-    cmd = ["make", "-s", "qos-app", f"PROG={prog}"]
+    target = "qos-app-macos" if sys.platform == "darwin" and os.uname().machine == "arm64" else "qos-app"
+    cmd = ["make", "-s", target, f"PROG={prog}"]
     if harts:
         cmd.append(f"HARTS={harts}")
     sh(cmd, cwd=FPR, quiet=True)

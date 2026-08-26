@@ -1305,7 +1305,7 @@ projField scrut f = do
   shapes <- gets dShapes
   let cands = [(tid, idx, length fs) | (fs, tid) <- M.toList shapes, f `elem` fs, let idx = length (takeWhile (/= f) (sort fs))]
   case cands of
-    [] -> error ("no record shape has field ." ++ f)
+    [] -> pure (CErr ("no record shape has field ." ++ f))
     [(_, idx, _)] -> pure (CProj idx scrut)
     many' -> do
       v <- fresh "r"
