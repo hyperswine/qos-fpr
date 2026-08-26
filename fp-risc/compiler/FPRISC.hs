@@ -249,7 +249,7 @@ expr = lamE <|> opExpr
       keyword "fn" -- word-boundary: `fnv1a ...` is an application, not a lambda
       ps <- some lowerName
       _ <- symbol "->"
-      SLam ps <$> expr
+      SLam ps <$> block -- bindings allowed, same block form as arms
 
 opExpr :: P SExpr
 opExpr = dollarChain
@@ -323,10 +323,29 @@ chainl1' p op = p >>= rest
   where
     rest a = (do f <- op; b <- p; rest (f a b)) <|> pure a
 
+-- TIGHT MINUS is a literal: '-' immediately followed by a digit (no
+-- space) negates the numeral -- `-1`, `-2.5`, `-1e3f`.  A SPACED
+-- minus is untouched: `a - 1` is subtraction (the binary layer wins
+-- wherever a left operand exists), and only `f -1`-style application
+-- arguments change meaning -- the corpus had zero code uses of that
+-- spelling.  Floats negate by flipping the IEEE sign bit inside the
+-- already-desugared frombits splice.
+negLit :: P SExpr
+negLit = try $ do
+  _ <- char '-'
+  e <- floatLit <|> (SInt <$> integer)
+  pure $ case e of
+    SInt n -> SInt (negate n)
+    SApp (SApp v@(SVar "f64frombits") (SInt hi)) lo ->
+      SApp (SApp v (SInt (hi `xor` 0x80000000))) lo
+    SApp v@(SVar "f32frombits") (SInt b) -> SApp v (SInt (b `xor` 0x80000000))
+    other -> other
+
 term :: P SExpr
 term =
   choice
-    [ try floatLit,
+    [ negLit,
+      try floatLit,
       SInt <$> integer,
       holeLit,
       atomLit,
@@ -415,7 +434,12 @@ caseE = do
   arms <- arm `sepBy1` pipeSep
   pure (SCase scrut arms)
   where
-    arm = do p <- pattern'; _ <- symbol "->"; (p,) <$> expr
+    -- arm bodies take the BLOCK form: bindings then a final
+    -- expression, exactly like a clause body.  The block is
+    -- self-delimiting (every stmt ends in ';' behind a try), so the
+    -- arm still stops cleanly at '|' or the clause terminator --
+    -- the doX/doX2 helper-splitting idiom is retired.
+    arm = do p <- pattern'; _ <- symbol "->"; (p,) <$> block
 
 stringLit :: P SExpr
 stringLit = lexeme $ do
@@ -666,22 +690,53 @@ aritySpill tops = (map top tops, notes)
 -- ---- autodrop: compiler-inserted drops on receive paths ---------------
 -- THE LAW (docs/MEMORY.md): every received message root is dropped once
 -- read.  Every leak in the qosp campaign was a missed manual drop.  This
--- pass discharges the common shape mechanically:
+-- pass discharges the common shapes mechanically:
 --
---     m = receive me;          m = receive me;
---     (a, b) = m;         =>   (a, b) = m;
---     ...m never again...      _autodrop_m = drop m;
---                              ...
+--   shape 1   m = receive me; (a, b) = m; ...      drop after destructure
+--   shape 2   m = receive me; case m of ...        drop at each arm start
+--   shape 3   m = <receive-origin>; <borrow uses>  drop after the LAST use
+--             (v2: the general shape -- covers the rpc-helper idiom
+--              `r = rpc svc msg; k = case r of ...; ...` that every
+--              client used to discharge by hand)
 --
--- Inserted ONLY when all three hold: (1) the binding's RHS is a receive,
--- (2) the next reference is a destructuring SBindPat of m, (3) m is
--- never referenced after that destructure (so it cannot escape — a later
--- `send x m` or `drop m` blocks insertion).  Anything fancier (m used
--- inside case arms, conditional drops) stays manual: conservative and
--- reported, never silently wrong.
+-- RECEIVE-ORIGIN (v2) is TRANSITIVE: a fixpoint over the program marks
+-- every function whose result position IS the message root -- receive/
+-- receiveFrom/receiveRes themselves, then anything that tail-returns
+-- one (mvu's svcCall, std.uart's rpc, svc.fpr's storeRpc), then
+-- anything that tail-returns THOSE.  The old hardcoded name list
+-- ("ask", "svcCall") survives only as extra seeds.
+--
+-- Shape 3 inserts ONLY when every use of m is BORROW-SHAPED: a case
+-- scrutinee, a destructure source, or a direct argument to a borrowing
+-- builtin (send deep-copies; the string prims read).  A bare m in any
+-- other context -- returned, tupled up, captured under a lambda,
+-- passed whole to a user function -- blocks insertion, as does an
+-- explicit `drop m` anywhere.  Conservative and reported, never
+-- silently wrong; the early-drop placement is SOUND because the
+-- runtime defers the slab release to this actor's next receive
+-- (fpr_drop_park), where copy-on-retain says every borrow is dead.
 autoDrop :: [STop] -> ([STop], [String])
 autoDrop tops = (tops', concat notess)
   where
+    -- the transitive receive-origin set: name -> all clause bodies;
+    -- a name joins when EVERY clause's result position resolves to a
+    -- known origin (through blocks, and through cases whose arms all
+    -- qualify).  Monotone, bounded by the name count.
+    clauseBodies = M.fromListWith (++) [(n, [b]) | TBind n _ _ b <- tops]
+    originSeeds = S.fromList ["receive", "receiveFrom", "receiveRes", "ask", "svcCall"]
+    origins = fixOrigins originSeeds
+    fixOrigins known =
+      let step = S.fromList
+            [ nm | (nm, bs) <- M.toList clauseBodies,
+                   not (S.member nm known),
+                   all (resultIsOrigin known) bs ]
+       in if S.null step then known else fixOrigins (S.union known step)
+    resultIsOrigin known e = case e of
+      SBlock _ fin -> resultIsOrigin known fin
+      SCase _ arms -> not (null arms) && all (resultIsOrigin known . snd) arms
+      _ -> case adHeadName e of
+        Just h -> S.member h known
+        Nothing -> False
     (tops', notess) = unzip (map top tops)
     top (TBind n ps gs b) = let (b', ns) = goE n b in (TBind n ps gs b', ns)
     top t = (t, [])
@@ -724,9 +779,50 @@ autoDrop tops = (tops', concat notess)
             SCase (SVar m) [(pt, dropInto m b) | (pt, b) <- arms],
             [ "autodrop: " ++ n ++ ": inserted `drop " ++ m ++ "` into "
                 ++ show (length arms) ++ " case arm(s)" ] )
+    -- shape 3 (v2): the general last-use drop.  Applies when shapes 1
+    -- and 2 declined but every use of m is borrow-shaped and m does
+    -- not reach the block's final expression.
+    goStmts n (SBind m [] rhs : rest) fin
+      | isReceive rhs,
+        not (droppedIn m rest fin),
+        not (refE m fin),
+        all (okUse m) rest =
+          let (rest', fin', ns) = goStmts n rest fin
+              lastUse = maximum (0 : [i | (i, st) <- zip [1 ..] rest', any (refE m) (stmtEs st)])
+              (pre, post) = splitAt lastUse rest'
+              d = SBind ("_autodrop_" ++ m) [] (SApp (SVar "drop") (SVar m))
+           in ( SBind m [] rhs : pre ++ d : post,
+                fin',
+                ("autodrop: " ++ n ++ ": inserted `drop " ++ m ++ "` after its last use") : ns )
     goStmts n (st : rest) fin =
       let (rest', fin', ns) = goStmts n rest fin in (st : rest', fin', ns)
     goStmts _ [] fin = ([], fin, [])
+    -- borrow-shaped uses of m within one statement: the destructure
+    -- statement itself, a case scrutinee (arms checked recursively),
+    -- or a DIRECT argument of a borrowing builtin.  Anything else
+    -- containing a bare m refuses shape 3.
+    okUse m (SBindPat _ (SVar x)) | x == m = True
+    okUse m st = all (okE m) (stmtEs st)
+    okE m e = case e of
+      SVar x -> x /= m
+      SCase (SVar x) arms | x == m -> all (okE m . snd) arms
+      _ | (SVar h, as@(_ : _)) <- adSpine e [],
+          h `elem` ["send", "print", "strlen", "strcat", "charAt", "substr", "chr"] ->
+            all (\x -> case x of SVar _ -> True; _ -> okE m x) as
+      SApp a b -> okE m a && okE m b
+      SLam _ b -> not (refE m b) -- capture: lifetime unknown, refuse
+      SBlock ss f -> all (okUse m) ss && okE m f
+      SCase sc arms -> okE m sc && all (okE m . snd) arms
+      SBin _ a b -> okE m a && okE m b
+      SProj a _ -> okE m a
+      SRec fs -> all (okE m . snd) fs
+      SUpd a us -> okE m a && all (okE m . snd) us
+      STup es -> all (okE m) es
+      SList es -> all (okE m) es
+      SStrI segs -> and [okE m e' | SegExpr e' <- segs]
+      _ -> True
+    adSpine (SApp f a) acc = adSpine f (a : acc)
+    adSpine e acc = (e, acc)
     dropInto m b =
       let d = SBind ("_autodrop_" ++ m) [] (SApp (SVar "drop") (SVar m))
        in case b of
@@ -739,12 +835,9 @@ autoDrop tops = (tops', concat notess)
       PRec ns -> ns
       PSig v _ -> [v]
       _ -> []
-    isReceive e = case headName e of
-      Just n -> n `elem` ["receive", "receiveFrom", "receiveRes", "ask", "svcCall"]
+    isReceive e = case adHeadName e of
+      Just n -> S.member n origins
       Nothing -> False
-    headName (SVar n) = Just n
-    headName (SApp f _) = headName f
-    headName _ = Nothing
     droppedIn m ss fin = any isDropM (concatMap stmtEs ss ++ [fin])
       where
         isDropM e = case e of
@@ -769,6 +862,11 @@ autoDrop tops = (tops', concat notess)
       SList es -> any f es
       SStrI segs -> or [f e' | SegExpr e' <- segs]
       _ -> False
+
+adHeadName :: SExpr -> Maybe Name
+adHeadName (SVar n) = Just n
+adHeadName (SApp f _) = adHeadName f
+adHeadName _ = Nothing
 
 -- fold the `> e.` statements into a synthesized `main` (a block whose
 -- statements bind throwaways, last one is the result).  An explicit

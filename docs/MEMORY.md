@@ -74,15 +74,27 @@ Buys: no pauses, no discovery phase, WCET stays compositional (free is
 attributed to the operation that caused it), and the fpr-scheduler /
 fuel model never has to model a collector. Costs: the five laws above
 are LAWS — the compiler's linearity checker enforces tier 4, and law 1
-(drop what you receive) is now COMPILER-DISCHARGED on the two common
-shapes (autodrop in FPRISC.hs): the destructure-next-statement shape
-and the case-scrutinee actor loop, with the runtime holding up the
-other half — a dropped message slab is parked on the dropping actor's
+(drop what you receive) is now COMPILER-DISCHARGED on the three
+common shapes (autodrop in FPRISC.hs): the destructure-next-statement
+shape, the case-scrutinee actor loop, and (v2) the general LAST-USE
+shape over TRANSITIVE receive origins — a fixpoint marks every
+function whose result position IS the message root (receive itself,
+then rpc-style helpers that tail-return one, then their wrappers), and
+a binding of any origin call whose uses are all borrow-shaped (case
+scrutinee, destructure source, borrowing-builtin argument) gets its
+drop inserted after the last use.  The runtime holds up the other
+half — a dropped message slab is parked on the dropping actor's
 pending list and released at its NEXT RECEIVE (fpr_drop_park), so the
-inserted drop may precede the arm's reads of the message's children;
-the borrow window closes exactly where copy-on-retain says it must.
-Shapes autodrop cannot prove (a root that escapes, conditional drops)
-stay manual and reported, and ARC.qa audits still backstop them in CI.
+inserted drop may precede the reads of the message's children; the
+borrow window closes exactly where copy-on-retain says it must, and a
+payload that must outlive the next receive still needs its explicit
+copy (std.uart's readRx strcat).  Shapes autodrop cannot prove (a
+root that escapes into the result, a lambda capture, a whole-value
+pass to a user function, conditional drops) stay manual and reported,
+an explicit `drop` anywhere blocks insertion (no double drops in
+existing code), and ARC.qa audits still backstop them in CI.  The
+practical effect: the send/receiveFrom client idiom is now leak-free
+BY DEFAULT — std/uart.fpr carries zero manual drops.
 
 Two allocator rules retired with it: blocks above the bucket ceiling
 recycle through a per-pool exact-fit bigfree LIFO (tests/bigfree.fpr —

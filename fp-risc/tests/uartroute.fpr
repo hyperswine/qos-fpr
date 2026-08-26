@@ -22,7 +22,8 @@ ucall : Int -> Int -> _ -> Unit .
 ucall me a msg =
   _ = send a (me, msg);
   r = receiveFrom me a;
-  drop r.
+  Unit.
+  # ^ r's release is autodrop v2's (unused receive: dropped at once)
 
 main =
   me = myself 0;

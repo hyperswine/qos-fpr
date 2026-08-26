@@ -50,8 +50,8 @@ askW me w v =
   _ = send w (me, v);
   reply = receiveFrom me w;
   (r, a) = reply;
-  _ = drop reply;
   (r, a).
+  # ^ reply's release is autodrop's (the destructure shape)
 
 expectOk what r = case r of
     Ok i -> i
