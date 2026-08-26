@@ -152,26 +152,27 @@ static V h_device(V nameStr) {
 }
 FPR_FN(fpr_g_device, h_device, 1);
 
-/* ---- net: the posix contract, table transport ----------------------- */
+/* ---- net: the posix contract, table transport (v6: multi-conn).
+ * The FPRISC arg was always there; it is the CONNECTION ID now --
+ * netPoll 0 returns the next id with buffered bytes (0 = none), and
+ * netRead/netWrite/netClose address that id. */
 static V h_netPoll(V d) {
   (void)d;
   return TAG((sw)qos_hal->net_poll());
 }
 static V h_netRead(V d) {
-  (void)d;
   char buf[1024];
-  int64_t n = qos_hal->net_read(buf, sizeof buf);
+  int64_t n = qos_hal->net_read(ISINT(d) ? (int64_t)UNTAG(d) : 0, buf, sizeof buf);
   return (V)fpr_mkstr((const uint8_t *)buf, (uw)n);
 }
 static V h_netWrite(V d, V sv) {
-  (void)d;
   if (ISINT(sv) || TID(sv) != T_STR) fpr_cpanic("netWrite: not a String");
   str_t *s = (str_t *)sv;
-  return TAG((sw)qos_hal->net_write((const char *)s->bytes, s->len));
+  return TAG((sw)qos_hal->net_write(ISINT(d) ? (int64_t)UNTAG(d) : 0,
+                                    (const char *)s->bytes, s->len));
 }
 static V h_netClose(V d) {
-  (void)d;
-  return TAG((sw)qos_hal->net_close());
+  return TAG((sw)qos_hal->net_close(ISINT(d) ? (int64_t)UNTAG(d) : 0));
 }
 FPR_FN(fpr_g_netPoll, h_netPoll, 1);
 FPR_FN(fpr_g_netRead, h_netRead, 1);

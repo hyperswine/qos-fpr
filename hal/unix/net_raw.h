@@ -15,18 +15,23 @@
 
 #include <stdint.h>
 
-/* net: one connection at a time, poll-driven (the virt contract).
- * poll: 0 no conn, 1 open, 2 open + buffered rx.
- * read: drain up to cap bytes, returns count.
- * write: blocking-full, returns bytes actually placed (< len = peer
- *        closed under us).  close: drop the connection, keep listening.
+/* net: MULTI-CONNECTION, poll-driven (the virt contract, abi v6).
+ * Connections are numbered 1..QOS_NET_MAXCONN; 0 is never a valid id.
+ * poll:  pump (accept + read every open connection); returns the id
+ *        of a connection with buffered rx bytes, else 0.  Ids rotate
+ *        fairly so one busy peer cannot starve the rest.
+ * read:  drain up to cap buffered bytes of connection id.
+ * write: blocking-full on id; returns bytes placed (< len = peer
+ *        closed under us; 0 = no such connection).
+ * close: drop connection id, keep listening.
  * setup binds/listens on FPR_PORT (default 8000); poll/read/write on a
  * never-setup listener report no-connection rather than faulting. */
+#define QOS_NET_MAXCONN 8
 void qos_netraw_setup(void); /* idempotent; exits loudly on bind failure */
 int64_t qos_netraw_poll(void);
-int64_t qos_netraw_read(char *dst, uint64_t cap);
-int64_t qos_netraw_write(const char *src, uint64_t len);
-int64_t qos_netraw_close(void);
+int64_t qos_netraw_read(int64_t id, char *dst, uint64_t cap);
+int64_t qos_netraw_write(int64_t id, const char *src, uint64_t len);
+int64_t qos_netraw_close(int64_t id);
 
 /* the register tier: the uart/clint pseudo-bus (same addresses and
  * semantics as the virt console model).  0 = ok, -1 = unmapped. */

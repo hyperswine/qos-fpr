@@ -1730,9 +1730,24 @@ linExpr li env0 = go env0
       STup es ->
         let rs = map (go env) es
          in (concat [e | (e, _, _) <- rs], foldl' plus (Just zero) [c | (_, c, _) <- rs], LTupS [s | (_, _, s) <- rs])
-      SLam _ body ->
-        let caps = [v | v <- sFree body, maybe False isLin (M.lookup v env)]
-         in (["lambda captures linear variable(s) " ++ show caps ++ " (PoC: partial applications holding linear values unsupported)" | not (null caps)], Just zero, LU)
+      SLam ps body ->
+        -- a lambda may CAPTURE linear values: defining it consumes them
+        -- (they live in the closure now), the body must use each
+        -- exactly once, and the closure itself becomes LINEAR -- one
+        -- application, enforced by the same counting as any LL value.
+        -- (Runtime: the PAP carries the handle; the saturating apply
+        -- hands it on.  A never-applied linear closure strands its
+        -- handle -- consumed, not unsafe.)
+        let env' = M.union (M.fromList [(p, LU) | p <- ps]) env
+            (be, bc, _) = go env' body
+            caps = [v | v <- sFree body, v `notElem` ps, maybe False isLin (M.lookup v env)]
+            capErrs = case bc of
+              Nothing -> []
+              Just cc ->
+                [ "lambda body uses linear capture '" ++ v ++ "' " ++ show k ++ " time(s), expected exactly 1"
+                  | v <- caps, let k = M.findWithDefault 0 v cc, k /= 1 ]
+            sh = if null caps then LU else LL
+         in (be ++ capErrs, bc, sh)
       SCase scrut arms ->
         let (se, sc, sshape) = go env scrut
             armRes = map (checkArm env sshape) arms
@@ -1802,10 +1817,14 @@ linExpr li env0 = go env0
        in case h of
             SVar "error" -> (argErrs, Nothing, LU)
             SVar g ->
+              -- a PARTIAL application over linear argument(s) is a
+              -- linear PAP: the args are consumed into it (argCnt
+              -- already counts them once) and the PAP itself must be
+              -- applied exactly once.
               let (sh, full) = headShape g (length args)
-                  perr = ["partial application of '" ++ g ++ "' over linear argument(s) (PoC unsupported)" | anyLinArg && not full]
+                  sh2 = if anyLinArg && not full then LL else sh
                   (he, hc, _) = go env (SVar g)
-               in (argErrs ++ perr ++ he, plus hc argCnt, sh)
+               in (argErrs ++ he, plus hc argCnt, sh2)
             _ ->
               let (he, hc, _) = go env h
                in (argErrs ++ he, plus hc argCnt, LU)

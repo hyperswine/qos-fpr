@@ -34,11 +34,17 @@
 # a client-side listener -- future work, like push over SSE instead
 # of the poll script).
 #
-# ONE CONNECTION, by HAL contract: responses carry Connection: close
-# and the slot is released after each exchange, so every fetch is a
-# fresh, strictly serialized connection -- livejs's busy flag and the
-# poll guard keep a single client honest.  MQuit from update answers
-# the in-flight request, closes, and returns the run's result string.
+# MULTI-CLIENT (net tier v6): netPoll 0 returns the next connection
+# id with buffered bytes, and each connection accumulates its request
+# in its own buffer.  CLIENT identity is a cookie: GET / mints (or
+# re-reads) lvsid and Set-Cookie carries it; the browser sends it back
+# on every fetch, so a client's delta is computed against what THAT
+# client last saw while the MODEL is shared by everyone -- one bump
+# from client A is the delta client B's next poll flushes.  Sessions
+# are capped (oldest evicted; an evicted client just gets one full
+# render).  Responses still carry Connection: close -- connections are
+# per-request, sessions are per-client.  MQuit from update answers the
+# in-flight request, closes, and returns the run's result string.
 # ============================================================================
 
 MV = use "../../std/mvu".
@@ -111,6 +117,13 @@ jAt s i = until s i 34 "".
 
 httpResp code ctype body =
   "HTTP/1.1 {code}{crlf}Content-Type: {ctype}{crlf}Content-Length: {strlen body}{crlf}Connection: close{crlf}{crlf}{body}".
+httpRespC code ctype sid body =
+  "HTTP/1.1 {code}{crlf}Content-Type: {ctype}{crlf}Content-Length: {strlen body}{crlf}Set-Cookie: lvsid={sid}; Path=/{crlf}Connection: close{crlf}{crlf}{body}".
+
+# the client's session id off the Cookie header (0 = none)
+cookieSid req = csAt req (findSub req "lvsid=" 1).
+csAt req 0 = 0.
+csAt req i = digits req i 0.
 
 # ---- the page ---------------------------------------------------------------
 
@@ -138,12 +151,44 @@ quitOf (MQuit :: r) q = quitOf r 1.
 quitOf (MLog s :: r) q = _ = Sys.logAt 0 s; quitOf r q.
 quitOf (c :: r) q = quitOf r q.
 
-# ---- the server -------------------------------------------------------------
-# state: Sv model lastS lastD ltt buf -- lastS/lastD are what the ONE
-# client last saw (deltas are diffs against them), ltt the last
-# server-side tick, buf the partial request being accumulated.
+# ---- sessions + per-connection buffers --------------------------------------
+# sessions: (sid, lastS, lastD) per CLIENT, newest first, capped at 8
+# (deltas are diffs against what that client last saw); bufs: partial
+# request bytes per CONNECTION id.
 
-Sv = Type (Sv model ls ld ltt buf).
+maxSess = 8.
+
+sessGet : unsafe List (Int, List String, List String) -> Int -> _ .
+sessGet Nil sid = (0, Nil, Nil).
+sessGet ((i, ls, ld) :: r) sid | i == sid = (1, ls, ld).
+sessGet (e :: r) sid = sessGet r sid.
+
+sessPut : unsafe List (Int, List String, List String) -> Int -> List String -> List String -> _ .
+sessPut ss sid ls ld = sessTrim ((sid, ls, ld) :: sessDel ss sid) maxSess.
+sessDel : unsafe List (Int, List String, List String) -> Int -> _ .
+sessDel Nil sid = Nil.
+sessDel ((i, ls, ld) :: r) sid | i == sid = sessDel r sid.
+sessDel (e :: r) sid = e :: sessDel r sid.
+sessTrim : unsafe List a -> Int -> List a .
+sessTrim Nil n = Nil.
+sessTrim (e :: r) 0 = Nil.
+sessTrim (e :: r) n = e :: sessTrim r (n - 1).
+
+bufGet : unsafe List (Int, String) -> Int -> String .
+bufGet Nil cid = "".
+bufGet ((i, b) :: r) cid | i == cid = b.
+bufGet (e :: r) cid = bufGet r cid.
+bufPut : unsafe List (Int, String) -> Int -> String -> _ .
+bufPut bs cid b = (cid, b) :: bufDel bs cid.
+bufDel : unsafe List (Int, String) -> Int -> _ .
+bufDel Nil cid = Nil.
+bufDel ((i, b) :: r) cid | i == cid = bufDel r cid.
+bufDel (e :: r) cid = e :: bufDel r cid.
+
+# ---- the server -------------------------------------------------------------
+# state: Sv model sessions nsid ltt bufs
+
+Sv = Type (Sv model sess nsid ltt bufs).
 
 server app = serve { env = 0, css = G.cssFor } app.
 
@@ -153,25 +198,24 @@ serve cfg app =
   clint = device "clint";
   mt = reg32 clint 49144;
   m0 = ini cfg.env;
-  (s0, d0) = G.render (vw m0);
-  srvLoop mt cfg app (Sv m0 s0 d0 (read mt) "").
+  srvLoop mt cfg app (Sv m0 Nil 1 (read mt) Nil).
 
 srvLoop : unsafe Int -> _ -> App -> Sv -> String .
 srvLoop mt cfg app sv = srvPoll mt cfg app sv (netPoll 0).
 srvPoll : unsafe Int -> _ -> App -> Sv -> Int -> String .
-srvPoll mt cfg app sv st = case st == 2 of
-    True -> srvData mt cfg app sv
-  | False -> srvIdle mt cfg app sv.
+srvPoll mt cfg app sv cid = case cid == 0 of
+    True -> srvIdle mt cfg app sv
+  | False -> srvData mt cfg app sv cid.
 
 # idle: run a due server-side tick, else sleep a beat off the socket
 srvIdle : unsafe Int -> _ -> App -> Sv -> String .
 srvIdle mt cfg app sv =
   App ini upd sbs vw = app;
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
   srvTick mt cfg app sv (tickMsOf (sbs model)) (read mt).
 srvTick : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String .
 srvTick mt cfg app sv tickMs now =
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
   case and2 (tickMs > 0) (now - ltt >= tickMs * 10000) of
     True -> srvTickUp mt cfg app sv now
   | False -> srvNap mt cfg app sv.
@@ -182,85 +226,87 @@ srvNap mt cfg app sv =
 srvTickUp : unsafe Int -> _ -> App -> Sv -> Int -> String .
 srvTickUp mt cfg app sv now =
   App ini upd sbs vw = app;
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
   (m2, cs) = upd cfg.env ETick model;
-  srvAfterTick mt cfg app (Sv m2 ls ld now buf) (quitOf cs 0).
+  srvAfterTick mt cfg app (Sv m2 sess nsid now bufs) (quitOf cs 0).
 srvAfterTick : unsafe Int -> _ -> App -> Sv -> Int -> String .
 srvAfterTick mt cfg app sv 1 = srvBye sv.
 srvAfterTick mt cfg app sv q = srvLoop mt cfg app sv.
 
-# data: accumulate; answer when the request is complete
-srvData : unsafe Int -> _ -> App -> Sv -> String .
-srvData mt cfg app sv =
-  Sv model ls ld ltt buf = sv;
-  req = strcat buf (netRead 0);
-  srvHave mt cfg app (Sv model ls ld ltt req) (complete req).
-srvHave : unsafe Int -> _ -> App -> Sv -> Int -> String .
-srvHave mt cfg app sv 0 = srvLoop mt cfg app sv.
-srvHave mt cfg app sv done = srvRoute mt cfg app sv.
+# data: accumulate into THIS connection's buffer; answer when complete
+srvData : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvData mt cfg app sv cid =
+  Sv model sess nsid ltt bufs = sv;
+  req = strcat (bufGet bufs cid) (netRead cid);
+  srvHave mt cfg app (Sv model sess nsid ltt (bufPut bufs cid req)) cid req (complete req).
+srvHave : unsafe Int -> _ -> App -> Sv -> Int -> String -> Int -> String .
+srvHave mt cfg app sv cid req 0 = srvLoop mt cfg app sv.
+srvHave mt cfg app sv cid req done = srvRoute2 mt cfg app sv cid req (method req) (path req).
 
-srvRoute : unsafe Int -> _ -> App -> Sv -> String .
-srvRoute mt cfg app sv =
-  Sv model ls ld ltt buf = sv;
-  srvRoute2 mt cfg app sv (method buf) (path buf).
-srvRoute2 : unsafe Int -> _ -> App -> Sv -> String -> String -> String .
-srvRoute2 mt cfg app sv mth pth | G.strEq pth "/" = srvPage mt cfg app sv.
-srvRoute2 mt cfg app sv mth pth | G.strEq pth "/live/event" = srvEvent mt cfg app sv.
-srvRoute2 mt cfg app sv mth pth =
-  srvSend mt cfg app sv (httpResp "404 Not Found" "text/plain" "no such route") 0.
+srvRoute2 : unsafe Int -> _ -> App -> Sv -> Int -> String -> String -> String -> String .
+srvRoute2 mt cfg app sv cid req mth pth | G.strEq pth "/" = srvPage mt cfg app sv cid req.
+srvRoute2 mt cfg app sv cid req mth pth | G.strEq pth "/live/event" = srvEvent mt cfg app sv cid req.
+srvRoute2 mt cfg app sv cid req mth pth =
+  srvSend mt cfg app sv cid (httpResp "404 Not Found" "text/plain" "no such route") 0.
 
-# GET /: render the CURRENT model (server ticks included), remember
-# what the client now has, ship the page
-srvPage : unsafe Int -> _ -> App -> Sv -> String .
-srvPage mt cfg app sv =
+# GET /: mint (or re-read) the client's session, render the CURRENT
+# model, remember what THIS client now has, ship page + cookie
+srvPage : unsafe Int -> _ -> App -> Sv -> Int -> String -> String .
+srvPage mt cfg app sv cid req =
   App ini upd sbs vw = app;
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
+  sid0 = cookieSid req;
+  sid = case sid0 > 0 of True -> sid0 | False -> nsid;
+  nsid2 = case sid0 > 0 of True -> nsid | False -> nsid + 1;
   tree = vw model;
   (s, d) = G.render tree;
   html = page cfg.css tree s d (tickMsOf (sbs model));
-  srvSend mt cfg app (Sv model s d ltt buf) (httpResp "200 OK" "text/html" html) 0.
+  srvSend mt cfg app (Sv model (sessPut sess sid s d) nsid2 ltt bufs)
+          cid (httpRespC "200 OK" "text/html" sid html) 0.
 
-# POST /live/event: update (unless __poll), diff against what the
-# client saw, reply delta or full
-srvEvent : unsafe Int -> _ -> App -> Sv -> String .
-srvEvent mt cfg app sv =
-  Sv model ls ld ltt buf = sv;
-  body = bodyOf buf;
-  srvEv2 mt cfg app sv (jStr body "msg") (jStr body "arg").
-srvEv2 : unsafe Int -> _ -> App -> Sv -> String -> String -> String .
-srvEv2 mt cfg app sv msg arg | G.strEq msg "__poll" = srvReply mt cfg app sv 0.
-srvEv2 mt cfg app sv msg arg =
+# POST /live/event: update (unless __poll), diff against what THIS
+# client (the lvsid cookie) last saw, reply delta or full
+srvEvent : unsafe Int -> _ -> App -> Sv -> Int -> String -> String .
+srvEvent mt cfg app sv cid req =
+  body = bodyOf req;
+  srvEv2 mt cfg app sv cid (cookieSid req) (jStr body "msg") (jStr body "arg").
+srvEv2 : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String -> String -> String .
+srvEv2 mt cfg app sv cid sid msg arg | G.strEq msg "__poll" = srvReply mt cfg app sv cid sid 0.
+srvEv2 mt cfg app sv cid sid msg arg =
   App ini upd sbs vw = app;
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
   (m2, cs) = upd cfg.env (EMsg msg arg) model;
-  srvReply mt cfg app (Sv m2 ls ld ltt buf) (quitOf cs 0).
-srvReply : unsafe Int -> _ -> App -> Sv -> Int -> String .
-srvReply mt cfg app sv quit =
+  srvReply mt cfg app (Sv m2 sess nsid ltt bufs) cid sid (quitOf cs 0).
+srvReply : unsafe Int -> _ -> App -> Sv -> Int -> Int -> Int -> String .
+srvReply mt cfg app sv cid sid quit =
   App ini upd sbs vw = app;
-  Sv model ls ld ltt buf = sv;
+  Sv model sess nsid ltt bufs = sv;
   (s2, d2) = G.render (vw model);
-  srvReply2 mt cfg app (Sv model s2 d2 ltt buf) quit (G.sameStatics ls s2) ld d2.
-srvReply2 : unsafe Int -> _ -> App -> Sv -> Int -> Bool -> List String -> List String -> String .
-srvReply2 mt cfg app sv quit True ld d2 =
-  srvSend mt cfg app sv (httpResp "200 OK" "application/json" "\{\"d\":{G.deltaJson ld d2}}") quit.
-srvReply2 mt cfg app sv quit same ld d2 =
-  Sv model s2 dd ltt buf = sv;
-  srvSend mt cfg app sv (httpResp "200 OK" "application/json" "\{\"s\":{G.jarr s2},\"d\":{G.jarr d2}}") quit.
+  (found, ls, ld) = sessGet sess sid;
+  sv2 = Sv model (sessPut sess sid s2 d2) nsid ltt bufs;
+  case found == 1 of
+    False -> srvFull mt cfg app sv2 cid s2 d2 quit
+  | True -> (case G.sameStatics ls s2 of
+      True -> srvSend mt cfg app sv2 cid (httpResp "200 OK" "application/json" "\{\"d\":{G.deltaJson ld d2}}") quit
+    | False -> srvFull mt cfg app sv2 cid s2 d2 quit).
+srvFull : unsafe Int -> _ -> App -> Sv -> Int -> List String -> List String -> Int -> String .
+srvFull mt cfg app sv2 cid s2 d2 quit =
+  srvSend mt cfg app sv2 cid (httpResp "200 OK" "application/json" "\{\"s\":{G.jarr s2},\"d\":{G.jarr d2}}") quit.
 
-# ship the response, release the one-connection slot, next request
-srvSend : unsafe Int -> _ -> App -> Sv -> String -> Int -> String .
-srvSend mt cfg app sv resp quit =
-  Sv model ls ld ltt buf = sv;
-  _ = netWrite 0 resp;
-  _ = netClose 0;
-  srvNext mt cfg app (Sv model ls ld ltt "") quit.
+# ship the response, release THIS connection, forget its buffer
+srvSend : unsafe Int -> _ -> App -> Sv -> Int -> String -> Int -> String .
+srvSend mt cfg app sv cid resp quit =
+  Sv model sess nsid ltt bufs = sv;
+  _ = netWrite cid resp;
+  _ = netClose cid;
+  srvNext mt cfg app (Sv model sess nsid ltt (bufDel bufs cid)) quit.
 srvNext : unsafe Int -> _ -> App -> Sv -> Int -> String .
 srvNext mt cfg app sv 1 = srvBye sv.
 srvNext mt cfg app sv q = srvLoop mt cfg app sv.
 
 srvBye sv =
-  Sv model ls ld ltt buf = sv;
-  "lv: server closed (statics={lvLen ls} dynamics={lvLen ld})".
+  Sv model sess nsid ltt bufs = sv;
+  "lv: server closed ({lvLen sess} client session(s))".
 lvLen : unsafe List a -> Int .
 lvLen Nil = 0.
 lvLen (x :: r) = 1 + lvLen r.
