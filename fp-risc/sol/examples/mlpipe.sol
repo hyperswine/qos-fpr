@@ -14,8 +14,11 @@
 #   Vec.fold (gA a b c) ...      LLVM-JIT typed duals over the record's
 #                                SoA columns ({z,y} = two f64 columns),
 #                                captured weights as extras
-#   record construction          the honest interpreter tier (a map that
-#                                RETURNS records has no native dual yet)
+#   Vec.map (mkPt mu sd) ...     the vecmapr MULTI-OUTPUT dual: a map
+#                                that RETURNS a record compiles one
+#                                typed dual per field and writes k
+#                                native columns -- SoA construction
+#                                without boxing or per-row apply
 #
 # Every tier is bit-identical: run with SOL_GPU=0 and/or SOL_JIT=0 and
 # the learned coefficients do not move by one ulp.
@@ -73,7 +76,7 @@ chkClose name got want tol = case Numeric.abs (got - want) < tol of
   (sq, raw2) = Vec.fold (sqDev mu) 0 raw1;
   sd = Num.sqrt (sq / n);
   u0 = Vec.free raw2;
-  # build the standardized {z, y} rows (interpreter: record output)
+  # build the standardized {z, y} rows (vecmapr: native SoA construction)
   pts = Vec.map (mkPt mu sd) (Vec.range 1 n);
   # fit: 120 epochs of three captured JIT folds each
   (a, b, c, pts2) = train 120 n 0.3 0 0 0 pts;

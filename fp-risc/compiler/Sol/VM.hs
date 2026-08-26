@@ -985,6 +985,16 @@ vecScheme env scheme f macc r = do
     (Just jc, Just (g, extras), Just (scalar, ks, sig), Just aty0)
       | n >= jitThreshold ->
           compileVecScheme jc (vmCore env) scheme g scalar (map kindTy ks) sig (map snd extras) aty0 >>= \case
+            -- a map whose helper RETURNS a record has no scalar dual;
+            -- try the multi-output vecmapr path (native SoA
+            -- construction) before conceding to the interpreter
+            Nothing
+              | scheme == "vecmap" ->
+                  compileVecMapR jc (vmCore env) g scalar (map kindTy ks) sig (map snd extras) >>= \case
+                    Nothing -> pure Nothing
+                    Just (addr, tid, ftys) -> fmap Just $ withColPtrs st $ \cols -> withFuelCell env $ \pfuel ->
+                      vecFromColsM n tid [if t == JI then KInt else KNum | t <- ftys] $ \outs ->
+                        runVecMapR addr pfuel (map fst extras) cols n outs
             Nothing -> pure Nothing
             Just (addr, accTy, retTy) -> fmap Just $ withColPtrs st $ \cols -> withFuelCell env $ \pfuel ->
               case scheme of

@@ -51,11 +51,12 @@ import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Foreign.C.String
 import Foreign.Marshal.Alloc (alloca)
-import Foreign.Marshal.Array (allocaArray, withArrayLen)
+import Foreign.Marshal.Array (allocaArray, withArray, withArrayLen)
 import Foreign.Ptr
 import Foreign.Storable
 import Sol.Lang (Core (..), Name, Prog)
 import System.Environment (lookupEnv)
+import System.IO.Unsafe (unsafePerformIO)
 
 -- ---- raw LLVM-C bindings ----------------------------------------------------
 
@@ -1184,6 +1185,155 @@ compileVecScheme jc prog scheme root scalar colTys laySig exTys accTy0 = do
                           pure (addr, accTy, retTy)
                       )
                   pure r
+
+-- ---- record-returning map: native SoA CONSTRUCTION ---------------------
+-- The root body is a let-chain ending in a record CMk.  Each FIELD gets
+-- its own typed dual (the shared lets re-wrapped per field: dead ones
+-- are pure arithmetic, and llvm's DCE eats them), and ONE driver writes
+-- k output columns -- the result vector is assembled around those
+-- columns with no boxing and no per-row apply.  This is the
+-- construction quarter of the dispatch square, previously always the
+-- interpreter's job (mkPt-style builders in ML pipelines).
+splitMkR :: Core -> Maybe ([(Name, Core)], Int, Int, [Core])
+splitMkR = go []
+  where
+    go acc (CLet x v b) = go ((x, v) : acc) b
+    go acc (CMk t v fs) | not (null fs) = Just (reverse acc, t, v, fs)
+    go _ _ = Nothing
+
+mapRCache :: IORef (M.Map (String, Name) (Int64, Int, [JTy]))
+mapRCache = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE mapRCache #-}
+
+compileVecMapR :: JitCtx -> Prog -> Name -> Bool -> [JTy] -> String -> [JTy] -> IO (Maybe (Int64, Int, [JTy]))
+compileVecMapR jc prog root scalar colTys laySig exTys = do
+  let ckey = ("vecmapr|" ++ laySig ++ "|" ++ map tyChar exTys, root)
+  cache <- readIORef mapRCache
+  case M.lookup ckey cache of
+    Just hit -> pure (Just hit)
+    Nothing -> case fmap prepClosure (gatherFns prog root) of
+      Nothing -> pure Nothing
+      Just closure -> do
+        let ars = M.map (length . fst) closure
+            Just (rootPs, rootBody) = M.lookup root closure
+            helpers = M.delete root closure
+            nEx = length exTys
+            loadable = map (/= JW) colTys
+        case splitMkR rootBody of
+          Just (lets, tid, var, fs)
+            | length rootPs == nEx + 1,
+              let k = length fs,
+              k >= 1 && k <= 8,
+              -- records re-carry their field count in var; var-0
+              -- products carry 0.  Anything else (union variants) is
+              -- not an SoA element -- decline.
+              var == (if tid >= 100 then k else 0),
+              exPs <- take nEx rootPs,
+              elemP <- last rootPs,
+              fbodies <- [foldr (\(x, v) b -> CLet x v b) f lets | f <- fs],
+              all (uncurry (jitOK ars)) (M.elems helpers),
+              all (jitOKVec ars scalar loadable elemP exPs) fbodies -> do
+                let env0 = M.fromList (zip exPs exTys)
+                    inferF fb = inferSigs closure (\sigs -> tyExprV sigs closure scalar colTys (S.singleton elemP) env0 fb)
+                case mapM inferF fbodies of
+                  Just rs
+                    | all (\(_, t) -> t == JI || t == JD) rs -> do
+                        let ftys = map snd rs
+                            sigsAll = M.unions (map fst rs)
+                            allKeys = nub (M.keys sigsAll)
+                        r <- emit jc helpers sigsAll allKeys ("", []) $ \cg md ptrTy sym -> do
+                          duals <- forM (zip3 [0 :: Int ..] fbodies ftys) $ \(j, fb, fty) -> do
+                            let dualArgTys = [ptrTy] ++ map (repr cg) exTys ++ [ptrTy, cgI64 cg]
+                            dualTy <- withArrayLen dualArgTys $ \len p -> c_fnTy (repr cg fty) p len 0
+                            dual <- nm (sym ++ "_f" ++ show j) $ \s -> c_addFn md s dualTy
+                            bb <- nm "entry" $ c_appendBB (cgCtx cg) dual
+                            c_positionAtEnd (cgB cg) bb
+                            fuel <- c_param dual 0
+                            fuelTickIR cg fuel
+                            exVals <- mapM (\i -> c_param dual (1 + i)) [0 .. nEx - 1]
+                            colsP <- c_param dual (1 + nEx)
+                            idxP <- c_param dual (2 + nEx)
+                            let env = M.fromList (zip exPs (zip exVals exTys))
+                                va = VecAccess elemP scalar colTys colsP idxP ptrTy
+                            rres <- cgExprT cg fuel (Just va) env fb
+                            rv <- coerce cg rres fty
+                            _ <- c_bRet (cgB cg) rv
+                            pure (dual, dualTy, fty)
+                          buildVecMapRDriver cg md ptrTy sym duals exTys
+                          pure
+                            ( \addr -> do
+                                putStrLn ("[jit] compiled vecmapr<" ++ root ++ "> " ++ show (length ftys) ++ " field dual(s) over " ++ laySig ++ (if nEx > 0 then " + " ++ show nEx ++ " captured scalar(s)" else "") ++ " (native SoA construction)")
+                                let hit = (addr, tid, ftys)
+                                atomicModifyIORef' mapRCache (\m -> (M.insert ckey hit m, ()))
+                                pure hit
+                            )
+                        pure r
+                  _ -> jitDebug ("[jit-debug] " ++ root ++ ": vecmapr fields untypeable") >> pure Nothing
+          _ -> pure Nothing
+
+-- vecmapr driver: i64 drv(fuel*, extras*, cols**, n, outs**) -- one call
+-- per field per row, each store landing in its own output column
+buildVecMapRDriver :: CG -> LRef -> LRef -> String -> [(LRef, LRef, JTy)] -> [JTy] -> IO ()
+buildVecMapRDriver cg md ptrTy sym duals exTys = do
+  let i64 = cgI64 cg
+      f64 = cgF64 cg
+      b = cgB cg
+  dty <- withArrayLen [ptrTy, ptrTy, ptrTy, i64, ptrTy] $ \len p -> c_fnTy i64 p len 0
+  drv <- nm sym $ \s -> c_addFn md s dty
+  entry <- nm "entry" $ c_appendBB (cgCtx cg) drv
+  bbCond <- nm "cond" $ c_appendBB (cgCtx cg) drv
+  bbBody <- nm "body" $ c_appendBB (cgCtx cg) drv
+  bbExit <- nm "exit" $ c_appendBB (cgCtx cg) drv
+  fuel <- c_param drv 0
+  extras <- c_param drv 1
+  cols <- c_param drv 2
+  n <- c_param drv 3
+  outs <- c_param drv 4
+  c_positionAtEnd b entry
+  z <- c_constInt i64 0 0
+  o <- c_constInt i64 1 0
+  eVals <-
+    mapM
+      ( \(i, t) -> do
+          ki <- c_constInt i64 (fromIntegral i) 0
+          pe <- withArrayLen [ki] $ \len p -> nm "pex" $ c_bGEP b i64 extras p len
+          raw <- nm "ex" $ c_bLoad b i64 pe
+          if not (isF t) then pure raw else nm "exf" (c_bBitCast b raw f64)
+      )
+      (zip [0 :: Int ..] exTys)
+  -- resolve the k out-column base pointers once, before the loop
+  outPs <-
+    forM (zip [0 :: Int ..] duals) $ \(j, _) -> do
+      kj <- c_constInt i64 (fromIntegral j) 0
+      pj <- withArrayLen [kj] $ \len p -> nm "poj" $ c_bGEP b ptrTy outs p len
+      nm "outbase" $ c_bLoad b ptrTy pj
+  iA <- nm "i" $ c_bAlloca b i64
+  _ <- c_bStore b z iA
+  _ <- c_bBr b bbCond
+  c_positionAtEnd b bbCond
+  iv <- nm "iv" $ c_bLoad b i64 iA
+  more <- nm "more" $ c_bICmp b pSLT iv n
+  _ <- c_bCondBr b more bbBody bbExit
+  c_positionAtEnd b bbBody
+  forM_ (zip outPs duals) $ \(ob, (ef, efTy, fty)) -> do
+    r <- withArrayLen (fuel : eVals ++ [cols, iv]) $ \len p -> nm "fx" $ c_bCall b efTy ef p len
+    po <- withArrayLen [iv] $ \len p -> nm "po" $ c_bGEP b (repr cg fty) ob p len
+    _ <- c_bStore b r po
+    pure ()
+  i' <- nm "i1" $ c_bAdd b iv o
+  _ <- c_bStore b i' iA
+  _ <- c_bBr b bbCond
+  c_positionAtEnd b bbExit
+  _ <- c_bRet b n
+  pure ()
+
+-- run a vecmapr driver: outs are the k freshly allocated column bases
+runVecMapR :: Int64 -> Ptr Int64 -> [Int64] -> Ptr (Ptr Int64) -> Int -> [Ptr Int64] -> IO ()
+runVecMapR addr pfuel extras cols n outs = do
+  let f = mkDrv5 (castPtrToFunPtr (intPtrToPtr (fromIntegral addr)))
+  withArrayLen (extras ++ [0]) $ \_ pex ->
+    withArray outs $ \pouts ->
+      () <$ f pfuel pex (castPtr cols) (fromIntegral n) (castPtr pouts)
 
 -- typed vec driver: extras load as i64 bits and bitcast per their type;
 -- acc slot typed; vecfilter still emits kept row INDICES (i64)

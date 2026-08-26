@@ -30,8 +30,9 @@ import Data.IORef
 import Data.Int (Int64)
 import Data.List (intercalate)
 import System.IO.Unsafe (unsafePerformIO)
-import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, castForeignPtr, mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (withArray)
+import Foreign.Marshal.Utils (withMany)
 import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import qualified Data.ByteString as BS
@@ -454,6 +455,19 @@ renderNum d
   | otherwise = show d
   where
     r = round d :: Integer
+
+-- vecmapr's landing pad: allocate k native columns, hand their raw base
+-- pointers to the filler (the JIT driver writes every row), then
+-- assemble the SoA store AROUND them -- zero copy, no boxing, the
+-- constructed vector is column-native from its first instant
+vecFromColsM :: Int -> Int -> [ColKind] -> ([Ptr Int64] -> IO ()) -> IO Value
+vecFromColsM n tid ks fill = do
+  fps <- mapM (const (mallocForeignPtrArray (max 1 n))) ks
+  withMany withForeignPtr fps fill
+  let col KInt fp = CI (max 1 n) fp
+      col KNum fp = CD (max 1 n) (castForeignPtr fp)
+      col KBox _ = error "vecmapr: boxed column cannot be native-built"
+  VVec <$> newIORef (VecStore n (zipWith col ks fps) (RSoA tid ks))
 
 -- fresh scalar KNum vector from JITted map output
 vecFromNums :: [Double] -> IO Value
