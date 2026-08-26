@@ -114,6 +114,51 @@ typedef struct fpr_pool {
 void **fpr_bkt_take(void);   /* runtime.c: bucket-array recycler */
 void fpr_bkt_put(void **b);
 
+/* ---- the SHARED SCHEDULER PLANE (transparent ACBs) -----------------
+ * The unification: everything that runs is an ACB with a pid on ONE
+ * set of per-hart queues -- System.qa's actors are pid 0, a loaded
+ * process's actors are pid N, and the same donation/steal machinery
+ * moves all of them.  A separately-compiled process image reaches the
+ * ONE scheduler by routing its STRUCTURAL operations (send, receive,
+ * spawn, arc, slab grow/release, the fuel trap) through this table of
+ * the kernel's own functions; pool-local hot paths (bucket take, slab
+ * bump, fpr_free) need no routing because the slab refactor made them
+ * acb-carried.  fpr_sched is NULL on every normal boot (kernel, qosp,
+ * bare-metal: zero behavior change); the loader hands a process its
+ * table at entry. */
+typedef struct fpr_sched {
+  V (*send_as)(uw sender_key, V target, V m);
+  V (*receive)(V me);
+  V (*receive_from)(V me, V from);
+  V (*receive_res)(V me);
+  V (*spawn)(V f);                    /* pid inherits from the spawner */
+  V (*spawn_at)(V hart, V f);
+  V (*spawn_pid)(V f, uw pid);        /* the process root: explicit pid */
+  void (*arc_incref)(V v);
+  void (*arc_decref)(V v);
+  fpr_slab_t *(*slab_new)(uw want);   /* pool growth: the shared buddy */
+  void (*slab_release)(fpr_slab_t *sl);
+  void (*pool_reset)(void);
+  void (*fuel)(void);                 /* fpr_fuel_exhausted, kernel copy */
+  uw (*arc_live)(void);
+  char *heap_lo, *heap_hi;            /* fpr_in_heap bounds, shared span */
+} fpr_sched_t;
+extern fpr_sched_t *fpr_sched;        /* NULL = this image is the plane */
+void fpr_sched_export(fpr_sched_t *out); /* fill with THIS image's impls */
+/* the IMAGE-STATICS window carved out of the heap span: a loaded
+ * process's code/rodata/data sit INSIDE the buddy span (the fixed
+ * slot), but its cells are statics -- no 16-byte alloc preheader, so
+ * the deep-copier and ARC must treat them like any other immortal
+ * static.  Set by the kernel at load (slot..image_end) and by the
+ * process image itself at shared boot (its own link symbols); empty
+ * (0,0) everywhere else. */
+extern char *fpr_static_lo, *fpr_static_hi;
+fpr_slab_t *fpr_slab_new(uw want);   /* runtime.c: buddy-backed pool slab */
+void fpr_pool_reset_c(void);         /* runtime.c: Sys.poolReset, C-callable */
+uw fpr_arc_live_count(void);         /* runtime.c: the arc gauge */
+V fpr_receive_res_c(V me);           /* actors.c: receiveRes, C-callable */
+void fpr_fuel_exhausted(void);       /* actors.c: the fuel trap */
+
 /* deferred message-slab release (the drop-what-you-receive law's
  * runtime half): dropping a received root parks its ownerless slab on
  * the DROPPING actor's pending list instead of freeing it mid-borrow;
@@ -312,7 +357,8 @@ fpr_elf_load_t fpr_qaimg_load(const unsigned char *load, uw load_len,
  * just points the ELF header's e_entry at it, no assembly needed. */
 V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_bytes),
                     const unsigned char *caps, uw caps_len,
-                    sw (*syscall_fn)(uw, const char *, uw, char *, uw));
+                    sw (*syscall_fn)(uw, const char *, uw, char *, uw),
+                    void *shared_boot); /* NULL = legacy nested scheduler */
 
 /* actors.c: process-mode flags/result (see the essay in actors.c) */
 extern volatile int fpr_is_process;

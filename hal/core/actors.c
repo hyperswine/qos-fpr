@@ -100,6 +100,10 @@ typedef struct fpr_acb {
                     * contract (a graphics actor's EGL context is bound
                     * to its hart's thread on hosted targets) */
   uw parent;              /* spawner's actor id (0 = the boot actor) */
+  uw pid;                 /* owning process: 0 = the boot image
+                           * (System.qa / the hosted app); a loaded
+                           * process's actors carry its pid -- the ONLY
+                           * kernel/process distinction that remains */
   struct fpr_acb *all_nx; /* the all-actors ledger (monitor's walk) */
   fpr_slab_t *drop_pending; /* dropped-message slabs awaiting the next
                              * receive (fpr_drop_park in fpr.h): the
@@ -108,6 +112,8 @@ typedef struct fpr_acb {
                              * the batch is released */
   fpr_pool_t pool; /* this actor's slabs + recycle buckets (slab refactor) */
 } acb_t;
+
+fpr_sched_t *fpr_sched = 0; /* see fpr.h: NULL = this image is the plane */
 
 /* ---- deferred message-slab release (see fpr.h) ---------------------- */
 void fpr_drop_park(fpr_slab_t *sl) {
@@ -161,6 +167,7 @@ static char *acb_hp, *acb_end;
  * a print at an allocation site is a syscall inside the allocator */
 uw fpr_stk_pushes, fpr_stk_misses, fpr_spawns, fpr_chb_carves;
 static void stack_recycle(void *p);
+static V spawn_on_pid(uw hart, V f, uw pin, uw pid);
 static void *stack_block(void) {
   if (!fpr_is_process) return buddy_alloc(STACK_SZ);
   fpr_lock(&stack_lock);
@@ -424,9 +431,24 @@ static void donate(fpr_hart_t *h) {
    * Pinned actors (actor 0, spawnOn placements) never migrate -- the
    * walk is bounded by the backlog, which donation itself keeps near
    * DONATE_HI. */
+  /* only ST_READY entries may cross: a BLOCKED actor left in the
+   * backlog is ALSO the target of its waker's re-ship (wake CAS ->
+   * xr) -- donating it puts the same acb in two harts' backlogs, and
+   * two harts then resume the same context.  And never h->current:
+   * fuel preemption (and yield) enqueue the RUNNING actor before
+   * to_sched() saves its context, so until this hart's loop regains
+   * control that backlog entry points at an unsaved context -- a
+   * stealer would resume it mid-flight on another hart.  Every other
+   * READY entry is quiescent and stable: it isn't running, and wake
+   * only fires on BLOCKED actors. */
   acb_t *prev = 0, *a = h->bl_head;
-  while (a && a->pin) { prev = a; a = a->bl_next; }
+  while (a && (a->pin || a == h->current ||
+               __atomic_load_n(&a->var, __ATOMIC_ACQUIRE) != ST_READY)) {
+    prev = a;
+    a = a->bl_next;
+  }
   if (!a) return;
+  int shipped = 0;
   fpr_lock(&steal_lock);
   if (steal_t - steal_h < SCAP) {
     if (prev) prev->bl_next = a->bl_next;
@@ -435,8 +457,18 @@ static void donate(fpr_hart_t *h) {
     h->bl_len--;
     steal_ring[steal_t % SCAP] = a;
     steal_t++;
+    shipped = 1;
   }
   fpr_unlock(&steal_lock);
+  /* wake a sleeper: an idle hart is in (or headed for) wfi with no
+   * timer of its own -- without a doorbell the donated work sits in
+   * the ring until some unrelated send happens to IPI it.  The
+   * publish-then-check order pairs with the idle-then-recheck order
+   * in hart_loop (Dekker): either the sleeper's post-idle steal sees
+   * our entry, or we see its idle flag and raise msip. */
+  if (shipped)
+    for (uw i = 0; i < fpr_live_harts; i++)
+      if (i != h->id && fpr_harts[i].idle) { hal_ipi_send(i); break; }
 }
 
 static acb_t *steal(fpr_hart_t *h) {
@@ -618,12 +650,17 @@ static void hart_loop(fpr_hart_t *h) {
       if (__atomic_load_n(&n->var, __ATOMIC_ACQUIRE) == ST_DEAD) reap(n);
       continue;
     }
-    /* nothing local: deterministic steal — oldest donated work first */
+    /* nothing local: deterministic steal — oldest donated work first.
+     * idle is raised BEFORE the ring check (fenced), pairing with
+     * donate()'s publish-before-idle-scan: whichever side loses the
+     * race still observes the other's write, so a donated actor is
+     * never left in the ring under a sleeping hart. */
+    h->idle = 1;
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
     {
       acb_t *s = steal(h);
-      if (s) { backlog_add(h, s); continue; }
+      if (s) { h->idle = 0; backlog_add(h, s); continue; }
     }
-    h->idle = 1;
     if (h->id == 0) {
       /* deadlock detector, timer-paced: hart 0 wakes every DETECT_TICKS
        * even with no doorbell, samples the world, sleeps again.  A real
@@ -658,6 +695,7 @@ static void to_sched(void) {
 
 /* the compiler-inserted fuel check (0(tp) hit zero) lands here */
 void fpr_fuel_exhausted(void) {
+  if (fpr_sched) { fpr_sched->fuel(); return; }
   fpr_hart_t *h = fpr_hart();
   h->fuel_preempts++;
   h->fuel = FUEL_QUANTUM;
@@ -817,6 +855,7 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   main_acb.hart = 0;
   main_acb.pin = 1; /* the result carrier never migrates */
   main_acb.parent = 0;
+  main_acb.pid = 0;
   ledger_push(&main_acb);
   char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
@@ -846,6 +885,11 @@ void fpr_hart_secondary(int id) {
 /* ---- FPRISC-facing API ------------------------------------------------ */
 
 static V spawn_on(uw hart, V f, uw pin) {
+  return spawn_on_pid(hart, f, pin, (uw)-1);
+}
+/* pid (uw)-1 = inherit from the spawner (the transparent default);
+ * the loader passes a fresh pid for a process's root actor */
+static V spawn_on_pid(uw hart, V f, uw pin, uw pid) {
   fpr_spawns++;
   if (hart >= fpr_live_harts) fpr_cpanic("spawnOn: no such hart (Sys.harts is the live count)");
   if (ISINT(f) || TID(f) != T_PAP) fpr_cpanic("spawn: argument must be a function");
@@ -876,6 +920,7 @@ static V spawn_on(uw hart, V f, uw pin) {
   {
     acb_t *cur = fpr_hart()->current;
     a->parent = cur ? cur->id : 0;
+    a->pid = pid != (uw)-1 ? pid : (cur ? cur->pid : 0);
   }
   ledger_push(a);
   for (int i = 0; i < 16; i++) a->ctx[i] = 0;
@@ -889,17 +934,32 @@ static V spawn_on(uw hart, V f, uw pin) {
   return (V)a;
 }
 
-static V a_spawn(V f) { return spawn_on(fpr_hart()->id, f, 0); }
+static V a_spawn(V f) {
+  if (fpr_sched) return fpr_sched->spawn(f);
+  return spawn_on(fpr_hart()->id, f, 0);
+}
 static V a_spawn_at(V hv, V f) {
+  if (fpr_sched) return fpr_sched->spawn_at(hv, f);
   if (ISINT(hv) == 0) fpr_cpanic("spawnOn: hart must be an Int");
   return spawn_on((uw)UNTAG(hv), f, 1); /* explicit placement pins */
 }
+
+/* myPid u -> Int: the ACB's owning process (0 = the boot image) */
+static V a_mypid(V u) {
+  (void)u;
+  acb_t *cur = fpr_hart()->current;
+  return TAG((sw)(cur ? cur->pid : 0));
+}
+FPR_FN(fpr_g_myPid, a_mypid, 1);
+
+
 
 /* the send core, sender key EXPLICIT: a_send passes the current acb;
  * the SYSCALL TRAMPOLINE (process.c) passes its dormant reply mailbox
  * so a loaded process -- which lives in its own scheduler world -- can
  * still publish into System.qa's storage actor. */
 V fpr_send_as(uw sender_key, V av, V m) {
+  if (fpr_sched) return fpr_sched->send_as(sender_key, av, m);
   if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("send: target is not an actor");
   acb_t *a = (acb_t *)av;
   if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD)
@@ -960,6 +1020,7 @@ V fpr_syscall_wait_result(void) {
 
 /* fair receive: round-robin over channels, FIFO within a channel */
 static V a_receive(V me) {
+  if (fpr_sched) return fpr_sched->receive(me);
   fpr_hart_t *h = fpr_hart();
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("receive: not the current actor's handle");
@@ -979,6 +1040,7 @@ static V a_receive(V me) {
 
 /* selective receive by SENDER: only that sender's channel, FIFO */
 static V a_receive_from(V me, V fromv) {
+  if (fpr_sched) return fpr_sched->receive_from(me, fromv);
   fpr_hart_t *h = fpr_hart();
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("receiveFrom: not the current actor's handle");
@@ -996,6 +1058,7 @@ static V a_receive_from(V me, V fromv) {
 
 /* selective receive by TYPE: next T_RESULT from any channel */
 static V a_receive_res(V me) {
+  if (fpr_sched) return fpr_sched->receive_res(me);
   fpr_hart_t *h = fpr_hart();
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("receiveRes: not the current actor's handle");
@@ -1016,6 +1079,17 @@ static V a_receive_res(V me) {
 }
 
 static V a_yield(V me) {
+  if (fpr_sched) {
+    /* routed: requeue-and-reschedule THROUGH THE PLANE.  Running the
+     * local enq here would push the acb through this image's private
+     * copy of the backlog/donation machinery -- and a donation would
+     * strand it in a steal ring no kernel hart ever reads. */
+    fpr_hart_t *h = fpr_hart();
+    if (ISINT(me) || (acb_t *)me != h->current)
+      fpr_cpanic("yield: not the current actor's handle");
+    fpr_sched->fuel();
+    return (V)&fpr_unit;
+  }
   fpr_hart_t *h = fpr_hart();
   if (ISINT(me) || (acb_t *)me != h->current)
     fpr_cpanic("yield: not the current actor's handle");
@@ -1154,3 +1228,37 @@ static V g_actInfo(V iv) {
 }
 FPR_FN(fpr_g_Sys_x2eactLive, g_actLive, 1);
 FPR_FN(fpr_g_Sys_x2eactInfo, g_actInfo, 1);
+
+/* ---- the exported plane (fpr.h fpr_sched_t) ------------------------- */
+static V sched_spawn(V f) { return spawn_on(fpr_hart()->id, f, 0); }
+static V sched_spawn_at(V hv, V f) {
+  if (ISINT(hv) == 0) fpr_cpanic("spawnOn: hart must be an Int");
+  return spawn_on((uw)UNTAG(hv), f, 1);
+}
+static V sched_spawn_pid(V f, uw pid) {
+  return spawn_on_pid(fpr_hart()->id, f, 0, pid);
+}
+static V sched_receive(V me) { return a_receive(me); }
+static V sched_receive_from(V me, V from) { return a_receive_from(me, from); }
+static V sched_receive_res(V me) { return a_receive_res(me); }
+V fpr_receive_res_c(V me) { return a_receive_res(me); } /* process.c's syscall wait */
+static uw sched_arc_live(void) { return fpr_arc_live_count(); }
+void fpr_sched_export(fpr_sched_t *out) {
+  extern char _heap_start[], _proc_arena_end[];
+  out->send_as = fpr_send_as;
+  out->receive = sched_receive;
+  out->receive_from = sched_receive_from;
+  out->receive_res = sched_receive_res;
+  out->spawn = sched_spawn;
+  out->spawn_at = sched_spawn_at;
+  out->spawn_pid = sched_spawn_pid;
+  out->arc_incref = fpr_arc_incref;
+  out->arc_decref = fpr_arc_decref;
+  out->slab_new = fpr_slab_new;
+  out->slab_release = fpr_slab_release;
+  out->pool_reset = fpr_pool_reset_c;
+  out->fuel = fpr_fuel_exhausted;
+  out->arc_live = sched_arc_live;
+  out->heap_lo = _heap_start;
+  out->heap_hi = _proc_arena_end;
+}

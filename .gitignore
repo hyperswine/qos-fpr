@@ -29,3 +29,6 @@ fp-risc/build/beta.s*
 fp-risc/image.elf
 qos/qos-store/*.kv
 !qos/qos-store/qsys.kv
+fp-risc/build/tp.*
+fp-risc/build/tpar.*
+fp-risc/build/ck-par.*

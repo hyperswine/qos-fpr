@@ -19,6 +19,7 @@ ENTRY(fpr_process_entry)
 MEMORY { SLOT (rwx) : ORIGIN = PROC_SLOT_BASE, LENGTH = 16M }
 
 SECTIONS {
+  _proc_image_start = PROC_SLOT_BASE; /* statics window base (fpr_static_lo) */
   .text : { *(.text .text.*) } > SLOT
   .rodata : { *(.rodata .rodata.*) *(.srodata .srodata.*) } > SLOT
   .data : { *(.data .data.*) *(.sdata .sdata.*) } > SLOT

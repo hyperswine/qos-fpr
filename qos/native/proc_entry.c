@@ -7,8 +7,11 @@
  * loader on an already-running hart).
  *
  * What it does NOT do, on purpose, contrasted with crt0.S:
- *   - no secondary-hart wfi-park dance (a loaded process is single-hart
- *     in this design pass; SMP-within-a-process is future work)
+ *   - no secondary-hart wfi-park dance: on the SHARED PLANE (the
+ *     normal path now) the process has no harts of its own at all --
+ *     its actors are transparent pid-tagged ACBs in the kernel's
+ *     per-hart queues, donated and stolen across every live hart like
+ *     System.qa's own; the legacy branch below is single-hart
  *   - no fpr_rvv_enable() call (mstatus.VS is hart-global; if the
  *     loader's hart already enabled it, it's already on for us)
  *   - no reading of fixed _heap_start/_heap_end linker symbols for the
@@ -45,9 +48,46 @@ static V h_sys_store_req(V tagv, V payv) {
 }
 FPR_FN(fpr_g_Sys_x2estoreReq, h_sys_store_req, 2);
 
+/* the shared-plane boot blob (process.c passes it; NULL = legacy
+ * nested-scheduler mode).  With a plane, this image's actors are
+ * TRANSPARENT ACBs: spawned into the kernel's per-hart queues with
+ * this process's pid, donated/stolen like any of System.qa's own. */
+typedef struct {
+  fpr_sched_t *sched;
+  void *reply;          /* the launcher's acb: main's result goes here */
+  uw pid;
+  void (*on_exit)(void);
+} fpr_shared_boot_t;
+
+static V g_reply;
+static void (*g_on_exit)(void);
+extern V fpr_fn_main(void);
+extern V fpr_prim_fn_str(V v); /* runtime.c: render, same as print */
+
+/* the root ACB's body: run main, ship the result as a T_RESULT (the
+ * launcher's receiveRes picks it out of any interleaving), tell the
+ * loader the slot is quiescent, die like any actor */
+static V proc_root(V self) {
+  V r = fpr_prim_fn_str(fpr_fn_main()); /* launcher prints a STRING */
+  /* force a preheadered heap copy: main may return a rodata literal
+   * (fpr_prim_fn_str returns strings by identity), and send's deep
+   * copy sizes every cell from its 16-byte allocation preheader --
+   * which image statics, though inside the in_heap span, don't have */
+  str_t *rs = (str_t *)r;
+  r = (V)fpr_mkstr(rs->bytes, rs->len);
+  hdr_t *res = (hdr_t *)fpr_alloc(8 + sizeof(uw));
+  res->tid = T_RESULT;
+  res->var = 0; /* Ok */
+  *(V *)((char *)res + 8) = r;
+  fpr_send_as((uw)self, g_reply, (V)res);
+  if (g_on_exit) g_on_exit();
+  return (V)&fpr_unit;
+}
+
 V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_bytes),
                     const unsigned char *caps, uw caps_len,
-                    sw (*syscall_fn)(uw, const char *, uw, char *, uw)) {
+                    sw (*syscall_fn)(uw, const char *, uw, char *, uw),
+                    void *shared_boot) {
   extern char _bss_start[], _bss_end[];
   /* tp is a PHYSICAL CPU REGISTER, global to the hart -- fpr_set_tp
    * below repoints it at OUR OWN fpr_harts[0] so this image's
@@ -63,12 +103,53 @@ V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_b
    * apparent connection to process loading at all. */
   fpr_hart_t *caller_h;
   __asm__ volatile("mv %0, tp" : "=r"(caller_h));
+  fpr_shared_boot_t *sb = (fpr_shared_boot_t *)shared_boot;
   /* elfload.c already zeroes each segment's memsz-filesz tail, which
    * covers .bss when the linker merges it into the same PT_LOAD as
    * .data (the common case with this MEMORY layout's single rwx
    * region) -- clearing it again here is cheap and makes this function
    * correct on its own, independent of that merging detail. */
   for (char *p = _bss_start; p < _bss_end; p++) *p = 0;
+
+  if (sb) {
+    /* SHARED PLANE: no private harts, no nested hart loop, no tp
+     * repoint -- the root actor is spawned into the kernel's queues
+     * with our pid and runs whenever a hart picks it up.  Pools grow
+     * from the shared buddy (fpr_alloc's fpr_sched branch), so the
+     * kernel reaps our acbs exactly like its own. */
+    g_caps_bytes = caps;
+    g_caps_len = caps_len;
+    g_syscall = syscall_fn;
+    g_reply = (V)sb->reply;
+    g_on_exit = sb->on_exit;
+    fpr_sched = sb->sched;
+    /* OUR OWN statics window: the shared span (heap_lo..heap_hi)
+     * covers the slot this image is loaded into, but our code/rodata/
+     * data/bss cells have no alloc preheaders -- register the window
+     * so this image's own in_heap tests skip them too (fpr.h) */
+    {
+      extern char _proc_image_start[], _proc_image_end[];
+      fpr_static_lo = _proc_image_start;
+      fpr_static_hi = _proc_image_end;
+    }
+    (void)heap_base; (void)heap_size; (void)grow; /* legacy-slot plumbing */
+    /* the root pap must be a PREHEADERED heap cell: spawn deep-copies
+     * its entry pap, and the copier derives each cell's byte count
+     * from the 16-byte allocation preheader.  An image static sits
+     * inside the proc arena (so fpr_in_heap says yes) but has no
+     * preheader -- the garbage "size" there once asked the copier for
+     * ~250 MB.  tp still points at the CALLER's hart here, so this
+     * allocates from the launcher actor's pool, exactly where a spawn
+     * argument written in System.qa's own code would live. */
+    pap0_t *root = (pap0_t *)fpr_alloc(sizeof(pap0_t));
+    root->tid = T_PAP;
+    root->var = 0;
+    root->fn = (uw)proc_root;
+    root->arity = 1;
+    root->nargs = 0;
+    fpr_sched->spawn_pid((V)root, sb->pid);
+    return (V)&fpr_unit; /* launched; the result arrives as a message */
+  }
 
   fpr_hart_t *h = &fpr_harts[0];
   h->id = 0;

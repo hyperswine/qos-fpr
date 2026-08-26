@@ -432,6 +432,7 @@ builtinEnv =
       -- floats (raw-bits payloads; see runtime.c's float essay)
       ("f64frombits", mono (TFn tInt (TFn tInt tF64))),
       ("f32frombits", mono (TFn tInt tF32)),
+      ("myPid", mono (TFn tInt tInt)),
       ("F64.sqrt", mono (TFn tF64 tF64)),
       ("F64.log", mono (TFn tF64 tF64)),
       ("F64.log2", mono (TFn tF64 tF64)),
