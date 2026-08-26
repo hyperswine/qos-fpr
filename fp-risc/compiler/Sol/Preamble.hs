@@ -81,6 +81,7 @@ prelude =
       "readLineNow u = read NowLine.",
       "Vector 1 = Type (Vector Int).",
       "Vec.new : Unit -> Vector.",
+      "Vec.range : Int -> Int -> Vector.",
       "Vec.push : a -> Vector -> Vector.",
       "Vec.len : Vector -> (Int, Vector).",
       "Vec.get : Int -> Vector -> (a, Vector).",
@@ -169,7 +170,7 @@ halArities =
       ("read", 1), ("write", 2),
       ("Num.div", 2), ("Num.sqrt", 1), ("Num.floor", 1), ("Num.round", 1),
       ("map", 2), ("filter", 2), ("foldl", 3),
-      ("Vec.new", 1), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
+      ("Vec.new", 1), ("Vec.range", 2), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
       ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
       ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1),
       ("use", 1), ("run", 2), ("View.serve", 5)

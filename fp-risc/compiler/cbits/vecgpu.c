@@ -10,8 +10,9 @@
  *
  * API (Sol/Gpu.hs FFI):
  *   solgpu_init()                       -> 1 ok / 0 unavailable (probe once)
- *   solgpu_map_f64(src, xs, out, n)    -> 0 ok / -1 (src = full GLSL text;
- *                                          programs cached by source)
+ *   solgpu_map_f64(src, us, nu, xs, out, n) -> 0 ok / -1 (src = full GLSL
+ *                       text, programs cached by source; us = nu captured
+ *                       scalars bound to double uniforms u0..u{nu-1})
  */
 #if defined(__APPLE__) && !defined(SOL_GPU_APPLE)
 /* macOS: no system EGL; mesa-from-brew is opt-in (-DSOL_GPU_APPLE with
@@ -19,8 +20,9 @@
  * init instead of crashing at startup. */
 #include <stdint.h>
 int solgpu_init(void) { return 0; }
-int solgpu_map_f64(const char *src, const double *xs, double *out, long n) {
-  (void)src; (void)xs; (void)out; (void)n; return -1;
+int solgpu_map_f64(const char *src, const double *us, long nu,
+                   const double *xs, double *out, long n) {
+  (void)src; (void)us; (void)nu; (void)xs; (void)out; (void)n; return -1;
 }
 #else
 #include <EGL/egl.h>
@@ -66,6 +68,8 @@ typedef void (*PFNMEMBAR)(GLbitfield);
 typedef void (*PFNGETBUFSUB)(GLenum, GLintptr, GLsizeiptr, void *);
 typedef void (*PFNDELBUF)(GLsizei, const GLuint *);
 typedef void (*PFNDELSH)(GLuint);
+typedef GLint (*PFNGETUNILOC)(GLuint, const char *);
+typedef void (*PFNUNIFORM1D)(GLint, double);
 
 int solgpu_init(void) {
   if (g_ready) return 1;
@@ -120,9 +124,15 @@ static GLuint compileProg(const char *src) {
   return p;
 }
 
-int solgpu_map_f64(const char *src, const double *xs, double *out, long n) {
+/* captured scalars ride uniform slots u0..u{nu-1}: the program cache is
+ * keyed by SOURCE, so a training loop whose parameters change every
+ * epoch reuses one compiled shader and only the uniform values move */
+int solgpu_map_f64(const char *src, const double *us, long nu,
+                   const double *xs, double *out, long n) {
   if (!g_ready || n <= 0) return -1;
   GP(PFNUSEPROG, glUseProgram)
+  GP(PFNGETUNILOC, glGetUniformLocation)
+  GP(PFNUNIFORM1D, glUniform1d)
   GP(PFNGENBUF, glGenBuffers)
   GP(PFNBINDBUF, glBindBuffer)
   GP(PFNBUFDATA, glBufferData)
@@ -143,6 +153,15 @@ int solgpu_map_f64(const char *src, const double *xs, double *out, long n) {
   glBufferData_(SSBO, n * 8, NULL, SREAD);
   glBindBufferBase_(SSBO, 1, buf[1]);
   glUseProgram_(prog);
+  for (long i = 0; i < nu; i++) {
+    char nm[8];
+    nm[0] = 'u';
+    if (i < 10) { nm[1] = (char)('0' + i); nm[2] = 0; }
+    else { nm[1] = (char)('0' + i / 10); nm[2] = (char)('0' + i % 10); nm[3] = 0; }
+    GLint loc = glGetUniformLocation_(prog, nm);
+    if (loc < 0) { glDeleteBuffers_(2, buf); return -1; } /* mismatch: decline */
+    glUniform1d_(loc, us[i]);
+  }
   glDispatchCompute_((GLuint)((n + 63) / 64), 1, 1);
   glMemoryBarrier_(0x00000200 /* SHADER_STORAGE_BARRIER_BIT */);
   glBindBuffer_(SSBO, buf[1]);

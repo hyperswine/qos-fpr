@@ -387,6 +387,17 @@ toListVec ref = do
   n <- lenVec ref
   mapM (getVec ref) [0 .. n - 1]
 
+-- Vec.range lo hi: bulk construction at native speed -- one unboxed
+-- KInt column, no per-element interpretation.  `Vec.range 1 n |>
+-- Vec.map f` is the fast spelling of "generate n samples": the fill is
+-- this loop, the shaping is the JIT/GPU tier's map.
+vecRange :: Int64 -> Int64 -> IO Value
+vecRange lo hi = do
+  let n = max 0 (fromIntegral (hi - lo + 1))
+  fp <- mallocForeignPtrArray (max 1 n)
+  withForeignPtr fp $ \p -> mapM_ (\i -> pokeElemOff p i (lo + fromIntegral i)) [0 .. n - 1]
+  VVec <$> newIORef (VecStore n [CI (max 1 n) fp] (RScalar KInt))
+
 -- build a fresh scalar-int vector from native results (JIT map output)
 vecFromInts :: [Int64] -> IO Value
 vecFromInts xs = do

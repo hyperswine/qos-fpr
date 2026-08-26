@@ -363,7 +363,7 @@ builtinArities =
   M.union schemeArities $
     M.fromList
       [ ("use", 1), ("run", 2), ("View.serve", 5),
-        ("Vec.new", 1), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
+        ("Vec.new", 1), ("Vec.range", 2), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
         ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1)
       ]
@@ -491,8 +491,8 @@ schemeCall env name args = case (name, args) of
         Just g <- unappliedFn f,
         Just (JD, bits) <- toTyped xs,
         length bits >= Gpu.gpuMinLen,
-        Just src <- Gpu.glslOfFn (vmCore env) g = do
-          r <- Gpu.gpuMapF64 gc src (map b2d' bits)
+        Just src <- Gpu.glslOfFn (vmCore env) g 0 = do
+          r <- Gpu.gpuMapF64 gc src [] (map b2d' bits)
           case r of
             Just out -> do
               putStrLn ("[gpu] map<" ++ g ++ "> n=" ++ show (length bits) ++ " (f64 compute shader)")
@@ -917,6 +917,10 @@ getEnvDebug = unsafePerformIO (fmap (== Just "1") (lookupEnv "SOL_JIT_DEBUG"))
 vecCall :: VMEnv -> Name -> [Value] -> IO Value
 vecCall env name args = case (name, args) of
   ("Vec.new", [_]) -> newVec
+  -- bulk construction at NATIVE speed: the push-per-element fill loop is
+  -- interpreted bytecode and dominates ML-scale pipelines; range + a
+  -- JIT/GPU map is the fast spelling of "generate n samples"
+  ("Vec.range", [VInt lo, VInt hi]) -> vecRange (fromIntegral lo) (fromIntegral hi)
   ("Vec.push", [x, VVec r]) -> pushVec r x >> pure (VVec r)
   ("Vec.len", [VVec r]) -> do n <- lenVec r; pure (VData 4 0 [VInt (fromIntegral n), VVec r])
   ("Vec.get", [VInt i, VVec r]) -> do
@@ -955,18 +959,24 @@ vecScheme env scheme f macc r = do
   -- below the SSBO round-trip crossover the JIT wins).  Declines fall
   -- through to the JIT, which falls through to the interpreter.
   gpu <- case (vmGpu env, jitCallable env scheme f, layoutInfo st) of
-    (Just gc, Just (g, []), Just (_, [KNum], _))
+    (Just gc, Just (g, ex), Just (_, [KNum], _))
       | scheme == "vecmap",
         n >= Gpu.gpuMinLen,
-        Just src <- Gpu.glslOfFn (vmCore env) g ->
+        -- captured scalars ride double uniforms; only f64 captures keep
+        -- the bit-identical contract (an exact-Int capture could be used
+        -- in exact-int arithmetic the shader would silently double-ize)
+        all ((== JD) . snd) ex,
+        Just src <- Gpu.glslOfFn (vmCore env) g (length ex) ->
           withColPtrs st $ \colpp -> do
             colp <- peek colpp -- single column
             bits <- peekArray n colp
-            res <- Gpu.gpuMapF64 gc src (map b2d bits)
+            res <- Gpu.gpuMapF64 gc src (map (b2d . fst) ex) (map b2d bits)
             case res of
               Nothing -> pure Nothing
               Just out -> do
-                putStrLn ("[gpu] vecmap<" ++ g ++ "> n=" ++ show n ++ " (f64 compute; gates: pure+f64+n>=" ++ show Gpu.gpuMinLen ++ ")")
+                putStrLn ("[gpu] vecmap<" ++ g ++ "> n=" ++ show n
+                          ++ (if null ex then "" else " +" ++ show (length ex) ++ " uniform capture(s)")
+                          ++ " (f64 compute; gates: pure+f64+n>=" ++ show Gpu.gpuMinLen ++ ")")
                 Just <$> vecFromNums out
     _ -> pure Nothing
   jitted <- case gpu of
