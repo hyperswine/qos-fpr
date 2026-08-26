@@ -12,6 +12,7 @@ directories or thread app.qa paths by hand again.
 
     ./qos.py build                  bring fpr + qosp up to date
     ./qos.py run tests/dtree.fpr    compile + host on qosp (the default)
+    ./qos.py run programs/interactive_desktop_gl.fpr  ... on qosp-gl
     ./qos.py run tests/fmath.fpr --on virt      ... on bare-metal QEMU
     ./qos.py run sol/examples/todo.sol          ... .sol runs the sol profile
     ./qos.py serve tests/mvuweb.fpr --port 8080 LiveView app, URL printed
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent
 FPR = ROOT / "fp-risc"
@@ -43,7 +45,7 @@ def say(msg):
     print(f"\033[36m[qos]\033[0m {msg}", flush=True)
 
 
-def die(msg, code=1):
+def die(msg, code=1) -> NoReturn:
     print(f"\033[31m[qos]\033[0m {msg}", file=sys.stderr)
     sys.exit(code)
 
@@ -107,9 +109,11 @@ def build_fpr():
     sh(["make", "-s", "fpr"], cwd=FPR, quiet=True)
 
 
-def build_qosp():
-    say("qosp (portable host; no-op when fresh)")
-    sh(["make", "-s", "portable"], cwd=QOS, quiet=True)
+def build_qosp(gfx=False):
+    target = "portable-gl" if gfx else "portable"
+    host = "qosp-gl" if gfx else "qosp"
+    say(f"{host} (portable host; no-op when fresh)")
+    sh(["make", "-s", target], cwd=QOS, quiet=True)
 
 
 def build_native():
@@ -155,8 +159,10 @@ def cmd_run(a):
         return run_scan(cmd, cwd=FPR, expect=a.expect)
 
     # the default: host the .qa on qosp
+    gfx = a.gfx or Path(prog).stem.endswith("_desktop_gl")
+    host = "qosp-gl" if gfx else "qosp"
     build_app(prog, a.harts)
-    build_qosp()
+    build_qosp(gfx=gfx)
     env = {}
     if a.port:
         env["FPR_PORT"] = a.port
@@ -165,8 +171,8 @@ def cmd_run(a):
     if a.fresh_disk:
         (QOS / "qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
-    say(f"qosp: {prog}" + (f"  (port {a.port})" if a.port else ""))
-    rc = run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=a.expect)
+    say(f"{host}: {prog}" + (f"  (port {a.port})" if a.port else ""))
+    rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=a.expect)
     say(f"total {time.time() - t0:.1f}s")
 
     return rc
@@ -300,6 +306,7 @@ def main():
     p.add_argument("--on", choices=["qosp", "virt", "sol"], default="qosp", help="qosp (hosted, default) | virt (bare-metal QEMU) | sol")
     p.add_argument("--port", help="FPR_PORT for the socket tier")
     p.add_argument("--harts", help="hart count")
+    p.add_argument("--gfx", action="store_true", help="use the desktop-GL qosp host")
     p.add_argument("--fresh-disk", action="store_true", help="delete qosp.disk first")
     p.add_argument("--expect", help="require this substring in the output")
     p.set_defaults(f=cmd_run)
