@@ -62,12 +62,13 @@ rpc svc msg =
   _ = send svc (me, msg);
   receiveFrom me svc.
 
-# check-and-RELEASE: every reply is a deep-copied message whose slab
-# is ours to drop once read (the drop parks; the runtime frees it at
-# our next receive, which is after any borrow below ends)
-wantOk what r = case wantOk1 what r of
-    u -> drop r.
-wantOk1 what r = case r of
+# one checked round trip: rpc is a transitive receive-origin, so
+# AUTODROP v2 discharges the reply's release here -- no manual drop
+# anywhere in this module (the leak this client once shipped is now
+# impossible to write)
+okCall what svc msg =
+  r = rpc svc msg;
+  case r of
     UOk -> Unit
   | UErr e -> error "uart {what}: {e}"
   | o -> error "uart {what}: protocol reply mismatch".
@@ -76,19 +77,19 @@ wantOk1 what r = case r of
 
 open : Int -> UartCfg .
 open svc =
-  _ = wantOk "open" (rpc svc UOpen);
+  _ = okCall "open" svc UOpen;
   UartCfg svc.
 
 params : UartCfg -> Int -> UartCfg .
 params h d =
   svc = cfgSvc h;
-  _ = wantOk "params" (rpc svc (UParams d));
+  _ = okCall "params" svc (UParams d);
   UartCfg svc.
 
 buffer : UartCfg -> Int -> UartCfg .
 buffer h n =
   svc = cfgSvc h;
-  _ = wantOk "buffer" (rpc svc (UBuf n));
+  _ = okCall "buffer" svc (UBuf n);
   UartCfg svc.
 
 # ---- the phase transition ---------------------------------------------------
@@ -96,7 +97,7 @@ buffer h n =
 arm : UartCfg -> Uart .
 arm h =
   svc = cfgSvc h;
-  _ = wantOk "arm" (rpc svc UArm);
+  _ = okCall "arm" svc UArm;
   Uart svc.
 
 # ---- phase 2: live ----------------------------------------------------------
@@ -110,14 +111,13 @@ write h s =
     UOkI k -> k
   | UErr e -> error "uart write: {e}"
   | o -> error "uart write: protocol reply mismatch";
-  _ = drop r;
   (n, Uart svc).
 
 # completion: answered when the outgoing buffer has fully drained
 flush : Uart -> Uart .
 flush h =
   svc = uSvc h;
-  _ = wantOk "flush" (rpc svc UFlush);
+  _ = okCall "flush" svc UFlush;
   Uart svc.
 
 # take whatever rx bytes the interrupt path has buffered (may be "")
@@ -125,28 +125,28 @@ readRx : Uart -> (String, Uart) .
 readRx h =
   svc = uSvc h;
   r = rpc svc UGet;
-  # copy the payload OUT of the message slab before releasing it: the
-  # returned string must outlive our next receive
+  # copy the payload OUT of the message slab (strcat) -- the returned
+  # string must outlive our next receive; the reply root's release is
+  # autodrop's (shape 3, after this binding)
   s = case r of
     UOkS m -> strcat m ""
   | UErr e -> error "uart readRx: {e}"
   | o -> error "uart readRx: protocol reply mismatch";
-  _ = drop r;
   (s, Uart svc).
 
 # downstream push: future rx chunks arrive at `a` as (URx bytes)
 sub : Uart -> Int -> Uart .
 sub h a =
   svc = uSvc h;
-  _ = wantOk "sub" (rpc svc (USub a));
+  _ = okCall "sub" svc (USub a);
   Uart svc.
 
 # owner's opt-in to SHARED data movement (System.qa's routed tier)
 share : Uart -> Uart .
 share h =
   svc = uSvc h;
-  _ = wantOk "share" (rpc svc UM.UShare);
+  _ = okCall "share" svc UM.UShare;
   Uart svc.
 
 close : Uart -> Unit .
-close h = wantOk "close" (rpc (uSvc h) UClose).
+close h = okCall "close" (uSvc h) UClose.

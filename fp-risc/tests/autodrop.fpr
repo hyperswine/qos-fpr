@@ -59,6 +59,28 @@ loop me e n stop acc =
   (v, z) = r;
   loop me e (n + 1) stop (acc + v) .
 
+# ---- v2: the transitive-origin + last-use shape ---------------------
+# `ask2` tail-returns receiveFrom, so the FIXPOINT marks it a
+# receive-origin; `rq` binds its result, reads it through a case (a
+# borrow), and never drops -- shape 3 inserts the drop after the last
+# use.  200 rounds must leave arcLive flat, same witness as the
+# hand-free shapes above.
+ask2 : Int -> Int -> Int -> _ .
+ask2 me e n =
+  _ = send e (me, n);
+  receiveFrom me e.
+
+rq : Int -> Int -> Int -> Int .
+rq me e n =
+  r = ask2 me e n;
+  v = case r of (a, z) -> a;
+  v + z0 v.
+z0 v = 0.
+
+rloop : unsafe Int -> Int -> Int -> Int -> Int -> Int .
+rloop me e n stop acc | n > stop = acc.
+rloop me e n stop acc = rloop me e (n + 1) stop (acc + rq me e n).
+
 main =
   me = myself 0;
   _ = nl >> puts "autodrop: the drop law, discharged by the compiler" >> nl;
@@ -73,8 +95,11 @@ main =
   s2 = nloop me v 1 200 0;
   lv2 = arcLive 0;
   _ = puts "case-shape 200:   arcLive = {lv2}  (lensum = {s2})" >> nl;
-  verdict2 (lv == base) (lv2 == base) (s2 == 2092) .
+  s3 = rloop me e 1 200 0;
+  lv3 = arcLive 0;
+  _ = puts "shape-3 200:      arcLive = {lv3}  (sum = {s3})" >> nl;
+  verdict3 (lv == base) (lv2 == base) (lv3 == base) (s2 == 2092) .
 
-verdict2 : unsafe Bool -> Bool -> Bool -> Unit .
-verdict2 True True True = puts "AUTODROP HOLDS: 400 undropped-by-hand round trips (destructure + case shapes), zero Arc growth" >> nl.
-verdict2 a b c = puts "AUTODROP FAILED: flat1={a} flat2={b} sum={c}" >> nl.
+verdict3 : unsafe Bool -> Bool -> Bool -> Bool -> Unit .
+verdict3 True True True True = puts "AUTODROP HOLDS: 600 undropped-by-hand round trips (destructure + case + transitive last-use shapes), zero Arc growth" >> nl.
+verdict3 a b c d = puts "AUTODROP FAILED: flat1={a} flat2={b} flat3={c} sum={d}" >> nl.
