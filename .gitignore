@@ -34,3 +34,4 @@ fp-risc/build/tpar.*
 fp-risc/build/ck-par.*
 fp-risc/build/units/*-rvv.s
 fp-risc/build/ck-uneg*.fpr
+fp-risc/build/ck-m*.s
