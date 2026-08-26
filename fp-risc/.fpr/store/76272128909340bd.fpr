@@ -131,13 +131,9 @@ doOpen2 : unsafe Int -> St -> Int -> a .
 doOpen2 me st from =
   St dev owner cap txq rxs sub fl armed = st;
   d2 = device "uart";
-  # 8N1, interrupts off until UArm.  NO FCR write: setting the FIFO
-  # enable RESETS the rx fifo, and on the System tier open() runs at
-  # boot while the user's first keystrokes may already be buffered --
-  # the lost-y bug ate one permission answer and shifted the rest.
-  # QEMU's fifo is on regardless; a real 16550 bring-up would enable
-  # it in a context that owns the device from reset.
+  # 8N1, FIFO on, interrupts off until UArm
   _ = write (reg8 d2 3) 3;
+  _ = write (reg8 d2 2) 1;
   _ = write (reg8 d2 1) 0;
   reply me from UOk (St d2 from cap txq rxs sub fl 0).
 
