@@ -75,7 +75,7 @@ portable-a64: $(QOSP_SRC) appside/qos_abi.h portable/qa.h
 RT_CORE = $(HAL)/core/runtime.c $(HAL)/core/actors.c $(HAL)/core/bits.c \
           $(HAL)/core/vec.c $(HAL)/core/sstr.c $(HAL)/core/mod.c $(HAL)/core/buddy.c
 RT_VIRT = $(HAL)/virt/crt0.S $(HAL)/virt/ctx.S $(HAL)/virt/ctx_fab.c \
-          $(HAL)/virt/hal.c $(HAL)/virt/net.c $(HAL)/virt/blk.c $(HAL)/virt/memshim.c
+          $(HAL)/virt/hal.c $(HAL)/virt/plic.c $(HAL)/virt/net.c $(HAL)/virt/blk.c $(HAL)/virt/memshim.c
 ARCHFLAGS = -march=rv64imafdc_zicsr -mabi=lp64 -mcmodel=medany
 CFLAGS = $(ARCHFLAGS) -DFPR_NHARTS=$(HARTS) \
          -ffreestanding -nostdlib -nostartfiles -O2 -Wall -Wextra \

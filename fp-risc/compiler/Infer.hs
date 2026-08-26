@@ -492,6 +492,11 @@ builtinEnv =
       ("keep", scheme [0] (TFn (sv 0) (sv 0))),
       ("kill", mono (TFn tInt tUnit)),
       ("hartId", mono (TFn tInt tInt)),
+      -- device interrupts -> actor messages (actors.c irq bridge):
+      -- bind a PLIC source to an actor (deliveries arrive as plain
+      -- Int messages); ack re-arms the claimed-and-masked source
+      ("Sys.irqBind", mono (TFn tInt (TFn tInt tUnit))),
+      ("Sys.irqAck", mono (TFn tInt tUnit)),
       ("schedTau", mono (TFn tInt tInt)),
       ("schedSetTau", mono (TFn tInt tUnit)),
       ("schedMaxWait", mono (TFn tInt tInt)),

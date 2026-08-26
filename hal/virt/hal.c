@@ -291,6 +291,11 @@ void hal_timer_arm(uw hart, uint64_t delta) {
 
 /* mie.MSIE (bit 3) | mie.MTIE (bit 7); mstatus.MIE stays 0 on purpose */
 void hal_wfi_enable(void) {
-  __asm__ volatile("csrs mie, %0" ::"r"((uw)((1 << 3) | (1 << 7))));
+  /* MSIE | MTIE | MEIE: external interrupts join the wfi-wake set --
+   * mstatus.MIE stays OFF, so an enabled source pends (pops wfi) and
+   * the hart loop services it synchronously; no trap is ever taken.
+   * MEIP only ever raises on hart 0 (plic.c enables that one M
+   * context), so setting MEIE everywhere is harmless. */
+  __asm__ volatile("csrs mie, %0" ::"r"((uw)((1 << 3) | (1 << 7) | (1 << 11))));
 }
 void hal_wfi(void) { __asm__ volatile("wfi"); }

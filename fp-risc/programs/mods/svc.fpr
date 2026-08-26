@@ -39,6 +39,13 @@
 
 IoV = Type (IUnit | IInt Int | IStr String | IFn Int | IErr String).
 
+UartM = use "uart".
+UWrite = UartM.UWrite.
+UGet = UartM.UGet.
+UOkI = UartM.UOkI.
+UOkS = UartM.UOkS.
+UErr = UartM.UErr.
+
 # ---- module-local helpers ---------------------------------------------------
 
 and2 a b = case a of True -> b | False -> False.
@@ -112,8 +119,9 @@ capClk (Caps _ _ k _ _ _) = k.
 capGranted (Caps _ _ _ g _ _) = g.
 capId  (Caps _ _ _ _ a _) = a.
 capSt  (Caps _ _ _ _ _ s) = s.
-stHas st = case st of (h, _) -> h.
-stAct st = case st of (_, a) -> a.
+stHas st = case st of (h, _, _) -> h.
+stAct st = case st of (_, a, _) -> a.
+stUart st = case st of (_, _, u) -> u.
 
 # mode "rw" covers both verbs
 modeOk m want = or2 (strEq m want) (strEq m "rw").
@@ -197,9 +205,49 @@ dispatch caps url want v =
           True -> dModules url
         | False -> case prefixOf "/services/storage" url of
             True -> dStorage caps url want v
-          | False -> case prefixOf "/pins" url of
-              True -> dPins url want v
-            | False -> IErr (strcat "no route: " url).
+          | False -> case prefixOf "/services/uart" url of
+              True -> dUart caps want v
+            | False -> case prefixOf "/pins" url of
+                True -> dPins url want v
+              | False -> IErr (strcat "no route: " url).
+
+# "/services/uart": the actor-backed route to UART.qa (mods/uart.fpr).
+# write (IStr s) enqueues a DMA-shaped transmit and answers IInt n
+# (bytes accepted); read takes the rx buffer as IStr.  On System.qa's
+# native tier the service runs UNARMED and SHARED: tx rides the
+# service's outgoing buffer onto the console UART, rx stays the
+# keyboard service's (one 16550 is both).  A dedicated app that owns
+# its UART gets the full armed/interrupt path through std.uart.
+dUart caps want v = case strEq want "write" of
+    True -> dUartW caps v
+  | False -> dUartR caps.
+dUartW caps v = case v of
+    IStr s -> dUartW1 caps s
+  | _ -> IErr "/services/uart wants IStr".
+dUartW1 : unsafe _ -> String -> _ .
+dUartW1 caps s =
+  r = uartRpc caps (UWrite s);
+  o = uartWRep r;
+  _ = drop r;
+  o.
+uartWRep r = case r of
+    UOkI k -> IInt k
+  | UErr e -> IErr e
+  | ox -> IErr "/services/uart: protocol reply mismatch".
+dUartR : unsafe _ -> _ .
+dUartR caps =
+  r = uartRpc caps UGet;
+  o = uartRRep r;
+  _ = drop r;
+  o.
+uartRRep r = case r of
+    UOkS m -> IStr (strcat m "")
+  | UErr e -> IErr e
+  | ox -> IErr "/services/uart: protocol reply mismatch".
+uartRpc caps msg =
+  u = stUart (capSt caps);
+  _ = send u (capMe caps, msg);
+  receiveFrom (capMe caps) u.
 
 dDisplay caps url v = case v of
     IStr s -> dDisp1 caps url s
