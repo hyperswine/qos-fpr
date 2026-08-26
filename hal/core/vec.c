@@ -176,6 +176,32 @@ static V h_new(V unit) {
   return (V)x;
 }
 
+/* Vec.range lo hi: bulk construction at native speed -- one Int column
+ * filled by this loop instead of one interpreted/generic Vec.push per
+ * element (the fill loop dominates ML-scale pipelines; range + a
+ * specialized map is the fast spelling of "generate n samples").
+ * Empty range (hi < lo) leaves the layout UNSET, exactly like Vec.new. */
+static void fix_layout(vec_t *x, V v); /* fwd */
+static V h_range(V lov, V hiv) {
+  if (!ISINT(lov) || !ISINT(hiv)) fpr_cpanic("Vec.range: bounds must be Ints");
+  sw lo = UNTAG(lov), hi = UNTAG(hiv);
+  vec_t *x = (vec_t *)h_new((V)&fpr_unit);
+  if (hi < lo) return (V)x;
+  fix_layout(x, lov); /* one raw Int column */
+  col_t *c = x->cols[0];
+  uw n = (uw)(hi - lo + 1);
+  sw v = lo;
+  while (x->len < n) {
+    if (x->len == vl_cap(c->nblk)) vl_grow(c);
+    uw lim = vl_cap(c->nblk);
+    if (lim > n) lim = n;
+    uw *slot = vl_slot(c, x->len); /* blocks are contiguous arrays */
+    for (uw i = x->len; i < lim; i++) *slot++ = (uw)v++;
+    x->len = lim;
+  }
+  return (V)x;
+}
+
 static uw tuple_arity(uw tid) {
   if (tid == T_TUP2) return 2;
   if (tid == T_TUP3) return 3;
@@ -531,6 +557,7 @@ FPR_FN(fpr_g_Vec_x2emap, fpr_vec_map, 2);
 FPR_FN(fpr_g_Vec_x2efilter, fpr_vec_filter, 2);
 FPR_FN(fpr_g_Vec_x2efold, fpr_vec_fold, 3);
 FPR_FN(fpr_g_Vec_x2enewAs, h_newAs, 1);
+FPR_FN(fpr_g_Vec_x2erange, h_range, 2);
 FPR_FN(fpr_g_Vec_x2efromList, h_fromList, 1);
 FPR_FN(fpr_g_Vec_x2etoList, h_toList, 1);
 FPR_FN(fpr_g_Vec_x2efree, h_free, 1);

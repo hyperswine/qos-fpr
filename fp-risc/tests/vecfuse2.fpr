@@ -15,14 +15,13 @@
 # Expected: ok chain-sum / chain-inplace / wfold-sum / wfold-writeback /
 #           wfold-inplace, then "vecfuse2: OK"
 
+# v0 comes from Vec.range: the native bulk fill (one HAL loop, no
+# per-element push) -- `Vec.range 1 n |> Vec.map f` is the fast
+# spelling of "generate n samples", mirrored from the Sol tier.
 inc x = x + 1.
 dbl x = x * 2.
 mneg x = 0 - x.
 addA a x = a + x.
-
-fillI : unsafe Vector -> Int -> Int -> Vector .
-fillI v i lim | i > lim = v.
-fillI v i lim = fillI (Vec.push i v) (i + 1) lim.
 
 # reference for mneg (dbl (inc i)) summed over 1..lim
 refC : unsafe Int -> Int -> Int .
@@ -32,7 +31,7 @@ refC i lim = (0 - (i + 1) * 2) + refC (i + 1) lim.
 verdict n b = case b of True -> print "ok {n}" | False -> error "FAIL {n}".
 
 main =
-  v0 = fillI (Vec.new Unit) 1 1000;
+  v0 = Vec.range 1 1000;
 
   # ---- the 3-chain, pipeline spelling: must fully collapse ----
   h0 = heapUsed Unit;
