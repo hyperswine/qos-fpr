@@ -34,6 +34,7 @@ DESKTOP_GL_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 
 # ---- QOS Portable: the qosp host ---------------------------------------
 QOSP_SRC = portable/main.c portable/qa.c portable/haltab.c portable/store.c \
+           portable/compile.c \
            $(HAL)/unix/net_raw.c $(HAL)/unix/blk_raw.c $(HAL)/unix/hostlog.c \
            $(HAL)/unix/tty_raw.c $(HAL)/unix/evdev_raw.c \
            $(HAL)/core/buddy.c $(HAL)/core/qaimg.c

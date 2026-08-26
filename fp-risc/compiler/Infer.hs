@@ -545,7 +545,9 @@ builtinEnv =
       ("Sys.harts", mono (TFn tUnit tInt)),
       ("Sys.bindApp", scheme [0, 1] (TFn (sv 0) (sv 1))),
       ("Sys.bindStore", scheme [0, 1] (TFn (sv 0) (sv 1))),
-      ("Sys.storeReq", scheme [0, 1] (TFn (sv 0) (sv 1)))
+      ("Sys.storeReq", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      -- host compiler server (qosp tag-7 channel): profile -> source -> Result
+      ("Sys.compile", mono (TFn tStr (TFn tStr (tcon "Result" [tStr, tStr]))))
     ]
 
 builtinCons' :: TEnv
