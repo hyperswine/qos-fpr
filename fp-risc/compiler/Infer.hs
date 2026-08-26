@@ -548,6 +548,9 @@ builtinEnv =
       ("logWarn", scheme [0] (TFn tStr tUnit)),
       ("logErr", scheme [0] (TFn tStr tUnit)),
       ("Mod.has", mono (TFn tStr tBool)),
+      -- live-reload gate: every old export present in new, same arity
+      ("Mod.compatAt", scheme [0] (TFn tInt (TFn tInt (sv 0)))),
+      ("Mod.detachLast", mono (TFn tUnit tUnit)),
       -- Apps registry + Sys binding seam
       ("Apps.list", scheme [0] (TFn tUnit (sv 0))),
       ("Apps.read", scheme [0] (TFn tStr (sv 0))),

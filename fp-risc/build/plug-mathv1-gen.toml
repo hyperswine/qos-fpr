@@ -1,0 +1,5 @@
+name = "mathv1"
+id = "mathv1"
+entry = "fpr_modtab"
+version = "1"
+loadMode = "plugin"
