@@ -13,3 +13,7 @@ cd ../qos && make portable && ./qosp --yes ../fp-risc/app.qa
                                           # "[qos] hello => hello from a .qa: fold(1..10)=55 clamp=55"
 make native && make native-run            # kernel boots: disk online,
                                           # permission gate, TUI launcher + live clock
+
+DATA can be kept on GPU memory for large Vecs
+and transferred back to CPU memory when needed
+Otherwise it can be partitioned so 75/25
