@@ -4,6 +4,23 @@ ONE language, ONE frontend, FOUR execution profiles, and a provable std.
 This tree is the proof-of-concept merge of the previously separate
 qos-fpr and sol repos.
 
+## One entry point
+
+`./qos.py` is the pipeline layer over the tree -- the Makefiles stay
+the mechanism (each component's build knowledge), qos.py is the policy
+you actually drive it with:
+
+    ./qos.py run tests/dtree.fpr          # compile + host on qosp
+    ./qos.py run tests/fmath.fpr --on virt   # ... bare-metal QEMU
+    ./qos.py run sol/examples/todo.sol    # .sol -> the sol profile
+    ./qos.py serve tests/mvuweb.fpr --port 8080   # LiveView app
+    ./qos.py native --smoke               # kernel + disk + boot check
+    ./qos.py test                         # the fast smoke set (~30s)
+    ./qos.py test --all                   # the full sweep (check-all.sh)
+
+Everything delegates to make for staleness, so a fresh tree costs one
+compile and an up-to-date one costs nothing.
+
 ## Layout
 
     fp-risc/            the language project
