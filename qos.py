@@ -256,6 +256,7 @@ def cmd_test(a):
     build_qosp()
     t0 = time.time()
     fails = []
+    ran = 0
     for label, prog, backend, expect in SMOKE:
         if a.legs and not any(k in label or k in prog for k in a.legs):
             continue
@@ -270,6 +271,7 @@ def cmd_test(a):
                                capture_output=True, timeout=300)
             out = r.stdout.decode("utf-8", "replace")
         ok = expect in out
+        ran += 1
         say(f"{'ok  ' if ok else 'FAIL'} {label}")
         if not ok:
             fails.append(label)
@@ -278,11 +280,11 @@ def cmd_test(a):
         r = subprocess.run(["sh", "tests-host/mvuweb-check.sh"], cwd=QOS,
                            capture_output=True, timeout=300)
         ok = b"ALL LEGS PASS" in r.stdout
+        ran += 1
         say(f"{'ok  ' if ok else 'FAIL'} liveview multi-client")
         if not ok:
             fails.append("liveview")
-    say(f"smoke: {len(SMOKE) + 1 - len(fails)}/{len(SMOKE) + 1} in "
-        f"{time.time() - t0:.0f}s")
+    say(f"smoke: {ran - len(fails)}/{ran} in {time.time() - t0:.0f}s")
     if fails:
         die("failed: " + ", ".join(fails))
 
