@@ -8,7 +8,7 @@
  *     Polled, no interrupts — same discipline as the UART console.
  *
  *  2. A minimal transport so FPRISC can speak to the host: ARP responder,
- *     IPv4 (no fragments), and a ONE-connection TCP with no retransmit,
+ *     IPv4 (no fragments), and a small-table (NETCONN) TCP with no retransmit,
  *     no congestion control, and fire-and-forget sends. This is sound
  *     here and only here: the link is QEMU slirp, which is local and
  *     lossless. Think of it as a hardware TCP-offload engine the HAL
@@ -16,11 +16,12 @@
  *     file is the contract it would replace.
  *
  * FPRISC surface (every unknown FPRISC name links against fpr_g_*):
- *   netPoll d    -> Int     pump the NIC; 0 = no conn, 1 = conn open,
- *                           2 = conn open with buffered request bytes
- *   netRead d    -> String  drain up to 1 KiB of buffered payload
- *   netWrite d s -> Int     send s on the connection (segmented)
- *   netClose d   -> Int     FIN and release the connection slot
+ *   netPoll 0    -> Int     pump the NIC; the next connection id
+ *                           (1..NETCONN) with buffered request bytes,
+ *                           else 0 (fair rotation across peers)
+ *   netRead c    -> String  drain up to 1 KiB of connection c
+ *   netWrite c s -> Int     send s on connection c (segmented)
+ *   netClose c   -> Int     FIN and release connection c's slot
  *
  * Static identity (slirp defaults, no DHCP — PoC simplification):
  *   guest 10.0.2.15, gateway 10.0.2.2, MAC from device config space.
@@ -235,7 +236,8 @@ static u8 gw_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff}; /* learned from ARP/
 #define TCP_ACK 0x10
 
 #define RXRING 16384
-static struct {
+#define NETCONN 4
+typedef struct {
   int est;                 /* 0 free, 1 established */
   u8  pmac[6];
   u8  pip[4];
@@ -244,7 +246,21 @@ static struct {
   int peer_fin;
   u8  rx[RXRING];
   u32 rxlen;
-} conn;
+} conn_t;
+static conn_t conns[NETCONN];    /* v6: a small table, not one slot */
+static u32 conn_rr;              /* fair-poll rotation cursor */
+
+static conn_t *conn_find(const u8 *pip, u16 sport) {
+  for (int i = 0; i < NETCONN; i++)
+    if (conns[i].est && conns[i].pport == sport && neq(conns[i].pip, pip, 4))
+      return &conns[i];
+  return 0;
+}
+static conn_t *conn_alloc(void) {
+  for (int i = 0; i < NETCONN; i++)
+    if (!conns[i].est) return &conns[i];
+  return 0;                      /* table full: the SYN goes unanswered */
+}
 
 static u16 csum16(const u8 *p, u32 n, u32 seed) {
   u32 s = seed;
@@ -255,10 +271,10 @@ static u16 csum16(const u8 *p, u32 n, u32 seed) {
 }
 
 /* frame scratch layout inside tx_buf: [vhdr][eth 14][ip 20][tcp 20][payload] */
-static void tcp_send(u8 flags, const u8 *payload, u32 plen) {
+static void tcp_send(conn_t *cn, u8 flags, const u8 *payload, u32 plen) {
   u8 *eth = tx_buf + vhdr_len;
   u8 *ip = eth + 14, *tcp = ip + 20;
-  ncpy(eth, conn.pmac, 6);
+  ncpy(eth, cn->pmac, 6);
   ncpy(eth + 6, our_mac, 6);
   eth[12] = ETH_IP4 >> 8; eth[13] = ETH_IP4 & 0xff;
 
@@ -269,13 +285,13 @@ static void tcp_send(u8 flags, const u8 *payload, u32 plen) {
   ip[8] = 64; ip[9] = 6;                            /* TTL, TCP */
   ip[10] = 0; ip[11] = 0;
   ncpy(ip + 12, our_ip, 4);
-  ncpy(ip + 16, conn.pip, 4);
+  ncpy(ip + 16, cn->pip, 4);
   u16 ic = csum16(ip, 20, 0);
   ip[10] = ic >> 8; ip[11] = ic & 0xff;
 
   tcp[0] = 0; tcp[1] = 80;                          /* src port 80 */
-  tcp[2] = conn.pport >> 8; tcp[3] = conn.pport & 0xff;
-  u32 seq = conn.snd_nxt, ack = conn.rcv_nxt;
+  tcp[2] = cn->pport >> 8; tcp[3] = cn->pport & 0xff;
+  u32 seq = cn->snd_nxt, ack = cn->rcv_nxt;
   tcp[4] = seq >> 24; tcp[5] = seq >> 16; tcp[6] = seq >> 8; tcp[7] = seq;
   tcp[8] = ack >> 24; tcp[9] = ack >> 16; tcp[10] = ack >> 8; tcp[11] = ack;
   tcp[12] = 0x50;                                   /* 20-byte header */
@@ -287,7 +303,7 @@ static void tcp_send(u8 flags, const u8 *payload, u32 plen) {
   /* pseudo header: src ip, dst ip, 0, proto, tcp len; then TCP hdr+payload */
   u32 s = 0;
   s += (u32)(our_ip[0] << 8 | our_ip[1]); s += (u32)(our_ip[2] << 8 | our_ip[3]);
-  s += (u32)(conn.pip[0] << 8 | conn.pip[1]); s += (u32)(conn.pip[2] << 8 | conn.pip[3]);
+  s += (u32)(cn->pip[0] << 8 | cn->pip[1]); s += (u32)(cn->pip[2] << 8 | cn->pip[3]);
   s += 6; s += 20 + plen;
   {
     const u8 *p = tcp; u32 n = 20 + plen;
@@ -300,8 +316,8 @@ static void tcp_send(u8 flags, const u8 *payload, u32 plen) {
   tcp[16] = tc >> 8; tcp[17] = tc & 0xff;
 
   nic_tx(14 + iplen);
-  conn.snd_nxt += plen;
-  if (flags & (TCP_SYN | TCP_FIN)) conn.snd_nxt += 1;
+  cn->snd_nxt += plen;
+  if (flags & (TCP_SYN | TCP_FIN)) cn->snd_nxt += 1;
 }
 
 static void handle_arp(const u8 *f, u32 len) {
@@ -340,34 +356,37 @@ static void handle_tcp(const u8 *f, u32 len) {
   u8 flags = tcp[13];
   if (dport != 80) return;
 
-  if (flags & TCP_RST) { if (conn.est) conn.est = 0; return; }
+  conn_t *cn = conn_find(ip + 12, sport);
+  if (flags & TCP_RST) { if (cn) cn->est = 0; return; }
 
-  if ((flags & TCP_SYN) && !conn.est) {
-    conn.est = 1;
-    ncpy(conn.pmac, f + 6, 6);
-    ncpy(conn.pip, ip + 12, 4);
-    conn.pport = sport;
-    conn.rcv_nxt = seq + 1;
-    conn.snd_nxt = 0x00010000;
-    conn.rxlen = 0;
-    conn.peer_fin = 0;
-    tcp_send(TCP_SYN, 0, 0);                        /* SYN|ACK */
+  if ((flags & TCP_SYN) && !cn) {
+    cn = conn_alloc();
+    if (!cn) return;             /* table full: peer retries its SYN */
+    cn->est = 1;
+    ncpy(cn->pmac, f + 6, 6);
+    ncpy(cn->pip, ip + 12, 4);
+    cn->pport = sport;
+    cn->rcv_nxt = seq + 1;
+    cn->snd_nxt = 0x00010000;
+    cn->rxlen = 0;
+    cn->peer_fin = 0;
+    tcp_send(cn, TCP_SYN, 0, 0);                    /* SYN|ACK */
     return;
   }
-  if (!conn.est || sport != conn.pport || !neq(ip + 12, conn.pip, 4)) return;
+  if (!cn) return;
 
-  if (seq == conn.rcv_nxt) {
+  if (seq == cn->rcv_nxt) {
     if (plen) {
-      u32 room = RXRING - conn.rxlen;
+      u32 room = RXRING - cn->rxlen;
       u32 take = plen > room ? room : plen;
-      ncpy(conn.rx + conn.rxlen, payload, take);
-      conn.rxlen += take;
-      conn.rcv_nxt += plen;                         /* ack all; overflow drops */
+      ncpy(cn->rx + cn->rxlen, payload, take);
+      cn->rxlen += take;
+      cn->rcv_nxt += plen;                          /* ack all; overflow drops */
     }
-    if (flags & TCP_FIN) { conn.rcv_nxt += 1; conn.peer_fin = 1; }
-    if (plen || (flags & TCP_FIN)) tcp_send(0, 0, 0);
+    if (flags & TCP_FIN) { cn->rcv_nxt += 1; cn->peer_fin = 1; }
+    if (plen || (flags & TCP_FIN)) tcp_send(cn, 0, 0, 0);
   } else if (plen || (flags & TCP_FIN)) {
-    tcp_send(0, 0, 0);                              /* dup ACK at rcv_nxt */
+    tcp_send(cn, 0, 0, 0);                          /* dup ACK at rcv_nxt */
   }
 }
 
@@ -403,44 +422,61 @@ void net_setup(void) {
   if (!net_probe()) nputs("[net] no virtio-net device found\n");
 }
 
+/* v6: the arg is the CONNECTION ID.  netPoll 0 -> the next id with
+ * buffered rx (fair rotation) or 0; read/write/close address the id. */
+static conn_t *conn_of(V d) {
+  if (!ISINT(d)) return 0;
+  sw id = UNTAG(d);
+  if (id < 1 || id > NETCONN) return 0;
+  conn_t *cn = &conns[id - 1];
+  return cn->est ? cn : 0;
+}
+
 static V h_netPoll(V d) {
   (void)d;
   net_pump();
-  if (!conn.est) return TAG(0);
-  return TAG(conn.rxlen ? 2 : 1);
+  for (u32 k = 0; k < NETCONN; k++) {
+    u32 i = (conn_rr + k) % NETCONN;
+    if (conns[i].est && conns[i].rxlen) {
+      conn_rr = i + 1;
+      return TAG((sw)i + 1);
+    }
+  }
+  return TAG(0);
 }
 
 static V h_netRead(V d) {
-  (void)d;
   net_pump();
-  u32 n = conn.rxlen > 1024 ? 1024 : conn.rxlen;
-  str_t *s = fpr_mkstr(conn.rx, n);
+  conn_t *cn = conn_of(d);
+  if (!cn) return (V)fpr_mkstr((const u8 *)"", 0);
+  u32 n = cn->rxlen > 1024 ? 1024 : cn->rxlen;
+  str_t *s = fpr_mkstr(cn->rx, n);
   if (n) {
-    ncpy(conn.rx, conn.rx + n, conn.rxlen - n);
-    conn.rxlen -= n;
+    ncpy(cn->rx, cn->rx + n, cn->rxlen - n);
+    cn->rxlen -= n;
   }
   return (V)s;
 }
 
 static V h_netWrite(V d, V sv) {
-  (void)d;
   if (ISINT(sv) || TID(sv) != T_STR) fpr_cpanic("netWrite: not a String");
-  if (!conn.est) return TAG(0);
+  conn_t *cn = conn_of(d);
+  if (!cn) return TAG(0);
   str_t *s = (str_t *)sv;
   u64 off = 0;
   while (off < s->len) {
     u32 seg = s->len - off > 1200 ? 1200 : (u32)(s->len - off);
-    tcp_send(TCP_PSH, s->bytes + off, seg);
+    tcp_send(cn, TCP_PSH, s->bytes + off, seg);
     off += seg;
   }
   return TAG((sw)s->len);
 }
 
 static V h_netClose(V d) {
-  (void)d;
-  if (conn.est) {
-    tcp_send(TCP_FIN, 0, 0);
-    conn.est = 0;                /* PoC: no TIME_WAIT; slot free immediately */
+  conn_t *cn = conn_of(d);
+  if (cn) {
+    tcp_send(cn, TCP_FIN, 0, 0);
+    cn->est = 0;                 /* PoC: no TIME_WAIT; slot free immediately */
   }
   return TAG(0);
 }

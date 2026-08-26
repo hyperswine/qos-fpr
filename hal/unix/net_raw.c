@@ -17,10 +17,32 @@
 #include <unistd.h>
 
 #define RXCAP 8192
+#define MAXCONN QOS_NET_MAXCONN
 
-static int lfd = -1, cfd = -1;
-static uint8_t rx[RXCAP];
-static uint32_t rxlen;
+static int lfd = -1;
+static struct nconn {
+  int fd; /* -1 = free slot */
+  uint8_t rx[RXCAP];
+  uint32_t rxlen;
+} conns[MAXCONN];
+static int conns_init;
+static uint32_t poll_rr; /* fair-poll rotation cursor */
+
+static void conns_setup(void) {
+  if (conns_init) return;
+  conns_init = 1;
+  for (int i = 0; i < MAXCONN; i++) conns[i].fd = -1;
+}
+static struct nconn *conn_of(int64_t id) {
+  if (id < 1 || id > MAXCONN) return 0;
+  struct nconn *c = &conns[id - 1];
+  return c->fd >= 0 ? c : 0;
+}
+static void conn_drop(struct nconn *c) {
+  close(c->fd);
+  c->fd = -1;
+  c->rxlen = 0;
+}
 
 void qos_netraw_setup(void) {
   if (lfd >= 0) return;
@@ -48,53 +70,76 @@ void qos_netraw_setup(void) {
 
 static void net_pump(void) {
   if (lfd < 0) return;
-  if (cfd < 0) {
-    cfd = accept(lfd, 0, 0);
-    if (cfd < 0) return; /* EAGAIN: nobody there */
-    fcntl(cfd, F_SETFL, O_NONBLOCK);
+  conns_setup();
+  /* accept as many waiting peers as free slots allow; a full table
+   * leaves the rest in the listen backlog */
+  for (;;) {
+    int slot = -1;
+    for (int i = 0; i < MAXCONN; i++)
+      if (conns[i].fd < 0) { slot = i; break; }
+    if (slot < 0) break;
+    int fd = accept(lfd, 0, 0);
+    if (fd < 0) break; /* EAGAIN: nobody there */
+    fcntl(fd, F_SETFL, O_NONBLOCK);
     int one = 1;
-    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    conns[slot].fd = fd;
+    conns[slot].rxlen = 0;
   }
-  while (rxlen < RXCAP) {
-    ssize_t n = read(cfd, rx + rxlen, RXCAP - rxlen);
-    if (n > 0) { rxlen += (uint32_t)n; continue; }
-    if (n == 0 && rxlen == 0) { close(cfd); cfd = -1; } /* peer gone, drained */
-    break; /* EAGAIN or buffered EOF: serve what we have */
+  for (int i = 0; i < MAXCONN; i++) {
+    struct nconn *c = &conns[i];
+    if (c->fd < 0) continue;
+    while (c->rxlen < RXCAP) {
+      ssize_t n = read(c->fd, c->rx + c->rxlen, RXCAP - c->rxlen);
+      if (n > 0) { c->rxlen += (uint32_t)n; continue; }
+      if (n == 0 && c->rxlen == 0) conn_drop(c); /* peer gone, drained */
+      break; /* EAGAIN or buffered EOF: serve what we have */
+    }
   }
 }
 
 int64_t qos_netraw_poll(void) {
   net_pump();
-  if (cfd < 0) return 0;
-  return rxlen ? 2 : 1;
+  for (int k = 0; k < MAXCONN; k++) {
+    uint32_t i = (poll_rr + k) % MAXCONN;
+    if (conns[i].fd >= 0 && conns[i].rxlen) {
+      poll_rr = i + 1; /* rotate: next poll starts past this id */
+      return (int64_t)i + 1;
+    }
+  }
+  return 0;
 }
 
-int64_t qos_netraw_read(char *dst, uint64_t cap) {
+int64_t qos_netraw_read(int64_t id, char *dst, uint64_t cap) {
   net_pump();
-  uint32_t n = rxlen > cap ? (uint32_t)cap : rxlen;
-  memcpy(dst, rx, n);
+  struct nconn *c = conn_of(id);
+  if (!c) return 0;
+  uint32_t n = c->rxlen > cap ? (uint32_t)cap : c->rxlen;
+  memcpy(dst, c->rx, n);
   if (n) {
-    memmove(rx, rx + n, rxlen - n);
-    rxlen -= n;
+    memmove(c->rx, c->rx + n, c->rxlen - n);
+    c->rxlen -= n;
   }
   return (int64_t)n;
 }
 
-int64_t qos_netraw_write(const char *src, uint64_t len) {
-  if (cfd < 0) return 0;
+int64_t qos_netraw_write(int64_t id, const char *src, uint64_t len) {
+  struct nconn *c = conn_of(id);
+  if (!c) return 0;
   uint64_t off = 0;
   while (off < len) {
-    ssize_t n = write(cfd, src + off, len - off);
+    ssize_t n = write(c->fd, src + off, len - off);
     if (n > 0) { off += (uint64_t)n; continue; }
     if (n < 0 && errno == EAGAIN) continue; /* spin: PoC blocking send */
+    conn_drop(c);
     return (int64_t)off; /* peer closed under us */
   }
   return (int64_t)len;
 }
 
-int64_t qos_netraw_close(void) {
-  if (cfd >= 0) { close(cfd); cfd = -1; }
-  rxlen = 0;
+int64_t qos_netraw_close(int64_t id) {
+  struct nconn *c = conn_of(id);
+  if (c) conn_drop(c);
   return 0;
 }
 

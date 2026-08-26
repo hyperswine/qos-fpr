@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 5u
+#define QOS_ABI_VERSION 6u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -88,10 +88,12 @@ typedef struct {
   /* net: the posix contract verbatim (one connection, poll-driven).
    * poll: 0 no conn, 1 open, 2 open+rx.  read drains into dst, returns
    * bytes.  write is blocking-full, returns len.  close keeps listening. */
+  /* v6: connection-addressed (multi-conn).  poll returns a connection
+   * id (1..) with buffered rx, else 0; read/write/close take the id. */
   int64_t (*net_poll)(void);
-  int64_t (*net_read)(char *dst, uint64_t cap);
-  int64_t (*net_write)(const char *src, uint64_t len);
-  int64_t (*net_close)(void);
+  int64_t (*net_read)(int64_t id, char *dst, uint64_t cap);
+  int64_t (*net_write)(int64_t id, const char *src, uint64_t len);
+  int64_t (*net_close)(int64_t id);
 
   /* gfx (NULLABLE: NULL in a host built without GFX=1 -- the app-side
    * shim panics honestly on use, the missing-capability behavior).

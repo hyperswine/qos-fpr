@@ -512,7 +512,6 @@ compileFn prog name (params, body) = do
       nslots = length params + slotsNeeded ext prog (S.fromList params) body + 2
       frame = ((2 * w + w * nslots + 15) `div` 16) * 16
       env0 = M.fromList (zip params [0 ..])
-  when (frame > 2032) $ error (name ++ ": frame too large for PoC (12-bit imm)")
   bodyLines <- gen prog env0 (length params) Tail body
   -- FUEL: every supercombinator entry decrements the global fuel
   -- counter and traps to the scheduler at zero. Function entry is the
@@ -536,19 +535,15 @@ compileFn prog name (params, body) = do
   pure $ wcetAnnotate name $
     [ "# " ++ name ++ " (arity " ++ show (length params) ++ ")" ]
       ++ [ "    .globl fpr_fn_" ++ m | S.member name exps ]
-      ++ [ "fpr_fn_" ++ m ++ ":",
-      "    addi sp, sp, -" ++ show frame,
-      "    " ++ tgtSt tgt ++ " ra, " ++ show (frame - w) ++ "(sp)",
-      "    " ++ tgtSt tgt ++ " s0, " ++ show (frame - 2 * w) ++ "(sp)",
-      "    addi s0, sp, " ++ show frame
-    ]
-      ++ ["    " ++ tgtSt tgt ++ " a" ++ show i ++ ", " ++ slotRef tgt i | (i, _) <- zip [0 :: Int ..] params, i < 8]
+      ++ [ "fpr_fn_" ++ m ++ ":" ]
+      ++ framePro tgt frame
+      ++ concat [stSlot tgt ("a" ++ show i) i | (i, _) <- zip [0 :: Int ..] params, i < 8]
       -- wide params ride the hart spill cells: copy them into frame
       -- slots BEFORE the fuel check (fpr_fuel_exhausted may deschedule;
       -- by then the cells must be dead)
       ++ (if length params > 8 then "    mv t0, tp" : concat
-            [ [ "    " ++ tgtLd tgt ++ " t1, " ++ spillRef tgt (i - 8) ++ "(t0)",
-                "    " ++ tgtSt tgt ++ " t1, " ++ slotRef tgt i ]
+            [ ("    " ++ tgtLd tgt ++ " t1, " ++ spillRef tgt (i - 8) ++ "(t0)")
+                : stSlot tgt "t1" i
             | i <- [8 .. length params - 1] ]
           else [])
       ++ fuelCheck
@@ -563,7 +558,55 @@ compileFn prog name (params, body) = do
 
 -- slot k lives below the saved ra/s0 pair: -(3W + W*k)(s0)
 slotRef :: Target -> Int -> String
-slotRef t k = show (-((3 + k) * tgtW t)) ++ "(s0)"
+slotRef t k = show (slotOff t k) ++ "(s0)"
+
+slotOff :: Target -> Int -> Int
+slotOff t k = -((3 + k) * tgtW t)
+
+-- slot access that stays legal past the rv64 12-bit displacement:
+-- in-range slots keep the one-liner, deeper ones ride t2 (self-
+-- contained; t0/t1 stay untouched for the staging sequences around).
+-- The x64/a64 translators accept either form.
+ldSlot :: Target -> String -> Int -> [String]
+ldSlot t r k
+  | slotOff t k >= -2048 = ["    " ++ tgtLd t ++ " " ++ r ++ ", " ++ slotRef t k]
+  | otherwise =
+      [ "    li t2, " ++ show (slotOff t k),
+        "    add t2, s0, t2",
+        "    " ++ tgtLd t ++ " " ++ r ++ ", 0(t2)" ]
+
+stSlot :: Target -> String -> Int -> [String]
+stSlot t r k
+  | slotOff t k >= -2048 = ["    " ++ tgtSt t ++ " " ++ r ++ ", " ++ slotRef t k]
+  | otherwise =
+      [ "    li t2, " ++ show (slotOff t k),
+        "    add t2, s0, t2",
+        "    " ++ tgtSt t ++ " " ++ r ++ ", 0(t2)" ]
+
+-- sp/fp adjust in 12-bit-legal steps: a big frame is several addi's,
+-- which every backend already translates (x64/a64 fold immediates)
+frameSteps :: Int -> [Int]
+frameSteps n = replicate (n `div` 2032) 2032 ++ [r | r <- [n `mod` 2032], r > 0]
+
+framePro :: Target -> Int -> [String]
+framePro tgt frame
+  | frame <= 2032 =
+      [ "    addi sp, sp, -" ++ show frame,
+        "    " ++ tgtSt tgt ++ " ra, " ++ show (frame - w) ++ "(sp)",
+        "    " ++ tgtSt tgt ++ " s0, " ++ show (frame - 2 * w) ++ "(sp)",
+        "    addi s0, sp, " ++ show frame ]
+  | otherwise =
+      ["    addi sp, sp, -" ++ show c | c <- frameSteps frame]
+        ++ ["    mv t1, s0"] -- the caller's fp, parked while s0 rebuilds
+        ++ (case frameSteps frame of
+              (c : cs) ->
+                ("    addi s0, sp, " ++ show c)
+                  : ["    addi s0, s0, " ++ show c' | c' <- cs]
+              [] -> [])
+        ++ [ "    " ++ tgtSt tgt ++ " ra, " ++ show (-w) ++ "(s0)",
+             "    " ++ tgtSt tgt ++ " t1, " ++ show (-2 * w) ++ "(s0)" ]
+  where
+    w = tgtW tgt
 
 -- hart argument-spill cells (fpr.h fpr_hart_t.argspill): cell j at
 -- W*(1+j)(tp) -- fuel is 0(tp), the cells start one word past it
@@ -676,7 +719,7 @@ genT tgt spec prog ext = go
     go env nxt pos (CLet x a b) = do
       la <- go env nxt NonTail a
       lb <- go (M.insert x nxt env) (nxt + 1) pos b
-      pure (la ++ ["    " ++ st ++ " a0, " ++ slotRef tgt nxt] ++ lb)
+      pure (la ++ stSlot tgt "a0" nxt ++ lb)
     go env nxt _pos core = base env nxt core
 
     -- Evaluate args left-to-right into consecutive slots (arg i's own
@@ -689,7 +732,7 @@ genT tgt spec prog ext = go
       argLines <-
         concat
           <$> sequence
-            [ (++ ["    " ++ st ++ " a0, " ++ slotRef tgt (nxt + i)]) <$> go env (nxt + i + 1) NonTail a
+            [ (++ stSlot tgt "a0" (nxt + i)) <$> go env (nxt + i + 1) NonTail a
               | (i, a) <- zip [0 :: Int ..] args
             ]
       -- args 0..7 in registers; 8+ through the hart spill cells.  ALL
@@ -699,12 +742,12 @@ genT tgt spec prog ext = go
       -- the cells between here and the callee's prologue copies.  In
       -- Tail position the cell stores happen before teardown (slots
       -- are s0-relative and t0 is clobbered by the teardown itself).
-      let loads = ["    " ++ ld ++ " a" ++ show i ++ ", " ++ slotRef tgt (nxt + i) | i <- [0 .. min 7 (length args - 1)]]
+      let loads = concat [ldSlot tgt ("a" ++ show i) (nxt + i) | i <- [0 .. min 7 (length args - 1)]]
           spills =
             if length args > 8
               then "    mv t0, tp" : concat
-                     [ [ "    " ++ ld ++ " t1, " ++ slotRef tgt (nxt + i),
-                         "    " ++ st ++ " t1, " ++ spillRef tgt (i - 8) ++ "(t0)" ]
+                     [ ldSlot tgt "t1" (nxt + i)
+                         ++ ["    " ++ st ++ " t1, " ++ spillRef tgt (i - 8) ++ "(t0)"]
                      | i <- [8 .. length args - 1] ]
               else []
       pure $
@@ -723,7 +766,7 @@ genT tgt spec prog ext = go
 
     base env nxt = \case
       CVar n
-        | Just k <- M.lookup n env -> pure ["    " ++ ld ++ " a0, " ++ slotRef tgt k]
+        | Just k <- M.lookup n env -> pure (ldSlot tgt "a0" k)
         | Just (ps, _) <- M.lookup n prog ->
             pure $
               if null ps
@@ -1449,13 +1492,9 @@ compileUFn tgt prog uset label (params, body) = do
   pure $
     [ "# unboxed clone (raw ints, native arithmetic)",
       "    .globl " ++ label,
-      label ++ ":",
-      "    addi sp, sp, -" ++ show frame,
-      "    " ++ tgtSt tgt ++ " ra, " ++ show (frame - w) ++ "(sp)",
-      "    " ++ tgtSt tgt ++ " s0, " ++ show (frame - 2 * w) ++ "(sp)",
-      "    addi s0, sp, " ++ show frame
-    ]
-      ++ ["    " ++ tgtSt tgt ++ " a" ++ show i ++ ", " ++ slotRef tgt i | (i, _) <- zip [0 :: Int ..] params]
+      label ++ ":" ]
+      ++ framePro tgt frame
+      ++ concat [stSlot tgt ("a" ++ show i) i | (i, _) <- zip [0 :: Int ..] params]
       ++ [ "    mv t0, tp", -- per-hart fuel: 0(tp) is fpr_hart_t.fuel
            "    " ++ tgtLd tgt ++ " t1, 0(t0)",
            "    addi t1, t1, -1",
@@ -1514,9 +1553,9 @@ genU tgt prog uset = go
     go env nxt pos (CLet x a b) = do
       al <- go env nxt NonTail a
       bl <- go (M.insert x nxt env) (nxt + 1) pos b
-      pure (al ++ ["    " ++ st ++ " a0, " ++ slotRef tgt nxt] ++ bl)
+      pure (al ++ stSlot tgt "a0" nxt ++ bl)
     go env _ _ (CVar n)
-      | Just k <- M.lookup n env = pure ["    " ++ ld ++ " a0, " ++ slotRef tgt k]
+      | Just k <- M.lookup n env = pure (ldSlot tgt "a0" k)
     go _ _ _ (CInt i) = pure ["    li a0, " ++ show i]
     go _ _ _ (CMk 1 v []) = pure ["    li a0, " ++ show v]
     go _ _ _ (CErr msg) = do
@@ -1530,10 +1569,10 @@ genU tgt prog uset = go
       argLines <-
         concat
           <$> sequence
-            [ (++ ["    " ++ st ++ " a0, " ++ slotRef tgt (nxt + i)]) <$> go env (nxt + i + 1) NonTail a
+            [ (++ stSlot tgt "a0" (nxt + i)) <$> go env (nxt + i + 1) NonTail a
               | (i, a) <- zip [0 :: Int ..] args
             ]
-      pure (argLines ++ ["    " ++ ld ++ " a" ++ show i ++ ", " ++ slotRef tgt (nxt + i) | i <- [0 .. length args - 1]])
+      pure (argLines ++ concat [ldSlot tgt ("a" ++ show i) (nxt + i) | i <- [0 .. length args - 1]])
     op2 = \case
       "+" -> ["    add a0, a0, a1"]
       "-" -> ["    sub a0, a0, a1"]
