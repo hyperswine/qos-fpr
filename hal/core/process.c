@@ -75,6 +75,23 @@ static V mkrpc(V a, V b, V c, V d) {
   return (V)t;
 }
 
+/* ---- the shared plane (transparent process ACBs) --------------------
+ * One process at a time (the single slot); its root actor's exit
+ * clears the gate through on_exit so the next launch may reuse the
+ * slot.  Actors a process leaves running past its root are its own
+ * bug -- the slot must not be reloaded under them. */
+typedef struct {
+  fpr_sched_t *sched;
+  void *reply;
+  uw pid;
+  void (*on_exit)(void);
+} shared_boot_t;
+static fpr_sched_t g_kernel_sched;
+static int g_sched_ready;
+static uw g_next_pid = 1;
+static volatile int g_shared_live;
+static void shared_on_exit(void) { g_shared_live = 0; }
+
 sw qos_store_call(uw tag, const char *pay, uw plen, char *out, uw outcap) {
   if (!g_store_actor || !g_app_id) return -2; /* no disk / no app bound */
   if (tag != 2 && tag != 3) return -3;
@@ -91,10 +108,21 @@ sw qos_store_call(uw tag, const char *pay, uw plen, char *out, uw outcap) {
 
   V urlv = (V)fpr_mkstr((const uint8_t *)url, n);
   V payv = (V)fpr_mkstr((const uint8_t *)pay, plen);
-  V mb = (V)fpr_syscall_mailbox();
-  V msg = mkrpc(mb, TAG((sw)tag), urlv, payv);
-  fpr_send_as((uw)mb, g_store_actor, msg);
-  V r = fpr_syscall_wait_result();
+  V r;
+  if (g_shared_live) {
+    /* shared plane: the calling PROCESS ACB is the replyTo -- kv IO
+     * becomes an ordinary actor round trip (blocking receive frees
+     * the hart; no mailbox spin, no hart-1 assumption) */
+    void *me = fpr_hart()->current;
+    V msg = mkrpc((V)me, TAG((sw)tag), urlv, payv);
+    fpr_send_as((uw)me, g_store_actor, msg);
+    r = fpr_receive_res_c((V)me);
+  } else {
+    V mb = (V)fpr_syscall_mailbox();
+    V msg = mkrpc(mb, TAG((sw)tag), urlv, payv);
+    fpr_send_as((uw)mb, g_store_actor, msg);
+    r = fpr_syscall_wait_result();
+  }
   /* r = Ok s | Err s (builtin Result, variant 0/1), field at +8 */
   hdr_t *h = (hdr_t *)r;
   str_t *s = (str_t *)*(V *)((char *)h + 8);
@@ -102,6 +130,7 @@ sw qos_store_call(uw tag, const char *pay, uw plen, char *out, uw outcap) {
   for (uw i = 0; i < cp; i++) out[i] = (char)s->bytes[i];
   return h->var == 0 ? (sw)cp : -1;
 }
+
 
 #define MAX_GRANTS 64
 static void *grants[MAX_GRANTS];
@@ -175,6 +204,7 @@ static V g_sys_load_image_at(V qastr, V loffv, V llenv, V ioffv, V ilenv, V caps
     return mktup2v(TAG(0), (V)fpr_mkstr((const uint8_t *)"image larger than the process slot", 34));
 
   ngrants = 0;
+  fpr_static_lo = fpr_static_hi = 0; /* the outgoing image's window, if any */
   fpr_elf_load_t r = fpr_qaimg_load(lbytes, (uw)llen, ibytes, blen, slot, slot_size);
   if (!r.ok) {
     uw n = 0; while (r.err[n]) n++;
@@ -183,24 +213,50 @@ static V g_sys_load_image_at(V qastr, V loffv, V llenv, V ioffv, V ilenv, V caps
 
   void *heap_base = r.image_end;
   uw heap_size = (uw)slot + slot_size - (uw)heap_base;
+  /* the loaded image's cells are STATICS inside the buddy span: no
+   * alloc preheaders, so the deep-copier (spawn's entry pap, any
+   * static a process actor sends) and ARC must skip them (fpr.h) */
+  fpr_static_lo = (char *)slot;
+  fpr_static_hi = (char *)r.image_end;
 
   /* the process's OWN fpr_process_entry returns its result directly --
    * see the note in proc_entry.c about why this must not be fetched
    * via a same-named function call from THIS (System.qa's) image. */
+  if (g_shared_live)
+    return mktup2v(TAG(0), (V)fpr_mkstr(
+        (const uint8_t *)"a process is still running in the slot", 39));
   str_t *cs = (str_t *)capsv;
   V (*entry)(void *, uw, fpr_grant_t (*)(uw), const unsigned char *, uw,
-             sw (*)(uw, const char *, uw, char *, uw)) =
+             sw (*)(uw, const char *, uw, char *, uw), void *) =
       (V (*)(void *, uw, fpr_grant_t (*)(uw), const unsigned char *, uw,
-             sw (*)(uw, const char *, uw, char *, uw)))r.entry;
-  V result = entry(heap_base, heap_size, loader_grow_memory, cs->bytes, cs->len,
-                   qos_store_call);
-  V rendered = fpr_prim_fn_str(result); /* render() the SAME way `str`/print do -- runtime.c */
-  /* slab refactor: growth blocks ARE tracked now -- everything the
-   * process begged for goes back with the slot.  The ~3 MiB/run leak
-   * PROCESS-LOADING.md recorded is gone as a category. */
-  for (int i = 0; i < ngrants; i++) buddy_free(grants[i]);
-  ngrants = 0;
-  return mktup2v(TAG(1), rendered);
+             sw (*)(uw, const char *, uw, char *, uw), void *))r.entry;
+  if (!g_sched_ready) {
+    fpr_sched_export(&g_kernel_sched);
+    g_sched_ready = 1;
+  }
+  static shared_boot_t sb; /* single slot: one launch at a time */
+  sb.sched = &g_kernel_sched;
+  sb.reply = fpr_hart()->current; /* the launcher actor gets the result */
+  sb.pid = g_next_pid++;
+  sb.on_exit = shared_on_exit;
+  g_shared_live = 1;
+  entry(heap_base, heap_size, loader_grow_memory, cs->bytes, cs->len,
+        qos_store_call, &sb);
+  /* the root ACB is queued with our pid; ok=2 tells the launcher to
+   * receiveRes for main's result.  Growth grants are shared-buddy
+   * slabs reaped with the acbs, so nothing to free here. */
+  char pm[32];
+  uw pn = 0;
+  const char *pp = "pid ";
+  for (const char *q = pp; *q; q++) pm[pn++] = *q;
+  {
+    uw v = sb.pid, st = pn;
+    do { pm[pn++] = (char)('0' + v % 10); v /= 10; } while (v);
+    for (uw i = 0; i < (pn - st) / 2; i++) {
+      char t = pm[st + i]; pm[st + i] = pm[pn - 1 - i]; pm[pn - 1 - i] = t;
+    }
+  }
+  return mktup2v(TAG(2), (V)fpr_mkstr((const uint8_t *)pm, pn));
 }
 
 FPR_FN(fpr_g_Sys_x2eloadImageAt, g_sys_load_image_at, 6);

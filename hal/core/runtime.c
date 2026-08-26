@@ -117,7 +117,14 @@ void fpr_rt_init(void) {
   __atomic_store_n(&fpr_smp_go, 1, __ATOMIC_RELEASE);
 }
 
+char *fpr_static_lo, *fpr_static_hi; /* image-statics window (fpr.h) */
+
 int fpr_in_heap(V v) { /* the buddy span: heap + process regions */
+  /* a loaded process's IMAGE lives inside the span (the fixed slot)
+   * but its cells are statics without alloc preheaders -- exclude the
+   * window before either span test below can claim them */
+  if (!ISINT(v) && (char *)v >= fpr_static_lo && (char *)v < fpr_static_hi)
+    return 0;
 #ifdef FPR_QOSAPP
   /* the PLUGIN slot sits inside the arena span but holds IMAGE data
    * (a loaded library's code + rodata literals) -- immortal, never
@@ -126,6 +133,8 @@ int fpr_in_heap(V v) { /* the buddy span: heap + process regions */
   if ((uw)v >= QOS_PLUG_BASE && (uw)v < QOS_PLUG_BASE + QOS_PLUG_SIZE)
     return 0;
 #endif
+  if (fpr_sched) /* shared plane: the KERNEL's span is the heap */
+    return !ISINT(v) && (char *)v >= fpr_sched->heap_lo && (char *)v < fpr_sched->heap_hi;
   return !ISINT(v) && (char *)v >= _heap_start && (char *)v < _proc_arena_end;
 }
 
@@ -262,8 +271,18 @@ static void grant_put(fpr_slab_t *sl); /* fwd: defined just below */
  * process mode, buddy on a machine boot.  Split out so actors.c's
  * deferred-drop list can call it at drain time. */
 void fpr_slab_release(fpr_slab_t *sl) {
+  if (fpr_sched) { fpr_sched->slab_release(sl); return; }
   if (fpr_is_process) grant_put(sl);
   else buddy_free(sl);
+}
+
+/* a fresh pool slab from THIS image's lower allocator -- the shared
+ * plane's growth path for routed process pools (fpr.h fpr_sched_t) */
+fpr_slab_t *fpr_slab_new(uw want) {
+  fpr_slab_t *sl = (fpr_slab_t *)buddy_alloc(want);
+  if (!sl) return 0;
+  sl->end = (char *)sl + buddy_block_usable_size(sl);
+  return sl;
 }
 
 #ifdef FPR_GROWTRACE
@@ -412,6 +431,14 @@ V fpr_alloc(V raw_bytes) {
         sl = (fpr_slab_t *)g.ptr;
         sl->end = (char *)g.ptr + g.size;
       }
+    } else if (fpr_sched) {
+      /* shared plane: pools grow from the KERNEL's buddy, so every
+       * value this process builds lives in the one heap span and the
+       * kernel reaps its acbs like any other */
+      uw want = total + sizeof(fpr_slab_t);
+      if (want < SLAB_SZ) want = SLAB_SZ;
+      sl = fpr_sched->slab_new(want);
+      if (!sl) fpr_cpanic("heap exhausted (shared buddy has no free block)");
     } else {
       uw want = total + sizeof(fpr_slab_t);
       if (want < SLAB_SZ) want = SLAB_SZ;
@@ -869,6 +896,7 @@ static uw arc_probe(V v, int *found) {
 static fpr_slab_t *slab_of(V v) { return *(fpr_slab_t **)((char *)v - 8); }
 
 void fpr_arc_incref(V v) {
+  if (fpr_sched) { fpr_sched->arc_incref(v); return; }
   if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
   fpr_lock(&arc_lock);
   int found;
@@ -886,6 +914,7 @@ void fpr_arc_incref(V v) {
 }
 
 void fpr_arc_decref(V v) {
+  if (fpr_sched) { fpr_sched->arc_decref(v); return; }
   if (!fpr_in_heap(v)) return;
   fpr_lock(&arc_lock);
   int found;
@@ -957,6 +986,7 @@ void fpr_arc_teardown_pool(fpr_pool_t *pool) {
  * free cell lives in a slab this walk just recycled or orphaned. */
 static V g_poolReset(V u) {
   (void)u;
+  if (fpr_sched) { fpr_sched->pool_reset(); return (V)&fpr_unit; }
   fpr_hart_t *h = fpr_hart();
   fpr_pool_t *pool = cur_pool(h);
   fpr_drop_drain_current(); /* soft death = end of frame: borrows are done */
@@ -980,6 +1010,8 @@ static V g_poolReset(V u) {
   return (V)&fpr_unit;
 }
 FPR_FN(fpr_g_Sys_x2epoolReset, g_poolReset, 1);
+void fpr_pool_reset_c(void) { g_poolReset((V)&fpr_unit); }
+uw fpr_arc_live_count(void) { return arc_live; }
 
 /* ---- Sys.sleepUs: waitTick without pegging a core --------------------
  * The HAL hook actually sleeps where the host can (qosp: nanosleep);
@@ -1023,7 +1055,11 @@ static V g_substr(V sv, V off, V len) {
   if ((uw)l > s->len - (uw)(o - 1)) l = (sw)(s->len - (uw)(o - 1));
   return (V)fpr_mkstr(s->bytes + (o - 1), (uw)l);
 }
-static V g_arcLive(V d) { (void)d; return TAG(fpr_arc_live()); }
+static V g_arcLive(V d) {
+  (void)d;
+  if (fpr_sched) return TAG((sw)fpr_sched->arc_live());
+  return TAG(fpr_arc_live());
+}
 
 
 
@@ -1973,3 +2009,4 @@ FPR_FN(fpr_g_substr, g_substr, 3);
 FPR_FN(fpr_g_drop, g_drop, 1);
 FPR_FN(fpr_g_arcLive, g_arcLive, 1);
 FPR_FN(fpr_g_heapUsed, g_heapUsed, 1);
+

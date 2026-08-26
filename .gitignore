@@ -19,6 +19,7 @@ fp-risc/build/units/*qx64r*.s
 fp-risc/build/units/*-rv64.s
 qos/build/
 qos/disk.img
+qos/disk-seeded.img
 qos/qos-native.elf
 fp-risc/build/prog.s
 fp-risc/build/prog.s.abirev
@@ -28,3 +29,6 @@ fp-risc/build/beta.s*
 fp-risc/image.elf
 qos/qos-store/*.kv
 !qos/qos-store/qsys.kv
+fp-risc/build/tp.*
+fp-risc/build/tpar.*
+fp-risc/build/ck-par.*
