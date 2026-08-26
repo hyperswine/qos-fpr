@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """qos.py -- the pipeline layer over the whole tree.
 
 The Makefiles stay what they are: MECHANISM (cross-compilation,
@@ -66,11 +67,10 @@ def run_scan(cmd, cwd, env=None, expect=None):
     e = dict(os.environ)
     if env:
         e.update({k: str(v) for k, v in env.items()})
-    p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE,
-                         stderr=subprocess.STDOUT)
+    p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     hit = expect is None
     try:
-        for raw in p.stdout:
+        for raw in p.stdout: # type: ignore
             line = raw.decode("utf-8", "replace")
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -141,17 +141,18 @@ def cmd_run(a):
     t0 = time.time()
     prog = resolve_prog(a.prog)
     build_fpr()
-    if prog.endswith(".sol") or a.on == "sol":
+
+    if prog.endswith(".sol") or a.on == "sol": # type: ignore
         say(f"sol profile: {prog}")
         env = {"LD_LIBRARY_PATH": "/usr/lib/llvm-18/lib"}
-        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=env,
-                        expect=a.expect)
+        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=env, expect=a.expect)
     if a.on == "virt":
         say(f"bare-metal QEMU virt: {prog}")
         cmd = ["make", "-s", "bare-metal-run", f"PROG={prog}"]
         if a.harts:
             cmd.append(f"HARTS={a.harts}")
         return run_scan(cmd, cwd=FPR, expect=a.expect)
+
     # the default: host the .qa on qosp
     build_app(prog, a.harts)
     build_qosp()
@@ -164,9 +165,9 @@ def cmd_run(a):
         (QOS / "qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
     say(f"qosp: {prog}" + (f"  (port {a.port})" if a.port else ""))
-    rc = run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS,
-                  env=env, expect=a.expect)
+    rc = run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=a.expect)
     say(f"total {time.time() - t0:.1f}s")
+
     return rc
 
 
@@ -176,8 +177,8 @@ def cmd_serve(a):
     build_app(prog)
     build_qosp()
     say(f"serving {prog} at http://127.0.0.1:{a.port}/  (Ctrl-C stops)")
-    return run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS,
-                    env={"FPR_PORT": a.port})
+
+    return run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, env={"FPR_PORT": a.port})
 
 
 def cmd_native(a):
@@ -196,15 +197,17 @@ def cmd_native(a):
             "-device", "virtio-blk-device,drive=hd0"]
     if a.smoke:
         say("smoke boot (scripted, ~10s)")
+
         p = subprocess.Popen(qemu, cwd=QOS, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL)
-        p.stdin.write(b"yyyy")
-        p.stdin.flush()
+
+        p.stdin.write(b"yyyy") # type: ignore
+        p.stdin.flush() # type: ignore
         t0, buf = time.time(), b""
         ok = False
         while time.time() - t0 < 20:
-            b = p.stdout.read1(4096)
+            b = p.stdout.read1(4096) # type: ignore
             if not b:
                 break
             buf += b
@@ -216,24 +219,19 @@ def cmd_native(a):
             die("smoke boot: launcher never appeared")
         say(f"launcher up at +{time.time() - t0:.2f}s")
         return 0
-    say(f"booting QOS Native ({a.smp} harts, {a.mem}, {disk.name}) -- "
-        "q quits the launcher; C-a x kills QEMU")
-    return subprocess.call(qemu, cwd=QOS)
 
+    say(f"booting QOS Native ({a.smp} harts, {a.mem}, {disk.name}) -- " "q quits the launcher; C-a x kills QEMU")
+    return subprocess.call(qemu, cwd=QOS)
 
 def cmd_disk(a):
     build_fpr()  # apps may have just been rebuilt; mkdisk itself is pure
     say(f"mkdisk {a.img} ({a.size_mb}MB, {len(a.apps)} app(s))")
-    sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), a.img,
-        str(a.size_mb)] + a.apps, cwd=Path.cwd())
-
+    sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), a.img, str(a.size_mb)] + a.apps, cwd=Path.cwd())
 
 def cmd_commit(a):
     build_fpr()
     mod = resolve_prog(a.mod)
-    return sh([str(FPR / "fpr"), "commit"] + (["--major"] if a.major else [])
-              + [mod], cwd=FPR, check=False)
-
+    return sh([str(FPR / "fpr"), "commit"] + (["--major"] if a.major else []) + [mod], cwd=FPR, check=False)
 
 SMOKE = [
     # (label, list-of-(prog, backend, expect))
@@ -246,7 +244,6 @@ SMOKE = [
     ("autodrop / virt",   "tests/autodrop.fpr", "virt", "AUTODROP HOLDS"),
     ("bigframe / virt",   "tests/bigframe.fpr", "virt", "sum3=57569"),
 ]
-
 
 def cmd_test(a):
     if a.all:
@@ -262,13 +259,10 @@ def cmd_test(a):
             continue
         if backend == "qosp":
             build_app(prog)
-            r = subprocess.run(["./qosp", "--yes", "../fp-risc/app.qa"],
-                               cwd=QOS, capture_output=True, timeout=180)
+            r = subprocess.run(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, capture_output=True, timeout=180)
             out = r.stdout.decode("utf-8", "replace")
         else:
-            r = subprocess.run(["make", "-s", "bare-metal-run",
-                                f"PROG={prog}"], cwd=FPR,
-                               capture_output=True, timeout=300)
+            r = subprocess.run(["make", "-s", "bare-metal-run", f"PROG={prog}"], cwd=FPR, capture_output=True, timeout=300)
             out = r.stdout.decode("utf-8", "replace")
         ok = expect in out
         ran += 1
@@ -277,8 +271,7 @@ def cmd_test(a):
             fails.append(label)
     # the multi-client LiveView wire rides its own script
     if not a.legs or any("web" in k or "live" in k for k in a.legs):
-        r = subprocess.run(["sh", "tests-host/mvuweb-check.sh"], cwd=QOS,
-                           capture_output=True, timeout=300)
+        r = subprocess.run(["sh", "tests-host/mvuweb-check.sh"], cwd=QOS, capture_output=True, timeout=300)
         ok = b"ALL LEGS PASS" in r.stdout
         ran += 1
         say(f"{'ok  ' if ok else 'FAIL'} liveview multi-client")
@@ -288,32 +281,25 @@ def cmd_test(a):
     if fails:
         die("failed: " + ", ".join(fails))
 
-
 def cmd_clean(a):
     sh(["make", "-s", "clean"], cwd=FPR, quiet=True, check=False)
     sh(["make", "-s", "clean"], cwd=QOS, quiet=True, check=False)
     say("clean")
 
-
 def main():
-    ap = argparse.ArgumentParser(
-        prog="qos.py", description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="qos.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("build", help="bring the toolchain + hosts up to date")
-    p.add_argument("what", nargs="?", default="host",
-                   choices=["fpr", "host", "native", "all"])
+    p.add_argument("what", nargs="?", default="host", choices=["fpr", "host", "native", "all"])
     p.set_defaults(f=cmd_build)
 
     p = sub.add_parser("run", help="compile + run one program (the pipeline)")
     p.add_argument("prog", help=".fpr or .sol, from anywhere in the tree")
-    p.add_argument("--on", choices=["qosp", "virt", "sol"], default="qosp",
-                   help="qosp (hosted, default) | virt (bare-metal QEMU) | sol")
+    p.add_argument("--on", choices=["qosp", "virt", "sol"], default="qosp", help="qosp (hosted, default) | virt (bare-metal QEMU) | sol")
     p.add_argument("--port", help="FPR_PORT for the socket tier")
     p.add_argument("--harts", help="hart count")
-    p.add_argument("--fresh-disk", action="store_true",
-                   help="delete qosp.disk first")
+    p.add_argument("--fresh-disk", action="store_true", help="delete qosp.disk first")
     p.add_argument("--expect", help="require this substring in the output")
     p.set_defaults(f=cmd_run)
 
@@ -323,12 +309,10 @@ def main():
     p.set_defaults(f=cmd_serve)
 
     p = sub.add_parser("native", help="build + boot QOS Native under QEMU")
-    p.add_argument("--apps", nargs="*", default=[],
-                   help=".qa files to seed onto a fresh disk image")
+    p.add_argument("--apps", nargs="*", default=[], help=".qa files to seed onto a fresh disk image")
     p.add_argument("--smp", type=int, default=2)
     p.add_argument("--mem", default="256M")
-    p.add_argument("--smoke", action="store_true",
-                   help="scripted boot-to-launcher check instead of a console")
+    p.add_argument("--smoke", action="store_true", help="scripted boot-to-launcher check instead of a console")
     p.set_defaults(f=cmd_native)
 
     p = sub.add_parser("disk", help="seed a QLOG disk image (mkdisk)")
@@ -352,7 +336,6 @@ def main():
 
     a = ap.parse_args()
     sys.exit(a.f(a) or 0)
-
 
 if __name__ == "__main__":
     main()
