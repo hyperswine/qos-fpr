@@ -1,0 +1,58 @@
+# editor.fpr -- the Editor.qa loop, end to end on QOS Portable:
+# a source string edited INSIDE the app goes out through std.compile
+# (the qosp tag-7 syscall channel -> unix domain socket -> the host
+# fprd server running ./fprc), the compiled ASSEMBLY comes back the
+# same way, and both land on qosp.disk as NEW files via mods/qlog --
+# the whole editing/storing policy inside QOS, the compiler outside.
+#
+#   ed/hello.fpr     the "buffer" saved as a source file
+#   ed/hello.s       the returned .s, a new disk file, read back to
+#                    prove it round-trips through the log
+#
+# Also probes the honest failure: a source with a syntax error must
+# come back Err with the compiler's diagnostics, not wedge the app.
+#
+#   cd fp-risc && python3 tools/fprd.py &        # the compiler server
+#   make qos-app PROG=tests/editor.fpr
+#   (cd ../qos && make portable && FPR_DISK=/tmp/ed.img ./qosp --yes ../fp-risc/app.qa)
+#
+# Expected result line:
+#   editor: compiled <n>B of qos-portable asm; stored ed/hello.fpr (14B) +
+#   ed/hello.s (<n>B readback ok); bad source -> Err ok
+
+CP = use "../std/compile".
+QL = use "../programs/mods/qlog".
+
+src = "main = 6 * 7 .".
+
+main =
+  dsk = device "blk";
+  h0 = QL.ensure dsk;
+  h1 = QL.appendRec dsk h0 "QREC" "ed/hello.fpr" src;
+  r = CP.qosApp src;
+  case r of
+    Err e -> "editor: compile FAILED: {e}"
+  | Ok s -> stepStore dsk h1 s.
+
+stepStore dsk h1 s =
+  h2 = QL.appendRec dsk h1 "QREC" "ed/hello.s" s;
+  back = QL.readLatest dsk h2 "ed/hello.s";
+  case back of
+    Err e -> "editor: disk readback FAILED: {e}"
+  | Ok t -> stepVerify dsk h2 s t.
+
+stepVerify dsk h2 s t = case strlen t == strlen s of
+    False -> "editor: readback size mismatch ({strlen t} != {strlen s})"
+  | True -> stepBad dsk h2 s.
+
+# the honest-failure probe: a broken buffer answers Err, app keeps going
+stepBad dsk h2 s =
+  bad = CP.qosApp "main = (6 *";
+  case bad of
+    Ok x -> "editor: BAD SOURCE COMPILED?!"
+  | Err e -> stepDone dsk h2 s.
+
+stepDone dsk h2 s =
+  srcBack = QL.readLatest dsk h2 "ed/hello.fpr";
+  n = case srcBack of Ok u -> strlen u | Err e -> 0 - 1;
+  "editor: compiled {strlen s}B of qos-portable asm; stored ed/hello.fpr ({n}B) + ed/hello.s ({strlen s}B readback ok); bad source -> Err ok".

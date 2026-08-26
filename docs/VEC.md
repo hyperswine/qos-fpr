@@ -101,8 +101,17 @@ programmer at compile time.
 
 Known genuine declines today: element functions that pattern-match or
 otherwise reconstruct opaquely, nested record updates/construction inside
-an output field, lambda element functions on record FOLDS, AOT record-map
-outputs over 4 fields, and boxed records over 8 fields.
+an output field, record FOLDS (named element fns decline too, not just
+lambdas -- fold duals are scalar-only), AOT record-map outputs over 4
+fields, and boxed records over 8 fields.
+
+Target caveat: on x64 (qosp on x86-64) the ENTIRE specialization tier
+is off -- SysV has only 6 callee-saved registers and the spec loops
+need s6+ -- so every Vec site runs the generic apply tier there, and
+because the decline scan is gated on the same flag, x64 compiles emit
+NO vec notes at all: the fallback is silent on exactly the target
+where it is total.  a64 and rv64 keep the tier.  tests/fuse.fpr's
+in-place witnesses accordingly hold on bare-metal/a64, not on qosp-x64.
 
 ## 5. Fusion by default for adjacent passes
 
@@ -161,6 +170,21 @@ Using a Vec non-linearly is a compile error, not a silent copy.  This
 is deliberate: a silent deep copy of a compute-bound array is the
 single worst thing a "helpful" runtime could do here.
 
+Enforcement is INFERENCE-DRIVEN (the audit's hole, closed): the
+checker's shapes come from three sources, most-authored first --
+explicit signatures, the INFERRED types of unannotated binds, and the
+builtin prims' own types (derived from the type environment itself,
+so the table cannot drift).  An unannotated `main` that double-frees
+a let-bound Vec, or a sigless `g v = (Vec.len v, Vec.len v)`, is now
+refused with the same exactly-once error a declared signature always
+bought.  Corollary made uniform on the way: SString READS
+(SStr.len/at/toStr) now THREAD their handle back as `(value, handle)`
+-- the Vec.len convention -- because a "read" typed as consuming
+without returning a successor is unusable under exactly-once, and a
+borrow exemption for reads would have been unsound for Vec (a
+`Vector -> Int` fn that folds AND frees would type identically to a
+borrow).
+
 ## 8. Tier structure
 
     declared float columns ('i'/'d'/'s'/'b')   -- widths chosen, not guessed
@@ -177,3 +201,21 @@ compile-time note or a declared choice.
 2. fusion fixpoint for 3+ chains
 3. record -> scalar projection maps (layout-changing: new 1-col output)
 4. lambda-fold duals (the main remaining genuine decline)
+
+## RVV status (audit, 2026-08)
+
+The `--rvv` lowering (strip-mined `vsetvli` loops, `vle64/vadd.vv`
+folds) is FUNCTIONALLY CORRECT: tests/fuse.fpr passes all seven
+witnesses under `qemu -cpu rv64,v=true` when built with it.  But the
+path is dormant and unshipped:
+
+  * no Makefile rule passes `--rvv`; the default QEMU cpu has no V
+    extension and ARCHFLAGS omits `v`, so the C prim tier compiles
+    scalar on rv64 too (its autovectorization is real only on hosted
+    x64/a64 baselines: adds/compares/blend take SSE2/NEON lanes,
+    64-bit multiplies stay scalar below AVX-512)
+  * `--rvv` emits a strong `fpr_rvv_enable` into the program AND into
+    every module unit compiled with the flag, so any program that uses
+    the prelude fails to link (multiple definition) -- the enable
+    shim needs to move to the runtime or become link-once before the
+    flag can ship

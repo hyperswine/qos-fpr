@@ -568,6 +568,53 @@ static acb_t *deq(fpr_hart_t *h) {
   return 0;
 }
 
+/* ---- device interrupts -> actor messages ----------------------------
+ * The no-trap model's last mile: a device source bound with
+ * Sys.irqBind is claimed-and-masked by hart 0's loop (hal_irq_claim,
+ * plic.c on virt; weak no-ops on hosts, where "interrupts" are the
+ * host tier's poll loops) and delivered to its actor as a PLAIN INT
+ * message -- copy-free, allocation-free, safe from scheduler context.
+ * The actor services the device and re-arms with Sys.irqAck.  Only
+ * the BOUND actor is interrupted; everything downstream of it sees
+ * ordinary messages it chooses to send. */
+__attribute__((weak)) void hal_irq_open(uw src) { (void)src; }
+__attribute__((weak)) sw hal_irq_claim(void) { return 0; }
+__attribute__((weak)) void hal_irq_ack(uw src) { (void)src; }
+
+#define IRQ_MAX 64
+static acb_t *irq_act[IRQ_MAX];
+static volatile int irq_bound; /* gate: keep the hot loop MMIO-free */
+static uw irq_src_key;         /* the deliveries' stable channel key */
+
+static V a_irq_bind(V irqv, V av) {
+  if (!ISINT(irqv)) fpr_cpanic("Sys.irqBind: irq must be an Int");
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("Sys.irqBind: target is not an actor");
+  uw n = (uw)UNTAG(irqv);
+  if (n == 0 || n >= IRQ_MAX) fpr_cpanic("Sys.irqBind: irq out of range");
+  irq_act[n] = (acb_t *)av;
+  __atomic_store_n(&irq_bound, 1, __ATOMIC_RELEASE);
+  hal_irq_open(n);
+  return (V)&fpr_unit;
+}
+static V a_irq_ack(V irqv) {
+  if (!ISINT(irqv)) fpr_cpanic("Sys.irqAck: irq must be an Int");
+  hal_irq_ack((uw)UNTAG(irqv));
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_Sys_x2eirqBind, a_irq_bind, 2);
+FPR_FN(fpr_g_Sys_x2eirqAck, a_irq_ack, 1);
+
+static void irq_drain(fpr_hart_t *h) {
+  if (h->id != 0 || !__atomic_load_n(&irq_bound, __ATOMIC_ACQUIRE)) return;
+  for (;;) {
+    sw s = hal_irq_claim(); /* claims AND masks: no same-source spin */
+    if (!s) return;
+    acb_t *a = ((uw)s < IRQ_MAX) ? irq_act[s] : 0;
+    if (a) fpr_send_as((uw)&irq_src_key, (V)a, TAG(s));
+    /* unbound sources stay masked: nobody would ever ack them */
+  }
+}
+
 static void drain(fpr_hart_t *h) {
   for (uw s = 0; s < FPR_NHARTS; s++) {
     xring_t *x = &xr[s][h->id];
@@ -627,7 +674,9 @@ static void hart_loop(fpr_hart_t *h) {
     if (__atomic_load_n(&fpr_shutdown, __ATOMIC_ACQUIRE))
       for (;;) hal_wfi();
     /* hot path first, NO MMIO: fuel preempts and local yields bounce
-     * through here thousands of times a second */
+     * through here thousands of times a second (irq_drain is gated on
+     * irq_bound, so machines with no bound sources pay one flag read) */
+    irq_drain(h);
     drain(h);
     acb_t *n = deq(h);
     if (!n) {
@@ -636,6 +685,7 @@ static void hart_loop(fpr_hart_t *h) {
        * re-raises msip and the wfi below falls straight through. */
       hal_ipi_clear(h->id);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      irq_drain(h); /* MEIP wakes ride the same doorbell protocol */
       drain(h);
       n = deq(h);
     }

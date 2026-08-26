@@ -116,7 +116,12 @@ data IEnv = IEnv
     iHoledCons :: S.Set (Name, Int), -- constructors with ?? fields: calls trap
     iNextSite :: !Int,
     iSites :: IM.IntMap (Name, Type), -- operator sites awaiting resolution
-    iCarriers :: IM.IntMap (Name, Name) -- carrier var -> (param, sig)
+    iCarriers :: IM.IntMap (Name, Name), -- carrier var -> (param, sig)
+    iLinSigs :: [(Name, ([LShape], LShape))] -- INFERRED linearity shapes
+      -- per user bind (zonked types -> LShape): the linearity checker
+      -- consumes these for functions WITHOUT an explicit sig, closing
+      -- the audited hole where an unannotated function (main included)
+      -- could double-use a Vec because liSigs only knew declared TSigs
   }
 
 type I = State IEnv
@@ -357,12 +362,12 @@ builtinEnv =
       ("str", scheme [0] (TFn (sv 0) tStr)),
       -- SString: fixed 128B inline string (sstr.c fpr_g_ externs)
       ("sstrNew", mono (TFn tUnit tSString)),
-      ("sstrLen", mono (TFn tSString tInt)),
-      ("sstrAt", mono (TFn tSString (TFn tInt tInt))),
+      ("sstrLen", mono (TFn tSString (TTupT [tInt, tSString]))),
+      ("sstrAt", mono (TFn tSString (TFn tInt (TTupT [tInt, tSString])))),
       ("sstrPut", mono (TFn tSString (TFn tInt (TFn tInt tSString)))),
       ("sstrPush", mono (TFn tSString (TFn tInt tSString))),
       ("sstrFromStr", mono (TFn tStr tSString)),
-      ("sstrToStr", mono (TFn tSString tStr)),
+      ("sstrToStr", mono (TFn tSString (TTupT [tStr, tSString]))),
       ("sstrClear", mono (TFn tSString tSString)),
       ("strcat", mono (TFn tStr (TFn tStr tStr))),
       ("strlen", mono (TFn tStr tInt)),
@@ -487,6 +492,11 @@ builtinEnv =
       ("keep", scheme [0] (TFn (sv 0) (sv 0))),
       ("kill", mono (TFn tInt tUnit)),
       ("hartId", mono (TFn tInt tInt)),
+      -- device interrupts -> actor messages (actors.c irq bridge):
+      -- bind a PLIC source to an actor (deliveries arrive as plain
+      -- Int messages); ack re-arms the claimed-and-masked source
+      ("Sys.irqBind", mono (TFn tInt (TFn tInt tUnit))),
+      ("Sys.irqAck", mono (TFn tInt tUnit)),
       ("schedTau", mono (TFn tInt tInt)),
       ("schedSetTau", mono (TFn tInt tUnit)),
       ("schedMaxWait", mono (TFn tInt tInt)),
@@ -545,7 +555,9 @@ builtinEnv =
       ("Sys.harts", mono (TFn tUnit tInt)),
       ("Sys.bindApp", scheme [0, 1] (TFn (sv 0) (sv 1))),
       ("Sys.bindStore", scheme [0, 1] (TFn (sv 0) (sv 1))),
-      ("Sys.storeReq", scheme [0, 1] (TFn (sv 0) (sv 1)))
+      ("Sys.storeReq", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      -- host compiler server (qosp tag-7 channel): profile -> source -> Result
+      ("Sys.compile", mono (TFn tStr (TFn tStr (tcon "Result" [tStr, tStr]))))
     ]
 
 builtinCons' :: TEnv
@@ -1042,12 +1054,50 @@ applySites tgts = go
 
 -- infer all top-level bindings; returns errors (empty = well-typed)
 typecheck :: Sigs -> Structs -> [STop] -> [String]
-typecheck sigs structs tops = let (e, _, _, _) = inferTops sigs structs tops in e
+typecheck sigs structs tops = let (e, _, _, _, _) = inferTops sigs structs tops in e
 
-inferTops :: Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [STop])
+-- Infer.Type -> LShape, mirroring FPRISC.shapeOfTy's rules on the
+-- inference-side type language: a linear-named TC is LL, a type
+-- applied to a linear argument (List Vector, ...) is LL wholesale,
+-- tuples distribute, and everything unresolved/polymorphic/functional
+-- is LU (a quantified var can never BE the linear carrier itself --
+-- prims that consume one say so with a concrete Vector in their type).
+linShapeT :: [Name] -> Type -> LShape
+linShapeT linNs = go
+  where
+    go t = case t of
+      TTupT ts -> LTupS (map go ts)
+      TC n | n `elem` linNs -> LL
+      TAp _ _ ->
+        let (h, as) = unroll t []
+         in case h of
+              TC n | n `elem` linNs -> LL
+              _ -> if any (isLin . go) as then LL else LU
+      _ -> LU
+    unroll (TAp f a) acc = unroll f (a : acc)
+    unroll h acc = (h, acc)
+
+-- the BUILTIN prims' linearity shapes, derived from builtinEnv itself
+-- so this table can never drift from the types: Vec.push consumes and
+-- returns a Vector because its type says so, and any prim added later
+-- participates automatically.  Full-spine peel: prims are first-order
+-- at the top level (higher-order ARGUMENTS like Vec.map's element fn
+-- are TFn and shape LU, exactly right).
+builtinLinShapes :: [Name] -> M.Map Name ([LShape], LShape)
+builtinLinShapes linNs =
+  M.fromList
+    [ (n, (map (linShapeT linNs) ps, linShapeT linNs r))
+      | (n, Forall _ _ t) <- M.toList builtinEnv,
+        let (ps, r) = peelFn t
+    ]
+  where
+    peelFn (TFn a b) = let (as, r) = peelFn b in (a : as, r)
+    peelFn t = ([], t)
+
+inferTops :: Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
 inferTops sigs structs tops =
-  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty)
-   in (iErrs st, iNotes st, iHolesP st, tops')
+  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty [])
+   in (iErrs st, iNotes st, iHolesP st, iLinSigs st, tops')
   where
     aliases = M.fromList [(n, fs) | TShape n fs <- tops]
     run :: I [STop]
@@ -1096,12 +1146,24 @@ inferTops sigs structs tops =
       hs0 <- gets iHoles
       hs <- mapM (\(n, t) -> (,) n <$> prettyT t) hs0
       modify (\st -> st {iHolesP = hs})
-      -- record pretty schemes for reporting (user binds, in file order)
+      -- record pretty schemes for reporting (user binds, in file order),
+      -- and the same types as LINEARITY SHAPES: params peeled to the
+      -- bind's own clause arity, so the checker can enforce
+      -- exactly-once on Vec/Handle/SString params even when the user
+      -- wrote no signature (the audited unannotated-main hole)
+      let linNs = nub [n | TType n True _ _ <- tops]
       forM_ bindNames $ \n ->
         forM_ (M.lookup n env) $ \sc -> do
           t <- instantiate sc
           p <- prettyT t
-          modify (\s -> s {iNotes = iNotes s ++ [(n, p)]})
+          tz <- zonk t
+          let ar = case clausesOf n of ((ps0, _, _) : _) -> length ps0; [] -> 0
+              peel 0 tt = ([], tt)
+              peel k (TFn a b) = let (as, r) = peel (k - 1 :: Int) b in (a : as, r)
+              peel _ tt = ([], tt)
+              (pts, rt) = peel ar tz
+              lsig = (map (linShapeT linNs) pts, linShapeT linNs rt)
+          modify (\s -> s {iNotes = iNotes s ++ [(n, p)], iLinSigs = iLinSigs s ++ [(n, lsig)]})
       -- resolve operator sites against the final substitution, then
       -- rebuild the top list with markers rewritten, in original order
       tgts <- resolveSites sigs

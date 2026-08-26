@@ -150,12 +150,15 @@ int64_t qos_netraw_close(int64_t id) {
 #define CLINT_MTIME (QOS_CLINT_BASE + 49144) /* virt's mtime offset, honored */
 #define UART_THR (QOS_UART_BASE + 0)
 #define UART_RBR (QOS_UART_BASE + 0)
+#define UART_IER (QOS_UART_BASE + 1)
+#define UART_FCR (QOS_UART_BASE + 2)
 #define UART_LCR (QOS_UART_BASE + 3)
 #define UART_LSR (QOS_UART_BASE + 5)
 #define UART_SCR (QOS_UART_BASE + 7)
 
 static int stdin_pending = -1;
 static uint8_t uart_lcr, uart_scr;
+static uint8_t uart_ier, uart_dll, uart_dlm;
 
 static void stdin_peek(void) {
   if (stdin_pending >= 0) return;
@@ -170,6 +173,9 @@ int qos_mmioraw_read(uint64_t addr, uint64_t *out) {
   switch (addr) {
     case UART_LCR:
       *out = uart_lcr;
+      return 0;
+    case UART_IER:
+      *out = uart_ier;
       return 0;
     case UART_LSR: {
       stdin_peek();
@@ -200,11 +206,24 @@ int qos_mmioraw_read(uint64_t addr, uint64_t *out) {
 int qos_mmioraw_write(uint64_t addr, uint64_t v) {
   switch (addr) {
     case UART_THR: {
+      if (uart_lcr & 0x80) { uart_dll = (uint8_t)v; return 0; } /* DLAB: DLL */
       char c = (char)v;
       ssize_t r = write(1, &c, 1);
       (void)r;
       return 0;
     }
+    /* the interrupt-era registers, modeled honestly for a host with
+     * no interrupts: IER is stored (the uart service actor sets RDA/
+     * THRE; nothing fires -- the portable tier is its synchronous
+     * backend), FCR is accepted and ignored, and DLAB routes the
+     * divisor latches (UART.qa's params round trip must not leak
+     * divisor bytes into stdout). */
+    case UART_IER:
+      if (uart_lcr & 0x80) { uart_dlm = (uint8_t)v; return 0; } /* DLAB: DLM */
+      uart_ier = (uint8_t)v;
+      return 0;
+    case UART_FCR:
+      return 0;
     case UART_LCR:
       uart_lcr = (uint8_t)v;
       return 0;

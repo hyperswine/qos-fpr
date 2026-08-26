@@ -50,9 +50,13 @@
  * 5 kv record index, 6 sleep (payload = decimal MICROSECONDS text;
  * the app-side Sys.sleepUs backend -- weak/strong linking cannot
  * cross the image boundary, so the sleep goes through the channel
- * every other host service already uses) */
+ * every other host service already uses), 7 compile (payload =
+ * "<profile>\n<source>"; the host bridges to the fpr compiler
+ * server on its unix socket -- portable/compile.c + tools/fprd.py --
+ * and out gets the framed "ok\n<asm>" / "err\n<msg>" reply) */
 #define QOS_SYS_LOADQA 4
 #define QOS_SYS_SLEEPUS 6
+#define QOS_SYS_COMPILE 7
 
 /* ---- the HAL table --------------------------------------------------
  * The entries mirror the obligations runtime/posix's co-compiled HAL

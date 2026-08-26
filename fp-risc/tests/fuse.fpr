@@ -52,6 +52,7 @@ main =
   a2 = Vec.map shiftDn (Vec.map scaleUp a1);
   h1 = heapUsed Unit;
   (s1, a3) = sumI a2;
+  _ = Vec.free a3;
   u0 = verdict "fused-scalar-nested" (s1 == refI 1 4000);
   u1 = verdict "fused-scalar-inplace" (h1 - h0 < 4096);
 
@@ -60,6 +61,7 @@ main =
   b2 = Vec.map scaleUp b1;
   b3 = Vec.map shiftDn b2;
   (s2, b4) = sumI b3;
+  _ = Vec.free b4;
   u2 = verdict "fused-scalar-pipeline" (s2 == refI 1 4000);
 
   # ---- capture-free record map: the point-8 shape, no axpb spelled ----
@@ -68,6 +70,7 @@ main =
   c2 = Vec.map bump c1;
   h3 = heapUsed Unit;
   (s3, c3) = sumP c2;
+  _ = Vec.free c3;
   u3 = verdict "record-map0" (s3 == refP0 1 4000);
   u4 = verdict "record-map0-inplace" (h3 - h2 < 4096);
 
@@ -77,6 +80,7 @@ main =
   d2 = Vec.map swirl (Vec.map bump d1);
   h5 = heapUsed Unit;
   (s4, d3) = sumP d2;
+  _ = Vec.free d3;
   u5 = verdict "fused-record" (s4 == refP 1 4000);
   u6 = verdict "fused-record-inplace" (h5 - h4 < 4096);
   print "FUSION HOLDS".

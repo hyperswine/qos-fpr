@@ -88,6 +88,38 @@ static V h_sys_attach_qa(V bytesv) {
 }
 FPR_FN(fpr_g_Sys_x2eattachQa, h_sys_attach_qa, 1);
 
+/* Sys.compile <profile> <source> -> Ok asm | Err reason: the host-
+ * side fpr compiler server, reached over the syscall channel (tag 7,
+ * qos_abi.h) -- qosp bridges to the daemon's unix socket, and the
+ * "ok\n"/"err\n" status line framed into the reply is parsed HERE so
+ * callers get one Result.  The profile is a token the daemon
+ * whitelists (qos-portable | bare-metal), never argv passthrough. */
+static V h_sys_compile(V profv, V srcv) {
+  if (ISINT(profv) || ((hdr_t *)profv)->tid != T_STR)
+    fpr_cpanic("Sys.compile: profile must be a String");
+  if (ISINT(srcv) || ((hdr_t *)srcv)->tid != T_STR)
+    fpr_cpanic("Sys.compile: source must be a String");
+  if (!g_syscall) return fpr_mkresult(1, "no syscall channel (standalone run)");
+  str_t *prof = (str_t *)profv;
+  str_t *src = (str_t *)srcv;
+  uint64_t plen = prof->len + 1 + src->len;
+  char *req = (char *)fpr_alloc(plen);
+  for (uw i = 0; i < prof->len; i++) req[i] = (char)prof->bytes[i];
+  req[prof->len] = '\n';
+  for (uw i = 0; i < src->len; i++) req[prof->len + 1 + i] = (char)src->bytes[i];
+  int64_t r = g_syscall(7, req, plen, g_sysout, sizeof g_sysout);
+  if (r == -2) return fpr_mkresult(1, "no compiler server (start fp-risc/tools/fprd.py)");
+  if (r == -4) return fpr_mkresult(1, "compiled asm larger than the channel buffer");
+  if (r < 3) return fpr_mkresult(1, "compiler channel error");
+  if (g_sysout[0] == 'o' && g_sysout[1] == 'k' && g_sysout[2] == '\n')
+    return fpr_mkresultn(0, g_sysout + 3, (uw)r - 3);
+  if (r >= 4 && g_sysout[0] == 'e' && g_sysout[1] == 'r' && g_sysout[2] == 'r' &&
+      g_sysout[3] == '\n')
+    return fpr_mkresultn(1, g_sysout + 4, (uw)r - 4);
+  return fpr_mkresult(1, "malformed compiler reply");
+}
+FPR_FN(fpr_g_Sys_x2ecompile, h_sys_compile, 2);
+
 static V h_sys_store_req(V tagv, V payv) {
   if (!ISINT(tagv)) fpr_cpanic("Sys.storeReq: tag must be an Int");
   if (ISINT(payv) || ((hdr_t *)payv)->tid != T_STR)
