@@ -30,15 +30,30 @@ static V g_sstrNew(V u) {
   return (V)s;
 }
 
-/* len : SString -> Int */
-static V g_sstrLen(V sv) { return TAG(as_sstr(sv, "SStr.len: not an SString")->len); }
+/* a (value, handle) pair: linear READS thread the handle back, the
+ * same convention Vec.len/Vec.get follow -- a read that consumed the
+ * handle without returning a successor would be unusable under the
+ * exactly-once discipline the checker now enforces for SString. */
+static V sstr_pair(V a, V sv) {
+  hdr_t *t = (hdr_t *)fpr_alloc(8 + 2 * sizeof(uw));
+  t->tid = T_TUP2;
+  t->var = 0;
+  *(V *)((char *)t + 8) = a;
+  *(V *)((char *)t + 8 + sizeof(uw)) = sv;
+  return (V)t;
+}
 
-/* at : SString -> Int -> Int   (1-indexed; returns the byte code) */
+/* len : SString -> (Int, SString) */
+static V g_sstrLen(V sv) {
+  return sstr_pair(TAG(as_sstr(sv, "SStr.len: not an SString")->len), sv);
+}
+
+/* at : SString -> Int -> (Int, SString)   (1-indexed byte code) */
 static V g_sstrAt(V sv, V iv) {
   sstr_t *s = as_sstr(sv, "SStr.at: not an SString");
   sw k = UNTAG(iv);
   if (k < 1 || (uw)k > s->len) fpr_cpanic("SStr.at: index out of range");
-  return TAG(s->bytes[k - 1]);
+  return sstr_pair(TAG(s->bytes[k - 1]), sv);
 }
 
 /* put : SString -> Int -> Int -> SString   (overwrite byte i, 1-indexed) */
@@ -73,10 +88,10 @@ static V g_sstrFromStr(V strv) {
   return (V)s;
 }
 
-/* toStr : SString -> String   (a heap str_t copy of the live bytes) */
+/* toStr : SString -> (String, SString)   (heap copy of the live bytes) */
 static V g_sstrToStr(V sv) {
   sstr_t *s = as_sstr(sv, "SStr.toStr: not an SString");
-  return (V)fpr_mkstr(s->bytes, s->len);
+  return sstr_pair((V)fpr_mkstr(s->bytes, s->len), sv);
 }
 
 /* clear : SString -> SString   (reset length to 0; keep the buffer) */

@@ -12,7 +12,7 @@ import Data.List (isPrefixOf)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import FPRISC
-import Infer (inferTops)
+import Infer (builtinLinShapes, inferTops)
 import Safety (safetyCheck)
 import System.Environment (lookupEnv)
 import Struct (erasePSig, expandStructs, sigTable, specialize, structTable)
@@ -192,7 +192,7 @@ compileMain = do
                   ++ " runtime-checked, " ++ show nTrap ++ " builtin traps")
       -- typecheck the merged expanded program; rewritten tops carry
       -- operator sites resolved to prims / Str.+ / s.(+)
-      let (terrs, notes, holes, topsRW) = inferTops sigs structs tops'
+      let (terrs, notes, holes, linsigs, topsRW) = inferTops sigs structs tops'
       unless (null terrs) $ do
         putStrLn "=== TYPE ERRORS ==="
         mapM_ (putStrLn . ("  * " ++)) terrs
@@ -252,7 +252,23 @@ compileMain = do
               TType n _ _ _ <- uts,
               let t = tidFor ownerH n
             ]
-          li = buildLinInfo finalTops
+          -- linearity shapes come from THREE sources, most-authored
+          -- first (M.union is left-biased): explicit TSigs, then the
+          -- INFERRED types of unannotated binds, then the builtin
+          -- prims' own types (Vec.push consumes a Vector because its
+          -- type says so).  Before the latter two, an unannotated
+          -- function -- main included -- could double-free a Vec and
+          -- compile "linearity OK": the checker only knew declared
+          -- sigs, so let-bound results of Vec prims were untracked
+          -- and sigless params defaulted to unrestricted.
+          li0 = buildLinInfo finalTops
+          li =
+            li0
+              { liSigs =
+                  liSigs li0
+                    `M.union` M.fromList linsigs
+                    `M.union` builtinLinShapes (liLinTys li0)
+              }
           lerrs = lcheck li finalTops
       -- real tid clash check: same tid, different qualified type name
       let byTid = M.fromListWith (++) [(t, [q]) | (t, q) <- tidDecls]
@@ -275,7 +291,7 @@ compileMain = do
       -- (specialize ran on the whole program above); finalTops' root
       -- portion carries them.
       let resolveUnit uts =
-            let (_, _, _, rw) = inferTops sigs structs (preludeE' ++ uts)
+            let (_, _, _, _, rw) = inferTops sigs structs (preludeE' ++ uts)
                 bn = S.fromList ([fst3 b | b@(TBind {}) <- uts])
              in [t | t@(TBind n _ _ _) <- rw, S.member n bn]
                   ++ [t | t <- rw, not (isTBind t)]
@@ -324,7 +340,7 @@ compileMain = do
       createDirectoryIfMissing True unitDir
       -- prelude unit (unqualified names; the always-linked stdlib unit).
       -- The prelude is self-contained, so resolve its own operators.
-      let preludeResolved = let (_, _, _, rw) = inferTops sigs structs preludeE' in rw
+      let preludeResolved = let (_, _, _, _, rw) = inferTops sigs structs preludeE' in rw
       preludeOut <-
         if null preludeTops
           then pure []

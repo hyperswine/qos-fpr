@@ -31,9 +31,12 @@ main =
   s0 = SStr.new Unit;
   s1 = SStr.push s0 104;
   s2 = SStr.push s1 105;
-  ln = SStr.len s2;
-  c1 = SStr.at s2 1;
-  hs = SStr.toStr s2;
+  # reads THREAD the handle (the Vec.len convention; enforced now that
+  # the linearity checker sees inferred and builtin shapes)
+  (ln, s3) = SStr.len s2;
+  (c1, s4) = SStr.at s3 1;
+  (hs, s5) = SStr.toStr s4;
+  _ = drop s5;
 
   # -- 5. VList over the SoA vector --
   v0 = Vec.fromList [1, 2, 3];

@@ -170,15 +170,20 @@ Using a Vec non-linearly is a compile error, not a silent copy.  This
 is deliberate: a silent deep copy of a compute-bound array is the
 single worst thing a "helpful" runtime could do here.
 
-Enforcement boundary, honestly stated (audit finding): the linearity
-counter takes a variable's linear shape from its DECLARED signature
-(and from linear PAP captures), not from inference.  A function with a
-`: Vector -> ...` sig gets the exactly-once check; an UNANNOTATED
-function -- `main` included -- can double-use or double-free a
-let-bound Vec and compile "linearity OK" (the misuse then runs
-silently).  Inference knows the type; the checker does not consult it
-yet.  Until that lands, a `: ... Vector ...` sig on anything touching
-a Vec is what buys the guarantee.
+Enforcement is INFERENCE-DRIVEN (the audit's hole, closed): the
+checker's shapes come from three sources, most-authored first --
+explicit signatures, the INFERRED types of unannotated binds, and the
+builtin prims' own types (derived from the type environment itself,
+so the table cannot drift).  An unannotated `main` that double-frees
+a let-bound Vec, or a sigless `g v = (Vec.len v, Vec.len v)`, is now
+refused with the same exactly-once error a declared signature always
+bought.  Corollary made uniform on the way: SString READS
+(SStr.len/at/toStr) now THREAD their handle back as `(value, handle)`
+-- the Vec.len convention -- because a "read" typed as consuming
+without returning a successor is unusable under exactly-once, and a
+borrow exemption for reads would have been unsound for Vec (a
+`Vector -> Int` fn that folds AND frees would type identically to a
+borrow).
 
 ## 8. Tier structure
 

@@ -36,6 +36,7 @@ main =
   # the compacted vector is still a normal dense vector afterwards
   a4 = Vec.map (fn x -> x * 2) a3;
   (s2, a5) = sumI a4;
+  _ = Vec.free a5;
   u3 = verdict "dense-after-filter" (s2 == 501000);
 
   # records: every column compacts together, so rows stay aligned
@@ -45,6 +46,7 @@ main =
   h3 = heapUsed Unit;
   (n2, b2b) = Vec.len b2;
   (s3, b3) = sumP b2b;
+  _ = Vec.free b3;
   # x from 21..1000 summed, plus y = 2x  =>  3 * sum(21..1000)
   u4 = verdict "record-sum" (s3 == 3 * (500500 - 210));
   u5 = verdict "record-len" (n2 == 980);
