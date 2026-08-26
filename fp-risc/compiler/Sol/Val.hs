@@ -310,17 +310,33 @@ growCol len (CB cap a) = do
   mapM_ (\i -> readArray a i >>= writeArray a' i) [0 .. len - 1]
   pure (CB cap' a')
 
+-- record shape ids start here (Lang.collectShapes numbers them [100..];
+-- union Type tids run [10..]).  A RECORD value carries var == its field
+-- count, a union variant carries var == its constructor index -- the tid
+-- range is what tells them apart at the store boundary.
+recT0 :: Int
+recT0 = 100
+
+-- the var a reconstructed SoA element must carry: records re-carry their
+-- field count, var-0 products stay 0
+soaVar :: Int -> [k] -> Int
+soaVar tid ks = if tid >= recT0 then length ks else 0
+
 -- what one pushed value decomposes into, per the store's rep
 fieldsFor :: VecRep -> Value -> IO [Value]
 fieldsFor (RScalar _) v = pure [v]
-fieldsFor (RSoA tid ks) (VData t 0 fs) | t == tid, length fs == length ks = pure fs
+fieldsFor (RSoA tid ks) (VData t v fs) | t == tid, v == soaVar tid ks, length fs == length ks = pure fs
 fieldsFor (RSoA tid _) v =
   ioError (userError ("*** SOL PANIC: Vec.push: expected product <" ++ show tid ++ ".0 ...>, got " ++ render v ++ " ***"))
 fieldsFor RUnset _ = ioError (userError "*** SOL PANIC: Vec: unset layout ***")
 
--- decide the layout from the first pushed value
+-- decide the layout from the first pushed value.  var-0 products AND
+-- records (var == field count, tid >= recT0) both take one column per
+-- field -- the record case is what puts {x1,x2,y}-style ML rows into
+-- unboxed f64 columns instead of a boxed scalar column.
 repFor :: Value -> VecRep
 repFor (VData t 0 fs) | not (null fs), t /= listT, t /= atomT = RSoA t (map kindOf fs)
+repFor (VData t v fs) | t >= recT0, v == length fs, not (null fs) = RSoA t (map kindOf fs)
 repFor v = RScalar (kindOf v)
 
 pushVec :: IORef VecStore -> Value -> IO ()
@@ -351,7 +367,7 @@ getVec ref i = do
       fs <- mapM (`readCol` i) (vCols st)
       pure $ case vRep st of
         RScalar _ -> head fs
-        RSoA tid _ -> VData tid 0 fs
+        RSoA tid ks -> VData tid (soaVar tid ks) fs
         RUnset -> vUnit
 
 setVec :: IORef VecStore -> Int -> Value -> IO ()
