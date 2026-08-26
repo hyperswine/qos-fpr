@@ -10,3 +10,25 @@ Except timer interrupts, but those are meant to be mostly on auxiliary harts
 For prime harts not meant to be used often
 
 Device interrupts mostly on auxiliary harts, no prime hart interrupts if only one core
+
+---- implemented (aux-hart interrupts + the timer service) ----
+
+fpr_irq_hart = the LAST live hart (actors.c): plic.c enables only that
+hart's M context and the irq/timer drains are gated on it, so MEIP and
+the armed CLINT deadline pop an AUXILIARY hart out of wfi -- the prime
+hart (0) takes no device interrupts unless it is the only core.  Bound
+actors still run wherever the scheduler puts them (deliveries are
+ordinary sends; donation and stealing included).
+
+Timer.qa (mods/timer.fpr, "/services/timer" via System.qa) owns ALL the
+CLINT driver work: Sys.timerBind registers its actor, Sys.timerArm arms
+ONE deadline (nearest of its sorted pending set), and the irq hart
+delivers a bare Int when due.  A client's std.timer.after is ONE send;
+the TFire that comes back is an ordinary message wake -- the blocked
+caller moves from the backlog into the ready zone under the admission
+bounds (RQ_CAP batches, aging tau, g_max_wait), which is exactly the
+WCET-bounded "readily executed soon" story.  On hosts with no CLINT the
+same actor falls back to sleeper children over Sys.sleepUs.  Single-
+hart machines keep the hart-0 deadlock detector's 30 ms pacing: a
+sooner timer deadline overrides its mtimecmp arm, a later one rides the
+next detector sample.

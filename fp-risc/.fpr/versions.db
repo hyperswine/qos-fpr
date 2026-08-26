@@ -4,3 +4,6 @@ qlog v1.0 db7ad34be58483c9
 uart v1.1 3865188589abf611
 svc v1.1 5bb5fae33c7ae0e9
 qlog v1.1 76ba27032712e60f
+timer v1.0 7a68b33b8a0de04e
+svc v1.2 a5233a24b14a1da7
+qlog v1.2 8e1c0cdaaa6f8a71
