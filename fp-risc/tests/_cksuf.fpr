@@ -1,7 +1,0 @@
-main =
-  a = 2f;
-  b = 1.5f;
-  c = 1.5d;
-  d = 1.5;
-  e = 1e3;
-  print "{F32.str (a + b)} {F64.str (c + d)} {F64.str e}".
