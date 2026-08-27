@@ -23,3 +23,10 @@ Otherwise it can be partitioned so 75/25
 =================
 
 Sol should be done a bit better
+
+=================
+
+Sol's bytecode should be very simple, basically a register-stack machine thing
+And something like get-set for record fields
+And simple branch instructions - used for pattern matching
+Recursive calls should typically just add a new stack frame. Unless it is tail recursive

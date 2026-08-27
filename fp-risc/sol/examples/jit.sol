@@ -2,8 +2,9 @@
 # LLVM ORC when the list clears the threshold (64); below it, or when the
 # element function isn't arithmetic-only Core, the interpreter runs the loop.
 
-iota : (k : Int | measure k) -> List Int .
-iota k | k <= 0 = [].
+# this basically just builds a list from 1..n
+iota : unsafe Int -> List Int .
+iota k | k == 0 = [].
 iota k = k :: iota (k - 1).
 
 square x = x * x.
