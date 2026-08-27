@@ -30,3 +30,18 @@ Sol's bytecode should be very simple, basically a register-stack machine thing
 And something like get-set for record fields
 And simple branch instructions - used for pattern matching
 Recursive calls should typically just add a new stack frame. Unless it is tail recursive
+
+=================
+
+For a better LSP, need to cache intermediate builds that have not changed to avoid recomputing
+Then either use `fpr` or `sol` from the CLI or reimplement
+Can use `fpr typecheck` that does not generate artifacts, but just checks types and reports errors
+Use with --cache <dir> to store intermediate builds, and --cache-check to check if the cache is valid
+
+Have option to turn this on in the extension, otherwise use basic semantic highlighting instead
+
+Constant variables should use blue instead.
+
+=================
+
+Get rid of LLVM, use a custom backend that generates native code directly for JIT

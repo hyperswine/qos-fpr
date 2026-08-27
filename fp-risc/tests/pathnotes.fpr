@@ -80,6 +80,7 @@ appUpdate me env ev m = case ev of
     EMsg tag arg -> appMsg me env m tag arg
   | e -> (m, Nil).
 
+# this should be ideally using clause matching on string literals
 appMsg : unsafe Int -> _ -> _ -> String -> String -> _ .
 appMsg me env m tag arg = case L.strEq tag "note" of
     True -> appNote m arg

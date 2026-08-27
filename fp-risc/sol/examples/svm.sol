@@ -32,7 +32,7 @@ score w1 w2 b x1 x2 = w1 * x1 + w2 * x2 + b.
 # native.
 hW1 w1 w2 b acc p =
   acc + (case p.y * score w1 w2 b p.x1 p.x2 < 1 of
-    True -> 0 - p.y * p.x1
+    True -> 0 - p.y * p.x1 # meant to use - (...) instead of 0 - (...)
   | False -> Numeric.inexact 0).
 hW2 w1 w2 b acc p =
   acc + (case p.y * score w1 w2 b p.x1 p.x2 < 1 of
