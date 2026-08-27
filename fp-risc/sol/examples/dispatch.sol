@@ -5,7 +5,7 @@
 # The checksum must be IDENTICAL whichever tier fires.
 poly x = x * x / 7 + x - 3 .
 plus a b = a + b .
-fill : unsafe Vector -> Int -> Int -> Vector .
+fill : Vector -> (i : Int | measure (lim - i)) -> (lim : Int) -> Vector .
 fill v i lim | i > lim = v.
 fill v i lim = fill (Vec.push (Num.sqrt (i * i)) v) (i + 1) lim.
 

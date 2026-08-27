@@ -16,8 +16,8 @@ mkRow s =
   {x1 = cx + Rand.gauss4 s1 / 2, x2 = cy + Rand.gauss4 s2 / 2,
     y = case cls == 0 of True -> 0 - 1 | False -> 1}.
 
-fill : unsafe Vector -> Int -> Int -> Vector .
-fill v s k | k == 0 = v.
+fill : Vector -> Int -> (k : Int | measure k) -> Vector .
+fill v s k | k <= 0 = v.
 fill v s k = fill (Vec.push (mkRow (Rand.next (s + k * 100003))) v) s (k - 1).
 
 score w1 w2 b x1 x2 = w1 * x1 + w2 * x2 + b.
@@ -57,8 +57,8 @@ epoch n lr w1 w2 b v =
   w2n = w2 - lr * (s2 / n + lam * w2);
   (w1n, w2n, b - lr * (s3 / n), v3).
 
-train : unsafe Int -> Int -> Int -> Int -> Int -> Int -> Vector -> (Int, Int, Int, Vector) .
-train k n lr w1 w2 b v | k == 0 = (w1, w2, b, v).
+train : (k : Int | measure k) -> Int -> Int -> Int -> Int -> Int -> Vector -> (Int, Int, Int, Vector) .
+train k n lr w1 w2 b v | k <= 0 = (w1, w2, b, v).
 train k n lr w1 w2 b v =
   (w1a, w2a, ba, v2) = epoch n lr w1 w2 b v;
   train (k - 1) n lr w1a w2a ba v2.

@@ -18,7 +18,7 @@ dt = Numeric.div 1 100.     # 0.01 s
 g  = Numeric.div 981 100.   # 9.81 m/s^2
 cD = Numeric.div 2 1000.    # drag coefficient 0.002 (quadratic)
 
-upto : unsafe Int -> Int -> List Int .
+upto : (a : Int | measure (b - a)) -> (b : Int) -> List Int .
 upto a b | a > b = [].
 upto a b = a :: upto (a + 1) b.
 
@@ -46,7 +46,7 @@ rangeN p = flyN (Numeric.inexact 0) (Numeric.inexact 0) p.vx p.vy.
 # launch grid: vx 12..31 m/s, vy 8..27 m/s interleaved (ints promote on use)
 mkRow i = {vx = 12 + i - (i / 20) * 20, vy = 8 + (i * 7 - ((i * 7) / 20) * 20)}.
 
-fill : unsafe Vector -> List Int -> Vector .
+fill : Vector -> (xs : List Int | measure xs) -> Vector .
 fill v xs | xs == [] = v.
 fill v xs = case xs of i :: r -> fill (Vec.push (mkRow i) v) r.
 

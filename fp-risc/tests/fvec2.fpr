@@ -5,8 +5,8 @@ keepBig x = x > 4.0.
 addf : F64 -> F64 -> F64 .
 addf a b = a + b.
 
-build : unsafe Int -> Vector -> Vector .
-build n v = case n == 0 of True -> v | False -> build (n - 1) (Vec.push (F64.ofInt n) v).
+build : (n : Int | measure n) -> Vector -> Vector .
+build n v = case n <= 0 of True -> v | False -> build (n - 1) (Vec.push (F64.ofInt n) v).
 
 main =
   v = build 1000 (Vec.newAs "d");

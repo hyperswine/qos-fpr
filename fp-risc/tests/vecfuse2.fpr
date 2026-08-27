@@ -24,7 +24,7 @@ mneg x = 0 - x.
 addA a x = a + x.
 
 # reference for mneg (dbl (inc i)) summed over 1..lim
-refC : unsafe Int -> Int -> Int .
+refC : (i : Int | measure (lim - i)) -> Int -> Int .
 refC i lim | i > lim = 0.
 refC i lim = (0 - (i + 1) * 2) + refC (i + 1) lim.
 

@@ -39,7 +39,7 @@ plus x y = x + y.
 sqDev mu acc x = d = x - mu; acc + d * d.
 std mu sd x = (x - mu) / sd.
 
-mkPt : unsafe Int -> Int -> Int -> {z : Numeric, y : Numeric} .
+mkPt : Int -> Int -> Int -> {z : Numeric, y : Numeric} .
 mkPt mu sd i =
   z = (toZ i - mu) / sd;
   {z = z, y = trueA * z * z + trueB * z + trueC + wiggle z}.
@@ -56,8 +56,8 @@ epoch n lr a b c v =
   (s3, v3) = Vec.fold (gC a b c) 0 v2;
   (a - lr * (s1 / n), b - lr * (s2 / n), c - lr * (s3 / n), v3).
 
-train : unsafe Int -> Int -> Int -> Int -> Int -> Int -> Vector -> (Int, Int, Int, Vector) .
-train k n lr a b c v | k == 0 = (a, b, c, v).
+train : (k : Int | measure k) -> Int -> Int -> Int -> Int -> Int -> Vector -> (Int, Int, Int, Vector) .
+train k n lr a b c v | k <= 0 = (a, b, c, v).
 train k n lr a b c v =
   (a2, b2, c2, v2) = epoch n lr a b c v;
   train (k - 1) n lr a2 b2 c2 v2.

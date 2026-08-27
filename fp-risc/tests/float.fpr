@@ -30,7 +30,7 @@ ieeeGap = case 0.1 + 0.2 == 0.3 of True -> 0 | False -> 1.
 
 # ---- deep float TCO: compensated-free naive sum, 100000 terms -------------
 
-sumTo : unsafe F64 -> Int -> F64 .
+sumTo : F64 -> (n : Int | measure n) -> F64 .
 sumTo acc n | n > 0 = sumTo (acc + 0.5) (n - 1).
 sumTo acc n = acc.
 
@@ -42,7 +42,7 @@ wsum a b c d e f g h i j =
 
 # ---- floats in data: moved and folded, never printed ----------------------
 
-addAll : unsafe List F64 -> F64 -> F64 .
+addAll : (xs : List F64 | measure xs) -> F64 -> F64 .
 addAll xs acc = case xs of Nil -> acc | x :: r -> addAll r (acc + x).
 
 swapF (a, b) = (b, a).

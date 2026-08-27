@@ -15,11 +15,11 @@
 #
 # Expected: "BIGFREE HOLDS: ..." with the arena flat across 40 cycles.
 
-fill : unsafe Int -> Vector -> Vector .
-fill n v = case n == 0 of True -> v | False -> fill (n - 1) (Vec.push n v).
+fill : (n : Int | measure n) -> Vector -> Vector .
+fill n v = case n <= 0 of True -> v | False -> fill (n - 1) (Vec.push n v).
 
-cycle : unsafe Int -> Int -> Int .
-cycle 0 acc = acc.
+cycle : (k : Int | measure k) -> Int -> Int .
+cycle k acc | k <= 0 = acc.
 cycle k acc =
   v = fill 100000 (Vec.new Unit);
   (s, v2) = Vec.fold addI 0 v;
