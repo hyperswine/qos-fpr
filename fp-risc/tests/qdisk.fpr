@@ -16,9 +16,9 @@
 
 QL = use "../programs/mods/qlog".
 
-rep : unsafe String -> Int -> String .
+rep : String -> Int -> String .
 rep s n = repGo s n "".
-repGo : unsafe String -> Int -> String -> String .
+repGo : String -> (n : Int | measure n) -> String -> String .
 repGo s n acc = case n <= 0 of True -> acc | False -> repGo s (n - 1) (strcat acc s).
 
 okOr r alt = case r of Ok s -> s | Err e -> alt.

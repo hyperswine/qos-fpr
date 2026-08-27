@@ -19,8 +19,8 @@ P = pl.P.
 
 # ---- damped spring: x'' = -4x - 0.3v ---------------------------------------
 
-spring : unsafe Int -> Int -> Int -> Int -> (List _, List _) .
-spring k t x v | k == 0 = ([], []).
+spring : (k : Int | measure k) -> Int -> Int -> Int -> (List _, List _) .
+spring k t x v | k <= 0 = ([], []).
 spring k t x v =
   v2 = v + (0 - 4) * x * 0.05 - 0.3 * v * 0.05;
   x2 = x + v2 * 0.05;
@@ -29,8 +29,8 @@ spring k t x v =
 
 # ---- gradient descent on f(a,b) = (a-2)^2 + 3(b+1)^2 ----------------------
 
-gd : unsafe Int -> Int -> Int -> Int -> (List _, List _) .
-gd k i a b | k == 0 = ([], []).
+gd : (k : Int | measure k) -> Int -> Int -> Int -> (List _, List _) .
+gd k i a b | k <= 0 = ([], []).
 gd k i a b =
   loss = (a - 2) * (a - 2) + 3 * (b + 1) * (b + 1);
   a2 = a - 0.15 * 2 * (a - 2);
@@ -40,8 +40,8 @@ gd k i a b =
 
 # ---- two-body orbits: a = -r / |r|^3 (mu = 1), Euler-Cromer ---------------
 
-orbit : unsafe Int -> Int -> Int -> Int -> Int -> Int -> List _ .
-orbit k every x y vx vy | k == 0 = [].
+orbit : (k : Int | measure k) -> Int -> Int -> Int -> Int -> Int -> List _ .
+orbit k every x y vx vy | k <= 0 = [].
 orbit k every x y vx vy =
   r2 = x * x + y * y;
   r3 = r2 * Num.sqrt r2;
@@ -56,13 +56,13 @@ orbit k every x y vx vy =
 
 # ---- travelling pulse: y = 1/(1 + 8(x - c)^2), c sweeps 0..4 --------------
 
-waveRow : unsafe Int -> Int -> List _ .
+waveRow : Int -> (i : Int | measure (40 - i)) -> List _ .
 waveRow c i | i > 40 = [].
 waveRow c i =
   x = i / 10.0;
   d = x - c;
   (x, 1 / (1 + 8 * d * d)) :: waveRow c (i + 1).
-waveFrames : unsafe Int -> List _ .
+waveFrames : (f : Int | measure (24 - f)) -> List _ .
 waveFrames f | f > 24 = [].
 waveFrames f = waveRow (f / 6.0) 1 :: waveFrames (f + 1).
 

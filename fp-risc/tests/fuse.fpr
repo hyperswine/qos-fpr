@@ -19,11 +19,11 @@ shiftDn v = v - 2.
 bump p = {p | x = 2 * p.x + 1, y = p.y - 4}.
 swirl p = {x = p.x + p.y, y = p.x - p.y}.
 
-fillI : unsafe Vector -> Int -> Int -> Vector .
+fillI : Vector -> (i : Int | measure (lim - i)) -> Int -> Vector .
 fillI v i lim | i > lim = v.
 fillI v i lim = fillI (Vec.push i v) (i + 1) lim.
 
-fillP : unsafe Vector -> Int -> Int -> Vector .
+fillP : Vector -> (i : Int | measure (lim - i)) -> Int -> Vector .
 fillP v i lim | i > lim = v.
 fillP v i lim = fillP (Vec.push {x = i, y = i * 3} v) (i + 1) lim.
 
@@ -31,12 +31,12 @@ sumI vv = Vec.fold (fn a x -> a + x) 0 vv .
 sumP vv = Vec.fold (fn a p -> a + p.x * 5 + p.y) 0 vv .
 
 # scalar reference for the fused scalar pipeline: shiftDn (scaleUp i)
-refI : unsafe Int -> Int -> Int .
+refI : (i : Int | measure (lim - i)) -> Int -> Int .
 refI i lim | i > lim = 0.
 refI i lim = (i * 3 + 1 - 2) + refI (i + 1) lim.
 
 # record reference for the fused record pipeline: swirl (bump p)
-refP : unsafe Int -> Int -> Int .
+refP : (i : Int | measure (lim - i)) -> Int -> Int .
 refP i lim | i > lim = 0.
 refP i lim =
   bx = 2 * i + 1;
@@ -86,6 +86,6 @@ main =
   print "FUSION HOLDS".
 
 # reference for the un-fused record single map: sumP of bump
-refP0 : unsafe Int -> Int -> Int .
+refP0 : (i : Int | measure (lim - i)) -> Int -> Int .
 refP0 i lim | i > lim = 0.
 refP0 i lim = (2 * i + 1) * 5 + (i * 3 - 4) + refP0 (i + 1) lim.

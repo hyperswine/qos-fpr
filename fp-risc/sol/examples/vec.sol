@@ -6,15 +6,15 @@
 
 Student = {age : Int, name : String}.
 
-iota : unsafe Int -> List Int .
-iota k | k == 0 = [].
+iota : (k : Int | measure k) -> List Int .
+iota k | k <= 0 = [].
 iota k = k :: iota (k - 1).
 
 mkStudent i = {age = 17 + (i - (i / 40) * 40), name = "student{i}"}.
 plus a b = a + b.
 
 # build: push_back with doubling realloc, entirely in place (linear!)
-fill : unsafe Vector -> Int -> Int -> Vector .
+fill : Vector -> (i : Int | measure (lim - i)) -> (lim : Int) -> Vector .
 fill v i lim | i > lim = v.
 fill v i lim = fill (Vec.push (mkStudent i) v) (i + 1) lim.
 

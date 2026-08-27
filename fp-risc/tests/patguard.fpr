@@ -52,7 +52,7 @@ shape p = "sparse".
 # call-based fallthrough it is stack death unless the calls are TCO'd
 # tail calls — 200000 deep says they are.
 
-spin : unsafe Int -> Int -> Int .
+spin : (n : Int | measure n) -> Int -> Int .
 spin n acc | n < 0 = acc.
 spin n acc | Some h <- half n, h > n = acc.      # never: h <= n
 spin n acc | None <- half (2 * n + 2) = acc.     # never: even

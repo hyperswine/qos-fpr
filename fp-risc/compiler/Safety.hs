@@ -184,10 +184,16 @@ safetyCheck preludeNames tops notes = (errs, suggests)
                 Just (cm, km)
                   | M.null (M.filter (/= 0) cm) -> km >= 0
                   | otherwise ->
+                      -- measure m = <cm.x> + km, fact <fc.x> >= flo with
+                      -- fc == cm gives m >= flo + km: the floor holds when
+                      -- flo + km >= 0.  (Subtracting km was a sign slip,
+                      -- invisible while every corpus measure had km == 0 --
+                      -- variable limits and countdowns -- but it refused
+                      -- every CONSTANT-limit measure like `40 - i`.)
                       any
                         ( \(fc, flo) ->
                             M.filter (/= 0) (M.unionWith (+) fc (M.map negate cm)) == M.empty
-                              && flo - km >= 0
+                              && flo + km >= 0
                         )
                         (concatMap factGe facts)
                 Nothing -> False

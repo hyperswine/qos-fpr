@@ -22,8 +22,8 @@ dy = Numeric.div yspan h.
 
 imod a b = a - (a / b) * b.
 
-mand : unsafe Int -> Int -> Int -> Int -> Int -> Int .
-mand cr ci zr zi k | k == 0 = 0.
+mand : Int -> Int -> Int -> Int -> (k : Int | measure k) -> Int .
+mand cr ci zr zi k | k <= 0 = 0.
 mand cr ci zr zi k =
   r2 = zr * zr;
   i2 = zi * zi;
@@ -31,13 +31,13 @@ mand cr ci zr zi k =
     True -> k
   | False -> mand cr ci (r2 - i2 + cr) (2 * zr * zi + ci) (k - 1).
 
-pix : unsafe Int -> Int .
+pix : Int -> Int .
 pix i =
   col = imod (i - 1) w;
   row = (i - 1) / w;
   mand (xmin + col * dx) (ymin + row * dy) 0 0 maxIter.
 
-upto : unsafe Int -> Int -> List Int .
+upto : (a : Int | measure (b - a)) -> (b : Int) -> List Int .
 upto a b | a > b = [].
 upto a b = a :: upto (a + 1) b.
 plus a b = a + b.
@@ -47,17 +47,17 @@ charFor c = case c == 0 of
   True -> "@"
 | False -> palette ! (case c / 10 + 1 > 9 of True -> 9 | False -> c / 10 + 1).
 
-rowStr : unsafe List Int -> String .
+rowStr : (cs : List Int | measure cs) -> String .
 rowStr cs | cs == [] = "".
 rowStr cs = case cs of c :: r -> "{charFor c}{rowStr r}".
 
-dropN : unsafe Int -> List y29 -> List y29 .
-dropN n xs | n == 0 = xs.
+dropN : (n : Int | measure n) -> List y29 -> List y29 .
+dropN n xs | n <= 0 = xs.
 dropN n xs | xs == [] = [].
 dropN n xs = case xs of x :: r -> dropN (n - 1) r.
 
-takeN : unsafe Int -> List z29 -> List z29 .
-takeN n xs | n == 0 = [].
+takeN : (n : Int | measure n) -> List z29 -> List z29 .
+takeN n xs | n <= 0 = [].
 takeN n xs | xs == [] = [].
 takeN n xs = case xs of x :: r -> x :: takeN (n - 1) r.
 

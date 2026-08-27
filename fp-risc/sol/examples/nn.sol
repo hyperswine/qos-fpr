@@ -31,22 +31,22 @@ M = mx.M.
 
 # ---- small list algebra (rows are lists at the matmul boundary) ------------
 
-zip2W : unsafe (a1 -> b1 -> c1) -> List a1 -> List b1 -> List c1 .
+zip2W : (a1 -> b1 -> c1) -> (xs : List a1 | measure xs) -> List b1 -> List c1 .
 zip2W f xs ys | xs == [] = [].
 zip2W f xs ys = x :: xr = xs; y :: yr = ys; f x y :: zip2W f xr yr.
 
-lSum : unsafe List d1 -> d1 .
+lSum : (xs : List d1 | measure xs) -> d1 .
 lSum xs | xs == [] = 0.
 lSum xs = x :: r = xs; x + lSum r.
 
 lScale k xs = map (fn x -> k * x) xs.
-lSub : unsafe List a2 -> List a2 -> List a2 .
+lSub : List a2 -> List a2 -> List a2 .
 lSub xs ys = zip2W (fn a b -> a - b) xs ys.
-lAdd : unsafe List b2 -> List b2 -> List b2 .
+lAdd : List b2 -> List b2 -> List b2 .
 lAdd xs ys = zip2W (fn a b -> a + b) xs ys.
 
-lZeros : unsafe Int -> List Int .
-lZeros n | n == 0 = [].
+lZeros : (n : Int | measure n) -> List Int .
+lZeros n | n <= 0 = [].
 lZeros n = Numeric.inexact 0 :: lZeros (n - 1).
 
 # ---- the net ---------------------------------------------------------------
@@ -55,16 +55,16 @@ relu x = case x > 0 of True -> x | False -> Numeric.inexact 0.
 sq x = x * x.
 
 # deterministic small init in (-0.7, 0.7)
-initRow : unsafe Int -> Int -> List Int .
-initRow s k | k == 0 = [].
+initRow : Int -> (k : Int | measure k) -> List Int .
+initRow s k | k <= 0 = [].
 initRow s k = Rand.unit s * 0.7 :: initRow (Rand.next s) (k - 1).
-initRows : unsafe Int -> Int -> Int -> List _ .
-initRows s r c | r == 0 = [].
+initRows : Int -> (r : Int | measure r) -> Int -> List _ .
+initRows s r c | r <= 0 = [].
 initRows s r c = initRow s c :: initRows (Rand.next4 (s + 7919)) (r - 1) c.
 
 # training data: n samples, x1/x2 in [-1,1), y = x1*x2 (augmented col of 1s)
-mkData : unsafe Int -> Int -> (List _, List Int) .
-mkData s n | n == 0 = ([], []).
+mkData : Int -> (n : Int | measure n) -> (List _, List Int) .
+mkData s n | n <= 0 = ([], []).
 mkData s n =
   s1 = Rand.next s; s2 = Rand.next4 s1;
   x1 = Rand.unit s1; x2 = Rand.unit s2;
@@ -85,11 +85,11 @@ augRows rss = map (fn r -> List.append r [Numeric.inexact 1]) rss.
 #   work).  Returns updated parameters, the epoch's MSE, and Xaug.
 
 lTail xs = x :: r = xs; r.
-lT : unsafe Int -> List _ -> List _ .
-lT c rss | c == 0 = [].
+lT : (c : Int | measure c) -> List _ -> List _ .
+lT c rss | c <= 0 = [].
 lT c rss = map (fn xs -> xs ! 1) rss :: lT (c - 1) (map (fn xs -> lTail xs) rss).
 
-epoch : unsafe Int -> Int -> _ -> List _ -> List Int -> List _ -> List Int -> _ .
+epoch : Int -> Int -> _ -> List _ -> List Int -> List _ -> List Int -> _ .
 epoch n lr xaug xrows ys w1rows w2 =
   # forward: Z1 = Xaug (n x 3) * W1' (3 x H)
   w1t = M.fromRows (lT 3 w1rows);
@@ -115,26 +115,26 @@ epoch n lr xaug xrows ys w1rows w2 =
   w2n = lSub w2 (lScale lr dw2);
   (w1n, w2n, mse, xaug2).
 
-lDot : unsafe List e1 -> List e1 -> e1 .
+lDot : (xs : List e1 | measure xs) -> List e1 -> e1 .
 lDot xs ys | xs == [] = 0.
 lDot xs ys = x :: xr = xs; y :: yr = ys; x * y + lDot xr yr.
 reluGate z g = case z > 0 of True -> g | False -> Numeric.inexact 0.
-dropLast : unsafe List f1 -> List f1 .
+dropLast : (xs : List f1 | measure xs) -> List f1 .
 dropLast xs | (x :: r) <- xs, r == [] = [].
 dropLast xs = x :: r = xs; x :: dropLast r.
 
 # acc += d_i * row_i, over all samples (the dW2 accumulation)
-accumRows : unsafe List _ -> List g1 -> List g1 -> List g1 .
+accumRows : (rows : List _ | measure rows) -> List g1 -> List g1 -> List g1 .
 accumRows rows ds acc | rows == [] = acc.
 accumRows rows ds acc =
   r :: rr = rows; d :: dr = ds;
   accumRows rr dr (lAdd acc (lScale d r)).
 
 # acc_j += dz1row_i[j] * xrow_i, over all samples (the dW1 accumulation)
-lZeros3 : unsafe Int -> List _ .
-lZeros3 h | h == 0 = [].
+lZeros3 : (h : Int | measure h) -> List _ .
+lZeros3 h | h <= 0 = [].
 lZeros3 h = lZeros 3 :: lZeros3 (h - 1).
-accumOuter : unsafe List _ -> List _ -> List _ -> List _ .
+accumOuter : (dzs : List _ | measure dzs) -> List _ -> List _ -> List _ .
 accumOuter dzs xs acc | dzs == [] = acc.
 accumOuter dzs xs acc =
   dz :: dzr = dzs; x :: xr = xs;
@@ -144,13 +144,13 @@ mAllRowsOf m = M.mapRows (fn r -> r) m.
 
 # ---- the training loop -----------------------------------------------------
 
-train : unsafe Int -> Int -> Int -> _ -> List _ -> List Int -> List _ -> List Int -> Int -> _ .
-train k n lr xaug xrows ys w1 w2 last | k == 0 = (w1, w2, last, xaug).
+train : (k : Int | measure k) -> Int -> Int -> _ -> List _ -> List Int -> List _ -> List Int -> Int -> _ .
+train k n lr xaug xrows ys w1 w2 last | k <= 0 = (w1, w2, last, xaug).
 train k n lr xaug xrows ys w1 w2 last =
   (w1n, w2n, mse, xaug2) = epoch n lr xaug xrows ys w1 w2;
   train (k - 1) n lr xaug2 xrows ys w1n w2n mse.
 
-predict : unsafe List _ -> List Int -> Int -> Int -> Int .
+predict : List _ -> List Int -> Int -> Int -> Int .
 predict w1rows w2 x1 x2 =
   z1s = map (fn wr -> lDot wr [x1, x2, Numeric.inexact 1]) w1rows;
   lDot (List.append (map (fn z -> relu z) z1s) [Numeric.inexact 1]) w2.

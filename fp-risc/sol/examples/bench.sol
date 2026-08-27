@@ -1,5 +1,5 @@
-iota : unsafe Int -> List Int .
-iota k | k == 0 = [].
+iota : (k : Int | measure k) -> List Int .
+iota k | k <= 0 = [].
 iota k = k :: iota (k - 1).
 collatzLen : unsafe Int -> Int .
 collatzLen n | n == 1 = 0.
