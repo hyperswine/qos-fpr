@@ -434,10 +434,19 @@ b2d = castWord64ToDouble . fromIntegral
 toTyped :: Value -> Maybe (JTy, [Int64])
 toTyped v0 = do
   xs <- nums v0
-  let ety
-        | all isI xs = JI
-        | all (not . isI) xs = JD
-        | otherwise = JW
+  -- classify by what the elements ARE, never by what they are not: a
+  -- list of NON-numbers (rows, records, strings) must bail to the
+  -- interpreter.  The old "not an Int => Double" read classified a
+  -- list of lists as JD and encoded every element as 0 bits -- any
+  -- boxed-element map/filter/fold over the JIT threshold silently
+  -- computed on zeros (the NN's row lists were the first witness).
+  ety <-
+    if all isI xs
+      then Just JI
+      else
+        if all isD xs
+          then Just JD
+          else if all (\x -> isI x || isD x) xs then Just JW else Nothing
   pure (ety, map (enc ety) xs)
   where
     nums (VData t 1 [x, r]) | t == listT = (x :) <$> nums r
@@ -445,6 +454,8 @@ toTyped v0 = do
     nums _ = Nothing
     isI VInt {} = True
     isI _ = False
+    isD VNum {} = True
+    isD _ = False
     enc JI (VInt i) = fromIntegral i
     enc _ (VInt i) = d2b (fromIntegral i)
     enc _ (VNum d) = d2b d
