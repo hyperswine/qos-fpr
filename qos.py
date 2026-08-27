@@ -15,6 +15,9 @@ directories or thread app.qa paths by hand again.
                                     fp-risc/apps/myapp/ (templates: min |
                                     service | mvu | notes) -- it runs,
                                     self-checks, and packs immediately
+    ./qos.py dev apps/myapp/app.fpr             the SKETCH loop: run
+                                    INTERPRETED (sol profile: actors, MVU,
+                                    paths, transactions), rerun on save
     ./qos.py run tests/dtree.fpr    compile + host on qosp (the default)
     ./qos.py run tests/pathnotes.fpr            a program DECLARES its own
                                     harness in `#:` header lines: plugins
@@ -49,6 +52,7 @@ entry point over the existing one.
 
 import argparse
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -324,6 +328,77 @@ def cmd_pack(a):
     else:
         say(f"run it: {QOS / host} --yes {rel}/{name}.qa")
     say(f"pack done in {time.time() - t0:.1f}s")
+
+
+def watch_set(prog_abs):
+    """The file + its transitive `use` targets, textually scanned --
+    what a save should rerun.  Extension resolution mirrors the
+    compiler: the importer's own extension first, the sibling second."""
+    seen, out = set(), []
+
+    def visit(p):
+        try:
+            p = p.resolve()
+        except OSError:
+            return
+        if p in seen or not p.is_file():
+            return
+        seen.add(p)
+        out.append(p)
+        try:
+            src = p.read_text(errors="replace")
+        except OSError:
+            return
+        exts = [p.suffix, ".sol" if p.suffix == ".fpr" else ".fpr"]
+        for spec in re.findall(r'use\s+"([^"#]+)', src):
+            base = p.parent / spec
+            cands = [base] if base.suffix in (".sol", ".fpr") else [base.with_suffix(e) for e in exts]
+            for c in cands:
+                if c.is_file():
+                    visit(c)
+                    break
+
+    visit(Path(prog_abs))
+    return out
+
+
+def cmd_dev(a):
+    """The sketch loop: run the program on the SOL profile (interpreted
+    bytecode -- actors, MVU, paths, transactions all live), then rerun
+    on every save of the file or anything it uses."""
+    prog = resolve_prog(a.prog)
+    build_fpr()
+    e = dict(os.environ)
+    e["LD_LIBRARY_PATH"] = "/usr/lib/llvm-18/lib"
+    say(f"dev {prog}: sol profile, rerun on save")
+
+    def mt(f):
+        try:
+            return f.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    while True:
+        t0 = time.time()
+        try:
+            r = subprocess.run([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=e).returncode
+            say(f"dev: exit {r} in {time.time() - t0:.1f}s")
+        except KeyboardInterrupt:
+            print()
+            say("dev: app interrupted")
+        files = watch_set(FPR / prog)
+        say(f"dev: watching {len(files)} file(s) -- save to rerun, Ctrl-C to leave")
+        try:
+            base = {f: mt(f) for f in files}
+            changed = None
+            while changed is None:
+                time.sleep(0.3)
+                changed = next((f for f in files if mt(f) != base[f]), None)
+            say(f"dev: changed {os.path.relpath(changed, FPR)}")
+        except KeyboardInterrupt:
+            print()
+            say("dev: bye")
+            return 0
 
 
 def cmd_serve(a):
@@ -729,6 +804,10 @@ def main():
     p.add_argument("--plugin", action="append", help="plugin module to seed (repeatable; overrides `#: plugins`)")
     p.add_argument("--no-plugins", action="store_true", help="ignore the program's `#: plugins` line")
     p.set_defaults(f=cmd_pack)
+
+    p = sub.add_parser("dev", help="the sketch loop: run interpreted (sol profile), rerun on save")
+    p.add_argument("prog", help=".fpr or .sol, from anywhere in the tree")
+    p.set_defaults(f=cmd_dev)
 
     p = sub.add_parser("serve", help="host a LiveView app on a port")
     p.add_argument("prog")

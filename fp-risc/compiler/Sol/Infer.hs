@@ -332,6 +332,22 @@ builtinEnv =
       -- accepted (write) depends on the path/query value the HAL decodes,
       -- so both are maximally generic — the same stance `stat` already took.
       ("read", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      -- the actor shim (VM.hs): same schemes as the AOT tier's Infer
+      ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("receive", scheme [0] (TFn tInt (sv 0))),
+      ("receiveFrom", scheme [0] (TFn tInt (TFn tInt (sv 0)))),
+      ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
+      ("myself", mono (TFn tInt tInt)),
+      ("yield", scheme [0] (TFn tInt (sv 0))),
+      ("kill", mono (TFn tInt tUnit)),
+      ("drop", scheme [0] (TFn (sv 0) tUnit)),
+      ("keep", scheme [0] (TFn (sv 0) (sv 0))),
+      ("device", scheme [0] (TFn tStr (sv 0))),
+      ("reg32", scheme [0, 1] (TFn (sv 0) (TFn tInt (sv 1)))),
+      ("Sys.poolReset", scheme [0] (TFn tInt (sv 0))),
+      ("Sys.sleepUs", mono (TFn tInt tUnit)),
+      ("Sys.logAt", scheme [0] (TFn tInt (TFn tStr tUnit))),
+      ("Sys.memStats", scheme [0] (TFn tInt (sv 0))),
       ("Num.div", mono (TFn tInt (TFn tInt tInt))), -- tInt IS the Numeric type
       ("Num.sqrt", mono (TFn tInt tInt)),
       ("Num.floor", mono (TFn tInt tInt)),

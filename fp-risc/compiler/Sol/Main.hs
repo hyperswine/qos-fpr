@@ -303,26 +303,45 @@ expandUses depth prefix seenRef impExt baseDir tops = do
     notEval TEval {} = False
     notEval _ = True
 
--- rewrite references through struct-targeted `Local = mod.Struct.` aliases
+-- rewrite references through `Local = target.` aliases whose target the
+-- merged program DEFINES: structs (the original case), and -- for the
+-- .fpr sketch tier -- types, constructors and values re-exported from a
+-- spliced module (`MQuit = MV.MQuit.`, `STick = MV.STick.`).  Renames
+-- expressions, PATTERNS (a case arm `ETick -> ...` is a PCon), and sig
+-- types; alias chains resolve transitively (bounded).  Alias names are
+-- capitalized by grammar, locals lowercase, so shadowing cannot occur.
 aliasStructRefs :: [STop] -> [STop]
 aliasStructRefs tops
   | M.null amap = tops
   | otherwise = map top tops
   where
     structNames = S.fromList [n | TStruct n _ _ <- tops]
-    amap = M.fromList [(t, tgt) | TAlias t tgt <- tops, S.member tgt structNames]
-    ren v = case M.lookup v amap of
-      Just tgt -> tgt
+    defined = S.union structNames (S.fromList (topNames tops))
+    amap = M.fromList [(t, tgt) | TAlias t tgt <- tops, S.member tgt defined]
+    ren = renFuel (8 :: Int)
+    renFuel 0 v = v
+    renFuel fuel v = case M.lookup v amap of
+      Just tgt -> renFuel (fuel - 1) tgt
       Nothing -> case break (== '.') v of
-        (h, '.' : rest) | Just tgt <- M.lookup h amap -> tgt ++ "." ++ rest
+        (h, '.' : rest) | Just tgt <- M.lookup h amap -> renFuel (fuel - 1) (tgt ++ "." ++ rest)
         _ -> v
-    re bs = transformE (\_ e -> case e of SVar v -> SVar (ren v); _ -> e) bs
+    rp = \case
+      PCon c ps -> PCon (ren c) (map rp ps)
+      PTup ps -> PTup (map rp ps)
+      o -> o
+    rt = \case
+      TCon n as -> TCon (ren n) (map rt as)
+      TTup ts -> TTup (map rt ts)
+      TArrT a b -> TArrT (rt a) (rt b)
+      o -> o
+    re bs = transformEP (\_ e -> case e of SVar v -> SVar (ren v); _ -> e) rp bs
     top = \case
       TBind n ps g b ->
-        let (bs, g') = renGuards re id (S.fromList (concatMap patVars ps)) g
-         in TBind n ps g' (re bs b)
+        let (bs, g') = renGuards re rp (S.fromList (concatMap patVars ps)) g
+         in TBind n (map rp ps) g' (re bs b)
       TEval e -> TEval (re S.empty e)
       TStruct n sigs fs -> TStruct n sigs [(f, re S.empty e) | (f, e) <- fs]
+      TSig n (ps, r) pcs -> TSig n (map rt ps, rt r) pcs
       other -> other
 
 -- ---- realtime escape reporting --------------------------------------------
