@@ -1193,6 +1193,173 @@ collectShapes tops = M.fromList [(fs, shapeIdFor fs) | fs <- allShapes]
     stmtShapes (SBind _ _ x) = exprShapes x
     stmtShapes (SBindPat p x) = patShapes p ++ exprShapes x
 
+-- ---- first-class paths (docs/PATHS.md) --------------------------------
+--
+-- A TYPE-ROOTED path literal `@Model.field.sub` is validated here --
+-- unconditionally, against the record alias's declared field types --
+-- and desugars to an ORDINARY record value
+--
+--   { get  = fn s -> s.field.sub,
+--     set  = fn v s -> {s | field.sub = v},
+--     segs = ["field", "sub"] }
+--
+-- at plain type Path s a: no new type-system machinery, all the magic
+-- lives in this one rewrite (composition is a normal function, in
+-- std/lens).  The parser already turns every `@...` into
+-- SApp (SVar "Path") <string> (sol's file-path literal); a literal
+-- whose FIRST segment names a declared record alias is a path into
+-- that shape and rewrites, everything else passes through untouched
+-- (file paths start lowercase or '/', so the split is honest).
+--
+-- The BARE root `@Model` is the SCHEMA: the flattened list of every
+-- string-addressable leaf, each entry
+--
+--   { path = "a.b", tag = "int"|"str",
+--     get  = fn s -> <leaf rendered as String>,
+--     set  = fn v s -> <s with leaf := v parsed by tag> }
+--
+-- -- the string tier for wires, shells and inspectors (std/lens walks
+-- it).  Both tiers construct the SAME {get,set} closures, so a parsed
+-- path and a literal path are indistinguishable downstream.  Leaves
+-- are Int/String fields plus nested record aliases (flattened);
+-- fields of any other type are typed-tier-only (a List index is a
+-- traversal, not a total path) and are skipped by the schema.
+--
+-- Runs on the SURFACE tree right after module load (Compile.hs), so
+-- collectShapes sees the generated records like any user record and
+-- every profile downstream is oblivious.
+
+shapeTyTable :: [STop] -> M.Map Name [(Name, Ty)]
+shapeTyTable tops = M.fromList [(n, fs) | TShape n fs <- tops]
+
+expandPathLits :: M.Map Name [(Name, Ty)] -> [STop] -> ([String], [STop])
+expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
+  where
+    top (TBind n ps gs b) = TBind n ps (map (mapGuardE goE) gs) (goE b)
+    top (TStruct n as fs) = TStruct n as [(f, goE e) | (f, e) <- fs]
+    top t = t
+    errsTop (TBind _ _ gs b) = concatMap errsG gs ++ errsE b
+      where errsG (GBool e) = errsE e
+            errsG (GPat _ e) = errsE e
+    errsTop (TStruct _ _ fs) = concatMap (errsE . snd) fs
+    errsTop _ = []
+
+    splitDots s = case break (== '.') s of
+      (a, []) -> [a]
+      (a, _ : r) -> a : splitDots r
+
+    pathTarget e = case e of
+      SApp (SVar "Path") (SStrI [SegStr p])
+        | (root : fields) <- splitDots p,
+          not (null root),
+          isUpper (head root),
+          Just fs <- M.lookup root tbl ->
+            Just (p, root, fields, fs)
+      _ -> Nothing
+
+    goE e
+      | Just (p, root, fields, fs) <- pathTarget e =
+          case rewriteLit p root fields fs of
+            Right e' -> e'
+            Left _ -> e -- reported via errsE; keep the tree well-formed
+    goE e = descend e
+
+    errsE e
+      | Just (p, root, fields, fs) <- pathTarget e =
+          either (: []) (const []) (rewriteLit p root fields fs)
+    errsE e = concatMap errsE (children e)
+
+    rewriteLit p root [] _ = schemaFor p root
+    rewriteLit p root fields fs = do
+      validate p root fields fs
+      pure $
+        SRec
+          [ ("get", SLam ["s"] (SProj (SVar "s") fields)),
+            ("set", SLam ["v", "s"] (SUpd (SVar "s") [(fields, SVar "v")])),
+            ("segs", SList [SStrI [SegStr f] | f <- fields])
+          ]
+
+    validate _ _ [] _ = Right ()
+    validate p shape (f : rest) fs = case lookup f fs of
+      Nothing ->
+        Left
+          ( "path literal @" ++ p ++ ": " ++ shape ++ " has no field '" ++ f
+              ++ "' (fields: " ++ intercalate ", " (map fst fs) ++ ")"
+          )
+      Just t
+        | null rest -> Right ()
+        | TCon sub [] <- t, Just fs' <- M.lookup sub tbl -> validate p sub rest fs'
+        | otherwise ->
+            Left
+              ( "path literal @" ++ p ++ ": field '" ++ f
+                  ++ "' is not a declared record shape -- cannot descend into it"
+              )
+
+    -- the schema: flatten every addressable leaf under the root alias.
+    -- visited guards against a (declared) recursive shape cycle.
+    schemaFor p root = SList . map entry <$> leaves p [root] [] (tbl M.! root)
+    leaves p visited pre fs = concat <$> mapM leaf fs
+      where
+        leaf (f, TCon "Int" []) = pure [(pre ++ [f], "int")]
+        leaf (f, TCon "String" []) = pure [(pre ++ [f], "str")]
+        leaf (f, TCon sub [])
+          | Just fs' <- M.lookup sub tbl =
+              if sub `elem` visited
+                then
+                  Left
+                    ( "schema @" ++ p ++ ": shape " ++ sub
+                        ++ " recursively contains itself -- cannot flatten"
+                    )
+                else leaves p (sub : visited) (pre ++ [f]) fs'
+        leaf _ = pure [] -- typed-tier-only leaf: not string-addressable
+    entry (segs, tag) =
+      SRec
+        [ ("path", SStrI [SegStr (intercalate "." segs)]),
+          ("tag", SStrI [SegStr tag]),
+          ("get", SLam ["s"] (renderLeaf tag (SProj (SVar "s") segs))),
+          ("set", SLam ["v", "s"] (SUpd (SVar "s") [(segs, parseLeaf tag (SVar "v"))]))
+        ]
+    renderLeaf "int" e = SApp (SVar "str") e
+    renderLeaf _ e = e
+    parseLeaf "int" v = SApp (SVar "parseInt") v
+    parseLeaf _ v = v
+
+    children e = case e of
+      SApp a b -> [a, b]
+      SLam _ b -> [b]
+      SBlock ss fin -> concatMap sChildren ss ++ [fin]
+      SCase sc arms -> sc : map snd arms
+      SBin _ a b -> [a, b]
+      SProj a _ -> [a]
+      STup xs -> xs
+      SList xs -> xs
+      SRec fs -> map snd fs
+      SUpd a us -> a : map snd us
+      SStrI segs -> [x | SegExpr x <- segs]
+      _ -> []
+      where
+        sChildren (SBind _ _ x) = [x]
+        sChildren (SBindPat _ x) = [x]
+
+    descend e = case e of
+      SApp a b -> SApp (goE a) (goE b)
+      SLam x b -> SLam x (goE b)
+      SBlock ss fin -> SBlock (map stmt ss) (goE fin)
+      SCase sc arms -> SCase (goE sc) [(pt, goE x) | (pt, x) <- arms]
+      SBin o a b -> SBin o (goE a) (goE b)
+      SProj a f' -> SProj (goE a) f'
+      STup xs -> STup (map goE xs)
+      SList xs -> SList (map goE xs)
+      SRec fs -> SRec [(f', goE x) | (f', x) <- fs]
+      SUpd a us -> SUpd (goE a) [(f', goE x) | (f', x) <- us]
+      SStrI segs -> SStrI (map seg segs)
+      _ -> e
+      where
+        stmt (SBind x xs rhs) = SBind x xs (goE rhs)
+        stmt (SBindPat pt rhs) = SBindPat pt (goE rhs)
+        seg (SegExpr x) = SegExpr (goE x)
+        seg s = s
+
 dExpr :: SExpr -> D Core
 dExpr = \case
   SVar n -> do
