@@ -42,7 +42,7 @@
 # -- and events are DATA, not ints:
 #
 #   Ev  = ETick | EKey k | EMsg m a | EResize w h
-#   Sub = STick ms | SKeys
+#   Sub = STick ms | SKeys | SPort p
 #
 # Subscriptions are elm's: update hears ONLY what subs(model) asks for.
 # STick ms delivers ETick when ms milliseconds elapsed (event pacing,
@@ -96,7 +96,7 @@
 
 MC   = Type (MQuit | MLog s).
 Ev   = Type (ETick | EKey k | EMsg m a | EResize w h).
-Sub  = Type (STick ms | SKeys).
+Sub  = Type (STick ms | SKeys | SPort p).
 App  = Type (App ini upd sbs vw).
 MApp = Type (MApp ini upd sk vw vl dn sbs).
 Rv   = Type (Render st vs sc fr | Dims u | Poll u).
@@ -115,19 +115,85 @@ revK : unsafe List a -> List a -> List a .
 revK acc l = case l of Nil -> acc | x :: r -> revK (x :: acc) r.
 imod a b = a - (a / b) * b.
 
-# ---- subscriptions: the list, folded to (tickMs, keysOn) --------------------
+# ---- subscriptions: the list, folded to (tickMs, keysOn, port) --------------
 
 subsOf app m =
   MApp ini upd sk vw vl dn sbs = app;
-  subFold (sbs m) (0, 0).
-subFold : unsafe List Sub -> (Int, Int) -> (Int, Int) .
+  subFold (sbs m) (0, 0, 0).
+subFold : unsafe List Sub -> (Int, Int, Int) -> (Int, Int, Int) .
 subFold l acc = case l of Nil -> acc | s :: r -> subOne r acc s.
-subOne : unsafe List Sub -> (Int, Int) -> Sub -> (Int, Int) .
+subOne : unsafe List Sub -> (Int, Int, Int) -> Sub -> (Int, Int, Int) .
 subOne r acc s =
-  (t, k) = acc;
+  (t, k, p) = acc;
   case s of
-    STick ms -> subFold r (ms, k)
-  | SKeys -> subFold r (t, 1).
+    STick ms -> subFold r (ms, k, p)
+  | SKeys -> subFold r (t, 1, p)
+  | SPort pa -> subFold r (t, k, pa).
+
+# ---- the message port: EMsg from ANY actor, one writer, per-frame -----------
+# The debug/wire channel the paths design asks for (docs/PATHS.md): a
+# shell, a supervisor, a script sends (tag, arg) STRING PAIRS to the
+# port actor; the loop drains it once per frame (SPort port in subs)
+# and hands each pair to update as EMsg tag arg -- the SAME arm the
+# LiveView driver feeds browser events through.  The model actor stays
+# the single writer (a path-set is applied BY update, transactionally),
+# messages from one sender arrive in order (per-sender FIFO), and a
+# reload nudge is just another message -- so a code swap lands exactly
+# at a step boundary, never inside one.
+#
+#   port = spawn MV.port;              # anyone: send port ("set", "cap 9")
+#   subs m = SPort port :: ...         # the app: hear it as EMsg
+#
+# Drop laws here: queued roots are kept ACROSS receives (the one shape
+# autodrop must not touch -- the fallthrough arm references m to block
+# it) and dropped after the drain reply's deep copy; the drained list
+# root on the loop side is dropped after its strings are copied out.
+
+PortQ = Type (PDrain from).
+
+port : unsafe Int -> a .
+port me = portLoop me Nil.
+portLoop : unsafe Int -> List _ -> a .
+portLoop me q =
+  m = receive me;
+  case m of
+    PDrain from -> portFlush me m from q
+  | _ -> portLoop me (m :: q).
+portFlush : unsafe Int -> _ -> Int -> List _ -> a .
+portFlush me m from q =
+  _ = send from (revK Nil q);
+  _ = drop m;
+  _ = portDropAll q;
+  portLoop me Nil.
+portDropAll : unsafe List _ -> Int .
+portDropAll l = case l of Nil -> 0 | x :: r -> portDrop1 r x.
+portDrop1 : unsafe List _ -> _ -> Int .
+portDrop1 r x = _ = drop x; portDropAll r.
+
+# loop side: drain the subscribed port into EMsg events (Nil when
+# no port is subscribed)
+portEvs : unsafe Int -> Int -> List Ev .
+portEvs me pa = case pa == 0 of True -> Nil | False -> portAsk me pa.
+portAsk : unsafe Int -> Int -> List Ev .
+portAsk me pa =
+  _ = send pa (PDrain me);
+  ms = receiveFrom me pa;
+  evs = portConv ms Nil;
+  _ = drop ms;
+  evs.
+portConv : unsafe List _ -> List Ev -> List Ev .
+portConv ms acc = case ms of
+    Nil -> revK Nil acc
+  | tv :: r -> portConv1 r acc tv.
+portConv1 : unsafe List _ -> List Ev -> _ -> List Ev .
+portConv1 r acc tv =
+  (tag, arg) = tv;
+  portConv r (EMsg (strCopy tag) (strCopy arg) :: acc).
+# fresh allocation: the EMsg outlives the drained list root
+strCopy s = substr s 1 (strlen s).
+
+catEvs : unsafe List Ev -> List Ev -> List Ev .
+catEvs a b = case a of Nil -> b | x :: r -> x :: catEvs r b.
 
 # ---- input: drain the poll service, ARRIVAL order ---------------------------
 # (prepend-built, reversed before applying -- the voxel-interactive law)
@@ -263,8 +329,9 @@ loopM me cfg app rw vp cache ms =
   env = cfg.env; mt = cfg.mt; input = cfg.input;
   Ms model fr sc lastR ltt = ms;
   t0 = read mt;
-  (tickMs, keysOn) = subsOf app model;
-  (evs, ltt2) = dueTick (evsOf me input keysOn) t0 ltt tickMs;
+  (tickMs, keysOn, portA) = subsOf app model;
+  evs0 = catEvs (evsOf me input keysOn) (portEvs me portA);
+  (evs, ltt2) = dueTick evs0 t0 ltt tickMs;
   (m2, quit) = applyEvs me env app evs (model, 0);
   case quit == 1 of
     True -> finish app m2 fr sc lastR

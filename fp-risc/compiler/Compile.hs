@@ -9,6 +9,7 @@ import X64 (lowerX64, deTlsQosApp, x64Rev)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
 import Data.List (isPrefixOf)
+import qualified Data.List as List
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import FPRISC
@@ -126,8 +127,22 @@ compileMain = do
   lr <- loadProgram preludeTops inp rootTops
   case lr of
     Left e -> putStrLn e >> exitFailure
-    Right (LoadResult tops0R exports notes units0 root0 rootHash) -> do
+    Right (LoadResult tops0RL exports notes units0L root0L rootHash) -> do
       mapM_ putStrLn notes
+      -- first-class paths: validate + desugar @Shape.path literals on the
+      -- surface tree, first transform after load (ONE table from the
+      -- merged program, so root and unit rewrites agree; the generated
+      -- records then flow through every later pass like user code).
+      let ptbl = shapeTyTable tops0RL
+          (pathErrsM, tops0R) = expandPathLits ptbl tops0RL
+          (pathErrsR, root0) = expandPathLits ptbl root0L
+          unitsPR = [(h, expandPathLits ptbl uts) | (h, uts) <- units0L]
+          units0 = [(h, ts) | (h, (_, ts)) <- unitsPR]
+          pathErrs = List.nub (pathErrsM ++ pathErrsR ++ concat [es | (_, (es, _)) <- unitsPR])
+      unless (null pathErrs) $ do
+        putStrLn "=== PATH LITERALS: ERRORS ==="
+        mapM_ (putStrLn . ("  * " ++)) pathErrs
+        exitFailure
       -- autodrop: mechanical discharge of the drop-what-you-receive law
       -- (conservative destructure-then-dead shape; see FPRISC.autoDrop)
       let (tops0S, asNotes) = aritySpill tops0R
