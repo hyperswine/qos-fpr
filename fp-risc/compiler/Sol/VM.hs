@@ -23,12 +23,13 @@ import Sol.Val
 import Sol.Web
 import Data.Bits (shiftL, (.|.), (.&.))
 import GHC.Float (castDoubleToWord64, castWord32ToFloat, castWord64ToDouble)
+import Foreign.ForeignPtr (mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (peekArray)
 import Foreign.Ptr ()
 import Foreign.Storable (peek)
 import qualified Sol.Gpu as Gpu
 import qualified Sol.HandJIT as Hand
-import Control.Monad (when)
+import Control.Monad (forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
@@ -42,7 +43,7 @@ import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IM
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
-import Foreign.Storable (peek, poke)
+import Foreign.Storable (peek, peekElemOff, poke, pokeElemOff)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef
@@ -363,7 +364,7 @@ builtinArities =
   M.union schemeArities $
     M.fromList
       [ ("use", 1), ("run", 2), ("View.serve", 5),
-        ("Vec.new", 1), ("Vec.range", 2), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
+        ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
         ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1)
       ]
@@ -953,7 +954,60 @@ vecCall env name args = case (name, args) of
   ("Vec.map", [f, VVec r]) -> vecScheme env "vecmap" f Nothing r
   ("Vec.filter", [f, VVec r]) -> vecScheme env "vecfilter" f Nothing r
   ("Vec.fold", [f, z, VVec r]) -> vecScheme env "vecfold" f (Just z) r
+  ("Vec.mmul", [VInt r, VInt k, VInt c, VVec va, VVec vb]) ->
+    vecMatmul (fromIntegral r) (fromIntegral k) (fromIntegral c) va vb
   _ -> vmPanic (name ++ ": bad arguments (is the vector argument last?)")
+
+-- ---- native matmul: lib/matrix's cells-column product ----------------------
+-- a: ra x ka row-major cells, b: ka x cb row-major cells -> out ra x cb,
+-- both operands threaded back (the matrices stay linear).  The FAST path
+-- (both cells columns unboxed f64) is an unboxed triple loop whose inner
+-- accumulation is mDot's exact fold shape -- k DESCENDING, seeded by the
+-- exact-zero base -- so the result is BIT-IDENTICAL to the interpreted
+-- list algebra it replaces.  Every other layout takes the GENERAL path:
+-- the same cell loop over reconstructed Values through the VM's own
+-- `arith`, so exact-Integer products stay exact bignums and mixed-type
+-- cells panic exactly where the interpreter would.
+vecMatmul :: Int -> Int -> Int -> IORef VecStore -> IORef VecStore -> IO Value
+vecMatmul ra ka cb sra srb = do
+  sa <- readIORef sra
+  sb <- readIORef srb
+  when (vLen sa /= ra * ka || vLen sb /= ka * cb) $
+    vmPanic ("Vec.mmul: cells/dims mismatch (a: " ++ show (vLen sa) ++ " cells vs " ++ show ra ++ "x" ++ show ka
+             ++ ", b: " ++ show (vLen sb) ++ " cells vs " ++ show ka ++ "x" ++ show cb ++ ")")
+  out <- case (vRep sa, vCols sa, vRep sb, vCols sb) of
+    (RScalar KNum, [CD _ fpa], RScalar KNum, [CD _ fpb]) -> do
+      when getEnvDebug $ putStrLn ("[mmul] native f64 " ++ show ra ++ "x" ++ show ka ++ " * " ++ show ka ++ "x" ++ show cb)
+      fpo <- mallocForeignPtrArray (max 1 (ra * cb))
+      withForeignPtr fpa $ \pa -> withForeignPtr fpb $ \pb -> withForeignPtr fpo $ \po ->
+        forM_ [0 .. ra - 1] $ \i ->
+          forM_ [0 .. cb - 1] $ \j -> do
+            let go k acc
+                  | k < 0 = pure acc
+                  | otherwise = do
+                      x <- peekElemOff pa (i * ka + k)
+                      y <- peekElemOff pb (k * cb + j)
+                      go (k - 1) (x * y + acc)
+            s <- go (ka - 1) (0 :: Double)
+            pokeElemOff po (i * cb + j) s
+      VVec <$> newIORef (VecStore (ra * cb) [CD (max 1 (ra * cb)) fpo] (RScalar KNum))
+    _ -> do
+      o <- newVec
+      let VVec ro = o
+      forM_ [0 .. ra - 1] $ \i ->
+        forM_ [0 .. cb - 1] $ \j -> do
+          let go k acc
+                | k < 0 = pure acc
+                | otherwise = do
+                    x <- getVec sra (i * ka + k)
+                    y <- getVec srb (k * cb + j)
+                    xy <- arith OMul x y
+                    acc' <- arith OAdd xy acc
+                    go (k - 1) acc'
+          s <- go (ka - 1) (VInt 0)
+          pushVec ro s
+      pure o
+  pure (VData 5 0 [out, VVec sra, VVec srb])
 
 vecScheme :: VMEnv -> String -> Value -> Maybe Value -> IORef VecStore -> IO Value
 vecScheme env scheme f macc r = do

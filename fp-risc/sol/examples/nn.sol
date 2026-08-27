@@ -8,8 +8,9 @@
 #   * batch activations   Z1 = Xaug * W1', A1 = relu cells — the
 #     elementwise relu is ONE Vec.map over the n*H cells column (the
 #     typed JIT dual); the loss is one Vec.fold (JIT)
-#   * matmul / matvec     lib/matrix's list-row algebra: interpreted
-#     by design today (indexed work threads the Vec through get/set)
+#   * matmul              NATIVE (Vec.mmul, VM.hs): an unboxed f64
+#     triple loop over the cells columns, bit-identical to the list
+#     algebra it replaced; matvec keeps the list path
 #   * linearity           every Matrix threads through mMul/mMap/
 #     mAllRows and is freed exactly once — the checker enforces the
 #     whole training loop's resource discipline at compile time
