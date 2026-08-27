@@ -12,6 +12,15 @@ directories or thread app.qa paths by hand again.
 
     ./qos.py build                  bring fpr + qosp up to date
     ./qos.py run tests/dtree.fpr    compile + host on qosp (the default)
+    ./qos.py run tests/pathnotes.fpr            a program that needs plugin
+                                    modules on its disk DECLARES them in a
+                                    `#: plugins a.fpr b.fpr` header line --
+                                    they are built, seeded onto a fresh QLOG
+                                    image, and FPR_DISK points at it.  Flags
+                                    do the same ad hoc: --plugin x.fpr
+                                    (repeatable, overrides the directive),
+                                    --no-plugins, --disk my.img (use an
+                                    existing image verbatim)
     ./qos.py run programs/interactive_desktop_gl.fpr  ... on qosp-gl
     ./qos.py run tests/fmath.fpr --on virt      ... on bare-metal QEMU
     ./qos.py run sol/examples/todo.sol          ... .sol runs the sol profile
@@ -102,6 +111,27 @@ def resolve_prog(prog):
     die(f"no such program: {prog} (looked in ., fp-risc/, repo root)")
 
 
+def prog_directives(path):
+    """`#: key val val...` lines in a program's header comment -- the
+    program declares its own harness (today: plugins) instead of every
+    caller hand-rolling make plugin-qa + mkdisk + FPR_DISK.  Scanned in
+    the first 60 lines; repeated keys extend."""
+    d = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 60:
+                    break
+                line = line.strip()
+                if line.startswith("#:"):
+                    parts = line[2:].split()
+                    if parts:
+                        d.setdefault(parts[0], []).extend(parts[1:])
+    except OSError:
+        pass
+    return d
+
+
 # ---- the stages -------------------------------------------------------------
 
 def build_fpr():
@@ -130,6 +160,27 @@ def build_app(prog, harts=None):
     sh(cmd, cwd=FPR, quiet=True)
 
 
+def build_plugins(prog, plugins):
+    """Build each .fpr as a plugin .qa (sub-slot = list order), seed a
+    fresh QLOG image named after the program, return its path.  Mirrors
+    the livereload harness: plugsyms after the shell build, then one
+    plugin-qa per module, then mkdisk."""
+    mac = sys.platform == "darwin" and os.uname().machine == "arm64"
+    sh(["make", "-s", "plugsyms-macos" if mac else "plugsyms"], cwd=FPR, quiet=True)
+    qas = []
+    for slot, p in enumerate(plugins):
+        rel = resolve_prog(p)
+        say(f"plugin-qa {rel} (sub-slot {slot})")
+        sh(["make", "-s", "plugin-qa-macos" if mac else "plugin-qa",
+            f"PROG={rel}", f"PLUGSLOT={slot}"], cwd=FPR, quiet=True)
+        qas.append(Path(rel).stem + ".qa")
+    img = FPR / "build" / f"plugdisk-{Path(prog).stem}.img"
+    say(f"disk: {img.relative_to(ROOT)} <- {' '.join(qas)}")
+    sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), str(img), "8"] + qas,
+       cwd=FPR, quiet=True)
+    return img
+
+
 # ---- commands ---------------------------------------------------------------
 
 def cmd_build(a):
@@ -146,6 +197,13 @@ def cmd_run(a):
     t0 = time.time()
     prog = resolve_prog(a.prog)
     build_fpr()
+
+    # the program's declared harness (overridable per flag)
+    plugins = [] if a.no_plugins else (a.plugin or prog_directives(FPR / prog).get("plugins", []))
+    if plugins and a.on in ("virt", "sol"):
+        die(f"--on {a.on}: plugin modules ride FPR_DISK, which is the qosp host's; run on qosp (or seed `./qos.py native --apps` yourself)")
+    if plugins and a.disk:
+        die("--disk and plugins together: an explicit image is used verbatim (pass --no-plugins, or drop --disk to seed one)")
 
     if prog.endswith(".sol") or a.on == "sol": # type: ignore
         say(f"sol profile: {prog}")
@@ -168,6 +226,11 @@ def cmd_run(a):
         env["FPR_PORT"] = a.port
     if a.harts:
         env["FPR_HARTS"] = a.harts
+    if plugins:
+        env["FPR_DISK"] = str(build_plugins(prog, plugins))
+    elif a.disk:
+        env["FPR_DISK"] = str(Path(a.disk).resolve())
+        say(f"disk: {a.disk} (as given)")
     if a.fresh_disk:
         (QOS / "qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
@@ -309,6 +372,9 @@ def main():
     p.add_argument("--gfx", action="store_true", help="use the desktop-GL qosp host")
     p.add_argument("--fresh-disk", action="store_true", help="delete qosp.disk first")
     p.add_argument("--expect", help="require this substring in the output")
+    p.add_argument("--plugin", action="append", help="build this .fpr as a plugin module and seed it onto a fresh disk (repeatable; overrides the program's `#: plugins` line)")
+    p.add_argument("--no-plugins", action="store_true", help="ignore the program's `#: plugins` line")
+    p.add_argument("--disk", help="run against this existing QLOG image (FPR_DISK)")
     p.set_defaults(f=cmd_run)
 
     p = sub.add_parser("serve", help="host a LiveView app on a port")

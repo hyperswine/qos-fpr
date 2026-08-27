@@ -10,6 +10,11 @@
 #   3. LR.load mathbad (mathOp arity changed) is REFUSED by the
 #      compat gate, detached, and the worker keeps running v2
 #
+#   ./qos.py run tests/livereload.fpr       (the line below is the harness
+#                                            qos.py reads: build + seed + run)
+#: plugins tests/mathv1.fpr tests/mathv2.fpr tests/mathbad.fpr
+#
+#   by hand, the same thing:
 #   make qos-app PROG=tests/livereload.fpr && make plugsyms
 #   make plugin-qa PROG=tests/mathv1.fpr PLUGSLOT=0
 #   make plugin-qa PROG=tests/mathv2.fpr PLUGSLOT=1

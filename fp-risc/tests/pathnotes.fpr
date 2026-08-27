@@ -20,6 +20,13 @@
 #     FIFO, drained once per frame -- every mutation of the model,
 #     debug sets included, is an ordinary message.
 #
+#   ./qos.py run tests/pathnotes.fpr        (the line below IS the harness:
+#                                            qos.py builds these as plugin
+#                                            modules, seeds a fresh QLOG
+#                                            image, points FPR_DISK at it)
+#: plugins tests/notesed1.fpr tests/notesed2.fpr tests/notesedbad.fpr
+#
+#   by hand, the same thing:
 #   make qos-app PROG=tests/pathnotes.fpr && make plugsyms
 #   make plugin-qa PROG=tests/notesed1.fpr PLUGSLOT=0
 #   make plugin-qa PROG=tests/notesed2.fpr PLUGSLOT=1
