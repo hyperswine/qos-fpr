@@ -395,7 +395,7 @@ viewServe _ _ = vmPanic "View.serve: expected port init update view subs"
 -- ---- content-addressed file modules (Mod.hs does the work) -----------------
 modCall :: VMEnv -> Name -> [Value] -> IO Value
 modCall env "use" [VStr spec] = do
-  r <- resolveModule (vmBaseDir env) spec
+  r <- resolveModule ".sol" (vmBaseDir env) spec
   case r of
     Left e -> vmPanic e
     Right (p, h, pinned) -> do
@@ -652,6 +652,7 @@ mkHal cons tx preempts rt =
       ("String.len", (1, \[v] -> VInt . fromIntegral . length <$> vsStr v)),
       ("strlen", (1, \[v] -> VInt . fromIntegral . length <$> vsStr v)),
       ("charAt", (2, charAtH)),
+      ("substr", (3, substrH)),
       ("chr", (1, \[VInt c] -> pure (VStr [toEnum (fromIntegral c)]))),
       -- VBStr ops: O(1) amortised; declared as a separate HAL surface so the
       -- linearity checker treats them the same as Vec.* (the BStr 1 prelude
@@ -874,6 +875,19 @@ mkHal cons tx preempts rt =
             then pure (VInt (fromIntegral (fromEnum (s !! (n - 1)))))
             else vmPanic "charAt: index out of range"
     charAtH _ = vmPanic "charAt: bad args"
+    -- clamping semantics, mirrored from the AOT runtime's g_substr:
+    -- 1-based offset, out-of-range never panics, it narrows to ""
+    substrH [sv, VInt o0, VInt l0]
+      | isStrVal sv = do
+          s <- vsStr sv
+          let o1 = max 1 (fromIntegral o0 :: Int)
+              l1 = max 0 (fromIntegral l0 :: Int)
+              (o, l) =
+                if o1 - 1 >= length s
+                  then (1, 0)
+                  else (o1, min l1 (length s - (o1 - 1)))
+          pure (VStr (take l (drop (o - 1) s)))
+    substrH _ = vmPanic "substr: bad args"
 
     bsSubH [VBStr r, VInt i, VInt j] = do
       s <- bsContent r

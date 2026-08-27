@@ -163,7 +163,7 @@ halArities :: M.Map Name Int
 halArities =
   M.fromList
     [ ("str", 1), ("strcat", 2), ("String.len", 1), ("strlen", 1),
-      ("error", 1), ("parseInt", 1), ("charAt", 2), ("chr", 1), ("!", 2),
+      ("error", 1), ("parseInt", 1), ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
       ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1),
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),
       ("BStr.append", 2), ("BStr.cat", 2), ("BStr.len", 1),

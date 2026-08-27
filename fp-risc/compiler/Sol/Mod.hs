@@ -24,6 +24,7 @@
 
 module Sol.Mod where
 
+import Control.Monad (filterM)
 import Data.Bits (xor)
 import Data.Char (ord)
 import Data.List (foldl', isSuffixOf)
@@ -58,14 +59,22 @@ parseModuleFile path = do
         Right tops -> pure (Right (path, hashAST tops))
 
 -- "name", "name#hash", "dir/name#hash", "name.sol#hash" — resolved
--- relative to the importing script's directory
-resolveModule :: FilePath -> String -> IO (Either String (FilePath, String, Bool))
-resolveModule baseDir spec = do
+-- relative to the importing script's directory.  An extensionless spec
+-- is LANGUAGE-MATCHED: the importer's own extension is tried first,
+-- the sibling second (an .fpr program's `use "../std/std"` finds
+-- std.fpr even though a std.sol sits beside it, and a .sol script's
+-- finds std.sol) -- one grammar, two file suffixes, no shadowing.
+resolveModule :: String -> FilePath -> String -> IO (Either String (FilePath, String, Bool))
+resolveModule prefExt baseDir spec = do
   let (name, hashPart) = break (== '#') spec
       wantHash = drop 1 hashPart
       pinned = not (null wantHash)
-      file = if ".sol" `isSuffixOf` name then name else name ++ ".sol"
-      path = if take 1 file == "/" then file else baseDir </> file
+      exts = if prefExt == ".fpr" then [".fpr", ".sol"] else [".sol", ".fpr"]
+      explicit = any (`isSuffixOf` name) [".sol", ".fpr"]
+      cands = if explicit then [name] else [name ++ e | e <- exts]
+      mkPath f = if take 1 f == "/" then f else baseDir </> f
+  hits <- filterM (doesFileExist . mkPath) cands
+  let path = mkPath (case hits of f : _ -> f; [] -> head cands)
   r <- parseModuleFile path
   pure $ case r of
     Left e -> Left e

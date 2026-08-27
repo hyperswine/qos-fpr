@@ -11,16 +11,26 @@ and where every intermediate lives, so you never cd between component
 directories or thread app.qa paths by hand again.
 
     ./qos.py build                  bring fpr + qosp up to date
+    ./qos.py new myapp --template mvu           scaffold a WORKING app in
+                                    fp-risc/apps/myapp/ (templates: min |
+                                    service | mvu | notes) -- it runs,
+                                    self-checks, and packs immediately
     ./qos.py run tests/dtree.fpr    compile + host on qosp (the default)
-    ./qos.py run tests/pathnotes.fpr            a program that needs plugin
-                                    modules on its disk DECLARES them in a
-                                    `#: plugins a.fpr b.fpr` header line --
-                                    they are built, seeded onto a fresh QLOG
-                                    image, and FPR_DISK points at it.  Flags
+    ./qos.py run tests/pathnotes.fpr            a program DECLARES its own
+                                    harness in `#:` header lines: plugins
+                                    to build + seed onto a fresh QLOG disk
+                                    (`#: plugins a.fpr b.fpr`, FPR_DISK
+                                    pointed at it) and its success line
+                                    (`#: expect ...` -- a run that misses
+                                    it, or panics, exits nonzero).  Flags
                                     do the same ad hoc: --plugin x.fpr
                                     (repeatable, overrides the directive),
                                     --no-plugins, --disk my.img (use an
-                                    existing image verbatim)
+                                    existing image verbatim), --expect s
+    ./qos.py pack tests/pathnotes.fpr --bundle  dist/pathnotes/: the named
+                                    .qa (its dependency closure inside),
+                                    the seeded disk, qosp + run.sh -- a
+                                    self-contained folder to hand out
     ./qos.py run programs/interactive_desktop_gl.fpr  ... on qosp-gl
     ./qos.py run tests/fmath.fpr --on virt      ... on bare-metal QEMU
     ./qos.py run sol/examples/todo.sol          ... .sol runs the sol profile
@@ -39,6 +49,8 @@ entry point over the existing one.
 
 import argparse
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -72,14 +84,20 @@ def sh(cmd, cwd=ROOT, env=None, quiet=False, check=True):
     return r.returncode
 
 
+PANICS = ("*** FPRISC PANIC", "*** SOL PANIC")
+
+
 def run_scan(cmd, cwd, env=None, expect=None):
     """Stream a child's output live; if expect is set, also scan for it
-    and report the verdict in the exit code."""
+    and report the verdict in the exit code.  A panic line in the output
+    fails the run even when the host process exits 0 (a hosted image's
+    panic is qosp's output, not its exit code)."""
     e = dict(os.environ)
     if env:
         e.update({k: str(v) for k, v in env.items()})
     p = subprocess.Popen(cmd, cwd=cwd, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     hit = expect is None
+    panic = None
     try:
         for raw in p.stdout: # type: ignore
             line = raw.decode("utf-8", "replace")
@@ -87,10 +105,14 @@ def run_scan(cmd, cwd, env=None, expect=None):
             sys.stdout.flush()
             if expect and expect in line:
                 hit = True
+            if panic is None and any(m in line for m in PANICS):
+                panic = line.strip()
         p.wait()
     except KeyboardInterrupt:
         p.terminate()
         p.wait()
+    if panic:
+        die(f"run panicked: {panic}")
     if expect:
         if hit:
             say(f"expect: found {expect!r}")
@@ -160,7 +182,7 @@ def build_app(prog, harts=None):
     sh(cmd, cwd=FPR, quiet=True)
 
 
-def build_plugins(prog, plugins):
+def build_plugins(prog, plugins, size_mb=8):
     """Build each .fpr as a plugin .qa (sub-slot = list order), seed a
     fresh QLOG image named after the program, return its path.  Mirrors
     the livereload harness: plugsyms after the shell build, then one
@@ -176,9 +198,17 @@ def build_plugins(prog, plugins):
         qas.append(Path(rel).stem + ".qa")
     img = FPR / "build" / f"plugdisk-{Path(prog).stem}.img"
     say(f"disk: {img.relative_to(ROOT)} <- {' '.join(qas)}")
-    sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), str(img), "8"] + qas,
+    sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), str(img), str(size_mb)] + qas,
        cwd=FPR, quiet=True)
     return img
+
+
+def declared_plugins(a, prog):
+    """The program's plugin harness: --plugin flags win, then the
+    program's own `#: plugins` line; --no-plugins silences both."""
+    if getattr(a, "no_plugins", False):
+        return []
+    return getattr(a, "plugin", None) or prog_directives(FPR / prog).get("plugins", [])
 
 
 # ---- commands ---------------------------------------------------------------
@@ -198,8 +228,12 @@ def cmd_run(a):
     prog = resolve_prog(a.prog)
     build_fpr()
 
-    # the program's declared harness (overridable per flag)
-    plugins = [] if a.no_plugins else (a.plugin or prog_directives(FPR / prog).get("plugins", []))
+    # the program's declared harness (overridable per flag): plugins to
+    # seed, and its own success line (`#: expect ...`) -- a run that
+    # misses it fails, so every program is its own smoke test
+    plugins = declared_plugins(a, prog)
+    d = prog_directives(FPR / prog)
+    expect = a.expect or (" ".join(d["expect"]) if "expect" in d else None)
     if plugins and a.on in ("virt", "sol"):
         die(f"--on {a.on}: plugin modules ride FPR_DISK, which is the qosp host's; run on qosp (or seed `./qos.py native --apps` yourself)")
     if plugins and a.disk:
@@ -208,13 +242,13 @@ def cmd_run(a):
     if prog.endswith(".sol") or a.on == "sol": # type: ignore
         say(f"sol profile: {prog}")
         env = {"LD_LIBRARY_PATH": "/usr/lib/llvm-18/lib"}
-        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=env, expect=a.expect)
+        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=env, expect=expect)
     if a.on == "virt":
         say(f"bare-metal QEMU virt: {prog}")
         cmd = ["make", "-s", "bare-metal-run", f"PROG={prog}"]
         if a.harts:
             cmd.append(f"HARTS={a.harts}")
-        return run_scan(cmd, cwd=FPR, expect=a.expect)
+        return run_scan(cmd, cwd=FPR, expect=expect)
 
     # the default: host the .qa on qosp
     gfx = a.gfx or Path(prog).stem.endswith("_desktop_gl")
@@ -235,10 +269,61 @@ def cmd_run(a):
         (QOS / "qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
     say(f"{host}: {prog}" + (f"  (port {a.port})" if a.port else ""))
-    rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=a.expect)
+    rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=expect)
     say(f"total {time.time() - t0:.1f}s")
 
     return rc
+
+
+def cmd_pack(a):
+    """One program -> one shippable folder.  dist/<name>/ holds the
+    named .qa (the container: its whole dependency closure is inside),
+    the seeded QLOG disk when the program declares plugins, and with
+    --bundle the qosp host binary + a run.sh -- a folder you can hand
+    to someone."""
+    t0 = time.time()
+    prog = resolve_prog(a.prog)
+    d = prog_directives(FPR / prog)
+    name = a.name or (d.get("name") or [Path(prog).stem])[0]
+    size_mb = int((d.get("disk-mb") or ["8"])[0])
+    build_fpr()
+    gfx = a.gfx or Path(prog).stem.endswith("_desktop_gl")
+    host = "qosp-gl" if gfx else "qosp"
+    build_app(prog, a.harts)
+    build_qosp(gfx=gfx)
+    out = Path(a.out).resolve() if a.out else ROOT / "dist" / name
+    out.mkdir(parents=True, exist_ok=True)
+    qa = out / f"{name}.qa"
+    shutil.copy2(FPR / "app.qa", qa)
+    pieces = [f"{qa.name} ({qa.stat().st_size // 1024}KB)"]
+    disk = None
+    plugins = declared_plugins(a, prog)
+    if plugins:
+        img = build_plugins(prog, plugins, size_mb)
+        disk = out / f"{name}.disk"
+        shutil.copy2(img, disk)
+        pieces.append(f"{disk.name} ({disk.stat().st_size // 1024}KB, {len(plugins)} plugin(s))")
+    if a.bundle:
+        shutil.copy2(QOS / host, out / host)
+        runner = out / "run.sh"
+        lines = ["#!/bin/sh",
+                 f"# {name} -- packed by qos.py ({time.strftime('%Y-%m-%d')}); self-contained",
+                 'cd "$(dirname "$0")"']
+        if disk is not None:
+            lines.append(f'export FPR_DISK="${{FPR_DISK:-{disk.name}}}"')
+        lines.append(f'exec ./{host} --yes {name}.qa "$@"')
+        runner.write_text("\n".join(lines) + "\n")
+        runner.chmod(runner.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        pieces.append(f"{host} + run.sh")
+    rel = os.path.relpath(out, Path.cwd())
+    say(f"packed {rel}/: " + ", ".join(pieces))
+    if a.bundle:
+        say(f"run it anywhere: {rel}/run.sh")
+    elif disk is not None:
+        say(f"run it: (cd {rel} && FPR_DISK={disk.name} {QOS / host} --yes {name}.qa)")
+    else:
+        say(f"run it: {QOS / host} --yes {rel}/{name}.qa")
+    say(f"pack done in {time.time() - t0:.1f}s")
 
 
 def cmd_serve(a):
@@ -249,6 +334,257 @@ def cmd_serve(a):
     say(f"serving {prog} at http://127.0.0.1:{a.port}/  (Ctrl-C stops)")
 
     return run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, env={"FPR_PORT": a.port})
+
+
+# ---- scaffolding templates (qos.py new) -------------------------------------
+# Every template is a WORKING app: it compiles, runs, and carries its
+# own `#:` harness + expect line, so run/test/pack work immediately.
+# Tokens: __NAME__ = project name, __STD__ = ../../std from apps/<name>/.
+
+TPL_MIN = {"app.fpr": '''\
+# __NAME__ -- a minimal QOS app: pure compute through std, one result line.
+#   ./qos.py run apps/__NAME__/app.fpr
+#: name __NAME__
+#: expect __NAME__: ok fold=55
+
+STD = use "__STD__/std".
+Std = STD.Std.
+
+main =
+  s = Std.fold 1 10 (fn i acc -> acc + i) 0;
+  "__NAME__: ok fold={s}".
+'''}
+
+TPL_SERVICE = {"app.fpr": '''\
+# __NAME__ -- the smallest two-actor app: a SERVICE actor owning its
+# accumulator in its loop args, a client asking through the rpc shape
+# (send + selective receiveFrom).  Grow it by adding message arms.
+#   ./qos.py run apps/__NAME__/app.fpr
+#: name __NAME__
+#: expect __NAME__: replies 5 15 36
+
+worker : unsafe Int -> a .
+worker me = wloop me 0.
+wloop : unsafe Int -> Int -> a .
+wloop me acc =
+  m = receive me;
+  (from, v) = m;
+  _ = send from (acc + v);
+  wloop me (acc + v).
+
+# (named askW: the prelude already exports an `ask`)
+askW me w v =
+  _ = send w (me, v);
+  receiveFrom me w.
+
+main =
+  me = myself 0;
+  w = spawn worker;
+  a = askW me w 5;
+  b = askW me w 10;
+  c = askW me w 21;
+  _ = kill w;
+  "__NAME__: replies {a} {b} {c}".
+'''}
+
+TPL_MVU = {"app.fpr": '''\
+# __NAME__ -- an MVU app on std.mvu with a DECLARED Model, so @Model is
+# a live schema: any actor (a debug shell, a supervisor, your tests)
+# can send ("set", "cap 20") / ("dump", "") to the message port while
+# it runs -- value-space iteration from day one (docs/PATHS.md).
+#   ./qos.py run apps/__NAME__/app.fpr
+#: name __NAME__
+#: expect __NAME__: done count=12 note=hi
+
+MV = use "__STD__/mvu".
+L = use "__STD__/lens".
+
+MApp = MV.MApp.  MQuit = MV.MQuit.  EMsg = MV.EMsg.
+ETick = MV.ETick.  STick = MV.STick.  SPort = MV.SPort.
+
+Model = {count : Int, cap : Int, note : String, port : Int}.
+
+appInit env = {count = 0, cap = 12, note = "hi", port = env}.
+
+appUpdate me env ev m = case ev of
+    ETick -> tickUp m
+  | EMsg tag arg -> onMsg m tag arg
+  | e -> (m, Nil).
+
+tickUp m =
+  m2 = {m | count = m.count + 1};
+  case m2.count >= m2.cap of
+    True -> (m2, MQuit :: Nil)
+  | False -> (m2, Nil).
+
+# the wire: sets are transactional (bad path -> printed, ignored),
+# dump walks the schema -- no per-app inspector code
+onMsg m tag arg = case L.strEq tag "set" of
+    True -> onSet m arg
+  | False -> case L.strEq tag "dump" of
+      True -> u = print "-- __NAME__ --\\n{L.dump (@Model) m ""}--"; (m, Nil)
+    | False -> (m, Nil).
+onSet m pv = case L.setWords (@Model) pv m of
+    Ok m2 -> (m2, Nil)
+  | Err e -> u = print "__NAME__: {e}"; (m, Nil).
+
+appSubs m = STick 1 :: SPort m.port :: Nil.
+appSkey m = 0.
+appView vp m = "__NAME__" :: Nil.
+appVals self env vp m = "count={m.count}" :: Nil.
+appDone m = "__NAME__: done count={m.count} note={m.note}".
+
+main =
+  me = myself 0;
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  render = spawn MV.textRender;
+  port = spawn MV.port;
+  cfg = { env = port, mt = mt, tick = 3000, input = 0, render = render };
+  app = MApp appInit appUpdate appSkey appView appVals appDone appSubs;
+  r = MV.run me cfg app;
+  _ = kill port;
+  r.
+'''}
+
+TPL_NOTES = {
+    "app.fpr": '''\
+# __NAME__ -- the notes-app shape (tests/pathnotes.fpr, distilled):
+# MVU + message port + first-class paths + LIVERELOAD.  The commit
+# function lives behind the module registry; a ("swap", "edit2")
+# message hot-swaps it mid-run through the compat gate.  The driver
+# actor below scripts a demo run -- replace it with your real input.
+#   ./qos.py run apps/__NAME__/app.fpr
+#: name __NAME__
+#: plugins apps/__NAME__/edit1.fpr apps/__NAME__/edit2.fpr
+#: expect __NAME__: done notes=one|Two n=2 ver=caps.v2
+
+QL = use "../../programs/mods/qlog".
+LR = use "__STD__/livereload".
+MV = use "__STD__/mvu".
+L = use "__STD__/lens".
+
+MApp = MV.MApp.  MQuit = MV.MQuit.  EMsg = MV.EMsg.  SPort = MV.SPort.
+
+Model = {notes : List String, count : Int, ver : String, port : Int}.
+
+revL : unsafe List a -> List a -> List a .
+revL acc l = case l of Nil -> acc | x :: r -> revL (x :: acc) r.
+joinBar : unsafe List String -> String -> String .
+joinBar l acc = case l of
+    Nil -> acc
+  | s :: r -> joinBar r (joinOne acc s).
+joinOne acc s = case strlen acc == 0 of True -> s | False -> "{acc}|{s}".
+
+appInit env =
+  (dsk, h0, port) = env;
+  nm = LR.bind "editName";
+  {notes = Nil, count = 0, ver = nm "", port = port}.
+
+appUpdate me env ev m = case ev of
+    EMsg tag arg -> onMsg me env m tag arg
+  | e -> (m, Nil).
+
+onMsg me env m tag arg = case L.strEq tag "note" of
+    True -> onNote m arg
+  | False -> case L.strEq tag "swap" of
+      True -> onSwap me env m arg
+    | False -> case L.strEq tag "quit" of
+        True -> (m, MQuit :: Nil)
+      | False -> (m, Nil).
+
+# resolved at the step, never stored in the model (a stored closure
+# would pin its version across a swap)
+onNote m line =
+  f = LR.bind "editLine";
+  ({m | notes = f line :: m.notes, count = m.count + 1}, Nil).
+
+onSwap : Int -> _ -> _ -> String -> _ .
+onSwap me env m id =
+  (dsk, h0, port) = env;
+  r = LR.load dsk h0 id;
+  case r of
+    Ok u -> swapOk m
+  | Err e -> (m, Nil).
+swapOk m =
+  nm = LR.bind "editName";
+  ({m | ver = nm ""}, Nil).
+
+appSubs m = SPort m.port :: Nil.
+appSkey m = 0.
+appView vp m = "__NAME__" :: Nil.
+appVals self env vp m = "n={m.count}" :: Nil.
+appDone : unsafe _ -> String .
+appDone m =
+  "__NAME__: done notes={joinBar (revL Nil m.notes) ""} n={m.count} ver={m.ver}".
+
+# ---- the scripted demo driver: replace with real input --------------
+
+driver : Int -> Int -> String .
+driver port me =
+  _ = send port ("note", "one");         # v1: verbatim
+  _ = send port ("swap", "edit2");       # hot swap at a step boundary
+  _ = send port ("note", "two");         # -> "Two"
+  _ = send port ("quit", "");
+  "driver done".
+
+main =
+  me = myself 0;
+  dsk = device "blk";
+  h0 = QL.ensure dsk;
+  r0 = LR.load dsk h0 "edit1";
+  _ = case r0 of Ok u -> 0 | Err e -> error "__NAME__ load edit1: {e}";
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  render = spawn MV.textRender;
+  port = spawn MV.port;
+  _ = spawn (driver port);
+  cfg = { env = (dsk, h0, port), mt = mt, tick = 3000, input = 0, render = render };
+  app = MApp appInit appUpdate appSkey appView appVals appDone appSubs;
+  r = MV.run me cfg app;
+  _ = kill port;
+  r.
+''',
+    "edit1.fpr": '''\
+# edit1 -- the commit function, v1: verbatim.  The swap surface is one
+# monomorphic function; keep the exports and arities stable and any
+# later version hot-swaps through the compat gate.
+editLine s = s.
+editName u = "plain.v1".
+''',
+    "edit2.fpr": '''\
+# edit2 -- SIGNATURE-COMPATIBLE successor: capitalizes the first letter.
+editLine s = case strlen s == 0 of
+    True -> s
+  | False -> "{upA (charAt s 1)}{substr s 2 (strlen s - 1)}".
+upA c = case c >= 97 of
+    True -> upB c
+  | False -> chr c.
+upB c = case c <= 122 of
+    True -> chr (c - 32)
+  | False -> chr c.
+editName u = "caps.v2".
+''',
+}
+
+TEMPLATES = {"min": TPL_MIN, "service": TPL_SERVICE, "mvu": TPL_MVU, "notes": TPL_NOTES}
+
+
+def cmd_new(a):
+    tpl = TEMPLATES[a.template]
+    name = a.name
+    if not name.replace("_", "").isalnum() or not name[0].islower():
+        die(f"name {name!r}: lowercase start, alphanumeric/underscore only (it becomes fn-safe identifiers)")
+    dest = FPR / "apps" / name
+    if dest.exists():
+        die(f"{dest.relative_to(ROOT)} already exists")
+    dest.mkdir(parents=True)
+    for fn, body in tpl.items():
+        (dest / fn).write_text(body.replace("__NAME__", name).replace("__STD__", "../../std"))
+    rel = dest.relative_to(ROOT)
+    say(f"new {a.template} app: {rel}/ ({', '.join(tpl)})")
+    say(f"run it:   ./qos.py run apps/{name}/app.fpr   (its `#: expect` line IS the check)")
+    say(f"ship it:  ./qos.py pack apps/{name}/app.fpr --bundle")
 
 
 def cmd_native(a):
@@ -376,6 +712,23 @@ def main():
     p.add_argument("--no-plugins", action="store_true", help="ignore the program's `#: plugins` line")
     p.add_argument("--disk", help="run against this existing QLOG image (FPR_DISK)")
     p.set_defaults(f=cmd_run)
+
+    p = sub.add_parser("new", help="scaffold a working app under fp-risc/apps/<name>/")
+    p.add_argument("name", help="project name (lowercase start; becomes the app + artifact name)")
+    p.add_argument("--template", choices=sorted(TEMPLATES), default="mvu",
+                   help="min (pure compute) | service (actor rpc) | mvu (Model+schema+port, default) | notes (MVU + paths + livereload)")
+    p.set_defaults(f=cmd_new)
+
+    p = sub.add_parser("pack", help="package one program into dist/<name>/ (qa + disk + optional host bundle)")
+    p.add_argument("prog", help=".fpr, from anywhere in the tree")
+    p.add_argument("-o", "--out", help="output directory (default dist/<name>/)")
+    p.add_argument("--name", help="artifact name (default: `#: name` directive, else the file stem)")
+    p.add_argument("--bundle", action="store_true", help="include the qosp host binary + run.sh")
+    p.add_argument("--gfx", action="store_true", help="bundle the desktop-GL qosp host")
+    p.add_argument("--harts", help="hart count baked into the image build")
+    p.add_argument("--plugin", action="append", help="plugin module to seed (repeatable; overrides `#: plugins`)")
+    p.add_argument("--no-plugins", action="store_true", help="ignore the program's `#: plugins` line")
+    p.set_defaults(f=cmd_pack)
 
     p = sub.add_parser("serve", help="host a LiveView app on a port")
     p.add_argument("prog")

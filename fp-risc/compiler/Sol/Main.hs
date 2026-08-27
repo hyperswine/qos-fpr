@@ -30,7 +30,7 @@ import Sol.JIT (JitCtx, initJIT)
 import System.Environment (getArgs, lookupEnv)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import System.Exit (exitFailure)
-import System.FilePath (dropExtension, takeDirectory)
+import System.FilePath (dropExtension, takeDirectory, takeExtension)
 import Text.Megaparsec (errorBundlePretty, parse)
 import Sol.Txn
 import qualified Sol.Gpu as Gpu
@@ -57,14 +57,24 @@ main = do
   -- definitions in, renamed under the alias; `m.f` references and
   -- `T = m.T.` constructor aliases then resolve against the merged program
   seenRef <- newIORef M.empty
-  utopsX0' <- expandUses 8 "" seenRef (takeDirectory path) utops
+  utopsX0' <- expandUses 8 "" seenRef (takeExtension path) (takeDirectory path) utops
   -- `Rand = rnd.Rand.` where the target is an imported STRUCT: resolve the
   -- local alias by rewriting every `Rand` / `Rand.f` reference to the
   -- canonical spliced name, so field calls hit the flat globals and
   -- struct-literal call sites still monomorphize. (Targets that are types
   -- or constructors keep the existing TAlias behavior untouched.)
-  let utopsX0 = aliasStructRefs utopsX0'
+  let utopsX1 = aliasStructRefs utopsX0'
 
+  -- first-class paths (docs/PATHS.md): the same surface rewrite the AOT
+  -- pipeline runs -- @Shape.field literals validate against the merged
+  -- program's declared shapes and desugar to {get,set,segs} records,
+  -- bare @Shape to the flattened schema; sol file-path literals
+  -- (lowercase / '/' roots) pass through untouched.
+  let (pathErrs, utopsX0) = expandPathLits (shapeTyTable utopsX1) utopsX1
+  unless (null pathErrs) $ do
+    putStrLn "=== PATH LITERALS: ERRORS ==="
+    mapM_ (putStrLn . ("  * " ++)) pathErrs
+    exitFailure
 
   -- sigs / structs / (s : Sig) params — now including the PRELUDE stdlib
   -- structs (Numeric/Str/List): conformance-check, expand structs to flat
@@ -259,12 +269,12 @@ parseOrDie name src = case parse program name src of
 -- their qualified references onto it. This is what keeps one type ONE type:
 -- a PT built by a library's internal logic import unifies with the app's
 -- own logic import because they are literally the same declarations.
-expandUses :: Int -> String -> IORef (M.Map String String) -> FilePath -> [STop] -> IO [STop]
-expandUses 0 _ _ _ _ = putStrLn "[sol] use: module nesting too deep" >> exitFailure >> pure []
-expandUses depth prefix seenRef baseDir tops = do
+expandUses :: Int -> String -> IORef (M.Map String String) -> String -> FilePath -> [STop] -> IO [STop]
+expandUses 0 _ _ _ _ _ = putStrLn "[sol] use: module nesting too deep" >> exitFailure >> pure []
+expandUses depth prefix seenRef impExt baseDir tops = do
   let aliases = [(mn, spec) | TUse mn spec <- tops]
   pairs <- forM aliases $ \(mn, spec) -> do
-    r <- resolveModule baseDir spec
+    r <- resolveModule impExt baseDir spec
     case r of
       Left e -> putStrLn e >> exitFailure >> pure ([], (mn, mn))
       Right (mpath, h, pinned) -> do
@@ -283,7 +293,7 @@ expandUses depth prefix seenRef baseDir tops = do
             modifyIORef' seenRef (M.insert h (prefix ++ mn))
             msrc <- readFile mpath
             mtops0 <- parseOrDie mpath msrc
-            mtops1 <- expandUses (depth - 1) (prefix ++ mn ++ ".") seenRef (takeDirectory mpath) mtops0
+            mtops1 <- expandUses (depth - 1) (prefix ++ mn ++ ".") seenRef (takeExtension mpath) (takeDirectory mpath) mtops0
             let defs = [t | t <- mtops1, notEval t]
                 rn = M.fromList [(n, mn ++ "." ++ n) | n <- topNames defs]
             pure (renameTops rn defs, (mn, mn))

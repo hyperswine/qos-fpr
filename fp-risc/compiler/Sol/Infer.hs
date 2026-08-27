@@ -326,6 +326,7 @@ builtinEnv =
       ("error", scheme [0] (TFn tStr (sv 0))),
       ("parseInt", mono (TFn tStr tInt)),
       ("charAt", mono (TFn tStr (TFn tInt tInt))), -- returns the char CODE
+      ("substr", mono (TFn tStr (TFn tInt (TFn tInt tStr)))),
       ("chr", mono (TFn tInt tStr)),
       -- read/write: THE two HAL doors. What comes back (read) or is
       -- accepted (write) depends on the path/query value the HAL decodes,

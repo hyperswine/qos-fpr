@@ -25,6 +25,7 @@
 #                                            modules, seeds a fresh QLOG
 #                                            image, points FPR_DISK at it)
 #: plugins tests/notesed1.fpr tests/notesed2.fpr tests/notesedbad.fpr
+#: expect pathnotes: OK notes=Third note|Fourth one n=4 cap=2 ui=live ver=caps.v2 log=refused notesedbad
 #
 #   by hand, the same thing:
 #   make qos-app PROG=tests/pathnotes.fpr && make plugsyms
