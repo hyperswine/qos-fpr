@@ -30,8 +30,9 @@ import Data.IORef
 import Data.Int (Int64)
 import Data.List (intercalate)
 import System.IO.Unsafe (unsafePerformIO)
-import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrArray, withForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr, castForeignPtr, mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (withArray)
+import Foreign.Marshal.Utils (withMany)
 import Foreign.Ptr (Ptr, nullPtr, castPtr)
 import Foreign.Storable (peekElemOff, pokeElemOff)
 import qualified Data.ByteString as BS
@@ -310,17 +311,33 @@ growCol len (CB cap a) = do
   mapM_ (\i -> readArray a i >>= writeArray a' i) [0 .. len - 1]
   pure (CB cap' a')
 
+-- record shape ids start here (Lang.collectShapes numbers them [100..];
+-- union Type tids run [10..]).  A RECORD value carries var == its field
+-- count, a union variant carries var == its constructor index -- the tid
+-- range is what tells them apart at the store boundary.
+recT0 :: Int
+recT0 = 100
+
+-- the var a reconstructed SoA element must carry: records re-carry their
+-- field count, var-0 products stay 0
+soaVar :: Int -> [k] -> Int
+soaVar tid ks = if tid >= recT0 then length ks else 0
+
 -- what one pushed value decomposes into, per the store's rep
 fieldsFor :: VecRep -> Value -> IO [Value]
 fieldsFor (RScalar _) v = pure [v]
-fieldsFor (RSoA tid ks) (VData t 0 fs) | t == tid, length fs == length ks = pure fs
+fieldsFor (RSoA tid ks) (VData t v fs) | t == tid, v == soaVar tid ks, length fs == length ks = pure fs
 fieldsFor (RSoA tid _) v =
   ioError (userError ("*** SOL PANIC: Vec.push: expected product <" ++ show tid ++ ".0 ...>, got " ++ render v ++ " ***"))
 fieldsFor RUnset _ = ioError (userError "*** SOL PANIC: Vec: unset layout ***")
 
--- decide the layout from the first pushed value
+-- decide the layout from the first pushed value.  var-0 products AND
+-- records (var == field count, tid >= recT0) both take one column per
+-- field -- the record case is what puts {x1,x2,y}-style ML rows into
+-- unboxed f64 columns instead of a boxed scalar column.
 repFor :: Value -> VecRep
 repFor (VData t 0 fs) | not (null fs), t /= listT, t /= atomT = RSoA t (map kindOf fs)
+repFor (VData t v fs) | t >= recT0, v == length fs, not (null fs) = RSoA t (map kindOf fs)
 repFor v = RScalar (kindOf v)
 
 pushVec :: IORef VecStore -> Value -> IO ()
@@ -351,7 +368,7 @@ getVec ref i = do
       fs <- mapM (`readCol` i) (vCols st)
       pure $ case vRep st of
         RScalar _ -> head fs
-        RSoA tid _ -> VData tid 0 fs
+        RSoA tid ks -> VData tid (soaVar tid ks) fs
         RUnset -> vUnit
 
 setVec :: IORef VecStore -> Int -> Value -> IO ()
@@ -370,6 +387,17 @@ toListVec :: IORef VecStore -> IO [Value]
 toListVec ref = do
   n <- lenVec ref
   mapM (getVec ref) [0 .. n - 1]
+
+-- Vec.range lo hi: bulk construction at native speed -- one unboxed
+-- KInt column, no per-element interpretation.  `Vec.range 1 n |>
+-- Vec.map f` is the fast spelling of "generate n samples": the fill is
+-- this loop, the shaping is the JIT/GPU tier's map.
+vecRange :: Int64 -> Int64 -> IO Value
+vecRange lo hi = do
+  let n = max 0 (fromIntegral (hi - lo + 1))
+  fp <- mallocForeignPtrArray (max 1 n)
+  withForeignPtr fp $ \p -> mapM_ (\i -> pokeElemOff p i (lo + fromIntegral i)) [0 .. n - 1]
+  VVec <$> newIORef (VecStore n [CI (max 1 n) fp] (RScalar KInt))
 
 -- build a fresh scalar-int vector from native results (JIT map output)
 vecFromInts :: [Int64] -> IO Value
@@ -427,6 +455,19 @@ renderNum d
   | otherwise = show d
   where
     r = round d :: Integer
+
+-- vecmapr's landing pad: allocate k native columns, hand their raw base
+-- pointers to the filler (the JIT driver writes every row), then
+-- assemble the SoA store AROUND them -- zero copy, no boxing, the
+-- constructed vector is column-native from its first instant
+vecFromColsM :: Int -> Int -> [ColKind] -> ([Ptr Int64] -> IO ()) -> IO Value
+vecFromColsM n tid ks fill = do
+  fps <- mapM (const (mallocForeignPtrArray (max 1 n))) ks
+  withMany withForeignPtr fps fill
+  let col KInt fp = CI (max 1 n) fp
+      col KNum fp = CD (max 1 n) (castForeignPtr fp)
+      col KBox _ = error "vecmapr: boxed column cannot be native-built"
+  VVec <$> newIORef (VecStore n (zipWith col ks fps) (RSoA tid ks))
 
 -- fresh scalar KNum vector from JITted map output
 vecFromNums :: [Double] -> IO Value

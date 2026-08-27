@@ -145,15 +145,21 @@ mMulVec m xs =
 mLenGuard n c | n == c = 0.
 mLenGuard n c = error "matrix: operand length {n} vs {c} cols".
 
-# matmul: a (r x k) * b (k x c) -> (new r x c, a, b)
+# matmul: a (r x k) * b (k x c) -> (new r x c, a, b).  NATIVE: the
+# cells columns go straight to Vec.mmul (VM.hs vecMatmul) -- an unboxed
+# f64 triple loop when both matrices are inexact, the same cell loop
+# over exact Values otherwise (integer Gram matrices stay exact
+# bignums).  Bit-identical to the old list-row algebra by construction:
+# the inner accumulation is mDot's fold shape, k descending from the
+# exact-zero base.
 mMul a b =
   (ra, ka, a2) = mDims a;
   (kb, cb, b2) = mDims b;
   u = mMulGuard ra ka kb cb;
-  (arows, a3) = mAllRows a2;
-  (brows, b3) = mAllRows b2;
-  bcols = mTRows cb brows;
-  (mFromRows (map (fn ar -> map (fn bc -> mDot ar bc) bcols) arows), a3, b3).
+  Mat r1 c1 va = a2;
+  Mat r2 c2 vb = b2;
+  (vo, va2, vb2) = Vec.mmul ra ka cb va vb;
+  (Mat ra cb vo, Mat r1 c1 va2, Mat r2 c2 vb2).
 
 mMulGuard ra ka kb cb | ka == kb = 0.
 mMulGuard ra ka kb cb = error "matrix: mul {ra}x{ka} * {kb}x{cb} inner dims differ".

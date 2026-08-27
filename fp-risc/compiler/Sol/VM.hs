@@ -23,12 +23,13 @@ import Sol.Val
 import Sol.Web
 import Data.Bits (shiftL, (.|.), (.&.))
 import GHC.Float (castDoubleToWord64, castWord32ToFloat, castWord64ToDouble)
+import Foreign.ForeignPtr (mallocForeignPtrArray, withForeignPtr)
 import Foreign.Marshal.Array (peekArray)
 import Foreign.Ptr ()
 import Foreign.Storable (peek)
 import qualified Sol.Gpu as Gpu
 import qualified Sol.HandJIT as Hand
-import Control.Monad (when)
+import Control.Monad (forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
@@ -42,7 +43,7 @@ import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IM
 import Foreign.Marshal.Alloc (alloca)
 import Foreign.Ptr (Ptr)
-import Foreign.Storable (peek, poke)
+import Foreign.Storable (peek, peekElemOff, poke, pokeElemOff)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Data.IORef
@@ -363,7 +364,7 @@ builtinArities =
   M.union schemeArities $
     M.fromList
       [ ("use", 1), ("run", 2), ("View.serve", 5),
-        ("Vec.new", 1), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
+        ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
         ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1)
       ]
@@ -434,10 +435,19 @@ b2d = castWord64ToDouble . fromIntegral
 toTyped :: Value -> Maybe (JTy, [Int64])
 toTyped v0 = do
   xs <- nums v0
-  let ety
-        | all isI xs = JI
-        | all (not . isI) xs = JD
-        | otherwise = JW
+  -- classify by what the elements ARE, never by what they are not: a
+  -- list of NON-numbers (rows, records, strings) must bail to the
+  -- interpreter.  The old "not an Int => Double" read classified a
+  -- list of lists as JD and encoded every element as 0 bits -- any
+  -- boxed-element map/filter/fold over the JIT threshold silently
+  -- computed on zeros (the NN's row lists were the first witness).
+  ety <-
+    if all isI xs
+      then Just JI
+      else
+        if all isD xs
+          then Just JD
+          else if all (\x -> isI x || isD x) xs then Just JW else Nothing
   pure (ety, map (enc ety) xs)
   where
     nums (VData t 1 [x, r]) | t == listT = (x :) <$> nums r
@@ -445,6 +455,8 @@ toTyped v0 = do
     nums _ = Nothing
     isI VInt {} = True
     isI _ = False
+    isD VNum {} = True
+    isD _ = False
     enc JI (VInt i) = fromIntegral i
     enc _ (VInt i) = d2b (fromIntegral i)
     enc _ (VNum d) = d2b d
@@ -491,8 +503,8 @@ schemeCall env name args = case (name, args) of
         Just g <- unappliedFn f,
         Just (JD, bits) <- toTyped xs,
         length bits >= Gpu.gpuMinLen,
-        Just src <- Gpu.glslOfFn (vmCore env) g = do
-          r <- Gpu.gpuMapF64 gc src (map b2d' bits)
+        Just src <- Gpu.glslOfFn (vmCore env) g 0 = do
+          r <- Gpu.gpuMapF64 gc src [] (map b2d' bits)
           case r of
             Just out -> do
               putStrLn ("[gpu] map<" ++ g ++ "> n=" ++ show (length bits) ++ " (f64 compute shader)")
@@ -917,6 +929,10 @@ getEnvDebug = unsafePerformIO (fmap (== Just "1") (lookupEnv "SOL_JIT_DEBUG"))
 vecCall :: VMEnv -> Name -> [Value] -> IO Value
 vecCall env name args = case (name, args) of
   ("Vec.new", [_]) -> newVec
+  -- bulk construction at NATIVE speed: the push-per-element fill loop is
+  -- interpreted bytecode and dominates ML-scale pipelines; range + a
+  -- JIT/GPU map is the fast spelling of "generate n samples"
+  ("Vec.range", [VInt lo, VInt hi]) -> vecRange (fromIntegral lo) (fromIntegral hi)
   ("Vec.push", [x, VVec r]) -> pushVec r x >> pure (VVec r)
   ("Vec.len", [VVec r]) -> do n <- lenVec r; pure (VData 4 0 [VInt (fromIntegral n), VVec r])
   ("Vec.get", [VInt i, VVec r]) -> do
@@ -938,7 +954,60 @@ vecCall env name args = case (name, args) of
   ("Vec.map", [f, VVec r]) -> vecScheme env "vecmap" f Nothing r
   ("Vec.filter", [f, VVec r]) -> vecScheme env "vecfilter" f Nothing r
   ("Vec.fold", [f, z, VVec r]) -> vecScheme env "vecfold" f (Just z) r
+  ("Vec.mmul", [VInt r, VInt k, VInt c, VVec va, VVec vb]) ->
+    vecMatmul (fromIntegral r) (fromIntegral k) (fromIntegral c) va vb
   _ -> vmPanic (name ++ ": bad arguments (is the vector argument last?)")
+
+-- ---- native matmul: lib/matrix's cells-column product ----------------------
+-- a: ra x ka row-major cells, b: ka x cb row-major cells -> out ra x cb,
+-- both operands threaded back (the matrices stay linear).  The FAST path
+-- (both cells columns unboxed f64) is an unboxed triple loop whose inner
+-- accumulation is mDot's exact fold shape -- k DESCENDING, seeded by the
+-- exact-zero base -- so the result is BIT-IDENTICAL to the interpreted
+-- list algebra it replaces.  Every other layout takes the GENERAL path:
+-- the same cell loop over reconstructed Values through the VM's own
+-- `arith`, so exact-Integer products stay exact bignums and mixed-type
+-- cells panic exactly where the interpreter would.
+vecMatmul :: Int -> Int -> Int -> IORef VecStore -> IORef VecStore -> IO Value
+vecMatmul ra ka cb sra srb = do
+  sa <- readIORef sra
+  sb <- readIORef srb
+  when (vLen sa /= ra * ka || vLen sb /= ka * cb) $
+    vmPanic ("Vec.mmul: cells/dims mismatch (a: " ++ show (vLen sa) ++ " cells vs " ++ show ra ++ "x" ++ show ka
+             ++ ", b: " ++ show (vLen sb) ++ " cells vs " ++ show ka ++ "x" ++ show cb ++ ")")
+  out <- case (vRep sa, vCols sa, vRep sb, vCols sb) of
+    (RScalar KNum, [CD _ fpa], RScalar KNum, [CD _ fpb]) -> do
+      when getEnvDebug $ putStrLn ("[mmul] native f64 " ++ show ra ++ "x" ++ show ka ++ " * " ++ show ka ++ "x" ++ show cb)
+      fpo <- mallocForeignPtrArray (max 1 (ra * cb))
+      withForeignPtr fpa $ \pa -> withForeignPtr fpb $ \pb -> withForeignPtr fpo $ \po ->
+        forM_ [0 .. ra - 1] $ \i ->
+          forM_ [0 .. cb - 1] $ \j -> do
+            let go k acc
+                  | k < 0 = pure acc
+                  | otherwise = do
+                      x <- peekElemOff pa (i * ka + k)
+                      y <- peekElemOff pb (k * cb + j)
+                      go (k - 1) (x * y + acc)
+            s <- go (ka - 1) (0 :: Double)
+            pokeElemOff po (i * cb + j) s
+      VVec <$> newIORef (VecStore (ra * cb) [CD (max 1 (ra * cb)) fpo] (RScalar KNum))
+    _ -> do
+      o <- newVec
+      let VVec ro = o
+      forM_ [0 .. ra - 1] $ \i ->
+        forM_ [0 .. cb - 1] $ \j -> do
+          let go k acc
+                | k < 0 = pure acc
+                | otherwise = do
+                    x <- getVec sra (i * ka + k)
+                    y <- getVec srb (k * cb + j)
+                    xy <- arith OMul x y
+                    acc' <- arith OAdd xy acc
+                    go (k - 1) acc'
+          s <- go (ka - 1) (VInt 0)
+          pushVec ro s
+      pure o
+  pure (VData 5 0 [out, VVec sra, VVec srb])
 
 vecScheme :: VMEnv -> String -> Value -> Maybe Value -> IORef VecStore -> IO Value
 vecScheme env scheme f macc r = do
@@ -955,18 +1024,24 @@ vecScheme env scheme f macc r = do
   -- below the SSBO round-trip crossover the JIT wins).  Declines fall
   -- through to the JIT, which falls through to the interpreter.
   gpu <- case (vmGpu env, jitCallable env scheme f, layoutInfo st) of
-    (Just gc, Just (g, []), Just (_, [KNum], _))
+    (Just gc, Just (g, ex), Just (_, [KNum], _))
       | scheme == "vecmap",
         n >= Gpu.gpuMinLen,
-        Just src <- Gpu.glslOfFn (vmCore env) g ->
+        -- captured scalars ride double uniforms; only f64 captures keep
+        -- the bit-identical contract (an exact-Int capture could be used
+        -- in exact-int arithmetic the shader would silently double-ize)
+        all ((== JD) . snd) ex,
+        Just src <- Gpu.glslOfFn (vmCore env) g (length ex) ->
           withColPtrs st $ \colpp -> do
             colp <- peek colpp -- single column
             bits <- peekArray n colp
-            res <- Gpu.gpuMapF64 gc src (map b2d bits)
+            res <- Gpu.gpuMapF64 gc src (map (b2d . fst) ex) (map b2d bits)
             case res of
               Nothing -> pure Nothing
               Just out -> do
-                putStrLn ("[gpu] vecmap<" ++ g ++ "> n=" ++ show n ++ " (f64 compute; gates: pure+f64+n>=" ++ show Gpu.gpuMinLen ++ ")")
+                putStrLn ("[gpu] vecmap<" ++ g ++ "> n=" ++ show n
+                          ++ (if null ex then "" else " +" ++ show (length ex) ++ " uniform capture(s)")
+                          ++ " (f64 compute; gates: pure+f64+n>=" ++ show Gpu.gpuMinLen ++ ")")
                 Just <$> vecFromNums out
     _ -> pure Nothing
   jitted <- case gpu of
@@ -975,6 +1050,16 @@ vecScheme env scheme f macc r = do
     (Just jc, Just (g, extras), Just (scalar, ks, sig), Just aty0)
       | n >= jitThreshold ->
           compileVecScheme jc (vmCore env) scheme g scalar (map kindTy ks) sig (map snd extras) aty0 >>= \case
+            -- a map whose helper RETURNS a record has no scalar dual;
+            -- try the multi-output vecmapr path (native SoA
+            -- construction) before conceding to the interpreter
+            Nothing
+              | scheme == "vecmap" ->
+                  compileVecMapR jc (vmCore env) g scalar (map kindTy ks) sig (map snd extras) >>= \case
+                    Nothing -> pure Nothing
+                    Just (addr, tid, ftys) -> fmap Just $ withColPtrs st $ \cols -> withFuelCell env $ \pfuel ->
+                      vecFromColsM n tid [if t == JI then KInt else KNum | t <- ftys] $ \outs ->
+                        runVecMapR addr pfuel (map fst extras) cols n outs
             Nothing -> pure Nothing
             Just (addr, accTy, retTy) -> fmap Just $ withColPtrs st $ \cols -> withFuelCell env $ \pfuel ->
               case scheme of

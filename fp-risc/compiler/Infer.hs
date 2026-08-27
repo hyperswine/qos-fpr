@@ -398,6 +398,11 @@ builtinEnv =
       -- 2..8 chars = SoA).  Floats cannot be classified by first push:
       -- their bits are indistinguishable from a pointer.
       ("Vec.newAs", mono (TFn tStr tVector)),
+      -- bulk construction at native speed: one Int column filled by the
+      -- HAL loop; `Vec.range 1 n |> Vec.map f` is the fast spelling of
+      -- "generate n samples" (the per-element push loop it replaces is
+      -- the dominant cost of ML-scale pipelines)
+      ("Vec.range", mono (TFn tInt (TFn tInt tVector))),
       ("Vec.push", scheme [0] (TFn (sv 0) (TFn tVector tVector))),
       ("Vec.len", mono (TFn tVector (TTupT [tInt, tVector]))),
       ("Vec.get", scheme [0] (TFn tInt (TFn tVector (TTupT [sv 0, tVector])))),
