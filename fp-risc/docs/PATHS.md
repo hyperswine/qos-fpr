@@ -147,9 +147,11 @@ notes — and the arity-changed v3 bounces off the gate.
 
   * list indices / constructor prisms: partial paths, type-indexed
     (`PathP`), not yet implemented;
-  * the sol (HostedBytecode) profile loads modules through its own
-    path and does not yet run the rewrite — path literals are an AOT
-    (bare-metal/qos) feature today;
+  * ~~the sol profile does not run the rewrite~~ — closed: the sol
+    pipeline runs expandPathLits too, and with the VM's actor shim
+    (green actors + Sys/mtime stubs, VM.hs) whole std.mvu apps — the
+    message port and schema sets included — run INTERPRETED under
+    `fpr sol` / `qos.py dev`, same results as the compiled tier;
   * unit-local shapes: literals resolve against the merged shape
     table; a shape declared inside a `use`d module is addressed by its
     qualified name, so in practice declare your Model in the root

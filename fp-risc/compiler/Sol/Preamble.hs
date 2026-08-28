@@ -163,12 +163,15 @@ halArities :: M.Map Name Int
 halArities =
   M.fromList
     [ ("str", 1), ("strcat", 2), ("String.len", 1), ("strlen", 1),
-      ("error", 1), ("parseInt", 1), ("charAt", 2), ("chr", 1), ("!", 2),
+      ("error", 1), ("parseInt", 1), ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
       ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1),
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),
       ("BStr.append", 2), ("BStr.cat", 2), ("BStr.len", 1),
       ("BStr.at", 2), ("BStr.sub", 3), ("BStr.free", 1),
       ("read", 1), ("write", 2),
+      ("myself", 1), ("spawn", 1), ("send", 2), ("receive", 1), ("receiveFrom", 2),
+      ("kill", 1), ("yield", 1), ("drop", 1), ("keep", 1), ("device", 1), ("reg32", 2),
+      ("Sys.poolReset", 1), ("Sys.sleepUs", 1), ("Sys.logAt", 2), ("Sys.memStats", 1),
       ("Num.div", 2), ("Num.sqrt", 1), ("Num.floor", 1), ("Num.round", 1),
       ("map", 2), ("filter", 2), ("foldl", 3),
       ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),

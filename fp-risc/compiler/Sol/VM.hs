@@ -38,7 +38,11 @@ import System.IO.Unsafe (unsafePerformIO)
 import Sol.JIT
 import Sol.Lang (Name)
 import qualified Sol.Lang as Lang
-import Control.Concurrent (threadDelay)
+import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
+import qualified Control.Concurrent
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newEmptyMVar, newMVar, takeMVar, tryPutMVar)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, try)
+import qualified Data.Set as S
 import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IM
 import Foreign.Marshal.Alloc (alloca)
@@ -363,7 +367,10 @@ builtinArities :: M.Map Name Int
 builtinArities =
   M.union schemeArities $
     M.fromList
-      [ ("use", 1), ("run", 2), ("View.serve", 5),
+      [ ("myself", 1), ("spawn", 1), ("send", 2), ("receive", 1), ("receiveFrom", 2),
+        ("kill", 1), ("yield", 1), ("drop", 1), ("keep", 1), ("device", 1), ("reg32", 2),
+        ("Sys.poolReset", 1), ("Sys.sleepUs", 1), ("Sys.logAt", 2), ("Sys.memStats", 1),
+        ("use", 1), ("run", 2), ("View.serve", 5),
         ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
         ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1)
@@ -374,6 +381,7 @@ builtinCall env g args
   | M.member g schemeArities = schemeCall env g args
   | g == "use" || g == "run" = modCall env g args
   | g == "View.serve" = viewServe env args
+  | S.member g actorNames = actorCall env g args
   | otherwise = vecCall env g args
 
 -- ---- gen_view: the MVU web behavior (Web.hs owns the transport) -------------
@@ -392,10 +400,158 @@ viewServe env [VInt port, fi, fu, fv, subsV] =
       }
 viewServe _ _ = vmPanic "View.serve: expected port init update view subs"
 
+-- ---- the actor shim (the sketch tier; docs/PATHS.md phase 1) ---------------
+--
+-- QOS actor programs -- std/mvu apps included -- run INTERPRETED here on
+-- green threads: spawn forks a GHC thread, an actor id is a plain Int
+-- (exactly what typed FPR code stores in models and compares to 0), and
+-- each mailbox is a lock+queue in arrival order with per-sender selective
+-- receive -- the same visible semantics as actors.c (per-sender FIFO,
+-- receiveFrom scans only that sender's messages), minus everything the
+-- sketch tier does not owe: no deep copy (values are immutable here), no
+-- WCET, no harts.  drop/keep are no-ops (ARC is the native runtime's);
+-- Sys.poolReset/memStats are honest zeros; device/reg32 hand out an
+-- mtime handle that `read` answers in the native 10MHz tick unit, so
+-- MVU frame pacing works on wall clock.
+--
+-- Wakeup protocol: senders enqueue THEN tryPutMVar the signal, receivers
+-- re-scan after every takeMVar -- a message can never be missed, only
+-- signalled twice (harmless: the re-scan finds nothing and blocks again).
+--
+-- A panic inside a spawned actor prints the SOL PANIC line (qos.py fails
+-- the run on it) and kills that actor only, like a crashed process; the
+-- main thread keeps its own result path.
+
+data ABox = ABox
+  { abQ :: MVar [(Int, Value)],
+    abSig :: MVar (),
+    abTid :: IORef (Maybe ThreadId)
+  }
+
+{-# NOINLINE actorReg #-}
+actorReg :: IORef (IM.IntMap ABox)
+actorReg = unsafePerformIO (newIORef IM.empty)
+
+{-# NOINLINE actorByTid #-}
+actorByTid :: IORef (M.Map ThreadId Int)
+actorByTid = unsafePerformIO (newIORef M.empty)
+
+{-# NOINLINE actorNext #-}
+actorNext :: IORef Int
+actorNext = unsafePerformIO (newIORef 1)
+
+newBox :: IO (Int, ABox)
+newBox = do
+  i <- atomicModifyIORef' actorNext (\n -> (n + 1, n))
+  q <- newMVar []
+  s <- newEmptyMVar
+  t <- newIORef Nothing
+  let b = ABox q s t
+  atomicModifyIORef' actorReg (\m -> (IM.insert i b m, ()))
+  pure (i, b)
+
+-- the calling thread's actor id, registered on first contact (the main
+-- interpreter thread becomes actor 1 the first time it touches the surface)
+actorSelf :: IO Int
+actorSelf = do
+  t <- myThreadId
+  m <- readIORef actorByTid
+  case M.lookup t m of
+    Just i -> pure i
+    Nothing -> do
+      (i, b) <- newBox
+      writeIORef (abTid b) (Just t)
+      atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
+      pure i
+
+actorEnqueue :: Int -> Int -> Value -> IO ()
+actorEnqueue to from m = do
+  reg <- readIORef actorReg
+  case IM.lookup to reg of
+    Nothing -> pure () -- dead (or never-born) target: the message is lost
+    Just b -> do
+      modifyMVar_ (abQ b) (\q -> pure (q ++ [(from, m)]))
+      _ <- tryPutMVar (abSig b) ()
+      pure ()
+
+actorTake :: (Int -> Bool) -> IO Value
+actorTake wants = do
+  i <- actorSelf
+  reg <- readIORef actorReg
+  case IM.lookup i reg of
+    Nothing -> vmPanic "receive: the current actor has no mailbox"
+    Just b -> loop b
+  where
+    loop b = do
+      r <- modifyMVar (abQ b) $ \q ->
+        case break (\(s, _) -> wants s) q of
+          (pre, (_, m) : post) -> pure (pre ++ post, Just m)
+          _ -> pure (q, Nothing)
+      case r of
+        Just m -> pure m
+        Nothing -> takeMVar (abSig b) >> loop b
+
+mtimeT :: Int
+mtimeT = 9977 -- runtime-range tid for the shim's mtime handle
+
+actorNames :: S.Set Name
+actorNames =
+  S.fromList
+    [ "myself", "spawn", "send", "receive", "receiveFrom", "kill", "yield",
+      "drop", "keep", "device", "reg32",
+      "Sys.poolReset", "Sys.sleepUs", "Sys.logAt", "Sys.memStats"
+    ]
+
+actorCall :: VMEnv -> Name -> [Value] -> IO Value
+actorCall _ "myself" [_] = VInt . fromIntegral <$> actorSelf
+actorCall env "spawn" [f] = do
+  (i, b) <- newBox
+  tid <- forkIO $ do
+    t <- myThreadId
+    atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
+    r <- try (apply env f (VInt (fromIntegral i)))
+    case r of
+      Left e
+        | Just ThreadKilled <- fromException e -> pure ()
+        | otherwise ->
+            putStrLn ("*** SOL PANIC [actor " ++ show i ++ "]: " ++ show (e :: SomeException) ++ " ***")
+      Right _ -> pure ()
+    atomicModifyIORef' actorReg (\m -> (IM.delete i m, ()))
+  writeIORef (abTid b) (Just tid)
+  pure (VInt (fromIntegral i))
+actorCall _ "send" [VInt to, m] = do
+  from <- actorSelf
+  actorEnqueue (fromIntegral to) from m
+  pure vUnit
+actorCall _ "receive" [VInt _me] = actorTake (const True)
+actorCall _ "receiveFrom" [VInt _me, VInt from] = actorTake (== fromIntegral from)
+actorCall _ "kill" [VInt i] = do
+  reg <- readIORef actorReg
+  case IM.lookup (fromIntegral i) reg of
+    Nothing -> pure vUnit
+    Just b -> do
+      mt <- readIORef (abTid b)
+      atomicModifyIORef' actorReg (\m -> (IM.delete (fromIntegral i) m, ()))
+      maybe (pure ()) killThread mt
+      pure vUnit
+actorCall _ "yield" [_] = Control.Concurrent.yield >> pure vUnit
+actorCall _ "drop" [_] = pure vUnit
+actorCall _ "keep" [v] = pure v
+actorCall _ "device" [_] = pure (VInt 0)
+actorCall _ "reg32" [_, _] = pure (VData mtimeT 0 [])
+actorCall _ "Sys.poolReset" [_] = pure (VInt 0)
+actorCall _ "Sys.sleepUs" [VInt us] = threadDelay (fromIntegral us) >> pure vUnit
+actorCall _ "Sys.logAt" [VInt h, s] = do
+  str <- vsStr s
+  putStrLn ("[log@" ++ show h ++ "] " ++ str)
+  pure vUnit
+actorCall _ "Sys.memStats" [_] = pure (VData 4 0 [VInt 0, VInt 0])
+actorCall _ g as = vmPanic ("actor shim " ++ g ++ ": bad arguments " ++ show (map render as))
+
 -- ---- content-addressed file modules (Mod.hs does the work) -----------------
 modCall :: VMEnv -> Name -> [Value] -> IO Value
 modCall env "use" [VStr spec] = do
-  r <- resolveModule (vmBaseDir env) spec
+  r <- resolveModule ".sol" (vmBaseDir env) spec
   case r of
     Left e -> vmPanic e
     Right (p, h, pinned) -> do
@@ -652,6 +808,7 @@ mkHal cons tx preempts rt =
       ("String.len", (1, \[v] -> VInt . fromIntegral . length <$> vsStr v)),
       ("strlen", (1, \[v] -> VInt . fromIntegral . length <$> vsStr v)),
       ("charAt", (2, charAtH)),
+      ("substr", (3, substrH)),
       ("chr", (1, \[VInt c] -> pure (VStr [toEnum (fromIntegral c)]))),
       -- VBStr ops: O(1) amortised; declared as a separate HAL surface so the
       -- linearity checker treats them the same as Vec.* (the BStr 1 prelude
@@ -755,6 +912,8 @@ mkHal cons tx preempts rt =
             ("streams `" ++ c ++ "` live and re-runs on every retry "
               ++ "(transactional: shq, which runs once inside the commit)")
           VInt . fromIntegral <$> rtShell c)
+    -- the actor shim's mtime handle: native 10MHz tick unit on wall clock
+    readIoH (VData t 0 []) | t == mtimeT = VInt . round . (* 1e7) <$> getMonotonicTime
     readIoH (VData t g [])
       | isCon "NowLine" t g = do
           noteEscape rt "readLineNow"
@@ -874,6 +1033,19 @@ mkHal cons tx preempts rt =
             then pure (VInt (fromIntegral (fromEnum (s !! (n - 1)))))
             else vmPanic "charAt: index out of range"
     charAtH _ = vmPanic "charAt: bad args"
+    -- clamping semantics, mirrored from the AOT runtime's g_substr:
+    -- 1-based offset, out-of-range never panics, it narrows to ""
+    substrH [sv, VInt o0, VInt l0]
+      | isStrVal sv = do
+          s <- vsStr sv
+          let o1 = max 1 (fromIntegral o0 :: Int)
+              l1 = max 0 (fromIntegral l0 :: Int)
+              (o, l) =
+                if o1 - 1 >= length s
+                  then (1, 0)
+                  else (o1, min l1 (length s - (o1 - 1)))
+          pure (VStr (take l (drop (o - 1) s)))
+    substrH _ = vmPanic "substr: bad args"
 
     bsSubH [VBStr r, VInt i, VInt j] = do
       s <- bsContent r

@@ -16,7 +16,7 @@
 module Sol.Lang (module Sol.Lang, module FPRISC) where
 
 import Control.Monad (foldM, unless, void, when)
-import FPRISC (SExpr (..), Seg (..), SStmt (..), SPat (..), SGuard (..), STop (..), Ty (..), Name, program, guardBools, mapGuardE)
+import FPRISC (SExpr (..), Seg (..), SStmt (..), SPat (..), SGuard (..), STop (..), Ty (..), Name, program, guardBools, mapGuardE, expandPathLits, shapeTyTable)
 -- (Name comes from FPRISC; sol's own alias deleted)
 import Control.Monad.State.Strict
 import Data.Char (isAlphaNum, isLetter, isLower, isUpper)
