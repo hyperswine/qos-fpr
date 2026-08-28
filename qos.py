@@ -272,8 +272,23 @@ def cmd_run(a):
     if a.fresh_disk:
         (QOS / "qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
+    # `#: fprd` (or --fprd): the program compiles/packages at runtime
+    # through Sys.compile, so start the host compiler daemon for the run
+    fprd_proc = None
+    if a.fprd or "fprd" in d:
+        sock = str(FPR / "build" / f"fprd-{os.getpid()}.sock")
+        say(f"fprd: compiler daemon on {os.path.relpath(sock, ROOT)}")
+        fprd_proc = subprocess.Popen(
+            [sys.executable, "tools/fprd.py", sock], cwd=FPR,
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        env["FPRD_SOCK"] = sock
+        time.sleep(0.8)
     say(f"{host}: {prog}" + (f"  (port {a.port})" if a.port else ""))
-    rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=expect)
+    try:
+        rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=expect)
+    finally:
+        if fprd_proc:
+            fprd_proc.terminate()
     say(f"total {time.time() - t0:.1f}s")
 
     return rc
@@ -786,6 +801,7 @@ def main():
     p.add_argument("--plugin", action="append", help="build this .fpr as a plugin module and seed it onto a fresh disk (repeatable; overrides the program's `#: plugins` line)")
     p.add_argument("--no-plugins", action="store_true", help="ignore the program's `#: plugins` line")
     p.add_argument("--disk", help="run against this existing QLOG image (FPR_DISK)")
+    p.add_argument("--fprd", action="store_true", help="start the host compiler daemon for the run (Sys.compile / CP.plugin)")
     p.set_defaults(f=cmd_run)
 
     p = sub.add_parser("new", help="scaffold a working app under fp-risc/apps/<name>/")

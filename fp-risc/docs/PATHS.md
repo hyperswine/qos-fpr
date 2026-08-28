@@ -131,6 +131,16 @@ notes — and the arity-changed v3 bounces off the gate.
     major migrate     ModelN -> ModelN' (fpr commit --major; audited)
     restart           topology changes -- out of live-reload scope
 
+The module-swap rung closes ON-QOS too: `CP.plugin slot id src`
+(std/compile) packages a source string into a hot-loadable module .qa
+through the host fprd daemon, the bytes land on the app's own qlog
+store as apps/<id>.qa, and LR.load pulls them through the same compat
+gate as a seeded disk -- tests/selfhost.fpr is the whole loop (edit,
+compile, package, store, hot-swap, impostor refused) without leaving
+the running system.  The packaged .qa is a MATCHED SET with the exact
+shell image it linked against (plugsyms bakes absolute addresses); the
+daemon re-derives plugsyms from the current build per package.
+
 ## Files
 
     compiler/FPRISC.hs   expandPathLits (+ shapeTyTable): the literal
