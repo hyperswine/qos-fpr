@@ -36,6 +36,8 @@ typedef struct {
   char id[64];
   char load_mode[16]; /* "process" is the only mode qosp runs */
   char abi[24];       /* "<QOS_ABI_VERSION>.<codegenRev>" or empty (pre-stamp) */
+  char shell[72];     /* plugin matched-set stamp: the LOAD sha of the shell
+                       * image it linked against; empty = pre-stamp */
   qa_perm_t perms[QA_MAX_PERMS];
   int nperms;
 } qa_t;

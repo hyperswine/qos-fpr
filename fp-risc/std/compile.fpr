@@ -20,9 +20,21 @@
 #                          "bare-metal") -- never shell passthrough
 #   qosApp src             compile for THIS tier (a qosp app image)
 #   bareMetal src          compile for the rv64 bare-metal profile
+#   plugin slot id src     the PACKAGE op: source -> a hot-loadable
+#                          module .qa (bytes in the Ok), linked at
+#                          sub-slot <slot>'s base against the CURRENT
+#                          shell -- append it to the qlog store as
+#                          "apps/<id>.qa" and LR.load pulls it through
+#                          the compat gate: the whole edit-compile-
+#                          swap ladder without leaving QOS.  The slot
+#                          is the runtime mapping base: one slot per
+#                          LIVE version, exactly like the disk-seeded
+#                          flow (tests/selfhost.fpr is the loop).
 
 compile profile src = Sys.compile profile src.
 
 qosApp src = Sys.compile "qos-portable" src.
 
 bareMetal src = Sys.compile "bare-metal" src.
+
+plugin slot id src = Sys.compile "plugin:{slot}:{id}" src.

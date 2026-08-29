@@ -159,6 +159,8 @@ static void parse_manifest(qa_t *qa) {
           copy_tok(qa->load_mode, sizeof qa->load_mode, v, vn);
         else if (kn == 3 && !strncmp(k, "abi", 3))
           copy_tok(qa->abi, sizeof qa->abi, v, vn);
+        else if (kn == 5 && !strncmp(k, "shell", 5))
+          copy_tok(qa->shell, sizeof qa->shell, v, vn);
       }
     }
     if (!nl) break;
