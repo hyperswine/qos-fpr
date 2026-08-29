@@ -139,7 +139,29 @@ gate as a seeded disk -- tests/selfhost.fpr is the whole loop (edit,
 compile, package, store, hot-swap, impostor refused) without leaving
 the running system.  The packaged .qa is a MATCHED SET with the exact
 shell image it linked against (plugsyms bakes absolute addresses); the
-daemon re-derives plugsyms from the current build per package.
+daemon re-derives plugsyms from the current build per package, and
+the set is now CHECKED, not conventional: mkqa stamps every plugin
+with the shell image's LOAD sha (`shell = ...`), and the host REFUSES
+an attach whose stamp does not match the hosted image -- what used to
+be a silent, layout-dependent memory corruption is a named error.
+
+## 6. The disk is the system (std.fs + std.loader)
+
+Everything that exists is a record on the ONE append-only log, and
+services are the only interpreters: `std/fs` is the client of the
+storage actor (the log's one writer -- apps hand it the device once
+and never touch it again), and `std/loader` is the actor that turns
+`apps/<id>.qa` records into live code.  Every gated, successful load
+appends the attach chain as the `sys/live` record, so THE RUNNING
+MODULE SET IS A PURE FUNCTION OF THE LOG: on boot, `LD.replay` reads
+`sys/live` and reassembles the whole chain -- hot swaps included --
+through the same gates, with no compiler and no operator present.
+A refused version (shell-stamp mismatch, arity drift) is detached and
+never recorded: the log cannot describe a set that was not live.
+
+tests/sysdisk.fpr is the proof, two boots of one image: boot 1 builds
+the live set message by message (load v1, hot-swap v2, impostor
+refused); boot 2 replays `sys/live` and the swap is simply THERE.
 
 ## Files
 

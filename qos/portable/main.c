@@ -89,6 +89,24 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
 #define PLUG_MAX 8
 static struct { uintptr_t lo, hi; } plug_ranges[PLUG_MAX];
 static int plug_n;
+
+/* the hosted shell image's LOAD sha -- the identity every plugin must
+ * have been linked against (plugsyms bakes the shell's ABSOLUTE symbol
+ * addresses into the plugin, so under any other shell its global
+ * accesses poke the wrong memory; the corruption is silent and
+ * layout-dependent, hence a HARD gate, not a warning) */
+static char g_shell_sha[72];
+static void load_sha_hex(const unsigned char *load, uint64_t n, char *out,
+                         uint64_t cap) {
+  out[0] = 0;
+  for (uint64_t i = 0; i + 4 < n; i++)
+    if (!memcmp(load + i, "sha ", 4) && (i == 0 || load[i - 1] == '\n')) {
+      uint64_t j = i + 4, k = 0;
+      while (j < n && load[j] != '\n' && k + 1 < cap) out[k++] = (char)load[j++];
+      out[k] = 0;
+      return;
+    }
+}
 int64_t qosp_load_plugin_bytes(const char *bytes, uint64_t len, char *err,
                                uint64_t errcap) {
   if (plug_n >= PLUG_MAX) {
@@ -114,6 +132,17 @@ int64_t qosp_load_plugin_bytes(const char *bytes, uint64_t len, char *err,
     qa_free(&qa);
     return -1;
   }
+  if (qa.shell[0] && g_shell_sha[0] && strcmp(qa.shell, g_shell_sha) != 0) {
+    snprintf(err, errcap, "matched-set REFUSED: plugin %s was linked against "
+             "shell %.12s... but this shell is %.12s... -- repackage against "
+             "the running image", qa.id, qa.shell, g_shell_sha);
+    qa_free(&qa);
+    return -1;
+  }
+  if (!qa.shell[0])
+    fprintf(stderr, "[qos] warning: plugin %s carries no shell stamp "
+            "(pre-stamp archive); the matched-set gate cannot protect it\n",
+            qa.id);
   /* the archive DECLARES its span (LOAD base/memsz) -- no more
    * recovering it from segment high-water marks and 4 MiB masks.
    * Overlap-check the declared span first, load second: a bad plugin
@@ -372,6 +401,7 @@ int main(int argc, char **argv) {
 
   qa_t qa;
   if (qa_load(qa_path, &qa)) return 1;
+  load_sha_hex(qa.load, qa.load_len, g_shell_sha, sizeof g_shell_sha);
   TRACE("stage 2: %s (id=%s, loadMode=%s), image %" PRIu64 "B, %d perms\n",
         qa.name, qa.id, qa.load_mode, qa.img_len, qa.nperms);
   if (qa.load_mode[0] && strcmp(qa.load_mode, "process")) {

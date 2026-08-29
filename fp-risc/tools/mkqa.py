@@ -57,9 +57,31 @@ def flatten_elf(elf):
         raise SystemExit("mkqa: e_entry outside the loadable span")
     return base, e_entry - base, execsz, rwoff, bytes(img), memsz
 
-def build(manifest_path, elf_path, out_path):
+def load_sha_of(qa_path):
+    """The LOAD section's image sha of an existing .qa -- the identity
+    of the shell a plugin links against (the matched-set stamp)."""
+    with open(qa_path, "rb") as f:
+        b = f.read()
+    if b[:5] != b"QAR2\n":
+        raise SystemExit(f"mkqa: --shell-of {qa_path}: not a QAR2 archive")
+    head, _, _ = b.partition(b"\n\n")
+    off = len(head) + 2
+    for line in head.decode().split("\n")[1:]:
+        name, o, n = line.split()
+        if name == "LOAD":
+            load = b[off + int(o) : off + int(o) + int(n)].decode()
+            for ln in load.split("\n"):
+                if ln.startswith("sha "):
+                    return ln.split()[1]
+    raise SystemExit(f"mkqa: --shell-of {qa_path}: no LOAD sha found")
+
+def build(manifest_path, elf_path, out_path, shell_of=None):
     with open(manifest_path, "rb") as f:
         manifest = f.read()
+    if shell_of:
+        # stamp the shell identity the plugin was LINKED against; the
+        # host refuses an attach under any other shell image (main.c)
+        manifest += ('shell = "%s"\n' % load_sha_of(shell_of)).encode()
 
     if elf_path and elf_path != "-" and os.path.exists(elf_path):
         with open(elf_path, "rb") as f:
@@ -93,5 +115,6 @@ if __name__ == "__main__":
     ap.add_argument("manifest")
     ap.add_argument("elf", nargs="?", default="-")
     ap.add_argument("-o", "--out", required=True)
+    ap.add_argument("--shell-of", help="stamp the manifest with this app .qa's image sha (plugin matched-set gate)")
     a = ap.parse_args()
-    build(a.manifest, a.elf, a.out)
+    build(a.manifest, a.elf, a.out, a.shell_of)

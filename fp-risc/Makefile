@@ -224,7 +224,7 @@ plugin-qa: fprc core/prelude.fpr
 	  build/plug-$(PLUGID).s $$(cat build/plug-$(PLUGID).s.units) -o build/plug-$(PLUGID).elf
 	@MF=build/plug-$(PLUGID)-gen.toml; \
 	printf 'name = "%s"\nid = "%s"\nentry = "fpr_modtab"\nversion = "1"\nloadMode = "plugin"\n' $(PLUGID) $(PLUGID) > $$MF; \
-	python3 tools/mkqa.py $$MF build/plug-$(PLUGID).elf -o $(PLUGID).qa
+	python3 tools/mkqa.py $$MF build/plug-$(PLUGID).elf -o $(PLUGID).qa --shell-of app.qa
 	@echo "$(PLUGID).qa built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
 
 plugin-qa-macos: fprc core/prelude.fpr
@@ -240,7 +240,7 @@ plugin-qa-macos: fprc core/prelude.fpr
 	  build/plug-$(PLUGID)-a64.s $$(cat build/plug-$(PLUGID)-a64.s.units) -o build/plug-$(PLUGID)-a64.elf
 	@MF=build/plug-$(PLUGID)-a64-gen.toml; \
 	printf 'name = "%s"\nid = "%s"\nentry = "fpr_modtab"\nversion = "1"\nloadMode = "plugin"\n' $(PLUGID) $(PLUGID) > $$MF; \
-	python3 tools/mkqa.py $$MF build/plug-$(PLUGID)-a64.elf -o $(PLUGID).qa
+	python3 tools/mkqa.py $$MF build/plug-$(PLUGID)-a64.elf -o $(PLUGID).qa --shell-of app.qa
 	@echo "$(PLUGID).qa built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
 
 qos-app-macos-run: qos-app-macos
