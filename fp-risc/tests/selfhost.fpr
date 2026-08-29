@@ -1,10 +1,13 @@
 # selfhost.fpr -- the on-QOS ladder, END TO END, without leaving the
-# running system: SOURCE STRINGS edited inside the app are compiled
-# and PACKAGED into hot-loadable module .qa bytes (CP.plugin -> the
-# tag-7 channel -> the host fprd daemon running the plugin-qa
-# pipeline), appended to the app's own qlog store as apps/<id>.qa --
-# the same records a seeded disk carries -- and pulled back through
-# std.livereload's compat gate:
+# running system, THE SERVICE WAY: SOURCE STRINGS edited inside the
+# app are compiled and PACKAGED into hot-loadable module .qa bytes
+# (CP.plugin -> the tag-7 channel -> the host fprd daemon running the
+# plugin-qa pipeline), appended through the Files service as
+# apps/<id>.qa records -- the same records a seeded disk carries --
+# and pulled back through the Loader service's gates.  The app touches
+# no device and reads no records itself; and because the loader writes
+# sys/live, every swap made here would also SURVIVE A REBOOT
+# (tests/sysdisk.fpr proves that property).
 #
 #   1. v1 ("editLine s = s") packaged at sub-slot 0, stored, loaded,
 #      bound, used
@@ -15,8 +18,6 @@
 #      it and v2 stays bound -- the checked precondition, not a
 #      convention, exactly as with disk-seeded versions
 #
-# The store records SURVIVE: a later boot of this disk can LR.load
-# "selfed2" without any compiler present.
 #
 #   ./qos.py run tests/selfhost.fpr     (the directive below starts the
 #                                        compiler daemon for the run)
@@ -26,8 +27,8 @@
 #   by hand: python3 tools/fprd.py &  then the usual qos-app + qosp run
 
 CP = use "../std/compile".
-QL = use "../programs/mods/qlog".
-LR = use "../std/livereload".
+FS = use "../std/fs".
+LD = use "../std/loader".
 
 srcV1 = "editLine s = s.\neditName u = \"self.v1\".".
 
@@ -42,23 +43,24 @@ expectOk what r = case r of
   | Err e -> error "selfhost {what}: {e}".
 
 # source -> .qa bytes (the daemon packages at sub-slot <slot>'s base)
-# -> a store record any later boot can load; returns the new head
-mint dsk h slot id src =
+# -> a record through the Files service, for any later boot to load
+mint me fs slot id src =
   qa = expectOk "package {id}" (CP.plugin slot id src);
-  QL.appendRec dsk h "QREC" "apps/{id}.qa" qa.
+  expectOk "store {id}" (FS.append me fs "apps/{id}.qa" qa).
 
 main =
-  dsk = device "blk";
-  h0 = QL.ensure dsk;
-  h1 = mint dsk h0 0 "selfed1" srcV1;
-  _ = expectOk "load v1" (LR.load dsk h1 "selfed1");
-  n1 = (LR.bind "editLine") "one";
-  h2 = mint dsk h1 1 "selfed2" srcV2;
-  _ = expectOk "load v2" (LR.load dsk h2 "selfed2");
-  n2 = (LR.bind "editLine") "two";
-  h3 = mint dsk h2 2 "selfedbad" srcBad;
-  bad = LR.load dsk h3 "selfedbad";
+  me = myself 0;
+  fs = FS.serve (device "blk");
+  ld = LD.serve fs;
+  _ = mint me fs 0 "selfed1" srcV1;
+  _ = expectOk "load v1" (LD.load me ld "selfed1");
+  n1 = (LD.bind "editLine") "one";
+  _ = mint me fs 1 "selfed2" srcV2;
+  _ = expectOk "load v2" (LD.load me ld "selfed2");
+  n2 = (LD.bind "editLine") "two";
+  _ = mint me fs 2 "selfedbad" srcBad;
+  bad = LD.load me ld "selfedbad";
   badS = case bad of Ok i -> "ACCEPTED?!" | Err e -> "refused";
-  n3 = (LR.bind "editLine") "three";
-  ver = (LR.bind "editName") "";
+  n3 = (LD.bind "editLine") "three";
+  ver = (LD.bind "editName") "";
   "selfhost: v1 {n1} | v2 hot self-compiled {n2} | bad: {badS} | still v2: {n3} ver={ver}".

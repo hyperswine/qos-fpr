@@ -2,6 +2,14 @@
 # std/livereload.fpr -- std.livereload: HOT MODULE SWAP for running
 # FP-RISC programs on QOS.
 #
+# NOTE (docs/PATHS.md §6): std.loader is now the INTENDED SURFACE --
+# the loader actor speaks the Files service instead of the device,
+# runs the same gates, and RECORDS the live set as sys/live so it
+# replays on boot.  This module remains the low-level tier: its
+# reload-safety rules below (what the compiler does and does not do
+# across the boundary) govern BOTH surfaces, and load/bind stay for
+# code that owns its own disk handle.
+#
 # The pieces this composes (all of which existed; this module is the
 # convention that makes them a reload system):
 #

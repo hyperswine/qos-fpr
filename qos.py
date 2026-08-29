@@ -540,17 +540,19 @@ main =
 TPL_NOTES = {
     "app.fpr": '''\
 # __NAME__ -- the notes-app shape (tests/pathnotes.fpr, distilled):
-# MVU + message port + first-class paths + LIVERELOAD.  The commit
-# function lives behind the module registry; a ("swap", "edit2")
-# message hot-swaps it mid-run through the compat gate.  The driver
-# actor below scripts a demo run -- replace it with your real input.
+# MVU + message port + first-class paths + the LOADER SERVICE.  The
+# commit function lives behind std.loader (over std.fs -- the app
+# touches no device); a ("swap", "edit2") message hot-swaps it mid-run
+# through the gates, and the loader records the live set as sys/live.
+# The driver actor below scripts a demo run -- replace it with your
+# real input.
 #   ./qos.py run apps/__NAME__/app.fpr
 #: name __NAME__
 #: plugins apps/__NAME__/edit1.fpr apps/__NAME__/edit2.fpr
 #: expect __NAME__: done notes=one|Two n=2 ver=caps.v2
 
-QL = use "../../programs/mods/qlog".
-LR = use "__STD__/livereload".
+FS = use "__STD__/fs".
+LD = use "__STD__/loader".
 MV = use "__STD__/mvu".
 L = use "__STD__/lens".
 
@@ -567,8 +569,8 @@ joinBar l acc = case l of
 joinOne acc s = case strlen acc == 0 of True -> s | False -> "{acc}|{s}".
 
 appInit env =
-  (dsk, h0, port) = env;
-  nm = LR.bind "editName";
+  (ld, port) = env;
+  nm = LD.bind "editName";
   {notes = Nil, count = 0, ver = nm "", port = port}.
 
 appUpdate me env ev m = case ev of
@@ -586,18 +588,20 @@ onMsg me env m tag arg = case L.strEq tag "note" of
 # resolved at the step, never stored in the model (a stored closure
 # would pin its version across a swap)
 onNote m line =
-  f = LR.bind "editLine";
+  f = LD.bind "editLine";
   ({m | notes = f line :: m.notes, count = m.count + 1}, Nil).
 
+# a swap is ONE message to the Loader service, which gates it (shell
+# stamp + arity chain) and records the new live set as sys/live
 onSwap : Int -> _ -> _ -> String -> _ .
 onSwap me env m id =
-  (dsk, h0, port) = env;
-  r = LR.load dsk h0 id;
+  (ld, port) = env;
+  r = LD.load me ld id;
   case r of
     Ok u -> swapOk m
   | Err e -> (m, Nil).
 swapOk m =
-  nm = LR.bind "editName";
+  nm = LD.bind "editName";
   ({m | ver = nm ""}, Nil).
 
 appSubs m = SPort m.port :: Nil.
@@ -620,16 +624,16 @@ driver port me =
 
 main =
   me = myself 0;
-  dsk = device "blk";
-  h0 = QL.ensure dsk;
-  r0 = LR.load dsk h0 "edit1";
+  fs = FS.serve (device "blk");
+  ld = LD.serve fs;
+  r0 = LD.load me ld "edit1";
   _ = case r0 of Ok u -> 0 | Err e -> error "__NAME__ load edit1: {e}";
   clint = device "clint";
   mt = reg32 clint 49144;
   render = spawn MV.textRender;
   port = spawn MV.port;
   _ = spawn (driver port);
-  cfg = { env = (dsk, h0, port), mt = mt, tick = 3000, input = 0, render = render };
+  cfg = { env = (ld, port), mt = mt, tick = 3000, input = 0, render = render };
   app = MApp appInit appUpdate appSkey appView appVals appDone appSubs;
   r = MV.run me cfg app;
   _ = kill port;

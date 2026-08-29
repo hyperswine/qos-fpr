@@ -9,7 +9,9 @@
 #     single writer, transactionally (bad path -> logged refusal,
 #     model untouched).  No per-app inspector code: ("dump", "") walks
 #     the schema and prints every leaf.
-#   * the line-EDIT function lives behind the livereload registry: a
+#   * the line-EDIT function lives behind the LOADER SERVICE
+#     (std.loader over std.fs -- the app touches no device, reads no
+#     records; every accepted swap is recorded as sys/live): a
 #     ("swap", "<id>") message pulls a version out of the DISK store at
 #     a STEP BOUNDARY.  v1 appends a newline; v2 capitalizes the first
 #     letter instead -- same signature, checked by the compat gate,
@@ -41,8 +43,8 @@
 #   pathnotes: OK notes=Third note|Fourth one n=4 cap=2
 #   ui=live ver=caps.v2 log=refused notesedbad
 
-QL = use "../programs/mods/qlog".
-LR = use "../std/livereload".
+FS = use "../std/fs".
+LD = use "../std/loader".
 MV = use "../std/mvu".
 L = use "../std/lens".
 
@@ -78,8 +80,8 @@ escOne acc c = case c == 10 of
 # ---- the app ----------------------------------------------------------------
 
 appInit env =
-  (dsk, h0, port) = env;
-  nm = LR.bind "editName";
+  (ld, port) = env;
+  nm = LD.bind "editName";
   {notes = Nil, input = "", count = 0, cap = 3,
    ver = nm "", log = "-", ui = {tag = "boot", fg = 2}, port = port}.
 
@@ -105,7 +107,7 @@ appMsg me env m tag arg = case L.strEq tag "note" of
 # step, never stored in the model -- a stored closure would pin v1)
 appNote : unsafe _ -> String -> _ .
 appNote m line =
-  f = LR.bind "editLine";
+  f = LD.bind "editLine";
   cP = @Model.count;
   ({m | notes = takeN m.cap (f line :: m.notes), count = cP.get m + 1}, Nil).
 
@@ -116,17 +118,19 @@ appSet m pv = case L.setWords (@Model) pv m of
     Ok m2 -> (m2, Nil)
   | Err e -> ({m | log = e}, Nil).
 
-# the ladder's next rung: module swap at a step boundary.  load gates
-# on signature compatibility; ver (a model VALUE) records what's live.
+# the ladder's next rung: module swap at a step boundary, as ONE
+# message to the Loader service -- which gates it (shell stamp, arity
+# chain) and records the new live set as sys/live; ver (a model VALUE)
+# records what's live on this side.
 appSwap : Int -> _ -> _ -> String -> _ .
 appSwap me env m id =
-  (dsk, h0, port) = env;
-  r = LR.load dsk h0 id;
+  (ld, port) = env;
+  r = LD.load me ld id;
   case r of
     Ok u -> appSwapOk m
   | Err e -> ({m | log = "refused {id}"}, Nil).
 appSwapOk m =
-  nm = LR.bind "editName";
+  nm = LD.bind "editName";
   ({m | ver = nm ""}, Nil).
 
 # the generic inspector: walk the schema, no per-app code
@@ -170,15 +174,15 @@ expectOk what r = case r of
 
 main =
   me = myself 0;
-  dsk = device "blk";
-  h0 = QL.ensure dsk;
-  _ = expectOk "load v1" (LR.load dsk h0 "notesed1");
+  fs = FS.serve (device "blk");
+  ld = LD.serve fs;
+  _ = expectOk "load v1" (LD.load me ld "notesed1");
   clint = device "clint";
   mt = reg32 clint 49144;
   render = spawn MV.textRender;
   port = spawn MV.port;
   _ = spawn (driver port);
-  cfg = { env = (dsk, h0, port), mt = mt, tick = 3000, input = 0, render = render };
+  cfg = { env = (ld, port), mt = mt, tick = 3000, input = 0, render = render };
   app = MApp appInit appUpdate appSkey appView appVals appDone appSubs;
   r = MV.run me cfg app;
   _ = kill port;
