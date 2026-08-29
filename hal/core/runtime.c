@@ -61,10 +61,7 @@ static void *hart_bkts[FPR_NHARTS][FPR_NBUCKETS];
 static void hart_init(int id) {
   fpr_hart_t *h = &fpr_harts[id];
   h->id = (uw)id;
-  h->pool.cur = 0;
-  h->pool.bigfree = 0;
-  h->pool.allocated = 0;
-  h->pool.buckets = hart_bkts[id];
+  fpr_pool_init(&h->pool, hart_bkts[id]);
   for (int i = 0; i < FPR_NBUCKETS; i++) h->pool.buckets[i] = 0;
   h->current = 0;
   h->rq_head = h->rq_tail = 0;
@@ -801,9 +798,9 @@ static V g_arena(V f) {
   fpr_hart_t *h = fpr_hart();
   struct fpr_pool *prev = h->pool_override;
   fpr_pool_t ap;
-  ap.cur = 0;
-  ap.allocated = 0;
-  ap.buckets = fpr_bkt_take();
+  fpr_pool_init(&ap, fpr_bkt_take()); /* bigfree=0 matters: a stack pool
+                                       * with garbage there walked it as
+                                       * a freelist on any >ceiling alloc */
   if (!ap.buckets) fpr_cpanic("Sys.arena: no memory for a bucket array");
   h->pool_override = (struct fpr_pool *)&ap;
   V r = fpr_apply(f, (V)&fpr_unit);

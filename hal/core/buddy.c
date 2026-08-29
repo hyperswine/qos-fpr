@@ -196,6 +196,69 @@ void buddy_free(void *p) {
   fpr_unlock(&buddy_lock);
 }
 
+/* grow or shrink a buddy block, IN PLACE whenever the structure
+ * allows -- the missing third op of the alloc/realloc/dealloc contract
+ * (docs/MEMORY.md).  A power-of-two buddy is the best possible
+ * substrate for realloc-by-doubling (contiguous Vec columns lean on
+ * exactly this):
+ *
+ *   shrink: always in place -- split off the upper halves back onto
+ *           their free lists (the block is naturally aligned, so every
+ *           upper half IS a valid buddy at its order).
+ *   grow:   in place while this block is the LOW half of its parent
+ *           and the buddy above is free at exactly this order -- absorb
+ *           it and double.  The seam rule from buddy_init holds
+ *           unchanged: a seeded root's buddy is never on a free list,
+ *           so growth can never merge across independent roots.
+ *   else:   alloc+copy+free.  NULL on exhaustion with the ORIGINAL
+ *           BLOCK INTACT (partial in-place growth is kept -- the
+ *           header records it, so a later free releases all of it).
+ */
+void *buddy_realloc(void *p, uw bytes) {
+  if (!p) return buddy_alloc(bytes);
+  char *hdr = (char *)p - sizeof(uw);
+  int have = (int)*(uw *)hdr;
+  int want = order_of(bytes);
+  if (want == have) return p;
+  if (want > max_order) return 0;
+  fpr_lock(&buddy_lock);
+  if (want < have) { /* shrink: free the upper halves, largest first */
+    while (have > want) {
+      have--;
+      free_node_t *upper = (free_node_t *)(hdr + block_size(have));
+      upper->next = free_lists[have];
+      free_lists[have] = upper;
+    }
+    fpr_unlock(&buddy_lock);
+    *(uw *)hdr = (uw)want;
+    return p;
+  }
+  /* grow: absorb the free buddy above while we are the low half */
+  uw off = offset_of(hdr);
+  int order = have;
+  while (order < want) {
+    if (off & block_size(order)) break; /* high half: cannot extend up */
+    char *buddy = arena_base + off + block_size(order);
+    free_node_t **pp = &free_lists[order];
+    int found = 0;
+    while (*pp) {
+      if ((char *)*pp == buddy) { *pp = (*pp)->next; found = 1; break; }
+      pp = &(*pp)->next;
+    }
+    if (!found) break; /* buddy live or split: stop */
+    order++;
+  }
+  fpr_unlock(&buddy_lock);
+  *(uw *)hdr = (uw)order; /* record any partial growth for free() */
+  if (order == want) return p;
+  void *n = buddy_alloc(bytes);
+  if (!n) return 0; /* exhausted; original (possibly grown) intact */
+  uw old_usable = block_size(have) - sizeof(uw);
+  __builtin_memcpy(n, p, old_usable < bytes ? old_usable : bytes);
+  buddy_free(p);
+  return n;
+}
+
 /* the usable size of a block returned by buddy_alloc (its header's
  * order, minus the header itself) -- lets a caller that requested N
  * bytes discover it actually got block_size(order)-sizeof(uw), often

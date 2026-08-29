@@ -189,11 +189,9 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
    * machinery as a machine boot, different lower allocator (grants
    * instead of buddy; fpr_alloc's process branch), verbatim the
    * proc_entry.c shape */
-  h->pool.cur = 0;
-  h->pool.allocated = 0;
   {
     static void *boot_bkts[FPR_NBUCKETS]; /* hart 0 lives forever */
-    h->pool.buckets = boot_bkts;
+    fpr_pool_init(&h->pool, boot_bkts);
   }
   {
     fpr_slab_t *sl = (fpr_slab_t *)boot->heap_base;

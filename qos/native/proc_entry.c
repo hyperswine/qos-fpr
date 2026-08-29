@@ -156,8 +156,7 @@ V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_b
   /* slab refactor: the loader's grant IS this process's first slab --
    * same pool machinery as a machine boot, different lower allocator
    * (grants instead of buddy; see fpr_alloc's process branch). */
-  h->pool.cur = 0;
-  h->pool.allocated = 0;
+  fpr_pool_init(&h->pool, 0); /* buckets carved from the slab below */
   {
     fpr_slab_t *sl = (fpr_slab_t *)heap_base;
     sl->next = 0;

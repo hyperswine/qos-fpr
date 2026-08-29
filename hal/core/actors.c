@@ -987,12 +987,9 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   ledger_push(&main_acb);
   char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
-  main_acb.pool.cur = 0;
-  main_acb.pool.bigfree = 0;
-  main_acb.drop_pending = 0;
-  main_acb.pool.allocated = 0;
   static void *main_bkts[FPR_NBUCKETS]; /* actor 0 lives forever */
-  main_acb.pool.buckets = main_bkts;
+  fpr_pool_init(&main_acb.pool, main_bkts);
+  main_acb.drop_pending = 0;
   main_acb.stack = stk;
   for (int i = 0; i < 16; i++) main_acb.ctx[i] = 0;
   fpr_ctx_fabricate(main_acb.ctx, (void (*)(void))trampoline,
@@ -1024,11 +1021,8 @@ static V spawn_on_pid(uw hart, V f, uw pin, uw pid) {
   acb_t *a = (acb_t *)acb_block();
   char *stk = (char *)stack_block();
   if (!a || !stk) fpr_cpanic("spawn: buddy has no free block");
-  a->pool.cur = 0;
-  a->pool.bigfree = 0;
+  fpr_pool_init(&a->pool, fpr_bkt_take()); /* zeroed; teardown returns it */
   a->drop_pending = 0;
-  a->pool.allocated = 0;
-  a->pool.buckets = fpr_bkt_take(); /* zeroed; teardown returns it */
   if (!a->pool.buckets) fpr_cpanic("spawn: no memory for a bucket array");
   f = fpr_msg_copy(f); /* the entry closure crosses like any message:
                         * deep-copied, so captures never dangle into

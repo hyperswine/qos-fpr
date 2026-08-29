@@ -111,6 +111,20 @@ typedef struct fpr_pool {
                      * payload word.  Cleared at teardown/reset:
                      * the blocks die with their slabs. */
 } fpr_pool_t;
+
+/* THE pool constructor.  fpr_pool_t is created in five places (hart
+ * init, actor 0, spawn, process entry, Sys.arena); a stack-built pool
+ * that hand-initializes fields WILL eventually miss one (Sys.arena
+ * shipped with bigfree uninitialized -- a wild-pointer walk on any
+ * above-ceiling alloc inside an arena).  Every creation site goes
+ * through here; buckets must be zeroed by the caller's source
+ * (fpr_bkt_take and the static boot arrays both are). */
+static inline void fpr_pool_init(fpr_pool_t *p, void **buckets) {
+  p->cur = 0;
+  p->buckets = buckets;
+  p->allocated = 0;
+  p->bigfree = 0;
+}
 void **fpr_bkt_take(void);   /* runtime.c: bucket-array recycler */
 void fpr_bkt_put(void **b);
 
@@ -172,6 +186,11 @@ void fpr_slab_release(fpr_slab_t *sl);   /* runtime.c: grant/buddy */
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a); /* actors.c: &a->pool */
 void fpr_pool_reclaim(struct fpr_acb *a);    /* runtime.c: death teardown */
 void *buddy_alloc(uw bytes);                 /* buddy.c */
+void *buddy_realloc(void *p, uw bytes);      /* grow/shrink; in-place when
+                                              * the buddy structure allows
+                                              * (see buddy.c), else
+                                              * alloc+copy+free.  NULL on
+                                              * exhaustion, original intact. */
 void buddy_free(void *p);
 uw buddy_block_usable_size(void *p);
 uw buddy_free_bytes(void);
@@ -295,12 +314,25 @@ static inline fpr_hart_t *fpr_hart(void) {
 }
 #endif
 
-/* test-and-test-and-set spinlock (AMO acquire/release; A is in imac) */
+/* test-and-test-and-set with EXPONENTIAL BACKOFF (AMO acquire/release;
+ * A is in imac).  The concurrency rule (docs/MEMORY.md): no spin site
+ * may burn a hart at full rate -- a loser backs off exponentially
+ * (capped) before retrying, so contention degrades bandwidth instead
+ * of livelocking a core.  These locks are TRANSITIONAL: the end-state
+ * moves each one behind an owning actor's mailbox (Memory.qa for
+ * buddy/grants, ARC.qa for promotion) and deletes it -- see
+ * docs/MEMORY-V2-PLAN.md.  Until then, backoff is the law here too. */
 typedef struct { volatile uw v; } fpr_lock_t;
+#define FPR_BACKOFF_CAP 1024 /* max pause iterations between retries */
+static inline void fpr_backoff(uw *delay) {
+  for (uw i = 0; i < *delay; i++) __asm__ volatile("nop");
+  if (*delay < FPR_BACKOFF_CAP) *delay <<= 1;
+}
 static inline void fpr_lock(fpr_lock_t *l) {
+  uw delay = 1;
   for (;;) {
     if (!__atomic_exchange_n(&l->v, 1, __ATOMIC_ACQUIRE)) return;
-    while (__atomic_load_n(&l->v, __ATOMIC_RELAXED)) __asm__ volatile("nop");
+    while (__atomic_load_n(&l->v, __ATOMIC_RELAXED)) fpr_backoff(&delay);
   }
 }
 static inline void fpr_unlock(fpr_lock_t *l) {
@@ -314,6 +346,7 @@ static inline void fpr_unlock(fpr_lock_t *l) {
  */
 void buddy_init(void *base, uw size);
 void *buddy_alloc(uw bytes);   /* NULL on exhaustion */
+void *buddy_realloc(void *p, uw bytes);
 void buddy_free(void *p);
 uw buddy_arena_size(void);
 uw buddy_free_bytes(void);
