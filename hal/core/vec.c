@@ -1,15 +1,17 @@
-/* vec.c — the LINEAR SoA VList vector.
+/* vec.c — the LINEAR SoA vector, CONTIGUOUS columns.
  *
- * Storage model
- * -------------
- * A Vector is columns; a column is a VList: a directory of geometrically
- * growing blocks (16, 32, 64, ... words).  Blocks are never reallocated
- * and never copied — push is O(1), a grown vector's old data stays where
- * it was, and every block up to the allocator's 8 KiB free-list ceiling
- * recycles exactly (no realloc-and-leak under this bump+freelist
- * allocator: that is WHY it's a VList and not a doubling array here).
- * Iteration is contiguous within a block, which is what the compiler's
- * specialized/vectorized loops stride over.
+ * Storage model (docs/MEMORY.md v2)
+ * ---------------------------------
+ * A Vector is columns; a column is ONE contiguous span of machine
+ * words, grown by realloc-by-doubling (fpr_realloc: the freed
+ * predecessor recycles exactly through the pool's ladder, so the
+ * doubling sequence reuses its own history).  Push is amortized O(1);
+ * the copy a growth pays is attributed to the push that grew, which
+ * keeps the WCET story compositional.  Indexing is base + i — no
+ * block directory, no per-index log2 — and the compiler's
+ * specialized/vectorized loops stride the whole column as one run.
+ * (The old VList block directory is gone: it existed only because the
+ * allocator had no realloc.)
  *
  * Layout is fixed by the FIRST push (the Sol PoC rule, verbatim):
  *   Int                    -> 1 unboxed column           (rep VR_INT)
@@ -30,8 +32,7 @@
 #include "fpr.h"
 #include <limits.h>
 
-#define VL_B0 16 /* words in block 0; block j holds VL_B0 << j */
-#define VL_DIR 24
+#define VL_B0 16 /* words in a fresh column's first allocation */
 #define VMAXCOLS 8
 
 /* VR_FLT: one raw FLOAT column.  It is a DECLARED rep, never inferred:
@@ -41,9 +42,11 @@
  * guess).  Vec.newAs declares the layout up front. */
 enum { VR_UNSET = 0, VR_INT = 1, VR_BOX = 2, VR_SOA = 3, VR_FLT = 4 };
 
+/* cap at 0, base at W: Codegen.hs (colBlk0) loads the base pointer at
+ * word offset 1 — the same slot the old directory kept blk[0] in */
 typedef struct {
-  uw nblk;
-  uw *blk[VL_DIR];
+  uw cap;   /* words allocated at base (0 for an empty column) */
+  uw *base; /* the ONE contiguous span */
 } col_t;
 
 /* field offsets here are mirrored by Codegen.hs (vec specialization):
@@ -58,40 +61,25 @@ typedef struct {
   col_t *cols[VMAXCOLS];
 } vec_t;
 
-/* ---- VList index math ------------------------------------------------ */
+/* ---- column access ---------------------------------------------------- */
 
-/* elements below block j: VL_B0 * (2^j - 1) */
-static inline uw vl_cap(uw nblk) { return VL_B0 * (((uw)1 << nblk) - 1); }
+static inline uw *vl_slot(col_t *c, uw i) { return &c->base[i]; }
 
-/* floor(log2 q), q >= 1 — by hand: -nostdlib means no libgcc __clzdi2,
- * and the loop runs at most VL_DIR times */
-static inline int vl_log2(uw q) {
-  int j = 0;
-  while (q >>= 1) j++;
-  return j;
-}
-
-static inline uw *vl_slot(col_t *c, uw i) {
-  int j = vl_log2(i / VL_B0 + 1);
-  uw off = i - VL_B0 * (((uw)1 << j) - 1);
-  return &c->blk[j][off];
-}
-
-static void vl_grow(col_t *c) {
-  if (c->nblk >= VL_DIR) fpr_cpanic("Vec: vector too large");
-  uw words = (uw)VL_B0 << c->nblk;
-  c->blk[c->nblk++] = (uw *)fpr_alloc(words * sizeof(uw));
+static void col_grow(col_t *c) {
+  uw ncap = c->cap ? c->cap * 2 : (uw)VL_B0;
+  c->base = (uw *)fpr_realloc((V)c->base, ncap * sizeof(uw));
+  c->cap = ncap;
 }
 
 static col_t *col_new(void) {
   col_t *c = (col_t *)fpr_alloc(sizeof(col_t));
-  c->nblk = 0;
-  for (int j = 0; j < VL_DIR; j++) c->blk[j] = 0;
+  c->cap = 0;
+  c->base = 0;
   return c;
 }
 
 static void col_free(col_t *c) {
-  for (uw j = 0; j < c->nblk; j++) fpr_free((V)c->blk[j]); /* >8KiB: bigfree LIFO */
+  if (c->base) fpr_free((V)c->base); /* >8KiB: bigfree LIFO */
   fpr_free((V)c);
 }
 
@@ -128,14 +116,12 @@ static void vfree(vec_t *x); /* fwd */
 static col_t *col_new(void);
 static col_t *col_copy(col_t *c, uw len) {
   col_t *n = col_new();
-  n->nblk = c->nblk;
-  uw rem = len;
-  for (uw j = 0; j < c->nblk; j++) {
-    uw bn = ((uw)VL_B0 << j) < rem ? ((uw)VL_B0 << j) : rem;
-    uw bytes = ((uw)VL_B0 << j) * sizeof(uw);
-    n->blk[j] = (uw *)fpr_alloc(bytes);
-    for (uw i = 0; i < bn; i++) n->blk[j][i] = c->blk[j][i];
-    rem -= bn;
+  if (len) {
+    uw cap = VL_B0;
+    while (cap < len) cap *= 2;
+    n->base = (uw *)fpr_alloc(cap * sizeof(uw));
+    n->cap = cap;
+    __builtin_memcpy(n->base, c->base, len * sizeof(uw));
   }
   return n;
 }
@@ -190,15 +176,11 @@ static V h_range(V lov, V hiv) {
   fix_layout(x, lov); /* one raw Int column */
   col_t *c = x->cols[0];
   uw n = (uw)(hi - lo + 1);
+  while (c->cap < n) col_grow(c);
   sw v = lo;
-  while (x->len < n) {
-    if (x->len == vl_cap(c->nblk)) vl_grow(c);
-    uw lim = vl_cap(c->nblk);
-    if (lim > n) lim = n;
-    uw *slot = vl_slot(c, x->len); /* blocks are contiguous arrays */
-    for (uw i = x->len; i < lim; i++) *slot++ = (uw)v++;
-    x->len = lim;
-  }
+  uw *slot = c->base;
+  for (uw i = 0; i < n; i++) *slot++ = (uw)v++;
+  x->len = n;
   return (V)x;
 }
 
@@ -329,7 +311,7 @@ static V h_push(V v, V vec) {
   vec_t *x = cow_wr(vchk(vec, "Vec.push: not a Vector"));
   if (VREP(x) == VR_UNSET) fix_layout(x, v);
   for (uw k = 0; k < x->ncols; k++)
-    if (x->len == vl_cap(x->cols[k]->nblk)) vl_grow(x->cols[k]);
+    if (x->len == x->cols[k]->cap) col_grow(x->cols[k]);
   switch (VREP(x)) {
     case VR_INT:
       if (!ISINT(v)) fpr_cpanic("Vec.push: Int vector got a non-Int");
@@ -445,17 +427,17 @@ V fpr_vec_map(V f, V vec) {
   return out;
 }
 
-/* filter is EAGER COMPACTION, deliberately (the design decision, made
- * explicit): under linearity there is no sharing to preserve, so the
- * kept rows slide down IN PLACE with two cursors and len shrinks --
- * zero allocation, and every later map/fold/zip/axpb stays dense and
- * mask-free.  Tombstones + bitmask + incremental GC would only win
- * when filters vastly outnumber scans; that is not this machine's
- * workload, and masked lanes would poison the whole SIMD tier.
- * Blocks beyond the new length stay attached (they recycle with the
- * vector; a VList never returns capacity early).  docs/VEC.md. */
+/* filter is EAGER COMPACTION today: the kept rows slide down in place
+ * with two cursors and len shrinks -- zero allocation, later scans
+ * stay dense.  MEMORY.md v2 names the branch-light end-state (a mask
+ * column that scans fuse, compaction deferred to Vec.compact or
+ * Sys.poolReset); until that lands with the mask-fusing loops, eager
+ * compaction is the correct simple thing.  Capacity beyond the new
+ * length stays attached (it recycles with the column).
+ * cow_wr FIRST: compaction is a write like any other -- filtering a
+ * dup'd/shared vector must not mutate the other holder's view. */
 V fpr_vec_filter(V f, V vec) {
-  vec_t *x = vchk(vec, "Vec.filter: not a Vector");
+  vec_t *x = cow_wr(vchk(vec, "Vec.filter: not a Vector"));
   uw j = 0;
   for (uw i = 0; i < x->len; i++) {
     V row = row_at(x, i);
@@ -605,9 +587,10 @@ static vec_t *vnum(V v, const char *who) {
 }
 
 /* Optional hosted GPU tier.  A strong backend definition may replace
- * this default.  It must leave blocks untouched when returning zero. */
-__attribute__((weak)) int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw a, sw b) {
-  (void)blocks; (void)len; (void)a; (void)b;
+ * this default.  It must leave the column untouched when returning
+ * zero.  Contiguous columns: the hook takes the raw span directly. */
+__attribute__((weak)) int fpr_gpu_vec_axpb(uw *col, uw len, sw a, sw b) {
+  (void)col; (void)len; (void)a; (void)b;
   return 0;
 }
 
@@ -621,34 +604,24 @@ static int gpu_axpb_exact(vec_t *x, sw a, sw b) {
   if (x->len < 65536 || a < INT32_MIN || a > INT32_MAX ||
       b < INT32_MIN || b > INT32_MAX)
     return 0;
-  uw rem = x->len;
-  for (uw j = 0; rem; j++) {
-    uw n = ((uw)VL_B0 << j) < rem ? ((uw)VL_B0 << j) : rem;
-    sw *p = (sw *)x->cols[0]->blk[j];
-    for (uw i = 0; i < n; i++) {
-      if (p[i] < INT32_MIN || p[i] > INT32_MAX) return 0;
-      int64_t product = (int64_t)(int32_t)a * (int64_t)(int32_t)p[i];
-      if (product < INT32_MIN || product > INT32_MAX) return 0;
-      int64_t result = product + (int64_t)(int32_t)b;
-      if (result < INT32_MIN || result > INT32_MAX) return 0;
-    }
-    rem -= n;
+  sw *p = (sw *)x->cols[0]->base;
+  for (uw i = 0; i < x->len; i++) {
+    if (p[i] < INT32_MIN || p[i] > INT32_MAX) return 0;
+    int64_t product = (int64_t)(int32_t)a * (int64_t)(int32_t)p[i];
+    if (product < INT32_MIN || product > INT32_MAX) return 0;
+    int64_t result = product + (int64_t)(int32_t)b;
+    if (result < INT32_MIN || result > INT32_MAX) return 0;
   }
-  return fpr_gpu_vec_axpb(x->cols[0]->blk, x->len, a, b);
+  return fpr_gpu_vec_axpb(x->cols[0]->base, x->len, a, b);
 }
 
-/* iterate one column's blocks: sw *p over contiguous runs of n words,
- * block index in j (VL_B0<<j words at base vl_cap(j)) */
+/* one column, one contiguous run: sw *p over all n words */
 #define VS_BLOCKS(x, BODY)                                           \
   do {                                                               \
-    uw _rem = (x)->len;                                              \
-    for (uw j = 0; _rem; j++) {                                      \
-      uw n = ((uw)VL_B0 << j) < _rem ? ((uw)VL_B0 << j) : _rem;      \
-      sw *p = (sw *)(x)->cols[0]->blk[j];                            \
-      (void)p;                                                       \
-      BODY;                                                          \
-      _rem -= n;                                                     \
-    }                                                                \
+    uw n = (x)->len;                                                 \
+    sw *p = (sw *)(x)->cols[0]->base;                                \
+    (void)p;                                                         \
+    if (n) { BODY; }                                                 \
   } while (0)
 
 static V h_iota(V nv) {
@@ -701,22 +674,18 @@ static V h_ges(V kv, V vec) {
   return (V)x;
 }
 
-/* zips: dst op= src, contiguously over the shared block partition */
+/* zips: dst op= src, one contiguous run each */
 static vec_t *vzip2(V dv, V sv, const char *who) {
   vec_t *d = vnum(dv, who), *s = vnum(sv, who);
   if (d->len != s->len) fpr_cpanic("SIMD tier: zip length mismatch");
-  return s; /* caller pairs blocks itself */
+  return s;
 }
 #define VS_ZIP(dv, sv, WHO, EXPR)                                            \
   do {                                                                       \
     vec_t *_d = cow_wr(vnum(dv, WHO)), *_s = vzip2(dv, sv, WHO);             \
-    uw _r = _d->len;                                                         \
-    for (uw _j = 0; _r; _j++) {                                              \
-      uw _n = ((uw)VL_B0 << _j) < _r ? ((uw)VL_B0 << _j) : _r;               \
-      sw *p = (sw *)_d->cols[0]->blk[_j], *q = (sw *)_s->cols[0]->blk[_j];   \
-      for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
-      _r -= _n;                                                              \
-    }                                                                        \
+    uw _n = _d->len;                                                         \
+    sw *p = (sw *)_d->cols[0]->base, *q = (sw *)_s->cols[0]->base;           \
+    for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
     cow_rel(_s);                                                             \
     return (V)_d;                                                            \
   } while (0)
@@ -746,13 +715,11 @@ static V h_blend(V mv, V sv, V dv) {
   vec_t *s = vnum(sv, "Vec.blend: not a Vector");
   vec_t *d = cow_wr(vnum(dv, "Vec.blend: not a Vector"));
   if (m->len != d->len || s->len != d->len) fpr_cpanic("Vec.blend: length mismatch");
-  uw r = d->len;
-  for (uw j = 0; r; j++) {
-    uw n = ((uw)VL_B0 << j) < r ? ((uw)VL_B0 << j) : r;
-    sw *pd = (sw *)d->cols[0]->blk[j], *pm = (sw *)m->cols[0]->blk[j],
-       *ps = (sw *)s->cols[0]->blk[j];
+  {
+    uw n = d->len;
+    sw *pd = (sw *)d->cols[0]->base, *pm = (sw *)m->cols[0]->base,
+       *ps = (sw *)s->cols[0]->base;
     for (uw i = 0; i < n; i++) pd[i] = pm[i] ? ps[i] : pd[i];
-    r -= n;
   }
   cow_rel(m); cow_rel(s);
   return (V)d;
@@ -777,8 +744,8 @@ static V h_burst(V ov, V sv, V dv) {
   sw off = UNTAG(ov);
   if (off < 0 || (uw)off + s->len > d->len) fpr_cpanic("Vec.burst: out of range");
   VS_BLOCKS(s, {
-    uw base = vl_cap(j); /* first index of block j */
-    for (uw i = 0; i < n; i++) *(sw *)vl_slot(d->cols[0], (uw)off + base + i) = p[i];
+    sw *pd = (sw *)d->cols[0]->base + off;
+    for (uw i = 0; i < n; i++) pd[i] = p[i];
   });
   cow_rel(s);
   return (V)d;

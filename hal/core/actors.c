@@ -159,8 +159,8 @@ static void *big_block(uw n) {
  *           send-to-dead reads), so they cannot be recycled -- but a
  *           bump arena carves many acbs from one grant instead of
  *           wasting a 64 KiB minimum grant on each 8 KiB acb. */
-static void *stack_pool;
-static fpr_lock_t stack_lock;
+static fpr_freelist_t stack_fl; /* the one freelist discipline (fpr.h) */
+static fpr_lock_t acb_lock;     /* the acb bump arena below */
 static char *acb_hp, *acb_end;
 
 /* pool telemetry, always on, PULL-based (Sys.memStats reads them):
@@ -170,12 +170,9 @@ static void stack_recycle(void *p);
 static V spawn_on_pid(uw hart, V f, uw pin, uw pid);
 static void *stack_block(void) {
   if (!fpr_is_process) return buddy_alloc(STACK_SZ);
-  fpr_lock(&stack_lock);
-  void *p = stack_pool;
-  if (p) stack_pool = *(void **)p;
-  else fpr_stk_misses++;
-  fpr_unlock(&stack_lock);
+  void *p = fpr_fl_take(&stack_fl, STACK_SZ);
   if (p) return p;
+  __atomic_add_fetch(&fpr_stk_misses, 1, __ATOMIC_RELAXED);
   /* SELF-TOPPING on a miss: take two, keep one warm.  A miss means
    * live+in-flight actors exceeded pool depth, so depth converges to
    * the real concurrency and each level is paid for at most once --
@@ -188,11 +185,8 @@ static void *stack_block(void) {
 }
 
 static void stack_recycle(void *p) {
-  fpr_lock(&stack_lock);
-  *(void **)p = stack_pool;
-  stack_pool = p;
-  fpr_stk_pushes++;
-  fpr_unlock(&stack_lock);
+  fpr_fl_put(&stack_fl, p, STACK_SZ);
+  __atomic_add_fetch(&fpr_stk_pushes, 1, __ATOMIC_RELAXED);
 }
 
 static acb_t *acb_block(void) {
@@ -202,13 +196,13 @@ static acb_t *acb_block(void) {
    * posix heap in ~1000 spawns on a Pi 4.  Carving packs ~250 acbs
    * into each floor-sized block. */
   uw sz = (sizeof(acb_t) + 15) & ~(uw)15;
-  fpr_lock(&stack_lock);
+  fpr_lock(&acb_lock);
   if (acb_hp + sz > acb_end) {
     uw want = 16 * sz;
     char *p;
     uw got;
     if (fpr_is_process && fpr_grow_memory) {
-      /* no growlog here: this runs under stack_lock, and the trace
+      /* no growlog here: this runs under acb_lock, and the trace
        * print is a uart SYSCALL under qosp -- printing inside an
        * allocator lock stalls the world and poisons the very numbers
        * the trace exists to collect (a lesson measured the hard way) */
@@ -220,7 +214,7 @@ static acb_t *acb_block(void) {
       got = p ? buddy_block_usable_size(p) : 0;
     }
     if (!p || got < sz) {
-      fpr_unlock(&stack_lock);
+      fpr_unlock(&acb_lock);
       return 0;
     }
     acb_hp = p;
@@ -228,7 +222,7 @@ static acb_t *acb_block(void) {
   }
   acb_t *a = (acb_t *)acb_hp;
   acb_hp += sz;
-  fpr_unlock(&stack_lock);
+  fpr_unlock(&acb_lock);
   return a;
 }
 
@@ -256,8 +250,12 @@ typedef struct chblk {
   struct chblk *nx;
   uw stamp[FPR_NHARTS];
 } chblk_t;
-static chblk_t *chb_free, *chb_limbo;
-static fpr_lock_t chb_lock;
+static fpr_freelist_t chb_fl; /* never-referenced carve extras ONLY --
+                               * reaped blocks go to limbo and are
+                               * reused from there, so the flnode
+                               * overlay can't race a stale send */
+static chblk_t *chb_limbo;
+static fpr_lock_t chb_lock; /* the limbo list + its epoch stamps */
 
 static int chb_matured(chblk_t *b) {
   for (uw i = 0; i < fpr_live_harts; i++)
@@ -278,11 +276,8 @@ static chan_t *chb_take(void) {
     }
     pp = &(*pp)->nx;
   }
-  if (!b && chb_free) {
-    b = chb_free;
-    chb_free = b->nx;
-  }
   fpr_unlock(&chb_lock);
+  if (!b) b = (chblk_t *)fpr_fl_take(&chb_fl, sizeof(chblk_t));
   if (!b) {
     /* fresh backing: the floor-sized block carves several channel
      * blocks; the extras seed the free list (type-stable forever) */
@@ -294,12 +289,8 @@ static chan_t *chb_take(void) {
     uw got = fpr_is_process ? want : buddy_block_usable_size(p);
     if (got < sz) got = sz;
     b = (chblk_t *)p;
-    fpr_lock(&chb_lock);
-    for (char *q = p + sz; q + sz <= p + got; q += sz) {
-      ((chblk_t *)q)->nx = chb_free;
-      chb_free = (chblk_t *)q;
-    }
-    fpr_unlock(&chb_lock);
+    for (char *q = p + sz; q + sz <= p + got; q += sz)
+      fpr_fl_put(&chb_fl, q, sz);
   }
   for (int i = 0; i < MAXSND; i++) {
     b->ch[i].sender = 0;

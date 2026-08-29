@@ -177,9 +177,31 @@ static void *bucket_take(fpr_pool_t *pool, uw idx) {
  * found the hard way when pshell's frame-per-actor renderer exhausted
  * a 256 MiB arena in fourteen seconds of idle shell on a Pi 4.
  * Own lock, taken while arc_lock may be held (never the reverse). */
-static fpr_slab_t *grant_pool;
+static fpr_freelist_t grant_fl; /* released grants, variable-size */
 static fpr_lock_t arc_lock; /* declared early: the deep-copy transfer,
                              * arena teardown, and ARC paths all take it */
+
+/* the one freelist discipline (fpr.h) -- every recycler below and in
+ * actors.c is an instance of these two functions plus local policy */
+void *fpr_fl_take(fpr_freelist_t *fl, uw want) {
+  fpr_lock(&fl->mu);
+  fpr_flnode_t **pp = &fl->head, *n = fl->head;
+  while (n) {
+    if (n->cap >= want) { *pp = n->next; break; }
+    pp = &n->next;
+    n = n->next;
+  }
+  fpr_unlock(&fl->mu);
+  return n;
+}
+void fpr_fl_put(fpr_freelist_t *fl, void *p, uw cap) {
+  fpr_flnode_t *n = (fpr_flnode_t *)p;
+  n->cap = cap;
+  fpr_lock(&fl->mu);
+  n->next = fl->head;
+  fl->head = n;
+  fpr_unlock(&fl->mu);
+}
 static fpr_slab_t *slab_of(V v); /* fwd (defined with the ARC table) */
  /* declared early: the arena teardown and
                              * the deep-copy paths run under it */
@@ -229,7 +251,6 @@ fpr_grant_t fpr_grow_counted(uw want, uw site) {
   }
   return g;
 }
-static fpr_lock_t grant_lock;
 
 static void praw(const char *s);
 static void pdec(uw u);
@@ -249,18 +270,9 @@ void fpr_growlog(const char *site, uw want) {
 }
 #endif
 static fpr_slab_t *grant_take(uw total) {
-  fpr_lock(&grant_lock);
-  fpr_slab_t **pp = &grant_pool, *sl = grant_pool;
-  while (sl) {
-    if ((uw)(sl->end - (char *)(sl + 1)) >= total) {
-      *pp = sl->next;
-      break;
-    }
-    pp = &sl->next;
-    sl = sl->next;
-  }
-  fpr_unlock(&grant_lock);
-  return sl;
+  /* the flnode rides next+owner; sl->end survives, which is the one
+   * field reuse needs (grant_put derived cap from it) */
+  return (fpr_slab_t *)fpr_fl_take(&grant_fl, total);
 }
 
 static void grant_put(fpr_slab_t *sl); /* fwd: defined just below */
@@ -285,28 +297,21 @@ fpr_slab_t *fpr_slab_new(uw want) {
 #ifdef FPR_GROWTRACE
 static uw grant_pool_len(void) {
   uw n = 0;
-  for (fpr_slab_t *p = grant_pool; p; p = p->next) n++;
+  for (fpr_flnode_t *p = grant_fl.head; p; p = p->next) n++;
   return n;
 }
 #endif
 
 static void grant_put(fpr_slab_t *sl) {
-  fpr_lock(&grant_lock);
-  sl->next = grant_pool;
-  grant_pool = sl;
-  fpr_unlock(&grant_lock);
+  fpr_fl_put(&grant_fl, sl, (uw)(sl->end - (char *)(sl + 1)));
 }
 
 /* bucket-array recycler (see fpr.h): fixed-size, type-stable */
 typedef struct bktblk { void *b[FPR_NBUCKETS]; } bktblk_t;
-static bktblk_t *bkt_free;
-static fpr_lock_t bkt_lock;
+static fpr_freelist_t bkt_fl;
 
 void **fpr_bkt_take(void) {
-  fpr_lock(&bkt_lock);
-  bktblk_t *k = bkt_free;
-  if (k) bkt_free = *(bktblk_t **)k;
-  fpr_unlock(&bkt_lock);
+  bktblk_t *k = (bktblk_t *)fpr_fl_take(&bkt_fl, sizeof(bktblk_t));
   if (!k) {
     if (fpr_is_process && fpr_grow_memory) {
 #ifdef FPR_GROWTRACE
@@ -323,11 +328,7 @@ void **fpr_bkt_take(void) {
 }
 
 void fpr_bkt_put(void **b) {
-  bktblk_t *k = (bktblk_t *)b;
-  fpr_lock(&bkt_lock);
-  *(bktblk_t **)k = bkt_free;
-  bkt_free = k;
-  fpr_unlock(&bkt_lock);
+  fpr_fl_put(&bkt_fl, b, sizeof(bktblk_t));
 }
 
 V fpr_alloc(V raw_bytes) {
@@ -465,6 +466,24 @@ V fpr_alloc(V raw_bytes) {
  * makes reading slab->owner race-free against death teardown (also
  * under arc_lock).  An orphaned slab's blocks are not recycled: the
  * whole slab goes back to buddy when its last promoted object drops. */
+/* the third op of the allocator contract (docs/MEMORY.md): grow a
+ * block to hold `want` payload bytes.  Copy-based through the pool
+ * tiers today: the preheader's total names the old payload capacity,
+ * and the freed predecessor recycles exactly (buckets below the
+ * ceiling, the bigfree LIFO above it), so a doubling ladder reuses
+ * its own history.  In-place growth arrives when bulk storage moves
+ * behind Memory.qa's buddy (docs/MEMORY-V2-PLAN.md), where
+ * buddy_realloc already provides it. */
+V fpr_realloc(V v, V want) {
+  if (!v) return fpr_alloc(want);
+  uw old = *(uw *)((char *)v - 16) - 16; /* payload capacity */
+  if (old >= (uw)want) return v;
+  V n = fpr_alloc(want);
+  __builtin_memcpy((void *)n, (void *)v, old);
+  fpr_free(v);
+  return n;
+}
+
 void fpr_free(V v) {
   char *p = (char *)v - 16;
   uw total = *(uw *)p;

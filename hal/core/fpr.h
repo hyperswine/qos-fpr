@@ -339,6 +339,22 @@ static inline void fpr_unlock(fpr_lock_t *l) {
   __atomic_store_n(&l->v, 0, __ATOMIC_RELEASE);
 }
 
+/* ---- the ONE freelist discipline (docs/MEMORY-V2-PLAN.md phase 1) --
+ * Every recycled-block pool in the runtime is the same structure: a
+ * locked LIFO of free blocks, each node carrying its capacity, taken
+ * first-fit.  Fixed-size users (stacks, bucket arrays, channel
+ * blocks) match every node trivially; the grant pool's variable
+ * sizes use the capacity for real.  What stays at each call site is
+ * POLICY: where a miss is filled from (buddy on a machine boot, the
+ * loader's grant in process mode), telemetry, and any deferred-reuse
+ * discipline layered on top (the chblk epoch limbo).  The node rides
+ * the free block's first two words -- callers must not hand out
+ * blocks smaller than one node. */
+typedef struct fpr_flnode { struct fpr_flnode *next; uw cap; } fpr_flnode_t;
+typedef struct { fpr_flnode_t *head; fpr_lock_t mu; } fpr_freelist_t;
+void *fpr_fl_take(fpr_freelist_t *fl, uw want); /* first-fit; NULL = miss */
+void fpr_fl_put(fpr_freelist_t *fl, void *p, uw cap);
+
 /* ---- process loading (docs/PROCESS-LOADING.md) ------------------------
  * buddy.c: a power-of-two allocator over the reserved process arena
  * (_proc_arena_start.._proc_arena_end, defined in link.ld). Owned by
@@ -425,6 +441,8 @@ void fpr_ctx_fabricate(uw *ctx, void (*entry)(void), uw stack_top16,
                        fpr_hart_t *owner); /* ctx layer (virt/posix) */ /* process.c: buddy_init over _proc_arena_start.._end */
 
 V fpr_alloc(V raw_bytes); /* bump + free list; arg is a RAW byte count, not tagged */
+V fpr_realloc(V obj, V raw_bytes); /* grow to a new payload size (copy-based;
+                                    * the freed block recycles exactly) */
 void fpr_free(V obj);     /* returns to the free list (sizes <= 8 KiB) */
 int fpr_in_heap(V v);     /* heap pointer (promotable) vs int/immortal static */
 V fpr_msg_copy(V v);      /* deep copy into one ownerless message slab */

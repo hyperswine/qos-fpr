@@ -381,7 +381,7 @@ static GLuint gfx_shader(GLenum type, const char *src) {
 }
 
 #ifndef FPR_DESKTOP_GL
-int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw av, sw bv) {
+int fpr_gpu_vec_axpb(uw *col, uw len, sw av, sw bv) {
   static GLuint program, buffer;
   static GLint uA, uB, uN;
   if (!G.inited || !G.haveTid || !pthread_equal(G.boundTid, pthread_self()) || len > UINT32_MAX)
@@ -409,13 +409,7 @@ int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw av, sw bv) {
   size_t bytes = (size_t)len * sizeof(int32_t);
   int32_t *values = malloc(bytes);
   if (!values) return 0;
-  uw rem = len, at = 0;
-  for (uw j = 0; rem; j++) {
-    uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
-    sw *block = (sw *)blocks[j];
-    for (uw i = 0; i < n; i++) values[at++] = (int32_t)block[i];
-    rem -= n;
-  }
+  for (uw i = 0; i < len; i++) values[i] = (int32_t)(sw)col[i];
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer);
   glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr)bytes, values, GL_STREAM_COPY);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buffer);
@@ -429,20 +423,15 @@ int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw av, sw bv) {
   if (!mapped) { free(values); return 0; }
   memcpy(values, mapped, bytes);
   glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-  rem = len; at = 0;
-  for (uw j = 0; rem; j++) {
-    uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
-    sw *block = (sw *)blocks[j];
-    for (uw i = 0; i < n; i++) block[i] = values[at++];
-    rem -= n;
-  }
+  for (uw i = 0; i < len; i++) col[i] = (uw)(sw)values[i];
   free(values);
   return 1;
 }
 
+/* mirrors hal/core/vec.c col_t: cap at 0, base (contiguous) at W */
 typedef struct {
-  uw nblk;
-  uw *blk[24];
+  uw cap;
+  uw *base;
 } gfx_gpu_col_t;
 
 int fpr_gpu_vec_fold_pair_sum(void *col0v, void *col1v, uw len, sw seed, sw *out) {
@@ -475,17 +464,12 @@ int fpr_gpu_vec_fold_pair_sum(void *col0v, void *col1v, uw len, sw seed, sw *out
   int32_t *values[2] = {malloc(bytes), malloc(bytes)};
   if (!values[0] || !values[1]) { free(values[0]); free(values[1]); return 0; }
   for (int k = 0; k < 2; k++) {
-    uw rem = len, at = 0;
-    for (uw j = 0; rem; j++) {
-      uw n = ((uw)16 << j) < rem ? ((uw)16 << j) : rem;
-      sw *block = (sw *)cols[k]->blk[j];
-      for (uw i = 0; i < n; i++) {
-        if (block[i] < INT32_MIN || block[i] > INT32_MAX) {
-          free(values[0]); free(values[1]); return 0;
-        }
-        values[k][at++] = (int32_t)block[i];
+    sw *span = (sw *)cols[k]->base;
+    for (uw i = 0; i < len; i++) {
+      if (span[i] < INT32_MIN || span[i] > INT32_MAX) {
+        free(values[0]); free(values[1]); return 0;
       }
-      rem -= n;
+      values[k][i] = (int32_t)span[i];
     }
   }
   for (uw i = 0; i < len; i++) {
@@ -756,9 +740,8 @@ static void stage_clear(void) {
  * The walker may run HOST-SIDE (qosp) against an APP-side vector, so
  * it reads the storage raw -- these mirrors restate vec.c's layout,
  * which is PINNED ("field offsets here are mirrored by Codegen.hs"):
- * a directory of geometrically-sized blocks (block j holds 16 << j
- * words), one unboxed Int column, cells stored TAGGED. */
-typedef struct { uw nblk; uw *blk[24]; } gfx_col_t;
+ * one contiguous span per column (cap at 0, base at W). */
+typedef struct { uw cap; uw *base; } gfx_col_t;
 typedef struct {
   uint32_t tid, var;
   uw len, eltid, elvar, ncols, kinds, fkinds; /* fkinds: float columns */
@@ -771,13 +754,9 @@ static sw gfx_vec_int_at(V vec, uw i) {
     fpr_cpanic("gfx: packed dynamics: not an Int vector");
   if (i >= x->len) fpr_cpanic("gfx: packed dynamics: index out of range");
   gfx_col_t *c = x->cols[0];
-  uw q = i / 16 + 1;
-  int j = 0;
-  while (q >>= 1) j++;              /* log2(i/16 + 1) */
-  uw off = i - 16 * ((((uw)1) << j) - 1);
   /* unboxed Int columns (kinds bit 0) store RAW sw words; boxed store
    * tagged values -- match get_cell's convention exactly */
-  uw raw = c->blk[j][off];
+  uw raw = c->base[i];
   /* a float column here would be IEEE bits, not a number this packer
    * can use -- refuse rather than reinterpret (vec.c's fkinds) */
   if (x->fkinds & 1) fpr_cpanic("gfx: packed dynamics: float column, expected Int");

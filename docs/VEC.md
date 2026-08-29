@@ -11,19 +11,31 @@ This file records the DECISIONS, not the code.  Where a decision was
 contested, the losing option is named too, so a later reader knows it
 was weighed rather than missed.
 
-## 1. Representation: VList blocks, not realloc
-A Vec is a directory of geometrically growing blocks (a VList), not
-one slab that doubles by copying.  Push is amortized O(1) with NO
-reallocation and no copy of live data, which matters more here than
-in C++: the allocator is a bump+freelist per actor, so a realloc
-strategy would churn the largest size classes exactly where the
-freelist ceiling bites.  Iteration is per-block contiguous, which is
-all the SIMD tier needs.
+## 1. Representation: ONE contiguous span per column (v2)
 
-Consequence, accepted: indexing is a directory hop plus an offset,
-not a single multiply.  Bulk operations amortize it away because they
-walk blocks, and per-element random access is not the workload Vec
-exists for.
+A column is one contiguous run of machine words, grown by
+realloc-by-doubling (`fpr_realloc`).  Push is amortized O(1); the
+copy a growth pays is attributed to the push that grew it, keeping
+WCET compositional; indexing is base + i.  Every consumer — the
+specialized/RVV loops, the gfx scene walker, GPU upload — strides one
+span with no directory hop and no per-block re-entry.
+
+The LOSING option, recorded (it shipped first): a VList block
+directory, chosen when the allocator had no realloc — "no
+realloc-and-leak under a bump+freelist allocator" was true, and the
+fix was to add the missing op, not to structure every vector around
+its absence.  What the VList cost: log2 index math on every random
+access, per-block strip-mining in every specialized emitter, and the
+layout restated in four places (vec.c, two gfx.c mirrors, the GPU
+paths).  The realloc churn worry resolves the other way now: the
+freed predecessor recycles EXACTLY (buckets below the ceiling, the
+bigfree LIFO above it), so a doubling ladder reuses its own history;
+the transient old+new footprint during a growth is the one real cost
+(visible as tests/bigfree.fpr's steady arena reading 5MB where the
+VList read 3MB — still flat across cycles, which is the property that
+matters).  In-place growth (no copy at all) arrives where storage
+sits on a buddy: `buddy_realloc` already extends a low-half block by
+absorbing its free buddy.
 
 ## 2. Conversion from List is cheap and explicit
 
@@ -156,32 +168,33 @@ fold takes capture-free g and int columns only (anything else falls
 back to the plain fold plan, whose map argument then specializes on
 its own).
 
-## 6. Filter is EAGER COMPACTION — decided, not defaulted
+## 6. Filter: eager compaction shipped, the MASK is the direction
 
-`Vec.filter` slides the kept rows down IN PLACE with two cursors and
-shrinks `len`.  Zero allocation, and the vector stays dense.
+What ships: `Vec.filter` slides the kept rows down IN PLACE with two
+cursors and shrinks `len`.  Zero allocation, and the vector stays
+dense for every later pass.
 
-The alternative — tombstones plus a bitmask plus incremental GC on
-later `Vec.x` calls — was considered and rejected FOR THIS MACHINE:
+The REVISED decision (docs/MEMORY.md v2): conditional operations
+should not branch per element.  The end-state filter writes a MASK
+column — the predicate evaluated branchlessly, cmov/SIMD-select
+lanes — scans FUSE the mask as a lane select, and density is restored
+by an explicit `Vec.compact` or automatically at `Sys.poolReset`:
+compaction becomes a frame-boundary event, one branch-light pass,
+instead of a data-dependent branch inside the hot loop.
 
-  * Linearity means there is no sharing to preserve, so the copy that
-    tombstones exist to avoid does not exist here.  A compacting
-    filter allocates nothing.
-  * Every downstream map/fold/zip/axpb would otherwise have to carry a
-    mask through the SIMD tier.  Masked lanes poison exactly the loops
-    Vec exists to make fast, and turn one dense pass into a
-    predicated one on every target that lacks lane masking.
-  * Incremental GC re-introduces unpredictable work into operations
-    whose cost is currently a function of length alone — bad for a
-    system with a WCET story.
+The original counterargument, kept because it was real: masked lanes
+predicate every downstream pass, and incremental reclamation
+re-introduces unpredictable work into length-priced operations.  The
+v2 answers: the mask is fused, not carried as control flow (a select
+is not a branch, and the wide targets this tier is shaped for — RVV,
+NEON — have first-class lane masks); and there is no incremental
+anything — compaction stays a single explicit pass, WCET a function
+of length, just scheduled at the loop boundary the program names.
+A program that wants the old behavior writes `filter |> compact` —
+the policy moves into the program, where this codebase puts policy.
 
-Tombstones win when filters vastly outnumber scans over the same
-vector.  That is not the games/scientific workload Vec is aimed at.
-If a workload ever demands it, the right shape is a separate
-`Vec.mask` view type, not a mode switch inside `Vec a`.
-
-Blocks past the new length stay attached and recycle with the vector:
-a VList does not return capacity early.
+Capacity past the new length stays attached and recycles with the
+column.
 
 ## 7. Linearity is the contract that makes it all sound
 

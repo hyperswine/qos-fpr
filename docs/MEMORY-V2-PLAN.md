@@ -6,7 +6,7 @@ The rule for the whole plan: each phase DELETES more mechanism than it
 adds, and no phase changes what programs mean except where a verb
 (`send_linear`, `send_arc`) makes a cost explicit that was implicit.
 
-Done already (this branch):
+Done on this branch — foundations, then phases 1 and 2:
 * `buddy_realloc` — buddy.c, proven by qos/tests-host/buddy-check.sh
   (in-place grow via buddy-absorb, in-place shrink, copy fallback,
   coalescing intact after 20k randomized rounds).
@@ -15,48 +15,54 @@ Done already (this branch):
 * Exponential backoff in `fpr_lock` — fpr.h (the transitional form of
   the no-hot-spin rule; deletion per site is phase 5).
 
-## Phase 1 — one freelist-over-buddy helper (delete three recyclers)
+## Phase 1 — one freelist discipline **[LANDED]**
 
-The stack pool (hal/core/actors.c:156-187), the grant recycler
-(hal/core/runtime.c:183-300), and the chblk backing store
-(hal/core/actors.c:235-319) are all "freelist of fixed-size blocks
-over a big block". Replace with ONE helper:
+Landed as `fpr_freelist_t` / `fpr_fl_take` / `fpr_fl_put` (fpr.h,
+runtime.c) — first-fit over capacity-carrying nodes rather than the
+planned fixed-size-only helper, because the grant pool's blocks vary
+in size and first-fit covers the fixed-size users trivially. Its four
+instances: the stack pool, the bucket-array recycler, the chblk carve
+extras, and the grant pool. The chblk EPOCH limbo stays as its own
+discipline on top (correctness, not recycling); the acb bump arena
+got its own lock instead of borrowing the stack pool's. Verified:
+the full qosp-reachable golden set byte-identical.
 
-    fpr_fixed_t  fpr_fixed(uw blksz);       /* freelist over buddy   */
-    void        *fpr_fixed_take(fpr_fixed_t*);
-    void         fpr_fixed_put(fpr_fixed_t*, void*);
+## Phase 2 — contiguous Vec on realloc **[LANDED]**
 
-The chblk EPOCH discipline (deferred reuse across the send/reap race)
-is correctness, not recycling — it stays, as a thin wrapper over the
-helper. The bucket-ARRAY recycler (runtime.c bkt_take/bkt_put) also
-folds in (blksz = 4 KiB). Inventory after phase 1: buddy, per-actor
-pool, fpr_fixed. That is the whole list.
-
-## Phase 2 — contiguous Vec on realloc (delete VList + bigfree)
-
-* hal/core/vec.c: `col_t` becomes {base, cap} with ONE contiguous
-  span; growth = `buddy_realloc` doubling on the native/qosp tier and
-  the grant-realloc path on the process tier. Delete vl_slot/vl_grow/
-  vl_cap/VL_B0 (vec.c:33-90) and every per-block walk below them.
-* Column storage comes from buddy DIRECTLY (not the pool), so
-  realloc applies and the pool's bigfree LIFO (runtime.c:353,477 and
-  fpr.h) retires — big blocks were only ever pooled because VList
-  couldn't realloc.
-* fp-risc/compiler/Codegen.hs specialized loops (the emitters at
-  ~1794-2442) drop their block-advance/guard machinery: base + i*w
-  addressing shrinks every emitter. The WCET story is unchanged
-  (doubling is amortized-O(1) push exactly as VList was; the copy is
-  attributed to the push that grew, same as today's vl_grow).
-* The layout is declared ONCE in a shared vec_layout.h; delete the
-  hand-mirrored copies in hal/unix/gfx.c:761-787, gfx.c:443-446, and
-  the `16 << j` literals in the GPU paths. GPU upload and the DRM
-  scene walker become single-span memcpys.
-* compiler/Sol/Val.hs's vec store mirrors the same change (it is
-  already contiguous per column internally; only the FFI boundary
-  shifts).
-* Gate: tests/vecedge.fpr, vecfuse2, fvec/fvec2, matvec, dtree
-  bit-for-bit, and the check-all Vec legs — all must stay green with
-  IDENTICAL printed output.
+* hal/core/vec.c: `col_t` is {cap, base} — ONE contiguous span, base
+  at word offset 1 (the slot the old directory kept blk[0] in, so
+  Codegen's colBlk0 pins unchanged). vl_slot/vl_grow/vl_cap/VL_DIR
+  and every per-block walk deleted; the SIMD tier (VS_BLOCKS/VS_ZIP,
+  blend, burst, gather) runs single spans.
+* Growth is `fpr_realloc` (runtime.c): copy-based through the pool
+  tiers, the freed predecessor recycling exactly. TWO DEVIATIONS
+  from the plan, recorded: (a) columns still allocate through the
+  pool, not buddy-direct — one allocation path is simpler, and the
+  process tier has no buddy under it anyway; in-place growth arrives
+  when bulk storage sits behind Memory.qa. (b) bigfree therefore
+  STAYS: it is the pool's exact-fit recycler for ALL big payloads
+  (strings included), and it is precisely what makes the realloc
+  ladder cheap. Its deletion moves to the Memory.qa phase.
+* Codegen.hs: specBlock reads base + done·W and hands the whole
+  remainder as one chunk (the loop shape and all five emitters keep
+  their structure; the next-block arm is now just the exit recheck);
+  the filter write cursor lost its per-block refill; mvmap and the
+  SoA fold dual load base-relative cursors. RVV strip-mining now
+  runs whole-column. fvec2's asm greps (fadd.d, the VR_FLT guard)
+  still hold.
+* hal/unix/gfx.c: both mirrors ({cap, base}) and the GPU
+  marshalling loops became straight copies; fpr_gpu_vec_axpb now
+  takes the raw span. portable-gl builds; the DRM branch
+  syntax-checks.
+* Sol needed NO change: its vec store is Haskell-side (Val.hs), not
+  a reader of this layout.
+* Verified: the golden set byte-identical except two footprint
+  diagnostics, both explained and accepted — bigfree.fpr's steady
+  arena reads 5MB (doubling transiently holds old+new; still flat
+  over 40 cycles, the actual invariant) and matvec's negative-control
+  heap delta shifted (smaller). dtree stays bit-for-bit; all three
+  Sol tiers agree; pathnotes/livereload (plugins, hot-swap, disk)
+  green; buddy-check green.
 
 ## Phase 3 — the send triad (delete vec CoW)
 
@@ -111,7 +117,10 @@ each site by giving the structure one owner:
 | lock                      | site                    | owner in v2                         |
 |---------------------------|-------------------------|-------------------------------------|
 | buddy_lock                | hal/core/buddy.c        | Memory.qa mailbox (grants are rare) |
-| grant_lock                | hal/core/runtime.c:235  | retires with phase 1's fpr_fixed    |
+| fpr_freelist_t mu ×4      | fpr.h (phase 1)         | one discipline now; each instance   |
+| (stacks/bkts/chb/grants)  |                         | retires behind Memory.qa with buddy |
+| acb_lock                  | hal/core/actors.c       | Memory.qa (acb carving is a grant)  |
+| chb_lock (epoch limbo)    | hal/core/actors.c       | owner-hart epochs + messages        |
 | arc_lock                  | hal/core/runtime.c      | retires with phase 4                |
 | ledger/reap               | hal/core/actors.c       | owner-hart only + messages          |
 | grow_mu / store_mu        | qos/portable/main.c     | the storage/growth trampoline actor |

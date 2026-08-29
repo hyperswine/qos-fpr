@@ -60,31 +60,38 @@ replaces, file:line. Everything else is live.
 ## The allocator contract
 
 * **Buddy (Memory.qa's mechanism).** One global power-of-two buddy
-  hands out grants — process slots, growth, and the backing for every
-  fixed-block need (stacks, acbs, channel blocks) through one
-  freelist-over-buddy helper. It implements all three ops:
-  `buddy_alloc`, `buddy_realloc` (in place whenever the block is the
-  low half and its buddy is free — the natural substrate for
-  realloc-by-doubling), `buddy_free`. **[pending: the separate
-  stack/acb/grant recyclers collapsing into the one helper]**
+  hands out grants — process slots, growth, and the backing for the
+  fixed-block needs (stacks, acbs, channel blocks). It implements all
+  three ops: `buddy_alloc`, `buddy_realloc` (in place whenever the
+  block is the low half and its buddy is free — the natural substrate
+  for realloc-by-doubling), `buddy_free`.
+* **The one freelist discipline.** Every recycled-block pool in the
+  runtime is the same structure — `fpr_freelist_t`: a locked LIFO of
+  free blocks, each node carrying its capacity, taken first-fit
+  (fpr.h; stacks, bucket arrays, channel-block extras, and the
+  variable-size grant pool are its four instances). What stays at a
+  call site is POLICY: where a miss fills from, telemetry, and any
+  deferred-reuse discipline layered on top (the chblk epoch limbo).
 * **Per-actor pool.** An actor's grant becomes a bump slab chain plus
-  ONE recycling tier: the exact-fit size-class buckets. Death returns
-  the chain wholesale — an actor's memory lifetime IS the actor's
+  two recycling tiers, both exact-fit: the size-class buckets below
+  the 8 KiB ceiling and the bigfree LIFO above it. Death returns the
+  chain wholesale — an actor's memory lifetime IS the actor's
   lifetime. Long-lived actors `Sys.poolReset` at loop boundaries.
-  Blocks too big for a bucket are not pooled at all: they come from
-  buddy directly and realloc/free through it, so the pool needs no
-  big-block machinery. **[pending: bigfree retires with this]**
-* Nothing else. A recycler that is not one of these two is debt.
+  `fpr_realloc` is the pool's third op: copy-based, with the freed
+  predecessor recycling exactly, so a doubling ladder reuses its own
+  history. **[pending: in-place growth for bulk storage arrives when
+  columns sit on Memory.qa's buddy, where buddy_realloc provides it]**
+* Nothing else. A recycler that is not an `fpr_freelist_t` instance,
+  a pool tier, or buddy itself is debt.
 
 ## Vectors: contiguous, branch-light
 
-A Vector's column is ONE contiguous span. Growth is
-`realloc`-by-doubling (in place when the allocator can, one copy when
-it can't); `Vec.get`/scan pointer math is base + i·width, no block
-walk, no per-index log2. The layout is declared once and shared with
-every consumer (codegen's specialized loops, the gfx scene walker,
-GPU upload — all read the same span). **[pending: today's storage is
-the VList block chain]**
+A Vector's column is ONE contiguous span (live — the VList block
+chain is gone). Growth is `realloc`-by-doubling; `Vec.get`/scan
+pointer math is base + i·width, no block walk, no per-index log2.
+Every consumer reads the same span: codegen's specialized/RVV loops
+stride it as one run, the gfx scene walker and GPU upload lost their
+block-walk mirrors.
 
 Conditional operations do not branch per element: `Vec.filter` and
 friends write a MASK (branchless predicate evaluation, SIMD-friendly),
