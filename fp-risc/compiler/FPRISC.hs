@@ -17,7 +17,7 @@ import Data.Bits (shiftR, xor)
 import qualified Data.Bits
 import GHC.Float (castDoubleToWord64, castFloatToWord32)
 import Data.Char (isAlphaNum, isLetter, isLower, isUpper, ord)
-import Data.List (foldl', intercalate, nub, sort, sortOn)
+import Data.List (foldl', intercalate, isPrefixOf, nub, sort, sortOn)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Maybe (fromMaybe)
@@ -1723,6 +1723,61 @@ pretty = go 0
 prettyProg :: Prog -> [Name] -> String
 prettyProg prog names = unlines [n ++ " " ++ unwords ps ++ " =\n  " ++ pretty b ++ "\n" | n <- names, Just (ps, b) <- [M.lookup n prog]]
 
+-- ---- source anchors (spans, step 1: bind-level) -----------------------------
+--
+-- The compiler's post-parse diagnostics were location-free strings.
+-- Step 1 anchors every "in NAME: ..." message to file:line of NAME's
+-- definition, with NO change to the AST (so nothing downstream moves
+-- and no pinned module hash churns):
+--
+--   * top declarations start at COLUMN 0 by the grammar, so a bind's
+--     anchor is the first col-0 line beginning with its name -- the
+--     signature line when one precedes the clauses, which is the
+--     better anchor anyway;
+--   * the map is keyed by the (possibly splice-renamed) top name; the
+--     scan token strips the @hash suffix module splicing appends, so
+--     unit anchors survive qualification.
+--
+-- Step 3 (statement-level SMark wrappers) replaces the scan with real
+-- parser positions; stripPosTops below is already the seam that keeps
+-- module identity blind to them.
+
+-- the SPAN-PROOFING seam (spans, step 0): module identity is the hash
+-- of the POSITIONLESS tree.  Any future source-position node (an SMark
+-- wrapper, a located bind) is erased HERE before Modules.hs hashes, so
+-- spans can never churn pinned module hashes.  Today no such node
+-- exists and this is the identity -- the hash string stays
+-- bit-compatible with every existing pin.
+stripPosTops :: [STop] -> [STop]
+stripPosTops = id
+
+type Anchors = M.Map Name (FilePath, Int)
+
+bindAnchors :: FilePath -> String -> [STop] -> Anchors
+bindAnchors file src tops =
+  M.fromList [(n, (file, ln)) | n <- names, Just ln <- [findLn (baseName n)]]
+  where
+    names = nub ([n | TBind n _ _ _ <- tops] ++ [n | TSig n _ _ <- tops])
+    baseName = takeWhile (/= '@')
+    srcLines = zip [1 :: Int ..] (lines src)
+    findLn tok =
+      case [i | (i, l) <- srcLines, tok `isPrefixOf` l, defLike (drop (length tok) l)] of
+        (i : _) -> Just i
+        [] -> Nothing -- struct fields etc. define off-column: no anchor, graceful
+    defLike (c : _) = c `elem` (" \t:=(" :: String)
+    defLike [] = True
+
+-- rewrite one diagnostic: "in NAME: ..." -> "file:line: in NAME: ..."
+-- (every per-bind error the passes emit carries that prefix; messages
+-- without it pass through untouched)
+anchorMsg :: Anchors -> String -> String
+anchorMsg anchors msg = case msg of
+  'i' : 'n' : ' ' : rest
+    | (n, ':' : _) <- break (== ':') rest,
+      Just (f, ln) <- M.lookup n anchors ->
+        f ++ ":" ++ show ln ++ ": " ++ msg
+  _ -> msg
+
 -- the primitive names the lambda lifter must not treat as free
 -- variables (the host-side evaluator this list once served is gone --
 -- both its copies; the Sol VM and Codegen are the executors)
@@ -1830,7 +1885,11 @@ lcheck li tops = concatMap checkGroup groups
           useErrs = case bc of
             Nothing -> []
             Just c -> ["in " ++ n ++ ": linear variable '" ++ v ++ "' used " ++ show (M.findWithDefault 0 v c) ++ " time(s), expected exactly 1" | v <- linear, M.findWithDefault 0 v c /= 1]
-       in wildErrs ++ ge ++ be ++ guardErr ++ useErrs
+          -- EVERY linearity error names its bind (spans step 1: the
+          -- "in NAME:" prefix is what the error sinks anchor to
+          -- file:line) -- body/guard errors from linExpr gain it here
+          pre e = if ("in " ++ n ++ ":") `isPrefixOf` e then e else "in " ++ n ++ ": " ++ e
+       in map pre (wildErrs ++ ge ++ be ++ guardErr ++ useErrs)
       where
         lin' = linExpr li
 

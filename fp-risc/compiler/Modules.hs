@@ -74,7 +74,10 @@ data LoadResult = LoadResult
     -- module's).  lrTops == prelude ++ concat units ++ root, unchanged.
     lrUnits :: [(String, [STop])],
     lrRootTops :: [STop],
-    lrRootHash :: String
+    lrRootHash :: String,
+    lrAnchors :: Anchors -- QUALIFIED bind name -> (file, line) across
+                         -- every spliced unit (spans step 1: the error
+                         -- sinks anchor "in NAME:" messages with this)
   }
 
 --------------------------------------------------------------------------------
@@ -86,12 +89,17 @@ data LoadResult = LoadResult
 hashAST :: [STop] -> String
 hashAST tops = pad (showHex h "")
   where
+    -- SPAN-PROOF (spans step 0): identity is the POSITIONLESS tree --
+    -- stripPosTops (FPRISC.hs) erases any future source-position node
+    -- before hashing, so spans can never churn a pinned hash.  Today
+    -- it is the identity: bit-compatible with every existing pin.
+    posless = stripPosTops tops
     -- precondition-free sigs print in the pre-contract shape so
     -- existing pinned module hashes stay valid (the AST is the same
     -- module; only the constructor grew a field)
     stable (TSig n tys pres) | all isNothing pres = "TSig " ++ show n ++ " " ++ show tys
     stable t = show t
-    h = foldl' step 0xcbf29ce484222325 ("[" ++ intercalate "," (map stable tops) ++ "]") :: Word64
+    h = foldl' step 0xcbf29ce484222325 ("[" ++ intercalate "," (map stable posless) ++ "]") :: Word64
     step acc c = (acc `xor` fromIntegral (ord c)) * 0x100000001b3
     pad s = replicate (16 - length s) '0' ++ s
 
@@ -105,7 +113,8 @@ qualify h n = n ++ "@" ++ h
 data ModUnit = ModUnit
   { muHash :: String,
     muTops :: [STop], -- as parsed (uses pin-normalized, not yet qualified)
-    muAliases :: [(Name, String)] -- import alias -> dep hash
+    muAliases :: [(Name, String)], -- import alias -> dep hash
+    muAnchors :: Anchors -- bind name -> (file, line), pre-qualification
   }
 
 -- "Name", "Name#hash", "dir/Name", "Name.fpr#hash" — resolved relative
@@ -217,7 +226,7 @@ loadModule cache stack path0 = do
                       -- the hash is a Merkle root over the dependency tree
                       let pinned = [pinUse aliases t | t <- tops]
                           h = hashAST pinned
-                          mu = ModUnit h tops aliases
+                          mu = ModUnit h tops aliases (bindAnchors path src tops)
                       modifyIORef' cache (M.insert path mu)
                       pure (Right mu)
   where
@@ -430,7 +439,9 @@ loadProgram preludeTops rootPath rootTops = do
               | mu <- units,
                 TBind n ps _ _ <- muTops mu
             ]
-      pure (Right (LoadResult merged exports (notes ++ depNotes) unitPairs root' rootHash))
+      let unitAnchors =
+            M.unions [M.mapKeys (qualify (muHash mu)) (muAnchors mu) | mu <- units]
+      pure (Right (LoadResult merged exports (notes ++ depNotes) unitPairs root' rootHash unitAnchors))
   where
     pinRoot aliases (TUse a spec) =
       let (nm, _) = specParts spec

@@ -74,11 +74,16 @@ parseArgs = foldl step (Opts rv64 False False False False False False False Fals
       | otherwise = o {oFiles = oFiles o ++ [a]}
 
 parseFile :: FilePath -> IO [STop]
-parseFile p = do
+parseFile p = snd <$> parseFileSrc p
+
+-- keep the source: bindAnchors scans it for the file:line of every
+-- top-level definition (spans step 1)
+parseFileSrc :: FilePath -> IO (String, [STop])
+parseFileSrc p = do
   src <- readFile p
   case parse program p src of
-    Left e -> putStrLn (errorBundlePretty e) >> exitFailure >> pure []
-    Right tops -> pure tops
+    Left e -> putStrLn (errorBundlePretty e) >> exitFailure >> pure (src, [])
+    Right tops -> pure (src, tops)
 
 -- top-level bind name -> arity, for the extern-known-globals map:
 -- cross-unit references stay KNOWN (direct calls, 0-ary `call`,
@@ -110,8 +115,8 @@ compileMain = do
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
     _ -> putStrLn "usage: fprc [--profile=bare-metal|qos-native|qos-portable] [--target=rv32|rv64|a64|a64mac|x64|qx64|qa64|qa64single|qa64mac] [--plugin] [--rvv] [--stdcheck] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
-  preludeTops <- maybe (pure []) parseFile (oPrelude opts)
-  rootTops0 <- parseFile inp
+  (preludeSrc, preludeTops) <- maybe (pure ("", [])) parseFileSrc (oPrelude opts)
+  (rootSrc, rootTops0) <- parseFileSrc inp
   -- ONE grammar, profile-gated views: `>` top-level statements are the
   -- sol/HostedBytecode surface.  Outside that view they are a profile
   -- error, not a parse error -- the sentence is grammatical everywhere,
@@ -127,8 +132,18 @@ compileMain = do
   lr <- loadProgram preludeTops inp rootTops
   case lr of
     Left e -> putStrLn e >> exitFailure
-    Right (LoadResult tops0RL exports notes units0L root0L rootHash) -> do
+    Right (LoadResult tops0RL exports notes units0L root0L rootHash unitAnchors) -> do
       mapM_ putStrLn notes
+      -- spans step 1: every "in NAME:" diagnostic below gets anchored
+      -- to NAME's definition line (root + prelude scanned here, spliced
+      -- units by Modules under their qualified names)
+      let anchors =
+            M.unions
+              [ bindAnchors inp rootSrc rootTops0,
+                maybe M.empty (\pp -> bindAnchors pp preludeSrc preludeTops) (oPrelude opts),
+                unitAnchors
+              ]
+          anchored = map (anchorMsg anchors)
       -- first-class paths: validate + desugar @Shape.path literals on the
       -- surface tree, first transform after load (ONE table from the
       -- merged program, so root and unit rewrites agree; the generated
@@ -141,7 +156,7 @@ compileMain = do
           pathErrs = List.nub (pathErrsM ++ pathErrsR ++ concat [es | (_, (es, _)) <- unitsPR])
       unless (null pathErrs) $ do
         putStrLn "=== PATH LITERALS: ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) pathErrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored pathErrs)
         exitFailure
       -- autodrop: mechanical discharge of the drop-what-you-receive law
       -- (conservative destructure-then-dead shape; see FPRISC.autoDrop)
@@ -172,7 +187,7 @@ compileMain = do
           tops = expandU tops0
       unless (null preludeExpErrs) $ do
         putStrLn "=== SIG/STRUCT: ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) preludeExpErrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored preludeExpErrs)
         exitFailure
       -- ---- preconditions (contracts): signatures may constrain params,
       -- (n : Int | n > 0).  Discharge obligations statically from local
@@ -185,7 +200,7 @@ compileMain = do
           preFragErrs = validatePre preTab
       unless (null preFragErrs) $ do
         putStrLn "=== PRECONDITION: ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) preFragErrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored preFragErrs)
         exitFailure
       let (pnAll, tops') = applyPreconds preTab tops
           preludeE' = snd (applyPreconds preTab preludeE)
@@ -210,7 +225,7 @@ compileMain = do
       let (terrs, notes, holes, linsigs, topsRW) = inferTops sigs structs tops'
       unless (null terrs) $ do
         putStrLn "=== TYPE ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) terrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored terrs)
         exitFailure
       -- typed holes: NAMED holes typecheck everything around them and
       -- then refuse to compile, with the inferred type -- exactly the
@@ -231,7 +246,7 @@ compileMain = do
             (serrs, ssug) = safetyCheck preludeNames tops' notes
         unless (null serrs) $ do
           putStrLn "=== SAFETY: the safe/unsafe line ==="
-          mapM_ (putStrLn . ("  * " ++)) serrs
+          mapM_ (putStrLn . ("  * " ++)) (anchored serrs)
           sug <- lookupEnv "FPR_UNSAFE_SUGGEST"
           when (sug == Just "1" && not (null ssug)) $ do
             putStrLn "-- paste-ready signatures (inferred types):"
@@ -243,7 +258,7 @@ compileMain = do
       let (specErrs, topsSpec) = specialize sigs structs topsRW
       unless (null specErrs) $ do
         putStrLn "=== SIG/STRUCT: ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) specErrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored specErrs)
         exitFailure
       let finalTops = erasePSig topsSpec
       -- ---- whole-program ANALYSES (cheap; codegen below is per-unit) ----
@@ -296,7 +311,7 @@ compileMain = do
         putStrLn ("linear types: " ++ unwords (liLinTys li))
       unless (null lerrs) $ do
         putStrLn "=== LINEARITY: ERRORS ==="
-        mapM_ (putStrLn . ("  * " ++)) lerrs
+        mapM_ (putStrLn . ("  * " ++)) (anchored lerrs)
         exitFailure
       -- ---- per-unit CODEGEN (separate compilation) ----
       -- Each unit is expanded already (preludeE/units/root'). For codegen
