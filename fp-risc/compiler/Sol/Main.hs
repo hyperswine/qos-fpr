@@ -167,7 +167,10 @@ main = do
 
   let cons = collectCons tops
       shapes = collectShapes tops
-      (prog, _) = runState (compileTop tops >>= liftFix) (DEnv 0 cons shapes [])
+      -- the shared desugar keeps string literals as UTF-8 bytes (the
+      -- AOT codegen contract); the VM speaks Chars -- decode once here
+      (prog0, _) = runState (compileTop tops >>= liftFix) (DEnv 0 cons shapes [])
+      prog = decodeProgStrings prog0
       bprog = compileProg halArities prog
 
   when dumpAsm $ do

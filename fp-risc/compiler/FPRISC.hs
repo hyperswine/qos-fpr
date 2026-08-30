@@ -1525,6 +1525,7 @@ matchPat :: Core -> SPat -> Core -> Core -> D Core
 matchPat scrut p ok fail' = case p of
   PWild -> pure ok
   PVar x -> pure (CLet x scrut ok)
+  PSig x _ -> pure (CLet x scrut ok) -- erased by erasePSig; PVar behavior if one survives
   PInt n -> pure (CIf (CApp (CApp (CVar "==") scrut) (CInt n)) ok fail')
   PStr s -> pure (CIf (CApp (CApp (CVar "==") scrut) (CStr s)) ok fail')
   PCon c ps -> do
@@ -1776,10 +1777,17 @@ shapeOfTy lin = \case
 buildLinInfo :: [STop] -> LinInfo
 buildLinInfo tops = LinInfo lin sigs conSh conAr
   where
-    lin = [n | TType n True _ _ <- tops]
+    -- TAlias resolves here too (the sol profile's module aliasing):
+    -- an alias of a linear type is linear, and its constructors carry
+    -- the target's shapes/arities
+    aliases = [(t, tgt) | TAlias t tgt <- tops]
+    lin0 = [n | TType n True _ _ <- tops]
+    lin = lin0 ++ [t | (t, tgt) <- aliases, tgt `elem` lin0]
     sigs = M.fromList [(n, (map sh ps, sh r)) | TSig n (ps, r) _ <- tops]
-    conSh = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
-    conAr = M.fromList [(c, length tys) | TType _ _ _ cs <- tops, (c, tys) <- cs]
+    conSh0 = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
+    conSh = foldl' (\m (t, tgt) -> maybe m (\e -> M.insert t e m) (M.lookup tgt m)) conSh0 aliases
+    conAr0 = M.fromList [(c, length tys) | TType _ _ _ cs2 <- tops, (c, tys) <- cs2]
+    conAr = foldl' (\m (t, tgt) -> maybe m (\e -> M.insert t e m) (M.lookup tgt m)) conAr0 aliases
     sh = shapeOfTy lin
 
 type Cnt = M.Map Name Int
@@ -1842,6 +1850,7 @@ wildLinErrs p s = case p of
 bindPat :: LinInfo -> SPat -> LShape -> [(Name, LShape)]
 bindPat li p s = case p of
   PVar x -> [(x, s)]
+  PSig x _ -> [(x, s)] -- erased by erasePSig; PVar behavior if one survives
   PWild -> []
   PInt _ -> []
   PStr _ -> []

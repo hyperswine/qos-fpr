@@ -125,7 +125,8 @@ tabEligible prog g = case M.lookup g prog of
   Just (ps, body) -> length ps <= 4 && ok body
   Nothing -> False
   where
-    pureOps = ["+", "-", "*", "/", "==", "/=", "<", "<=", ">", ">=", "imod", "mod", "and2", "or2", "not"]
+    -- ops from the ONE vocabulary (Bytecode.arithOps) + the pure helpers
+    pureOps = M.keys arithOps ++ ["imod", "mod", "and2", "or2", "not"]
     ok c = case c of
       Lang.CInt _ -> True
       Lang.CVar v -> v `elem` pureOps || v == g || isParamish v

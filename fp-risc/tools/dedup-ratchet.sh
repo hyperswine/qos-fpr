@@ -21,6 +21,6 @@ ck() { # ck <file> <ceiling>
 }
 
 ck compiler/Sol/Infer.hs 120   # the shim: sol's table + flags, nothing else
-ck compiler/Sol/Lang.hs  940   # shrinks as desugar/lift/linearity merge
+ck compiler/Sol/Lang.hs  240   # profile-only: tids, decode, splicing
 
 echo "dedup-ratchet: OK"

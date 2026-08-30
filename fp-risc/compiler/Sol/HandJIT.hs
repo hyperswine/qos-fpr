@@ -43,6 +43,7 @@ import Foreign.Ptr (Ptr, ptrToIntPtr)
 import GHC.Float (castDoubleToWord64)
 import Control.Monad (when)
 import Sol.Lang (Core (..), Prog, Name)
+import Sol.Bytecode (cmpNames)
 import System.Info (arch)
 import System.Environment (lookupEnv)
 
@@ -193,7 +194,8 @@ callsSelf h = go
       _ -> False
 
 cmpOps :: [String]
-cmpOps = ["<", "<=", ">", ">=", "==", "/="]
+cmpOps = cmpNames -- the ONE vocabulary (Bytecode.arithOps); the setcc
+                  -- tables' catch-all is setne, so != lands right
 
 spine :: Core -> (Core, [Core])
 spine = go []
