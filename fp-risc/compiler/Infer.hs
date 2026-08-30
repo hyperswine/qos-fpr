@@ -669,10 +669,32 @@ inferPat cons = \case
 
 -- ---- expression inference ---------------------------------------------------
 
+-- ---- profile parameterization ----------------------------------------------
+-- ONE inference engine, per-profile surfaces (the un-forking of
+-- Sol/Infer.hs): everything that genuinely differs between the AOT
+-- tiers and HostedBytecode rides here.  The float story needs no flag
+-- -- float literals splice to f64frombits/f32frombits calls, and the
+-- PROFILE'S TABLE types those (F64/F32 for AOT, Int-is-Numeric for
+-- sol), so the width sites resolve to plain ops under sol's table and
+-- the rewritten AST comes out exactly as sol's old engine produced.
+data IProf = IProf
+  { ipBuiltins :: TEnv, -- the profile's primitive surface
+    ipTopEvals :: Bool, -- infer + rewrite `> expr.` tops (HostedBytecode;
+                        -- the AOT driver handles TEval itself)
+    ipPathStr :: Bool, -- @Path literals type as String (HostedBytecode;
+                       -- AOT expands them structurally before inference)
+    ipMat4 :: Bool -- Mat4/Vec4 `*` elaboration -- only where the prelude
+                   -- defines mulMM/mulMV (the AOT tiers)
+  }
+
+aotProf :: IProf
+aotProf = IProf builtinEnv False False True
+
 data ICtx = ICtx
   { icEnv :: TEnv, -- values in scope
     icCons :: TEnv, -- constructor schemes (for patterns)
-    icSigs :: Sigs
+    icSigs :: Sigs,
+    icProf :: IProf
   }
 
 extend :: TEnv -> ICtx -> ICtx
@@ -735,6 +757,10 @@ recFields _ = Nothing
 
 inferE :: ICtx -> SExpr -> I (Type, SExpr)
 inferE ctx e0 = case e0 of
+  -- @paths (parsed by the shared grammar as (Path "…")) are URL strings
+  -- in the HostedBytecode profile; the AOT tiers expand them
+  -- structurally before inference (expandPathLits) and never reach here
+  SApp (SVar "Path") (SStrI [SegStr _]) | ipPathStr (icProf ctx) -> pure (tStr, e0)
   -- ?name / ?? — typed holes (parsed as this shape).  A fresh var lets
   -- everything AROUND the hole typecheck.  Named holes are recorded and
   -- REFUSE compilation later (with the zonked type); ?? elaborates to a
@@ -917,10 +943,11 @@ inferBin ctx op a b = case op of
         -- to fused multiply-add column loops (the axpb shape).
         za <- zonk ta
         zb <- zonk tb
-        let isShape ns t = maybe False ((== ns) . sortNames) (recFields t)
-            matL = isShape mat4Fields za
-            matR = isShape mat4Fields zb
-            vecR = isShape vec4Fields zb
+        let m4 = ipMat4 (icProf ctx) -- only where the prelude has mulMM/mulMV
+            isShape ns t = maybe False ((== ns) . sortNames) (recFields t)
+            matL = m4 && isShape mat4Fields za
+            matR = m4 && isShape mat4Fields zb
+            vecR = m4 && isShape vec4Fields zb
         case op of
           "*" | matL && matR -> do
                 (tr, _) <- inferE ctx (SApp (SApp (SVar "mulMM") a) b)
@@ -1116,7 +1143,10 @@ builtinLinShapes linNs =
     peelFn t = ([], t)
 
 inferTops :: Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
-inferTops sigs structs tops =
+inferTops = inferTopsWith aotProf
+
+inferTopsWith :: IProf -> Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
+inferTopsWith prof sigs structs tops =
   let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty [])
    in (iErrs st, iNotes st, iHolesP st, iLinSigs st, tops')
   where
@@ -1125,10 +1155,14 @@ inferTops sigs structs tops =
     run = do
       cons <- (\u -> M.union u builtinCons') <$> consEnv aliases tops
       declared <- sigAnnEnv aliases tops
-      let env0 = M.union declared builtinEnv
+      let env0 = M.union declared (ipBuiltins prof)
       -- group multi-clause binds under one name, preserving first-seen order
       let bindNames = nub [n | TBind n _ _ _ <- tops]
           clausesOf n = [(ps, g, b) | TBind n' ps g b <- tops, n' == n]
+          -- `> expr.` top-level effects: inferred and rewritten in the
+          -- HostedBytecode profile; the AOT driver owns them otherwise
+          -- (empty list = rebuild leaves every TEval untouched)
+          evals = if ipTopEvals prof then [e | TEval e <- tops] else []
           topSet = S.fromList bindNames
           nodes =
             [ (n, n, nub (concatMap refs (clausesOf n)))
@@ -1147,6 +1181,7 @@ inferTops sigs structs tops =
           (\(e, acc) ns -> do (e', rws) <- inferSCC cons e ns; pure (e', acc ++ rws))
           (env0, [])
           [ns | scc <- sccs, let ns = flat scc]
+      rwEvals <- forM evals $ \e -> snd <$> inferE (ICtx env cons sigs prof) e
       -- typed struct conformance
       checkStructConformance sigs structs env
       -- ?? markers -> traps: eta-wrap by the hole's ZONKED type so the
@@ -1209,13 +1244,16 @@ inferTops sigs structs tops =
                 other -> other
               goS (SBind n ps x) = SBind n ps (go' x)
               goS (SBindPat p x) = SBindPat p (go' x)
-      let rebuild bnds t = case t of
+      let rebuild (evs, bnds) t = case t of
+            TEval _ -> case evs of
+              (e : rest) -> ((rest, bnds), TEval (apE e))
+              [] -> ((evs, bnds), t)
             TBind n _ _ _ -> case M.lookup n bnds of
               Just ((ps, g, b) : more) ->
-                (M.insert n more bnds, TBind n ps (map (mapGuardE apE) g) (apE b))
-              _ -> (bnds, t)
-            _ -> (bnds, t)
-          (_, tops') = foldl' (\(st', acc) t -> let (st2, t') = rebuild st' t in (st2, acc ++ [t'])) (fmap reverse rwMap, []) tops
+                ((evs, M.insert n more bnds), TBind n ps (map (mapGuardE apE) g) (apE b))
+              _ -> ((evs, bnds), t)
+            _ -> ((evs, bnds), t)
+          (_, tops') = foldl' (\(st', acc) t -> let (st2, t') = rebuild st' t in (st2, acc ++ [t'])) ((rwEvals, fmap reverse rwMap), []) tops
       pure tops'
     flat (AcyclicSCC n) = [n]
     flat (CyclicSCC ns) = ns
@@ -1230,7 +1268,7 @@ inferTops sigs structs tops =
           nerrs0 <- gets (length . iErrs)
           -- params: PSig gets its sig's record type; others infer
           (ptys, penvs) <- unzip <$> mapM (inferParam cons) ps
-          let ctx = ICtx (M.union (M.unions penvs) recEnv) cons sigs
+          let ctx = ICtx (M.union (M.unions penvs) recEnv) cons sigs prof
           -- guards run left to right; a pattern guard's binds are in
           -- scope for the guards to its right and for the body
           (ctx2, g') <-

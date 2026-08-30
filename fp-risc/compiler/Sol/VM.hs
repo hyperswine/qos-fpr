@@ -780,9 +780,9 @@ withFuelCell env body = alloca $ \p -> do
 -- tids are passed in because the front-end assigns user-type ids in
 -- declaration order (prelude declares them first).
 
--- VBStr is an IORef; we can't put it directly in a VData field, so the
+-- a BStr's store is an IORef, which can't ride in a VData field, so the
 -- runtime uses a table of refs keyed by a fresh Int id -- the same bridge
--- Handle uses.
+-- Handle uses.  (This table IS the BStr representation.)
 type BStrTable = IORef (IM.IntMap (IORef BStrStore))
 
 newBStrTable :: IO BStrTable
@@ -1054,13 +1054,6 @@ mkHal cons tx preempts rt =
           pure (VStr (take l (drop (o - 1) s)))
     substrH _ = vmPanic "substr: bad args"
 
-    bsSubH [VBStr r, VInt i, VInt j] = do
-      s <- bsContent r
-      let lo = fromIntegral i; hi = fromIntegral j
-      if lo < 1 || hi > length s || lo > hi
-        then vmPanic "BStr.sub: index out of range"
-        else bstrFromString (take (hi - lo + 1) (drop (lo - 1) s))
-    bsSubH _ = vmPanic "BStr.sub: bad args"
     indexH [xs, VInt i] = idx xs i
       where
         idx (VVec r) k = getVec r (fromIntegral k - 1) -- O(1); consumes the vector (linearity) — Vec.get keeps it
