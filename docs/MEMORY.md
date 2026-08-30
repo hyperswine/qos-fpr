@@ -19,8 +19,9 @@ replaces, file:line. Everything else is live.
    consume point (`Vec.free`, scope exit, autodrop). Growth is
    realloc-by-doubling; release is all-at-once. Provably-scoped work
    uses arenas (bump, free wholesale). Linear data carries NO
-   refcount of any kind — not Rc, not CoW rc. **[pending: the vec
-   CoW rc retires with `send_linear`, see below]**
+   refcount of any kind — not Rc, not CoW rc (the vec CoW is gone;
+   the specialized column loops are sound by construction, not by
+   documented exception).
 
 2. **Rc — the fallback, intra-actor only.** Tree/list data that
    genuinely needs sharing inside one actor is reference-counted at
@@ -29,7 +30,7 @@ replaces, file:line. Everything else is live.
    Rc-zero calls `dealloc`; that is the whole protocol.
 
 3. **ARC — cross-actor, by explicit promotion only.** Nothing is
-   ever promoted implicitly. `send_arc` gives OWNERSHIP of the object
+   ever promoted implicitly. `sendArc` gives OWNERSHIP of the object
    to **ARC.qa**, which spawns a small manager actor for it; the
    refcount is structurally atomic because it only changes by
    INC/DEC messages drained through that manager's single mailbox —
@@ -42,20 +43,25 @@ replaces, file:line. Everything else is live.
 
 ## Sending — three verbs, no hidden modes
 
-* **`send` deep-copies. No exceptions.** The receiver's copy lands in
-  its own pool; nothing is shared, nothing is counted, nothing can
-  dangle. This is the default and what every existing program means.
-  **[pending: today vectors ride `send` by CoW rc++ — that
-  exception is exactly what retires]**
-* **`send_linear` moves.** Ownership of the value transfers to the
-  receiver — zero copy for the bulk storage. The sender's binding is
-  consumed (the linearity checker enforces it like any other
-  consume). This is the frames idiom made honest: double-buffer
-  ping-pong is `send_linear` / receive / re-own, and the "frames are
-  structure, not garbage" law is its contract.
-* **`send_arc` promotes.** For the rare genuinely-shared object:
-  ownership to ARC.qa as above, and what travels in the message is
-  the handle.
+* **`send` deep-copies. No exceptions.** One message = one ownerless
+  slab, vectors included (header, cols, and column spans all land in
+  it — vec_layout.h is the contract); nothing is shared, nothing can
+  dangle, and drop-of-root frees all of it. LIVE.
+* **`sendLinear` moves.** Ownership transfers to the receiver; the
+  sender's binding is consumed by the linearity checker (reuse after
+  a move is refused by name). A received message root transfers as
+  the SAME pointer — no copy, no count change; the one standing ARC
+  count changes hands — so a relay chain (the frames loop,
+  tests/frames.fpr + tests/sendlin.fpr) is zero-copy end to end.
+  Anything else deep-copies and releases what the sender owned. LIVE.
+* **`sendArc` shares — the ONE promotion path.** The pointer crosses,
+  the object is frozen by contract, and the count is the number of
+  HOLDERS: the sender's standing share is created at first promotion,
+  each send adds the receiver's, every holder releases with `drop`
+  (tests/sendarc.fpr: one tuple, three holders, balanced). A Vector
+  is refused — linear bulk moves or copies, never shares. LIVE on
+  the v1 mechanism; **[pending: the mechanism underneath moves from
+  the HAL's table+lock to the mailbox-serialized ARC.qa]**
 
 ## The allocator contract
 
@@ -118,7 +124,7 @@ frame-boundary event, not a per-element decision. **[pending]**
   once read — compiler-discharged on the common shapes (autodrop),
   ARC.qa audits backstop the rest (tests/arcaudit.fpr).
 * **Frames are structure, not garbage.** Double-buffer bulk data,
-  ping-pong by `send_linear` (consume) / receive (re-own). Lifetime
+  ping-pong by `sendLinear` (consume) / receive (re-own). Lifetime
   is the loop shape; nothing is ever "collected". (tests/frames.fpr:
   199 cross-actor bounces, arcLive delta 0.)
 * **A service owns its linear resource.** One actor holds the linear
@@ -126,7 +132,7 @@ frame-boundary event, not a per-element decision. **[pending]**
 * **Copy on retain.** A nested value kept beyond drop-of-root is a
   dangling pointer; the retainer copies into its own pool.
 * **Never send live state.** Reply with a disposable copy — or
-  `send_linear` the real thing and stop owning it. There is no third
+  `sendLinear` the real thing and stop owning it. There is no third
   option, which is the point.
 
 ## What "no GC" buys and costs

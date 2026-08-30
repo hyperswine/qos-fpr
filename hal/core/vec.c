@@ -33,33 +33,15 @@
 #include <limits.h>
 
 #define VL_B0 16 /* words in a fresh column's first allocation */
-#define VMAXCOLS 8
 
-/* VR_FLT: one raw FLOAT column.  It is a DECLARED rep, never inferred:
- * a float V is its bit pattern, so the runtime cannot tell one from a
- * pointer -- fix_layout's first-push rule is undecidable for floats
- * (the documented v1 hazard, here turned into an API instead of a
- * guess).  Vec.newAs declares the layout up front. */
-enum { VR_UNSET = 0, VR_INT = 1, VR_BOX = 2, VR_SOA = 3, VR_FLT = 4 };
-
-/* cap at 0, base at W: Codegen.hs (colBlk0) loads the base pointer at
- * word offset 1 — the same slot the old directory kept blk[0] in */
-typedef struct {
-  uw cap;   /* words allocated at base (0 for an empty column) */
-  uw *base; /* the ONE contiguous span */
-} col_t;
-
-/* field offsets here are mirrored by Codegen.hs (vec specialization):
- * len 8+0W | eltid 8+1W | elvar 8+2W | ncols 8+3W | kinds 8+4W
- * | fkinds 8+5W | cols 8+6W
- * kinds bit i: column i is RAW (untagged machine word, not a V)
- * fkinds bit i: that raw word is IEEE FLOAT BITS -- stored and read
- * verbatim, never tagged.  fkinds is always a subset of kinds. */
-typedef struct {
-  uint32_t tid, var; /* var = rep */
-  uw len, eltid, elvar, ncols, kinds, fkinds;
-  col_t *cols[VMAXCOLS];
-} vec_t;
+/* The layout lives in vec_layout.h (single source, shared with the
+ * runtime's deep copier and the host-side gfx walker; Codegen.hs
+ * mirrors the offsets).  VR_FLT there is a DECLARED rep, never
+ * inferred: a float V is its bit pattern, so the runtime cannot tell
+ * one from a pointer -- fix_layout's first-push rule is undecidable
+ * for floats (the documented v1 hazard, turned into an API instead of
+ * a guess).  Vec.newAs declares the layout up front. */
+#include "vec_layout.h"
 
 /* ---- column access ---------------------------------------------------- */
 
@@ -90,28 +72,16 @@ static vec_t *vchk(V v, const char *who) {
   return (vec_t *)v;
 }
 
-/* ---- copy-on-write sharing (rc in var bits 8+) -----------------------
- * var packs [rc:24 | rep:8].  rc is BIASED: 0 means one owner, n means
- * n+1 references.  Vec.dup and message deep-copy share by rc++ (O(1));
- * every WRITING op calls cow_wr first (private full copy when shared),
- * every consume goes through cow_rel (rc-- when shared, real free at
- * the last reference).  Reads (get, fold, gather's src) touch nothing.
- * The old law -- "one copy per CONSUMER, aliasing is silent corruption"
- * -- is gone: aliasing is now the mechanism.  Handles still follow
- * their owning POOL's lifetime, exactly as before.  Known hole: the
- * compiler's SPECIALIZED map/fold column loops write storage directly
- * without this check; the C fallbacks below own first.  Sharing today
- * happens via dup and messages, whose values feed the fixed-function
- * tier -- specialized sites on shared vectors are documented unsound
- * until the emitted layout guard also tests rc. */
-#define VREP(x) ((x)->var & 0xffu)
-static uw cow_rc(vec_t *x) { return __atomic_load_n(&x->var, __ATOMIC_ACQUIRE) >> 8; }
-static void cow_inc(vec_t *x) { __atomic_add_fetch(&x->var, 256u, __ATOMIC_ACQ_REL); }
-/* returns nonzero if this was the LAST reference (caller owns/frees) */
-static int cow_dec(vec_t *x) {
-  return (__atomic_fetch_sub(&x->var, 256u, __ATOMIC_ACQ_REL) >> 8) == 0 ? 1
-         : 0;
-}
+/* ---- ownership: ONE owner, real copies (MEMORY.md v2 phase 3) ------
+ * The CoW rc that used to ride var's high bits is GONE.  `send` deep-
+ * copies vectors into the message slab like every other value (no
+ * exceptions), `Vec.dup` is an honest copy, and mutation needs no
+ * ownership test anywhere -- which makes the compiler's specialized
+ * column loops (which write storage directly) sound BY CONSTRUCTION
+ * instead of "documented unsound on shared vectors".  It also closes
+ * the lifetime hole CoW had: a shared handle's storage died with the
+ * SENDER's pool (poolReset/death frees slabs regardless of rc); a
+ * receiver's copy is its own. */
 static void vfree(vec_t *x); /* fwd */
 static col_t *col_new(void);
 static col_t *col_copy(col_t *c, uw len) {
@@ -135,21 +105,13 @@ static vec_t *vcopy(vec_t *x) {
     n->cols[i] = x->cols[i] ? col_copy(x->cols[i], x->len) : 0;
   return n;
 }
-/* own before writing: shared -> private copy, rc-- on the original */
-static vec_t *cow_wr(vec_t *x) {
-  if (cow_rc(x) == 0) return x;
-  vec_t *n = vcopy(x);
-  cow_dec(x);
-  return n;
-}
-/* release a consumed input: last ref really frees */
-static void cow_rel(vec_t *x) {
-  if (cow_dec(x)) vfree(x);
-}
-
-/* the deep copier's vec hook: sharing IS the copy for vectors */
-void fpr_vec_share(V v) { cow_inc((vec_t *)v); }
-void fpr_vec_release(V v) { cow_rel((vec_t *)v); }
+/* one owner: writes need no ownership test, release IS the free.
+ * vfree no-ops on slab-resident pieces (fpr_free ignores ownerless
+ * slabs) and really frees pool-resident ones, so it is the universal
+ * release for local, message-copied, and post-receive-grown vectors
+ * alike.  fpr_vec_release stays exported: the deep copier's root-drop
+ * path (dc_release) uses it. */
+void fpr_vec_release(V v) { vfree((vec_t *)v); }
 
 static V h_new(V unit) {
   (void)unit;
@@ -308,7 +270,7 @@ static V h_new_like(vec_t *src) {
 }
 
 static V h_push(V v, V vec) {
-  vec_t *x = cow_wr(vchk(vec, "Vec.push: not a Vector"));
+  vec_t *x = vchk(vec, "Vec.push: not a Vector");
   if (VREP(x) == VR_UNSET) fix_layout(x, v);
   for (uw k = 0; k < x->ncols; k++)
     if (x->len == x->cols[k]->cap) col_grow(x->cols[k]);
@@ -377,7 +339,7 @@ static V h_get(V iv, V vec) {
 }
 
 static V h_set(V iv, V v, V vec) {
-  vec_t *x = cow_wr(vchk(vec, "Vec.set: not a Vector"));
+  vec_t *x = vchk(vec, "Vec.set: not a Vector");
   if (!ISINT(iv)) fpr_cpanic("Vec.set: index not an Int");
   sw i = UNTAG(iv);
   if (i < 1 || (uw)i > x->len) fpr_cpanic("Vec.set: index out of range");
@@ -402,7 +364,7 @@ static void vfree(vec_t *x) {
 }
 
 static V h_free(V vec) {
-  cow_rel(vchk(vec, "Vec.free: not a Vector"));
+  vfree(vchk(vec, "Vec.free: not a Vector"));
   return (V)&fpr_unit;
 }
 
@@ -423,7 +385,7 @@ V fpr_vec_map(V f, V vec) {
    * shape really changes. */
   V out = x->fkinds ? h_new_like(x) : h_new((V)&fpr_unit);
   for (uw i = 0; i < x->len; i++) out = h_push(fpr_apply(f, row_at(x, i)), out);
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return out;
 }
 
@@ -433,11 +395,10 @@ V fpr_vec_map(V f, V vec) {
  * column that scans fuse, compaction deferred to Vec.compact or
  * Sys.poolReset); until that lands with the mask-fusing loops, eager
  * compaction is the correct simple thing.  Capacity beyond the new
- * length stays attached (it recycles with the column).
- * cow_wr FIRST: compaction is a write like any other -- filtering a
- * dup'd/shared vector must not mutate the other holder's view. */
+ * length stays attached (it recycles with the column).  In-place is
+ * sound unconditionally now: no CoW, one owner, real copies. */
 V fpr_vec_filter(V f, V vec) {
-  vec_t *x = cow_wr(vchk(vec, "Vec.filter: not a Vector"));
+  vec_t *x = vchk(vec, "Vec.filter: not a Vector");
   uw j = 0;
   for (uw i = 0; i < x->len; i++) {
     V row = row_at(x, i);
@@ -492,7 +453,7 @@ static V h_toList(V vec) {
     *(V *)((char *)c + 8 + sizeof(uw)) = acc;
     acc = (V)c;
   }
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return acc;
 }
 
@@ -510,7 +471,7 @@ static V h_split(V nv, V vec) {
   V hi = x->fkinds ? h_new_like(x) : h_new((V)&fpr_unit);
   for (uw i = 0; i < (uw)n; i++) lo = h_push(row_at(x, i), lo);
   for (uw i = (uw)n; i < x->len; i++) hi = h_push(row_at(x, i), hi);
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return mktup2(lo, hi);
 }
 
@@ -634,12 +595,13 @@ static V h_iota(V nv) {
 
 static V h_dup(V vec) {
   vec_t *x = vchk(vec, "Vec.dup: not a Vector");
-  cow_inc(x); /* CoW: both names share until one writes */
-  return mktup2((V)x, (V)x);
+  /* an HONEST copy (v2): two independent owners from this point --
+   * the cost is visible at the dup, not smuggled into the next write */
+  return mktup2((V)vcopy(x), (V)x);
 }
 
 static V h_axpb(V av, V bv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.axpb: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.axpb: not a Vector");
   sw a = UNTAG(av), b = UNTAG(bv);
   if (gpu_axpb_exact(x, a, b)) return (V)x;
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = a * p[i] + b; });
@@ -647,28 +609,28 @@ static V h_axpb(V av, V bv, V vec) {
 }
 
 static V h_sar(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.sar: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.sar: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] >>= k; });
   return (V)x;
 }
 
 static V h_minS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.minS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.minS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < k ? p[i] : k; });
   return (V)x;
 }
 
 static V h_maxS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.maxS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.maxS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] > k ? p[i] : k; });
   return (V)x;
 }
 
 static V h_ges(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.ges: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.ges: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] >= k; });
   return (V)x;
@@ -682,11 +644,11 @@ static vec_t *vzip2(V dv, V sv, const char *who) {
 }
 #define VS_ZIP(dv, sv, WHO, EXPR)                                            \
   do {                                                                       \
-    vec_t *_d = cow_wr(vnum(dv, WHO)), *_s = vzip2(dv, sv, WHO);             \
+    vec_t *_d = vnum(dv, WHO), *_s = vzip2(dv, sv, WHO);             \
     uw _n = _d->len;                                                         \
     sw *p = (sw *)_d->cols[0]->base, *q = (sw *)_s->cols[0]->base;           \
     for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
-    cow_rel(_s);                                                             \
+    vfree(_s);                                                               \
     return (V)_d;                                                            \
   } while (0)
 
@@ -698,7 +660,7 @@ static V h_zipDiv(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipDiv", B == 0 ? 0 : A / B)
 
 /* gather: idx[i] := src[idx[i]] (out of range -> 0); src threads back */
 static V h_gather(V iv, V sv) {
-  vec_t *x = cow_wr(vnum(iv, "Vec.gather: not a Vector"));
+  vec_t *x = vnum(iv, "Vec.gather: not a Vector");
   vec_t *s = vnum(sv, "Vec.gather: not a Vector");
   VS_BLOCKS(x, {
     for (uw i = 0; i < n; i++) {
@@ -713,7 +675,7 @@ static V h_gather(V iv, V sv) {
 static V h_blend(V mv, V sv, V dv) {
   vec_t *m = vnum(mv, "Vec.blend: not a Vector");
   vec_t *s = vnum(sv, "Vec.blend: not a Vector");
-  vec_t *d = cow_wr(vnum(dv, "Vec.blend: not a Vector"));
+  vec_t *d = vnum(dv, "Vec.blend: not a Vector");
   if (m->len != d->len || s->len != d->len) fpr_cpanic("Vec.blend: length mismatch");
   {
     uw n = d->len;
@@ -721,7 +683,7 @@ static V h_blend(V mv, V sv, V dv) {
        *ps = (sw *)s->cols[0]->base;
     for (uw i = 0; i < n; i++) pd[i] = pm[i] ? ps[i] : pd[i];
   }
-  cow_rel(m); cow_rel(s);
+  vfree(m); vfree(s);
   return (V)d;
 }
 
@@ -739,7 +701,7 @@ static V h_slice(V ov, V nv, V vec) {
 /* burst: dst[off..] := src, contiguously; src consumed */
 static V h_burst(V ov, V sv, V dv) {
   vec_t *s = vnum(sv, "Vec.burst: not a Vector");
-  vec_t *d = cow_wr(vnum(dv, "Vec.burst: not a Vector"));
+  vec_t *d = vnum(dv, "Vec.burst: not a Vector");
   if (!ISINT(ov)) fpr_cpanic("Vec.burst: offset not an Int");
   sw off = UNTAG(ov);
   if (off < 0 || (uw)off + s->len > d->len) fpr_cpanic("Vec.burst: out of range");
@@ -747,7 +709,7 @@ static V h_burst(V ov, V sv, V dv) {
     sw *pd = (sw *)d->cols[0]->base + off;
     for (uw i = 0; i < n; i++) pd[i] = p[i];
   });
-  cow_rel(s);
+  vfree(s);
   return (V)d;
 }
 
@@ -761,13 +723,13 @@ static V h_zipEq(V dv, V sv)  { VS_ZIP(dv, sv, "Vec.zipEq", A == B); }
 static V h_zipMax(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipMax", A > B ? A : B); }
 
 static V h_absv(V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.absv: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.absv: not a Vector");
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < 0 ? -p[i] : p[i]; });
   return (V)x;
 }
 
 static V h_eqS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.eqS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.eqS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] == k; });
   return (V)x;

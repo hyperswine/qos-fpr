@@ -384,6 +384,8 @@ builtinEnv =
       -- SMP actors: messages are polymorphic; an actor id is an Int.
       -- send : Actor -> msg -> Unit ; receive : Actor -> msg
       ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
       ("receive", scheme [0] (TFn tInt (sv 0))),
       ("receiveRes", scheme [0, 1] (TFn tInt (tcon "Result" [sv 0, sv 1]))),
       ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
@@ -1099,6 +1101,11 @@ linShapeT linNs = go
 -- are TFn and shape LU, exactly right).
 builtinLinShapes :: [Name] -> M.Map Name ([LShape], LShape)
 builtinLinShapes linNs =
+  -- sendLinear MOVES its payload: the polymorphic type would derive LU
+  -- (a quantified var is never the carrier), but move semantics is the
+  -- verb's whole meaning, so the consume is declared here explicitly --
+  -- passing a linear value consumes it exactly like Vec.free does.
+  M.insert "sendLinear" ([LU, LL], LU) $
   M.fromList
     [ (n, (map (linShapeT linNs) ps, linShapeT linNs r))
       | (n, Forall _ _ t) <- M.toList builtinEnv,

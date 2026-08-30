@@ -334,6 +334,8 @@ builtinEnv =
       ("read", scheme [0, 1] (TFn (sv 0) (sv 1))),
       -- the actor shim (VM.hs): same schemes as the AOT tier's Infer
       ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
       ("receive", scheme [0] (TFn tInt (sv 0))),
       ("receiveFrom", scheme [0] (TFn tInt (TFn tInt (sv 0)))),
       ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),

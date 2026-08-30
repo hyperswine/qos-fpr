@@ -1096,6 +1096,55 @@ static V a_send(V av, V m) {
   return fpr_send_as((uw)fpr_hart()->current, av, m);
 }
 
+/* sendLinear: MOVE the message (docs/MEMORY.md v2, the send triad).
+ * The compiler's linearity checker consumes the payload argument, so
+ * the sender's binding is unusable afterward -- send_linear IS the
+ * value's release.  Mechanism, two cases:
+ *
+ *   TRANSFER -- the value is a received message root (ownerless slab,
+ *   tracked in the ARC table, fpr_arc_movable_root): enqueue the SAME
+ *   pointer.  No copy, no incref -- the one standing count changes
+ *   hands, and the receiver's ordinary drop parks the slab exactly as
+ *   if it had been sent fresh.  A relay chain (the frames ping-pong)
+ *   is zero-copy end to end.
+ *
+ *   COPY+CONSUME -- anything else (a locally built value, a child of
+ *   a still-held message): deep-copy like send, then release what the
+ *   sender owned.  A Vector root is freed on the spot (its columns
+ *   are the bulk); other locals stay pool-scoped, consumed in the
+ *   checker's eyes and reclaimed with the pool as ever.
+ *
+ * A dead target still consumes: the contract is "this value left me",
+ * so it is released exactly as a received-then-dropped message would
+ * be, never silently retained. */
+static V a_send_linear(V av, V m) {
+  if (fpr_sched) return fpr_sched->send_as((uw)fpr_hart()->current, av, m);
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("sendLinear: target is not an actor");
+  acb_t *a = (acb_t *)av;
+  int movable = fpr_arc_movable_root(m);
+  if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD) {
+    if (movable) fpr_arc_decref(m); /* the drop the receiver would have done */
+    else if (!ISINT(m) && fpr_in_heap(m) && TID(m) == T_VEC)
+      fpr_vec_release(m);
+    return (V)&fpr_unit;
+  }
+  chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
+  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP)
+    fpr_cpanic("sendLinear: per-sender channel full");
+  if (!movable) {
+    V orig = m;
+    m = fpr_msg_copy(m);
+    fpr_arc_incref(m);
+    if (!ISINT(orig) && fpr_in_heap(orig) && TID(orig) == T_VEC)
+      fpr_vec_release(orig); /* the bulk case: consume frees it now */
+  }
+  c->ring[c->rt % RING_CAP] = m;
+  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
+  wake(a);
+  return (V)&fpr_unit;
+}
+
 /* ---- the SYSCALL MAILBOX (process.c's trampoline) -------------------
  * A dormant acb that is never scheduled: var is pinned ST_READY so a
  * sender's wake CAS(BLOCKED->READY) always fails -- replies are
@@ -1252,7 +1301,37 @@ static V g_fuel_preempts(V d) {
 /* ---- the discoverable-symbol table ------------------------------------ */
 FPR_FN(fpr_g_spawn, a_spawn, 1);
 FPR_FN(fpr_g_spawnOn, a_spawn_at, 2);
+/* sendArc: SHARE by explicit promotion (docs/MEMORY.md v2) -- the
+ * only path by which an object becomes cross-actor shared.  The
+ * pointer itself crosses (no copy); the object is FROZEN BY CONTRACT
+ * from this send onward (writes after sharing are races the runtime
+ * cannot see -- which is why a Vector, linear bulk whose whole point
+ * is mutation, is refused: move it or copy it).  Every holder,
+ * sender included, releases with `drop`; the last drop reclaims.
+ * Deep trees reclaim shallowly at zero (children are pool-scoped) --
+ * share flat records/tuples, or accept pool lifetime for the rest. */
+static V a_send_arc(V av, V m) {
+  if (fpr_sched) return fpr_sched->send_as((uw)fpr_hart()->current, av, m);
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("sendArc: target is not an actor");
+  if (!ISINT(m) && fpr_in_heap(m) && TID(m) == T_VEC)
+    fpr_cpanic("sendArc: a Vector is linear bulk -- sendLinear moves it, send copies it");
+  acb_t *a = (acb_t *)av;
+  if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD)
+    return (V)&fpr_unit; /* no promotion happened; sender keeps sole ownership */
+  chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
+  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP)
+    fpr_cpanic("sendArc: per-sender channel full");
+  fpr_arc_promote_share(m);
+  c->ring[c->rt % RING_CAP] = m;
+  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
+  wake(a);
+  return (V)&fpr_unit;
+}
+
 FPR_FN(fpr_g_send, a_send, 2);
+FPR_FN(fpr_g_sendLinear, a_send_linear, 2);
+FPR_FN(fpr_g_sendArc, a_send_arc, 2);
 FPR_FN(fpr_g_receive, a_receive, 1);
 FPR_FN(fpr_g_receiveFrom, a_receive_from, 2);
 FPR_FN(fpr_g_receiveRes, a_receive_res, 1);

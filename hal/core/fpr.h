@@ -170,6 +170,8 @@ extern char *fpr_static_lo, *fpr_static_hi;
 fpr_slab_t *fpr_slab_new(uw want);   /* runtime.c: buddy-backed pool slab */
 void fpr_pool_reset_c(void);         /* runtime.c: Sys.poolReset, C-callable */
 uw fpr_arc_live_count(void);         /* runtime.c: the arc gauge */
+int fpr_arc_movable_root(V v);       /* runtime.c: sendLinear's transfer test */
+void fpr_arc_promote_share(V v);     /* runtime.c: sendArc's promotion */
 V fpr_receive_res_c(V me);           /* actors.c: receiveRes, C-callable */
 void fpr_fuel_exhausted(void);       /* actors.c: the fuel trap */
 
@@ -446,7 +448,6 @@ V fpr_realloc(V obj, V raw_bytes); /* grow to a new payload size (copy-based;
 void fpr_free(V obj);     /* returns to the free list (sizes <= 8 KiB) */
 int fpr_in_heap(V v);     /* heap pointer (promotable) vs int/immortal static */
 V fpr_msg_copy(V v);      /* deep copy into one ownerless message slab */
-void fpr_vec_share(V v);  /* CoW rc++ (vec.c) */
 void fpr_arc_incref(V v);
 void fpr_arc_decref(V v);
 uw fpr_arc_live(void);

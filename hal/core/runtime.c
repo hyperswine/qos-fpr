@@ -6,6 +6,7 @@
  * extern that hal.c (or any other module) satisfies at link time.
  */
 #include "fpr.h"
+#include "vec_layout.h" /* the deep copier lays vectors into slabs */
 #ifdef FPR_QOSAPP
 #include "qos_abi.h"
 #endif
@@ -535,8 +536,10 @@ void fpr_free(V v) {
  * zero word is copied verbatim, never recursed.  Special tids:
  *   T_STR/T_BITS/T_DEVICE/T_REGISTER  raw bytes, no V fields
  *   T_PAP                              nargs known in the struct
- *   T_VEC                              SHARED by CoW rc++ (vec.c) --
- *                                      handles keep pool lifetime
+ *   T_VEC                              COPIED like everything else
+ *                                      (v2: header, cols, and column
+ *                                      data all land in the slab --
+ *                                      vec_layout.h is the contract)
  *   T_ACTOR                            immortal acb: share pointer
  *   T_SSTR                             linear-local: refused honestly
  *   T_LIST var 1                       spine iterated, not recursed
@@ -545,11 +548,13 @@ void fpr_free(V v) {
  * never correctness).  fpr_dcopy also serves `keep` (retention into
  * the caller's own pool) with fpr_alloc as the allocator. */
 
-void fpr_vec_release(V v); /* vec.c: cow_rel */
+void fpr_vec_release(V v); /* vec.c: the universal vector free */
 
-/* release the vec references a message copy holds (+1 at dc_dup time,
- * -1 here at the root's final drop) -- runs only on ownerless message
- * slabs, whose content is immutable and private until this moment */
+/* release what a dropped message root still owns OUTSIDE its slab:
+ * slab-resident cells die with the slab wholesale, but a received
+ * vector the receiver GREW reallocated its column bases into the
+ * receiver's pool -- fpr_vec_release frees those (and no-ops on the
+ * slab pieces).  Runs only on ownerless message slabs at final drop. */
 static void dc_release(V v) {
   if (ISINT(v) || !v || !fpr_in_heap(v)) return;
   hdr_t *h = (hdr_t *)v;
@@ -583,12 +588,28 @@ static void dc_release(V v) {
 
 typedef struct { char *hp; fpr_slab_t *sl; } dctx_t;
 
+/* a fresh cell's slab footprint: fpr_alloc's exact rounding + header */
+static uw dc_cellsz(uw raw) { return (((raw + 15) & ~(uw)15)) + 16; }
+
 static uw dc_size(V v) {
   if (ISINT(v) || !v || !fpr_in_heap(v)) return 0;
   uw total = *(uw *)((char *)v - 16);
   hdr_t *h = (hdr_t *)v;
   switch (h->tid) {
-    case T_VEC: case T_ACTOR: return 0; /* shared, not copied */
+    case T_ACTOR: return 0; /* immortal acb: shared, not copied */
+    case T_VEC: {
+      vec_t *x = (vec_t *)v;
+      uw n = dc_cellsz(sizeof(vec_t));
+      for (uw k = 0; k < x->ncols; k++) {
+        if (!x->cols[k]) continue;
+        n += dc_cellsz(sizeof(col_t));
+        if (x->len) n += dc_cellsz(x->len * sizeof(uw));
+        if (!((x->kinds >> k) & 1)) /* boxed column: elements recurse */
+          for (uw i = 0; i < x->len; i++)
+            n += dc_size((V)x->cols[k]->base[i]);
+      }
+      return n;
+    }
     case T_SSTR: fpr_cpanic("send/keep: SString is linear-local");
     case T_STR: case T_BITS: case T_DEVICE: case T_REGISTER: return total;
     case T_PAP: {
@@ -629,14 +650,54 @@ static V dc_cell(V v, dctx_t *c, uw total) {
   return (V)(p + 16);
 }
 
+/* a FRESH cell in the slab (no source memcpy): the vec copier builds
+ * its header/cols/data cells directly */
+static V dc_bump(dctx_t *c, uw raw) {
+  uw total = dc_cellsz(raw);
+  char *p = c->hp;
+  c->hp += total;
+  *(uw *)p = total;
+  *(fpr_slab_t **)(p + 8) = c->sl;
+  return (V)(p + 16);
+}
+
 static V dc_dup(V v, dctx_t *c) {
   if (ISINT(v) || !v || !fpr_in_heap(v)) return v;
   uw total = *(uw *)((char *)v - 16);
   hdr_t *h = (hdr_t *)v;
   switch (h->tid) {
-    case T_VEC:
-      fpr_vec_share(v); /* CoW rc++ (vec.c) */
-      return v;
+    case T_VEC: {
+      /* the whole vector -- header, col_t's, column spans -- lands in
+       * the message slab: one message = one slab, vectors included.
+       * cap = len (tight): a later push on the receiver's side grows
+       * through fpr_realloc into ITS pool; the slab cell is then
+       * "freed" as a no-op and dies with the slab at root drop. */
+      vec_t *x = (vec_t *)v;
+      vec_t *n = (vec_t *)dc_bump(c, sizeof(vec_t));
+      n->tid = T_VEC;
+      n->var = x->var;
+      n->len = x->len; n->eltid = x->eltid; n->elvar = x->elvar;
+      n->ncols = x->ncols; n->kinds = x->kinds; n->fkinds = x->fkinds;
+      for (uw k = 0; k < VMAXCOLS; k++) n->cols[k] = 0;
+      for (uw k = 0; k < x->ncols; k++) {
+        if (!x->cols[k]) continue;
+        col_t *nc = (col_t *)dc_bump(c, sizeof(col_t));
+        nc->cap = 0;
+        nc->base = 0;
+        if (x->len) {
+          nc->base = (uw *)dc_bump(c, x->len * sizeof(uw));
+          nc->cap = x->len;
+          if ((x->kinds >> k) & 1)
+            __builtin_memcpy(nc->base, x->cols[k]->base,
+                             x->len * sizeof(uw));
+          else /* boxed column: elements are Vs, copy them too */
+            for (uw i = 0; i < x->len; i++)
+              nc->base[i] = (uw)dc_dup((V)x->cols[k]->base[i], c);
+        }
+        n->cols[k] = nc;
+      }
+      return (V)n;
+    }
     case T_ACTOR: return v;
     case T_STR: case T_BITS: case T_DEVICE: case T_REGISTER:
       return dc_cell(v, c, total);
@@ -675,7 +736,7 @@ static V dc_dup(V v, dctx_t *c) {
  * itself when there is nothing to copy: ints, statics, bare handles) */
 V fpr_msg_copy(V v) {
   uw need = dc_size(v);
-  if (!need) return dc_dup(v, 0); /* handles the bare-vec rc++ too */
+  if (!need) return dc_dup(v, 0); /* ints, statics, bare actor handles */
   fpr_slab_t *sl = 0;
   if (fpr_is_process && fpr_grow_memory) {
     sl = grant_take(need);
@@ -706,14 +767,42 @@ V fpr_msg_copy(V v) {
 }
 
 /* keep: retain a received value past its message's drop -- a deep copy
- * into the CALLER'S OWN pool (fpr_alloc), vecs shared by rc++.  This is
- * the one retention annotation the turn-scoped model needs. */
+ * into the CALLER'S OWN pool (fpr_alloc), vectors included (v2: a
+ * kept vector is the keeper's own; nothing outlives its slab by
+ * reference).  This is the one retention annotation the turn-scoped
+ * model needs. */
 static V kp_dup(V v) {
   if (ISINT(v) || !v || !fpr_in_heap(v)) return v;
   uw total = *(uw *)((char *)v - 16);
   hdr_t *h = (hdr_t *)v;
   switch (h->tid) {
-    case T_VEC: fpr_vec_share(v); return v;
+    case T_VEC: {
+      vec_t *x = (vec_t *)v;
+      vec_t *n = (vec_t *)fpr_alloc(sizeof(vec_t));
+      n->tid = T_VEC;
+      n->var = x->var;
+      n->len = x->len; n->eltid = x->eltid; n->elvar = x->elvar;
+      n->ncols = x->ncols; n->kinds = x->kinds; n->fkinds = x->fkinds;
+      for (uw k = 0; k < VMAXCOLS; k++) n->cols[k] = 0;
+      for (uw k = 0; k < x->ncols; k++) {
+        if (!x->cols[k]) continue;
+        col_t *nc = (col_t *)fpr_alloc(sizeof(col_t));
+        nc->cap = 0;
+        nc->base = 0;
+        if (x->len) {
+          nc->base = (uw *)fpr_alloc(x->len * sizeof(uw));
+          nc->cap = x->len;
+          if ((x->kinds >> k) & 1)
+            __builtin_memcpy(nc->base, x->cols[k]->base,
+                             x->len * sizeof(uw));
+          else
+            for (uw i = 0; i < x->len; i++)
+              nc->base[i] = (uw)kp_dup((V)x->cols[k]->base[i]);
+        }
+        n->cols[k] = nc;
+      }
+      return (V)n;
+    }
     case T_ACTOR: return v;
     case T_SSTR: fpr_cpanic("keep: SString is linear-local");
     case T_STR: case T_BITS: case T_DEVICE: case T_REGISTER: {
@@ -941,10 +1030,6 @@ void fpr_arc_decref(V v) {
     arct[i].ptr = ARC_TOMB; /* tombstone keeps probe chains intact */
     arc_live--;
     fpr_slab_t *sl = slab_of(v);
-    if (!ISINT(v) && TID(v) == T_VEC) {
-      /* a bare vec handle sent as the root: release its share */
-      fpr_vec_release(v);
-    }
     if (sl) {
       if (!sl->owner) dc_release(v); /* message slab: release its vecs */
       sl->escaped--;
@@ -1028,6 +1113,55 @@ static V g_poolReset(V u) {
 FPR_FN(fpr_g_Sys_x2epoolReset, g_poolReset, 1);
 void fpr_pool_reset_c(void) { g_poolReset((V)&fpr_unit); }
 uw fpr_arc_live_count(void) { return arc_live; }
+
+/* sendArc's promotion (actors.c): count = HOLDERS.  A value with no
+ * entry yet gains one at count 1 -- the SENDER's standing share, since
+ * the sender keeps using what it shared -- and every send adds the
+ * receiver's share on top.  A message root (already counted once for
+ * its current holder) just gains the receiver's.  Every holder
+ * releases with `drop`; the last drop reclaims exactly as today.
+ * First promotion of a pool value pins its slab (escaped++), so the
+ * shared object outlives the sender's poolReset/death by the existing
+ * orphan machinery.  This is the v1 mechanism; the mailbox-serialized
+ * ARC.qa (docs/MEMORY-V2-PLAN.md phase 4) replaces the table+lock
+ * underneath without changing this contract. */
+void fpr_arc_promote_share(V v) {
+  if (fpr_sched) { fpr_sched->arc_incref(v); return; }
+  if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
+  fpr_lock(&arc_lock);
+  int found;
+  uw i = arc_probe(v, &found);
+  if (!found) {
+    arct[i].ptr = v;
+    arct[i].cnt = 1; /* the sender's standing share */
+    arc_live++;
+    fpr_slab_t *sl = slab_of(v);
+    if (sl) sl->escaped++;
+  }
+  arct[i].cnt++; /* the receiver's share */
+  fpr_unlock(&arc_lock);
+}
+
+/* is v a TRACKED message root living in an ownerless slab?  The exact
+ * precondition for sendLinear's zero-copy transfer (actors.c): such a
+ * root carries the ONE standing ARC count for its slab, so handing the
+ * pointer to another actor hands the count with it -- no copy, no
+ * incref, and the receiver's ordinary drop parks the slab as ever.
+ * Anything else (a local value, a CHILD of a still-held message)
+ * fails here and takes the copy path -- a child's slab lifetime
+ * belongs to its parent root, never to a forwarded pointer. */
+int fpr_arc_movable_root(V v) {
+  if (fpr_sched) return 0; /* shared plane: conservative copy path */
+  if (!fpr_in_heap(v) || ISINT(v)) return 0;
+  if (TID(v) == T_ACTOR) return 0; /* handles: no preheader, share raw */
+  fpr_slab_t *sl = slab_of(v);
+  if (!sl || sl->owner) return 0;
+  fpr_lock(&arc_lock);
+  int found;
+  arc_probe(v, &found);
+  fpr_unlock(&arc_lock);
+  return found;
+}
 
 /* ---- Sys.sleepUs: waitTick without pegging a core --------------------
  * The HAL hook actually sleeps where the host can (qosp: nanosleep);

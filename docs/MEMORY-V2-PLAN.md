@@ -4,7 +4,7 @@ docs/MEMORY.md states the v2 contract; this file maps every [pending]
 marker to the mechanisms it replaces, file:line, in landing order.
 The rule for the whole plan: each phase DELETES more mechanism than it
 adds, and no phase changes what programs mean except where a verb
-(`send_linear`, `send_arc`) makes a cost explicit that was implicit.
+(`sendLinear`, `sendArc`) makes a cost explicit that was implicit.
 
 Done on this branch — foundations, then phases 1 and 2:
 * `buddy_realloc` — buddy.c, proven by qos/tests-host/buddy-check.sh
@@ -64,34 +64,56 @@ the full qosp-reachable golden set byte-identical.
   Sol tiers agree; pathnotes/livereload (plugins, hot-swap, disk)
   green; buddy-check green.
 
-## Phase 3 — the send triad (delete vec CoW)
+## Phase 3 — the send triad (delete vec CoW) **[LANDED]**
 
-* `send` = deep copy, NO exceptions. The vec CoW rc (vec.c:105-118,
-  rc packed in `var`) exists only to make `Vec.dup` and message
-  sharing O(1); with `send_linear` covering the hot path, delete it:
-  `Vec.dup` becomes an honest copy, and BOTH CoW soundness holes
-  (the Vec.filter in-place compaction, the specialized-tier writes
-  that skip the rc test) cease to exist rather than get fixed.
-* `send_linear` moves ownership: the message carries the root; vec
-  columns and big blocks reparent O(1) (they are buddy blocks — the
-  transfer is a header/owner update), the small spine deep-copies
-  into the receiver's pool like any message. Compiler surface:
-  builtinEnv entry with a consume-linearity shape (Infer.hs derives
-  shapes from builtinEnv already — extend that table, never a
-  parallel one), Codegen call emission, Sol VM parity, and the
-  frames idiom in std/ moves onto it (tests/frames.fpr is the gate:
-  199 bounces, arcLive 0, now with zero copies).
-* `send_arc` promotes by OWNERSHIP TRANSFER to ARC.qa (phase 4).
+* `send` = deep copy, NO exceptions: the vec CoW rc is deleted and
+  fpr_dcopy gained a real T_VEC case — header, col_t's, and column
+  spans all land in the message slab (kp_dup mirrors it for `keep`;
+  vec_layout.h is the shared contract; boxed columns recurse their
+  elements). Both CoW soundness holes ceased to exist, plus a third
+  the deletion surfaced: a CoW-shared vector's storage died with the
+  SENDER's pool regardless of rc.
+* `sendLinear` moves — by a BETTER mechanism than the planned block
+  reparenting: since a vector now lives INSIDE its message slab, a
+  received root transfers as the same pointer (fpr_arc_movable_root:
+  tracked + ownerless slab), no copy, no count change — the standing
+  ARC count changes hands. Locals deep-copy and release (a Vector
+  root is freed on the spot). The checker consumes the payload via
+  an explicit builtinLinShapes override (a polymorphic type would
+  derive LU); reuse-after-move is refused by name. Sol runs it as
+  send (immutable values: move == send).
+* tests/frames.fpr REWRITTEN onto the relay idiom — the old
+  ping-pong (retain a vec out of a dropped message) became a
+  copy-on-retain violation the moment vec copies were real; the new
+  spelling has no drops in the loop and holds ARC-flat at arcLive=1.
+  tests/sendlin.fpr is the qosp gate (200 zero-copy bounces + the
+  compile-time refusal), wired into check-all.
+
+## Phase 4 groundwork — sendArc on the v1 mechanism **[LANDED]**
+
+* `sendArc` is live as the ONE explicit promotion path:
+  fpr_arc_promote_share (count = HOLDERS; the sender's standing
+  share is created at first promotion, each send adds the
+  receiver's, every holder releases with `drop`; first promotion
+  pins the slab so the shared object survives sender death by the
+  existing orphan machinery). The pointer crosses uncopied; frozen
+  by contract; a Vector is refused at compile time (a bare linear
+  use is already a second use) AND at runtime (the generic-typed
+  sneak path panics by name). tests/sendarc.fpr: one tuple, three
+  holders, arcLive balanced; in check-all.
+* Deep trees reclaim SHALLOWLY at count-zero (children are
+  pool-scoped) — share flat records/tuples, or accept pool lifetime.
+  The full ARC.qa (below) lifts this along with the table.
 
 ## Phase 4 — ARC.qa owns promotion (delete the ARC table + orphan slabs)
 
-Today: a 1024-entry open-addressed table under arc_lock
-(runtime.c:874-948) that PANICS when full, plus escaped-counts and
-orphaned slabs (fpr.h slab comments) so cross-actor references never
-dangle. v2:
+The sendArc CONTRACT above is final; what remains is replacing the
+mechanism underneath it. Today: a 1024-entry open-addressed table
+under arc_lock that PANICS when full, plus escaped-counts and
+orphaned slabs so cross-actor references never dangle. v2:
 
-* `send_arc` freezes the object and moves it into ARC.qa's pool
-  (deep-copy once at promotion — promotion is rare by definition);
+* Promotion moves the object into ARC.qa's pool (deep-copy once at
+  promotion — promotion is rare by definition);
   ARC.qa spawns a manager actor per object; INC/DEC are messages to
   that manager; the count is structurally atomic because the mailbox
   linearizes it. DEC-to-zero: dealloc + manager exits.
