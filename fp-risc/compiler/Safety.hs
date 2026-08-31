@@ -68,6 +68,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
     topRefs2 bound e = [n | n <- coll bound e, S.member n topSet]
       where
         coll bs = \case
+          SMark _ x -> coll bs x
           SVar v | not (S.member v bs) -> [v]
           SApp a b -> coll bs a ++ coll bs b
           SLam ps x -> coll (bs <> S.fromList ps) x
@@ -199,6 +200,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
                 Nothing -> False
         -- walk the body: collect (self-call args, path facts, subterm set)
         mcollect facts smaller e = case e of
+          SMark _ x -> mcollect facts smaller x
           SBlock ss fin -> goB facts smaller ss fin
           SCase sc arms ->
             mcollect facts smaller sc
@@ -219,7 +221,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
             goB f sm (st : rest) fin =
               (case st of SBind _ _ x -> mcollect f sm x; SBindPat _ x -> mcollect f sm x)
                 ++ goB f (sm `S.union` stSm sm st) rest fin
-            stSm sm (SBindPat pt (SVar y)) | S.member y sm || isMeasVar y = subPat pt
+            stSm sm (SBindPat pt rhs) | SVar y <- unmark rhs, S.member y sm || isMeasVar y = subPat pt
             stSm _ _ = S.empty
         armF sc pt = case pt of
           PCon "True" [] -> msConj sc
@@ -283,6 +285,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
           SBin o a b -> SBin o (goR a) (goR b)
           _ -> e
     bindsAny vs e = case e of
+      SMark _ x -> bindsAny vs x
       SBlock ss fin -> any stB ss || bindsAny vs fin
       SCase sc arms -> bindsAny vs sc || any (bindsAny vs . snd) arms
       SApp a b -> bindsAny vs a || bindsAny vs b
@@ -292,6 +295,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
       where
         stB (SBind x _ rhs) = S.member x vs || bindsAny vs rhs
         stB (SBindPat pt rhs) = any (`S.member` vs) (patVars pt) || bindsAny vs rhs
+    mspine (SMark _ e) acc = mspine e acc
     mspine (SApp f a) acc = mspine f (a : acc)
     mspine h acc = (h, acc)
     -- rule 2: taint from marked, non-library callees

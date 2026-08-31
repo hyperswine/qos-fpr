@@ -179,6 +179,7 @@ specialize sigs structs tops0 = go 0 tops0 (SpecSt S.empty [] [])
     -- bottom-up rewrite; state-threading version of transformE, spine-aware
     rwE :: SExpr -> SpecSt -> (SExpr, SpecSt)
     rwE e0 st = case e0 of
+      SMark o e -> let (e', s) = rwE e st in (SMark o e', s)
       SApp {} -> rwSpine e0 st
       SVar {} -> rwSpine e0 st -- bare generic ref: 0-arg spine (no rewrite)
       SLam ps b -> let (b', s) = rwE b st in (SLam ps b', s)

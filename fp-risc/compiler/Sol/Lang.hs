@@ -98,6 +98,7 @@ collectShapes tops = M.fromList (zip allShapes [100 ..])
       PTup ps -> concatMap patShapes ps
       _ -> []
     exprShapes = \case
+      SMark _ e -> exprShapes e
       SRec fs -> [sort (map fst fs)] ++ concatMap (exprShapes . snd) fs
       SApp a b -> exprShapes a ++ exprShapes b
       SLam _ e -> exprShapes e

@@ -33,25 +33,42 @@ definition by the error sinks (Compile.hs, Sol/Main.hs):
   simply pass through unanchored — graceful, never wrong.
 
 check-all's "spans" leg holds the contract: a type error anchors to
-the sig line, a linearity error to the bind, a module bind to its own
-file.
+the sig line, a linearity error to the named token, a module bind to
+its own file, and a repeated token to the offending statement.
 
-## Step 2 — statement precision via a locator  [NEXT]
+## Step 2 — statement precision via a locator  [LANDED]
 
 Most error texts name a token (a variable, an operator, a field).
-Given the bind's line range (its anchor to the next top's), scan for
-the named token and report file:line:col; say so when ambiguous.
-Printer-only, still no AST change.
+`anchorMsg` (FPRISC.hs) extracts it — the first 'quoted' token, else
+the name after "application of " — and scans the bind's source range
+(anchor line to the next col-0 definition) with identifier-boundary
+matching; a unique hit upgrades the anchor to `file:line:col`.
+Printer-only, no AST change: the bind-line fallback of step 1 stays
+the floor, never wrong.
 
-## Step 3 — real spans, bounded  [LATER]
+## Step 3 — real spans, bounded  [LANDED]
 
-One wrapper node `SMark !Int SExpr` at BLOCK-STATEMENT and CASE-ARM
-granularity, ids into a side table of parser positions.  Bounded
-churn: the traversals are shared now (one desugar, transformE/EP),
-each pass skips SMark in one place, and step 0's strip keeps every
-pin intact.  Infer's marker-site machinery (newSite / markerPrefix)
-is the in-tree model for threading ids and rewriting them out; holes
-and operator sites get real spans the day the wrapper lands.
+One wrapper node `SMark !Int SExpr` (the Int is the raw source
+offset) at BLOCK-STATEMENT and CASE-ARM granularity: the parser
+stamps each statement's RHS and each arm's body via `getOffset`.
+Infer threads the innermost mark (`iHere`) and prefixes every error
+it reports with an `@OFF~ ` stamp; `anchorMsg` resolves the stamp to
+`file:line:col` and strips it — so a type error points at the
+OFFENDING STATEMENT even when the named token appears on many lines,
+and case-arm errors land on the arm.  The token locator (step 2)
+remains the refinement within a statement and the fallback for
+unstamped messages (linearity, preconds, safety).
+
+Costs held to the plan: every traversal either preserves marks
+(transformE/EP, Struct's rewriter, Precond, Infer's rebuild), strips
+them at its boundary (desugar's `dExpr` — Core stays markless), or
+looks through them via `unmark` where a pass pattern-matches on
+statement SHAPE (autodrop, linearity, Safety's measure descent).
+`stripPosTops` (step 0) erases marks before hashing in BOTH hashers —
+Modules.hs and Sol/Mod.hs — so every pinned hash is unchanged (the
+golden sweep's printed pins are the regression test).  Infer's
+marker-site machinery (newSite / markerPrefix) stays the model for
+holes and operator sites.
 
 Not chosen: a span field in every constructor.  Best precision, but
 it touches every pattern match in every pass at once — statement

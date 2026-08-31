@@ -132,18 +132,25 @@ compileMain = do
   lr <- loadProgram preludeTops inp rootTops
   case lr of
     Left e -> putStrLn e >> exitFailure
-    Right (LoadResult tops0RL exports notes units0L root0L rootHash unitAnchors) -> do
+    Right (LoadResult tops0RL exports notes units0L root0L rootHash unitAnchors unitSources) -> do
       mapM_ putStrLn notes
-      -- spans step 1: every "in NAME:" diagnostic below gets anchored
-      -- to NAME's definition line (root + prelude scanned here, spliced
-      -- units by Modules under their qualified names)
+      -- spans steps 1-3: every "in NAME:" diagnostic below gets the
+      -- best available anchor -- a stamped statement offset, the named
+      -- token's position, or NAME's definition line (root + prelude
+      -- scanned here, spliced units by Modules under qualified names)
       let anchors =
             M.unions
               [ bindAnchors inp rootSrc rootTops0,
                 maybe M.empty (\pp -> bindAnchors pp preludeSrc preludeTops) (oPrelude opts),
                 unitAnchors
               ]
-          anchored = map (anchorMsg anchors)
+          sources =
+            M.unions
+              [ M.singleton inp rootSrc,
+                maybe M.empty (`M.singleton` preludeSrc) (oPrelude opts),
+                unitSources
+              ]
+          anchored = map (anchorMsg sources anchors)
       -- first-class paths: validate + desugar @Shape.path literals on the
       -- surface tree, first transform after load (ONE table from the
       -- merged program, so root and unit rewrites agree; the generated

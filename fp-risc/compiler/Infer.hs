@@ -117,6 +117,9 @@ data IEnv = IEnv
     iNextSite :: !Int,
     iSites :: IM.IntMap (Name, Type), -- operator sites awaiting resolution
     iCarriers :: IM.IntMap (Name, Name), -- carrier var -> (param, sig)
+    iHere :: Maybe Int, -- spans step 3: the innermost enclosing SMark's
+                        -- source offset while inference walks under it;
+                        -- report stamps it into diagnostics as "@OFF~ "
     iLinSigs :: [(Name, ([LShape], LShape))] -- INFERRED linearity shapes
       -- per user bind (zonked types -> LShape): the linearity checker
       -- consumes these for functions WITHOUT an explicit sig, closing
@@ -133,7 +136,11 @@ freshR :: I Row
 freshR = do s <- get; put s {iFresh = iFresh s + 1}; pure (RV (iFresh s))
 
 report :: String -> I ()
-report e = modify (\s -> s {iErrs = iErrs s ++ [e]})
+report e = modify (\s -> s {iErrs = iErrs s ++ [stamp (iHere s) e]})
+  where
+    -- the error sinks resolve "@OFF~ " to file:line:col (anchorMsg)
+    stamp (Just o) msg = "@" ++ show o ++ "~ " ++ msg
+    stamp Nothing msg = msg
 
 -- ---- zonking (chase solutions) ----------------------------------------------
 
@@ -757,6 +764,14 @@ recFields _ = Nothing
 
 inferE :: ICtx -> SExpr -> I (Type, SExpr)
 inferE ctx e0 = case e0 of
+  -- position wrapper: remember the statement we are inside (errors
+  -- reported below it carry its offset), infer through, keep the mark
+  SMark o e -> do
+    old <- gets iHere
+    modify (\s -> s {iHere = Just o})
+    (t, e') <- inferE ctx e
+    modify (\s -> s {iHere = old})
+    pure (t, SMark o e')
   -- @paths (parsed by the shared grammar as (Path "…")) are URL strings
   -- in the HostedBytecode profile; the AOT tiers expand them
   -- structurally before inference (expandPathLits) and never reach here
@@ -1077,6 +1092,7 @@ applySites tgts = go
               OpGlobal g -> SApp (SApp (SVar g) (go a)) (go b)
               OpProj s o -> SApp (SApp (SProj (SVar s) [o]) (go a)) (go b)
         | otherwise -> SBin op (go a) (go b)
+      SMark o e -> SMark o (go e)
       SApp a b -> SApp (go a) (go b)
       SLam ps b -> SLam ps (go b)
       SBlock stmts fin -> SBlock (map goS stmts) (go fin)
@@ -1147,7 +1163,7 @@ inferTops = inferTopsWith aotProf
 
 inferTopsWith :: IProf -> Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
 inferTopsWith prof sigs structs tops =
-  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty [])
+  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty Nothing [])
    in (iErrs st, iNotes st, iHolesP st, iLinSigs st, tops')
   where
     aliases = M.fromList [(n, fs) | TShape n fs <- tops]
@@ -1230,6 +1246,7 @@ inferTopsWith prof sigs structs tops =
             where
               go' e = f (step' e)
               step' e = case e of
+                SMark o x -> SMark o (go' x)
                 SApp a b -> SApp (go' a) (go' b)
                 SLam ps x -> SLam ps (go' x)
                 SBlock stmts fin -> SBlock (map goS stmts) (go' fin)
@@ -1377,6 +1394,7 @@ inferTopsWith prof sigs structs tops =
     topRefs2 topSet bound e = [n | n <- coll bound e, S.member n topSet]
       where
         coll bs = \case
+          SMark _ x -> coll bs x
           SVar v | not (S.member v bs) -> [v]
           SApp a b -> coll bs a ++ coll bs b
           SLam ps x -> coll (bs <> S.fromList ps) x

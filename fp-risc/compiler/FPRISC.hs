@@ -35,6 +35,16 @@ type Name = String
 
 data SExpr
   = SVar Name
+  | SMark !Int SExpr -- source position wrapper (spans step 3): the Int
+                     -- is the SOURCE OFFSET in the defining file,
+                     -- attached by the parser at block-statement and
+                     -- case-arm granularity.  INVISIBLE to semantics:
+                     -- shape-sensitive matchers look through it
+                     -- (unmark), stripPosTops erases it before module
+                     -- hashing, the desugarer drops it at the Core
+                     -- boundary.  Infer stamps the innermost enclosing
+                     -- mark into its diagnostics ("@OFF~ "), which the
+                     -- error sinks resolve to file:line:col.
   | SInt Integer
   | SAtom Name
   | SStrI [Seg]
@@ -439,7 +449,7 @@ caseE = do
     -- self-delimiting (every stmt ends in ';' behind a try), so the
     -- arm still stops cleanly at '|' or the clause terminator --
     -- the doX/doX2 helper-splitting idiom is retired.
-    arm = do p <- pattern'; _ <- symbol "->"; (p,) <$> block
+    arm = do p <- pattern'; _ <- symbol "->"; o <- getOffset; b <- block; pure (p, SMark o b)
 
 stringLit :: P SExpr
 stringLit = lexeme $ do
@@ -632,6 +642,7 @@ aritySpill tops = (map top tops, notes)
     refG vs (GBool e) = any (\v -> refE' v e) vs
     refG vs (GPat _ e) = any (\v -> refE' v e) vs
     refE' v e = case e of
+      SMark _ e' -> refE' v e'
       SVar x -> x == v
       SApp a b -> refE' v a || refE' v b
       SLam _ b -> refE' v b
@@ -669,6 +680,7 @@ aritySpill tops = (map top tops, notes)
     unspine e = (e, [])
     respine h = foldl SApp h
     descend e = case e of
+      SMark o a -> SMark o (goE a)
       SApp a b -> SApp (goE a) (goE b)
       SLam x b -> SLam x (goE b)
       SBlock ss fin -> SBlock (map stmt ss) (goE fin)
@@ -732,6 +744,7 @@ autoDrop tops = (tops', concat notess)
                    all (resultIsOrigin known) bs ]
        in if S.null step then known else fixOrigins (S.union known step)
     resultIsOrigin known e = case e of
+      SMark _ e' -> resultIsOrigin known e'
       SBlock _ fin -> resultIsOrigin known fin
       SCase _ arms -> not (null arms) && all (resultIsOrigin known . snd) arms
       _ -> case adHeadName e of
@@ -749,7 +762,8 @@ autoDrop tops = (tops', concat notess)
     -- (fpr_drop_park), where copy-on-retain says every borrow is dead.
     goStmts n (SBind m [] rhs : rest) fin
       | isReceive rhs,
-        (SBindPat p (SVar m') : after) <- rest,
+        (SBindPat p rhsP : after) <- rest,
+        SVar m' <- unmark rhsP,
         m' == m,
         not (refStmts m after || refE m fin),
         not (droppedIn m rest fin) =
@@ -801,9 +815,10 @@ autoDrop tops = (tops', concat notess)
     -- statement itself, a case scrutinee (arms checked recursively),
     -- or a DIRECT argument of a borrowing builtin.  Anything else
     -- containing a bare m refuses shape 3.
-    okUse m (SBindPat _ (SVar x)) | x == m = True
+    okUse m (SBindPat _ rhsP) | SVar x <- unmark rhsP, x == m = True
     okUse m st = all (okE m) (stmtEs st)
     okE m e = case e of
+      SMark _ e' -> okE m e'
       SVar x -> x /= m
       SCase (SVar x) arms | x == m -> all (okE m . snd) arms
       _ | (SVar h, as@(_ : _)) <- adSpine e [],
@@ -821,6 +836,7 @@ autoDrop tops = (tops', concat notess)
       SList es -> all (okE m) es
       SStrI segs -> and [okE m e' | SegExpr e' <- segs]
       _ -> True
+    adSpine (SMark _ e) acc = adSpine e acc
     adSpine (SApp f a) acc = adSpine f (a : acc)
     adSpine e acc = (e, acc)
     dropInto m b =
@@ -850,6 +866,7 @@ autoDrop tops = (tops', concat notess)
       SVar x -> x == m
       _ -> anySub (refE m) e
     anySub f e = case e of
+      SMark _ a -> f a
       SApp a b -> f a || f b
       SLam _ b -> f b
       SBlock ss fin -> any f (concatMap stmtEs ss) || f fin
@@ -864,6 +881,7 @@ autoDrop tops = (tops', concat notess)
       _ -> False
 
 adHeadName :: SExpr -> Maybe Name
+adHeadName (SMark _ e) = adHeadName e
 adHeadName (SVar n) = Just n
 adHeadName (SApp f _) = adHeadName f
 adHeadName _ = Nothing
@@ -1081,15 +1099,17 @@ block = do
       n <- pName
       ps <- many lowerName
       eqSign
+      o <- getOffset
       e <- expr
       _ <- symbol ";"
-      pure (SBind n ps e)
+      pure (SBind n ps (SMark o e))
     patStmt = do
       p <- pattern'
       eqSign
+      o <- getOffset
       e <- expr
       _ <- symbol ";"
-      pure (SBindPat p e)
+      pure (SBindPat p (SMark o e))
 
 --------------------------------------------------------------------------------
 -- Desugaring
@@ -1178,6 +1198,7 @@ collectShapes tops = M.fromList [(fs, shapeIdFor fs) | fs <- allShapes]
       PTup ps -> concatMap patShapes ps
       _ -> []
     exprShapes = \case
+      SMark _ e -> exprShapes e
       SRec fs -> [sort (map fst fs)] ++ concatMap (exprShapes . snd) fs
       SApp a b -> exprShapes a ++ exprShapes b
       SLam _ e -> exprShapes e
@@ -1325,6 +1346,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
     parseLeaf _ v = v
 
     children e = case e of
+      SMark _ a -> [a]
       SApp a b -> [a, b]
       SLam _ b -> [b]
       SBlock ss fin -> concatMap sChildren ss ++ [fin]
@@ -1342,6 +1364,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
         sChildren (SBindPat _ x) = [x]
 
     descend e = case e of
+      SMark o a -> SMark o (goE a)
       SApp a b -> SApp (goE a) (goE b)
       SLam x b -> SLam x (goE b)
       SBlock ss fin -> SBlock (map stmt ss) (goE fin)
@@ -1362,6 +1385,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
 
 dExpr :: SExpr -> D Core
 dExpr = \case
+  SMark _ e -> dExpr e -- positions stop at the Core boundary
   SVar n -> do
     cons <- gets dCons
     pure $ case M.lookup n cons of
@@ -1749,7 +1773,40 @@ prettyProg prog names = unlines [n ++ " " ++ unwords ps ++ " =\n  " ++ pretty b 
 -- exists and this is the identity -- the hash string stays
 -- bit-compatible with every existing pin.
 stripPosTops :: [STop] -> [STop]
-stripPosTops = id
+stripPosTops = map stripTop
+  where
+    stripTop = \case
+      TBind n ps g b -> TBind n ps (map (mapGuardE stripE) g) (stripE b)
+      TEval e -> TEval (stripE e)
+      TStruct n sigs fs -> TStruct n sigs [(f, stripE e) | (f, e) <- fs]
+      t -> t
+
+-- erase every position wrapper (module identity, and any consumer that
+-- needs the pure syntactic tree)
+stripE :: SExpr -> SExpr
+stripE = \case
+  SMark _ e -> stripE e
+  SApp a b -> SApp (stripE a) (stripE b)
+  SLam ps e -> SLam ps (stripE e)
+  SBlock ss e -> SBlock (map stripS ss) (stripE e)
+  SCase s arms -> SCase (stripE s) [(p, stripE e) | (p, e) <- arms]
+  SBin o a b -> SBin o (stripE a) (stripE b)
+  SProj e fs -> SProj (stripE e) fs
+  SRec fs -> SRec [(f, stripE e) | (f, e) <- fs]
+  SUpd m as -> SUpd (stripE m) [(p, stripE e) | (p, e) <- as]
+  STup es -> STup (map stripE es)
+  SList es -> SList (map stripE es)
+  SStrI segs -> SStrI [case sg of SegExpr e -> SegExpr (stripE e); s -> s | sg <- segs]
+  e -> e
+  where
+    stripS (SBind n ps e) = SBind n ps (stripE e)
+    stripS (SBindPat p e) = SBindPat p (stripE e)
+
+-- look through position wrappers: every SHAPE-SENSITIVE match (a pass
+-- recognizing a special form by syntax) goes through this first
+unmark :: SExpr -> SExpr
+unmark (SMark _ e) = unmark e
+unmark e = e
 
 type Anchors = M.Map Name (FilePath, Int)
 
@@ -1767,16 +1824,76 @@ bindAnchors file src tops =
     defLike (c : _) = c `elem` (" \t:=(" :: String)
     defLike [] = True
 
--- rewrite one diagnostic: "in NAME: ..." -> "file:line: in NAME: ..."
--- (every per-bind error the passes emit carries that prefix; messages
--- without it pass through untouched)
-anchorMsg :: Anchors -> String -> String
-anchorMsg anchors msg = case msg of
+type Sources = M.Map FilePath String
+
+-- rewrite one diagnostic (spans steps 1-3, best available precision):
+--
+--   "in NAME: @OFF~ msg"  -> "file:line:col: in NAME: msg"   (step 3:
+--       Infer stamped the enclosing statement mark's source offset)
+--   "in NAME: ...'tok'..." -> "file:line:col: in NAME: ..."  (step 2:
+--       the first word-boundary occurrence of the token the message
+--       names, scanned within NAME's definition range)
+--   "in NAME: msg"         -> "file:line: in NAME: msg"      (step 1:
+--       NAME's definition line)
+--
+-- messages without a known "in NAME:" prefix pass through untouched.
+anchorMsg :: Sources -> Anchors -> String -> String
+anchorMsg srcs anchors msg = case msg of
   'i' : 'n' : ' ' : rest
-    | (n, ':' : _) <- break (== ':') rest,
-      Just (f, ln) <- M.lookup n anchors ->
-        f ++ ":" ++ show ln ++ ": " ++ msg
+    | (n, ':' : ' ' : body) <- break (== ':') rest,
+      Just (f, bindLn) <- M.lookup n anchors ->
+        let cleaned = "in " ++ n ++ ": " ++ dropMark body
+         in case markPos f body of
+              Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
+              Nothing -> case tokenPos f n bindLn body of
+                Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
+                Nothing -> f ++ ":" ++ show bindLn ++ ": " ++ cleaned
   _ -> msg
+  where
+    -- step 3: "@OFF~ " stamp from the inference engine
+    markPos f ('@' : b)
+      | (ds@(_ : _), '~' : ' ' : _) <- span (`elem` ("0123456789" :: String)) b =
+          offsetPos f (read ds)
+    markPos _ _ = Nothing
+    dropMark ('@' : b)
+      | (_ : _, '~' : ' ' : real) <- span (`elem` ("0123456789" :: String)) b = real
+    dropMark b = b
+    offsetPos f off = do
+      src <- M.lookup f srcs
+      let pre = take off src
+          l = 1 + length (filter (== '\n') pre)
+          c = 1 + length (takeWhile (/= '\n') (reverse pre))
+      pure (l, c)
+    -- step 2: the token the message names, found in the bind's range
+    tokenPos f n bindLn body = do
+      src <- M.lookup f srcs
+      tok <- msgToken body
+      let endLn = case [l | (_, (f', l)) <- M.toList anchors, f' == f, l > bindLn] of
+            [] -> length (lines src)
+            ls -> minimum ls - 1
+          slice = take (endLn - bindLn + 1) (drop (bindLn - 1) (lines src))
+      case [ (bindLn + i, c)
+             | (i, l) <- zip [0 ..] slice,
+               c <- take 1 (wordHits tok l)
+           ] of
+        (p : _) -> Just p
+        [] -> Nothing
+    msgToken body = case break (== '\'') body of
+      (_, '\'' : q) | (tok@(_ : _), '\'' : _) <- break (== '\'') q -> Just tok
+      _
+        | Just r <- afterStr "application of " body -> Just (takeWhile identChar r)
+        | otherwise -> Nothing
+    afterStr pat s
+      | pat `isPrefixOf` s = Just (drop (length pat) s)
+      | otherwise = case s of (_ : t) -> afterStr pat t; [] -> Nothing
+    wordHits tok l =
+      [ i + 1
+        | i <- [0 .. length l - length tok],
+          take (length tok) (drop i l) == tok,
+          i == 0 || not (identChar (l !! (i - 1))),
+          i + length tok >= length l || not (identChar (l !! (i + length tok)))
+      ]
+    identChar c = c `elem` ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.'@" :: String)
 
 -- the primitive names the lambda lifter must not treat as free
 -- variables (the host-side evaluator this list once served is gone --
@@ -1931,6 +2048,7 @@ linExpr li env0 = go env0
 
     go :: M.Map Name LShape -> SExpr -> LRes
     go env = \case
+      SMark _ e -> go env e
       SVar v -> case M.lookup v env of
         Just s | isLin s -> ([], Just (M.singleton v 1), s)
         Just s -> ([], Just zero, s)
@@ -2081,6 +2199,7 @@ sFree :: SExpr -> [Name]
 sFree = nub . go
   where
     go = \case
+      SMark _ e -> go e
       SVar v -> [v]
       SApp a b -> go a ++ go b
       SLam ps e -> filter (`notElem` ps) (go e)
@@ -2126,6 +2245,7 @@ transformEP :: (S.Set Name -> SExpr -> SExpr) -> (SPat -> SPat) -> S.Set Name ->
 transformEP f pf = go
   where
     go bs e0 = f bs $ case e0 of
+      SMark o e -> SMark o (go bs e)
       SApp a b -> SApp (go bs a) (go bs b)
       SLam ps b -> SLam ps (go (bs `S.union` S.fromList ps) b)
       SBlock stmts fin ->

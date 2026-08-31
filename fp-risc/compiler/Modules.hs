@@ -75,9 +75,11 @@ data LoadResult = LoadResult
     lrUnits :: [(String, [STop])],
     lrRootTops :: [STop],
     lrRootHash :: String,
-    lrAnchors :: Anchors -- QUALIFIED bind name -> (file, line) across
-                         -- every spliced unit (spans step 1: the error
-                         -- sinks anchor "in NAME:" messages with this)
+    lrAnchors :: Anchors, -- QUALIFIED bind name -> (file, line) across
+                          -- every spliced unit (spans step 1: the error
+                          -- sinks anchor "in NAME:" messages with this)
+    lrSources :: Sources -- unit file -> source (spans steps 2-3: the
+                         -- locator scans ranges / resolves offsets)
   }
 
 --------------------------------------------------------------------------------
@@ -114,7 +116,8 @@ data ModUnit = ModUnit
   { muHash :: String,
     muTops :: [STop], -- as parsed (uses pin-normalized, not yet qualified)
     muAliases :: [(Name, String)], -- import alias -> dep hash
-    muAnchors :: Anchors -- bind name -> (file, line), pre-qualification
+    muAnchors :: Anchors, -- bind name -> (file, line), pre-qualification
+    muSrc :: (FilePath, String) -- the unit's source (the locator scans it)
   }
 
 -- "Name", "Name#hash", "dir/Name", "Name.fpr#hash" — resolved relative
@@ -226,7 +229,7 @@ loadModule cache stack path0 = do
                       -- the hash is a Merkle root over the dependency tree
                       let pinned = [pinUse aliases t | t <- tops]
                           h = hashAST pinned
-                          mu = ModUnit h tops aliases (bindAnchors path src tops)
+                          mu = ModUnit h tops aliases (bindAnchors path src tops) (path, src)
                       modifyIORef' cache (M.insert path mu)
                       pure (Right mu)
   where
@@ -354,6 +357,7 @@ renameTops env qh = concatMap top
       PSig n sg -> (PSig n sg, S.insert n bound)
 
     expr bound = \case
+      SMark o e -> SMark o (expr bound e)
       SVar n
         | isUpper (head' n) -> refVar env bound n
         | otherwise -> if S.member n bound then SVar n else refVar env bound n
@@ -441,7 +445,8 @@ loadProgram preludeTops rootPath rootTops = do
             ]
       let unitAnchors =
             M.unions [M.mapKeys (qualify (muHash mu)) (muAnchors mu) | mu <- units]
-      pure (Right (LoadResult merged exports (notes ++ depNotes) unitPairs root' rootHash unitAnchors))
+          unitSources = M.fromList [muSrc mu | mu <- units]
+      pure (Right (LoadResult merged exports (notes ++ depNotes) unitPairs root' rootHash unitAnchors unitSources))
   where
     pinRoot aliases (TUse a spec) =
       let (nm, _) = specParts spec
