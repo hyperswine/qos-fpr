@@ -184,6 +184,7 @@ void fpr_fuel_exhausted(void);       /* actors.c: the fuel trap */
 void fpr_drop_park(fpr_slab_t *sl);      /* actors.c (arc_lock held) */
 void fpr_drop_drain_current(void);       /* actors.c: drain now */
 void fpr_slab_release(fpr_slab_t *sl);   /* runtime.c: grant/buddy */
+void fpr_vec_release(V v);               /* vec.c: universal vector free */
 
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a); /* actors.c: &a->pool */
 void fpr_pool_reclaim(struct fpr_acb *a);    /* runtime.c: death teardown */
