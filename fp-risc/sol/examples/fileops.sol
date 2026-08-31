@@ -10,6 +10,8 @@
 # mkdirp = create a dir and all its parents if needed, atomically. If the dir already exists, do nothing.
 # writePath = write a file atomically, creating parent dirs if needed. If the file already exists, overwrite it.
 # readPath = read a file into a string. If the file doesn't exist, abort.
+# (absence expected? spell it: readPathOr for a default, Try.readPath for
+#  the Ok/Err chain — see tryops.sol for the pattern.)
 
 base = use "../lib/base".
 

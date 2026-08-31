@@ -109,6 +109,9 @@ render (VData 1 0 []) = "False"
 render (VData 1 1 []) = "True"
 render (VData 6 0 [VStr a]) = ":" ++ a
 render (VData 0 0 []) = "()"
+-- Result (tid 3): the Ok/Err default pattern renders by name
+render (VData 3 0 [x]) = "Ok " ++ render x
+render (VData 3 1 [x]) = "Err " ++ render x
 render (VData 4 0 [a, b]) = "(" ++ render a ++ ", " ++ render b ++ ")"
 render (VData 5 0 [a, b, c]) = "(" ++ render a ++ ", " ++ render b ++ ", " ++ render c ++ ")"
 -- wide tuples: tids 10..14 = Tup4..Tup8 (FPRISC builtinCons / fpr.h)

@@ -34,9 +34,12 @@ import Foreign.C.Types (CInt (..))
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
+import qualified Data.ByteString as BS
+import qualified Data.ByteString.UTF8 as BSU
 import qualified Data.IntMap.Strict as IM
-import Data.List (isInfixOf, isSuffixOf, nub, sort)
+import Data.List (dropWhileEnd, isInfixOf, isSuffixOf, nub, sort)
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import System.Directory
   ( createDirectory,
     createDirectoryIfMissing,
@@ -50,10 +53,10 @@ import System.Directory
     removePathForcibly,
     renamePath,
   )
-import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Data.Time.Clock.POSIX (getPOSIXTime, utcTimeToPOSIXSeconds)
 import System.Exit (ExitCode (..))
 import System.IO (readFile')
-import System.IO (hFlush, hIsEOF, hGetLine, stderr, stdin, stdout, hPutStrLn)
+import System.IO (hFlush, hGetContents', hIsEOF, hGetLine, stderr, stdin, stdout, hPutStrLn)
 import System.Process (createProcess, readCreateProcessWithExitCode, shell, waitForProcess)
 
 -- The transaction's pending effect on the world, IN DECLARATION ORDER.
@@ -74,25 +77,52 @@ data TxState = TxState
     txView :: M.Map FilePath (Maybe String), -- current in-txn file view
     txDirView :: M.Map FilePath Bool, -- dirs mkdir'd (True) / rmdir'd (False)
     txHandles :: IM.IntMap FilePath, -- open handle id -> path
-    txNextH :: !Int
+    txNextH :: !Int,
+    txNonText :: S.Set FilePath, -- snapshotted paths that are NOT valid UTF-8
+    txSealed :: !Bool -- commit has read the effect log; later effects are lost
   }
 
 newTx :: IO (IORef TxState)
 newTx = newIORef emptyTx
 
 emptyTx :: TxState
-emptyTx = TxState M.empty M.empty [] M.empty M.empty IM.empty 1
+emptyTx = TxState M.empty M.empty [] M.empty M.empty IM.empty 1 S.empty False
 
 resetTx :: IORef TxState -> IO ()
 resetTx ref = writeIORef ref emptyTx
 
+-- an effect issued after commit sealed the log (an actor thread that
+-- outlived program order) can only be lost — name it, loudly
 pushEffect :: IORef TxState -> Effect -> IO ()
-pushEffect ref e = atomicModifyIORef' ref (\s -> (s {txEffects = e : txEffects s}, ()))
+pushEffect ref e = do
+  sealed <- atomicModifyIORef' ref (\s -> (s {txEffects = e : txEffects s}, txSealed s))
+  when sealed $
+    hPutStrLn stderr ("[sol] effect AFTER COMMIT (lost): " ++ effectBrief e
+                        ++ " — join actors before the script ends")
+  where
+    effectBrief (EWrite p _) = "write " ++ p
+    effectBrief (ERemove p) = "rm " ++ p
+    effectBrief (EMkdir p) = "mkdirp " ++ p
+    effectBrief (ERmdir p) = "rmdir " ++ p
+    effectBrief (EShell c) = "shq " ++ c
+
+-- Files are read as BYTES and decoded here, so a non-UTF-8 file is a
+-- fact we can report — it used to throw inside the locale decoder, get
+-- caught as an IOException, and read as ABSENT, which made
+-- read-modify-write silently clobber binaries. The Bool is UTF-8
+-- validity; the String is the lossy decode (invalid bytes become
+-- U+FFFD), which is what validation compares — consistent on both
+-- sides of the comparison. (Two binary files differing only in invalid
+-- bytes that decode alike could alias in validation; text never does.)
+diskReadT :: FilePath -> IO (Maybe (String, Bool))
+diskReadT p = do
+  r <- try (BS.readFile p) :: IO (Either IOException BS.ByteString)
+  case r of
+    Left _ -> pure Nothing
+    Right bs -> let t = BSU.toString bs in pure (Just (t, BSU.fromString t == bs))
 
 diskRead :: FilePath -> IO (Maybe String)
-diskRead p = do
-  r <- try (readFile' p) :: IO (Either IOException String)
-  pure (either (const Nothing) Just r)
+diskRead p = fmap fst <$> diskReadT p
 
 -- open: register the path, hand back a handle id. Reading is NOT done here;
 -- the snapshot happens lazily at first txHRead so a write-only open doesn't
@@ -113,26 +143,65 @@ txClose :: IORef TxState -> Int -> IO ()
 txClose ref h = atomicModifyIORef' ref $ \s ->
   (s {txHandles = IM.delete h (txHandles s)}, ())
 
--- snapshot a path into the read set (for validation) if not already there
+-- snapshot a path into the read set (for validation) if not already there;
+-- a non-UTF-8 file snapshots its lossy decode and is remembered as
+-- non-text so the read surface can refuse it while exists/stat still work
 snapshot :: IORef TxState -> FilePath -> IO (Maybe String)
 snapshot ref p = do
   s <- readIORef ref
   case M.lookup p (txReads s) of
     Just snap -> pure snap
     Nothing -> do
-      d <- diskRead p
-      atomicModifyIORef' ref (\st -> (st {txReads = M.insert p d (txReads st)}, ()))
-      pure d
+      d <- diskReadT p
+      let txt = fmap fst d
+          nonText = maybe False (not . snd) d
+      atomicModifyIORef' ref
+        ( \st ->
+            ( st
+                { txReads = M.insert p txt (txReads st),
+                  txNonText = if nonText then S.insert p (txNonText st) else txNonText st
+                },
+              ()
+            )
+        )
+      pure txt
 
--- transactional read: in-txn view > read snapshot > disk (snapshotting)
+-- transactional read, absence and binariness observable: in-txn view >
+-- read snapshot > disk (snapshotting). The Ok/Err surface (Try.readPath)
+-- reports the failure cases; the plain surface (readPath/readAll) treats
+-- them as panics.
+data TxRead = TxText String | TxMissing | TxNonText
+
+txTryRead :: IORef TxState -> FilePath -> IO TxRead
+txTryRead ref p = do
+  s <- readIORef ref
+  case M.lookup p (txView s) of
+    Just (Just w) -> pure (TxText w) -- this txn's own write: always text
+    Just Nothing -> pure TxMissing -- removed earlier in this txn
+    Nothing -> do
+      r <- snapshot ref p
+      s2 <- readIORef ref
+      pure $ case r of
+        Nothing -> TxMissing
+        Just w | S.member p (txNonText s2) -> TxNonText
+        Just w -> TxText w
+
+-- ABSENCE IS NOT EMPTY: a missing file used to read as "", which made
+-- read-modify-write silently fabricate empty state (and a binary file
+-- used to read as MISSING). The plain read now refuses both; existence
+-- questions go through exists/stat/Try.readPath.
 txHRead :: IORef TxState -> Int -> IO String
 txHRead ref h = do
   p <- txPathOf ref h
-  s <- readIORef ref
-  case M.lookup p (txView s) of
-    Just (Just w) -> pure w
-    Just Nothing -> pure "" -- removed earlier in this txn
-    Nothing -> maybe "" id <$> snapshot ref p
+  r <- txTryRead ref p
+  case r of
+    TxText w -> pure w
+    TxMissing ->
+      ioError (userError ("*** SOL PANIC: read: no such file: " ++ p
+                            ++ " — guard with `exists`, or use Try.readPath ***"))
+    TxNonText ->
+      ioError (userError ("*** SOL PANIC: read: not a UTF-8 text file: " ++ p
+                            ++ " — sol reads text; drive binary tools with sh/shq ***"))
 
 txHWrite :: IORef TxState -> Int -> String -> IO ()
 txHWrite ref h v = do
@@ -205,16 +274,37 @@ txIsDir ref p = do
     Just b -> pure b
     Nothing -> doesDirectoryExist p
 
--- (exists, size, mtime-seconds); content snapshotted for validation
+-- (exists, size, mtime-seconds). The transaction's own view answers
+-- first — a file this txn wrote EXISTS, sized by its pending content
+-- (UTF-8 bytes, matching what commit will put on disk), mtime = now
+-- (it has no disk mtime yet). Only a view miss consults the snapshot
+-- (content joins the read set for validation) and the disk metadata.
 txStat :: IORef TxState -> FilePath -> IO (Bool, Integer, Integer)
 txStat ref p = do
-  snap <- snapshot ref p
-  case snap of
-    Nothing -> pure (False, 0, 0)
-    Just _ -> do
-      sz <- getFileSize p
-      mt <- getModificationTime p
-      pure (True, sz, floor (utcTimeToPOSIXSeconds mt))
+  s <- readIORef ref
+  case M.lookup p (txView s) of
+    Just Nothing -> pure (False, 0, 0) -- removed earlier in this txn
+    Just (Just w) -> do
+      now <- getPOSIXTime
+      pure (True, fromIntegral (utf8Len w), floor now)
+    Nothing -> do
+      snap <- snapshot ref p
+      case snap of
+        Nothing -> pure (False, 0, 0)
+        Just _ -> do
+          sz <- getFileSize p
+          mt <- getModificationTime p
+          pure (True, sz, floor (utcTimeToPOSIXSeconds mt))
+
+-- byte length of the string as commit will encode it
+utf8Len :: String -> Int
+utf8Len = sum . map w
+  where
+    w c
+      | fromEnum c < 0x80 = 1
+      | fromEnum c < 0x800 = 2
+      | fromEnum c < 0x10000 = 3
+      | otherwise = 4
 
 -- ---- external commands -----------------------------------------------------
 
@@ -320,6 +410,29 @@ rtLine = do
   hFlush stdout
   eof <- hIsEOF stdin
   if eof then pure "" else hGetLine stdin
+
+-- ---- the stdin snapshot ----------------------------------------------------
+--
+-- `input` is transactional the same way a file read is: the FIRST call
+-- slurps stdin into a process-wide snapshot and every later call — and
+-- every RETRY — answers from it. (Before this, a retry re-slurped a
+-- consumed handle and died with a raw hGetContents' error: stdin was the
+-- one read the transaction forgot to snapshot.) The cache survives
+-- resetTx on purpose: the retried script must see the same input.
+
+{-# NOINLINE stdinSnap #-}
+stdinSnap :: IORef (Maybe String)
+stdinSnap = unsafePerformIO (newIORef Nothing)
+
+txInput :: IO String
+txInput = do
+  c <- readIORef stdinSnap
+  case c of
+    Just s -> pure s
+    Nothing -> do
+      s <- hGetContents' stdin
+      writeIORef stdinSnap (Just s)
+      pure s
 
 -- ---- commit protocol ------------------------------------------------------
 --
@@ -507,12 +620,14 @@ recoverJournal takeLocks j = do
           done <- readDone j
           hPutStrLn stderr ("[sol] recovering interrupted commit from " ++ j ++ " (" ++ show (length effs) ++ " effect(s), " ++ show (length done) ++ " shell(s) already done)")
           _ <- replayEffs j True done Nothing (zip [0 ..] effs)
-          clearJournal j
+          clearJournal j -- file effects all applied even past a failed shell
         when takeLocks (forM_ (reverse touched) release)
 
 -- ---- commit ---------------------------------------------------------------
 
-data CommitResult = Committed Int | Conflict [FilePath]
+-- Committed carries (applied file effects, a deferred command failed);
+-- the receipt only says "atomically" when the second is False
+data CommitResult = Committed Int Bool | Conflict [FilePath]
 
 effectPath :: Effect -> Maybe FilePath
 effectPath (EWrite p _) = Just p
@@ -529,7 +644,9 @@ effectPath (EShell _) = Nothing
 -- reports what did not run.
 commit :: IORef TxState -> FilePath -> IO CommitResult
 commit ref jpath = do
-  s <- readIORef ref
+  -- seal first, then read: an actor's effect racing this point either
+  -- lands in the log we take, or lands sealed and is reported as lost
+  s <- atomicModifyIORef' ref (\st -> (st {txSealed = True}, st {txSealed = True}))
   let effs = reverse (txEffects s)
       touched =
         M.keys
@@ -563,12 +680,43 @@ commit ref jpath = do
       then do
         crashAt <- (>>= readMaybe) <$> lookupEnv "SOL_CRASH_AT"
         when (not (null effs)) (writeJournal jpath effs)
-        n <- replayEffs jpath False [] crashAt (zip [0 ..] effs)
+        (n, sfail) <- replayEffs jpath False [] crashAt (zip [0 ..] effs)
         clearJournal jpath
-        pure (Committed n)
+        -- a `run` PARENT set SOL_REPORT_COMMIT so it can learn which
+        -- paths this child transaction committed (Mod.runModule reads
+        -- the marker off stderr and checks them against its own sets)
+        reportC <- lookupEnv "SOL_REPORT_COMMIT"
+        let wrotePaths = nub [p | e <- effs, Just p <- [effectPath e]]
+        when (reportC == Just "1" && not (null wrotePaths)) $
+          hPutStrLn stderr (childCommitMarker ++ show wrotePaths)
+        pure (Committed n sfail)
       else pure (Conflict stale)
   forM_ (reverse touched) release
   pure res
+
+-- the stderr line a child sol emits (under SOL_REPORT_COMMIT=1) naming
+-- the paths its commit touched; the parent's `run` parses it
+childCommitMarker :: String
+childCommitMarker = "[sol-child] committed-paths: "
+
+-- After a `run` child commits: paths it wrote that THIS transaction
+-- already read, listed (their directory), or wrote can never validate —
+-- every retry re-runs the child, which commits again, forever (and a
+-- non-idempotent child AMPLIFIES: its effect lands once per attempt).
+-- The caller refuses on overlap; disjoint paths need no repair, because
+-- a later read simply snapshots the child's committed content.
+txChildOverlap :: IORef TxState -> [FilePath] -> IO [FilePath]
+txChildOverlap ref ps = do
+  s <- readIORef ref
+  let dirOf p = case dropWhileEnd (/= '/') p of
+        "" -> "."
+        "/" -> "/"
+        d -> init d -- drop the trailing '/': ls keys are written bare
+      hit p =
+        M.member p (txReads s)
+          || M.member p (txView s)
+          || M.member (dirOf p) (txDirReads s)
+  pure (filter hit ps)
 
 -- .sol-lock dirs, reclaim renames, and .sol-tmp staging files are
 -- commit-protocol artifacts: invisible to validation and to txLs
@@ -583,38 +731,65 @@ lockArtifact n =
 -- the rest re-run (loudly — this is the at-least-once window). crashAt
 -- is the SOL_CRASH_AT hook: die like kill -9 just before applying that
 -- effect index, so the crash windows are deterministically testable.
-replayEffs :: FilePath -> Bool -> [Int] -> Maybe Int -> [(Int, Effect)] -> IO Int
-replayEffs _ _ _ _ [] = pure 0
-replayEffs j recovery done crashAt ((i, e) : rest) = do
-  case crashAt of
-    Just k | k == i -> do
-      hPutStrLn stderr ("[sol] SOL_CRASH_AT=" ++ show k ++ ": hard exit before effect " ++ show k)
-      hFlush stderr
-      c_hardExit 137
-    _ -> pure ()
-  case e of
-    EWrite p v -> writeAtomic p v >> rec'
-    ERemove p -> do
-      _ <- try (removeFile p) :: IO (Either IOException ())
-      rec'
-    EMkdir p -> createDirectoryIfMissing True p >> rec'
-    ERmdir p -> do
-      _ <- try (removeDirectory p) :: IO (Either IOException ())
-      rec'
-    EShell cmd
-      | recovery && i `elem` done -> do
-          hPutStrLn stderr ("[sol] redo: skipping already-run command: " ++ cmd)
-          rec'
-      | otherwise -> do
-          when recovery $ hPutStrLn stderr ("[sol] redo: re-running deferred command (at-least-once): " ++ cmd)
-          (code, out) <- txSh cmd
-          markDone j i
-          unless (null out) (putStr ("[sol] $ " ++ cmd ++ "\n" ++ out))
-          if code == 0
-            then rec'
-            else do
-              putStrLn ("[sol] deferred command FAILED (exit " ++ show code ++ "): " ++ cmd)
-              putStrLn ("[sol] " ++ show (length rest) ++ " queued effect(s) after it did NOT run")
-              pure 1
+--
+-- The count that comes back is what the receipt reports, so it counts
+-- FILE effects whose goal state holds afterwards — nothing else. A
+-- removal whose target still exists (rm of a directory, rmdir of a
+-- non-empty one) is a FAILED effect and says so; on the redo path the
+-- goal check is exactly what makes re-application idempotent (a file
+-- already gone is success, not a warning).
+--
+-- A FAILED deferred command does not tear the file transaction: file
+-- effects were validated under lock, so the replay keeps applying them
+-- past the failure. Only LATER SHELL commands are skipped (they may
+-- have depended on the failed one), each named. The Bool that comes
+-- back says a command failed, so the receipt can refuse the word
+-- "atomically".
+replayEffs :: FilePath -> Bool -> [Int] -> Maybe Int -> [(Int, Effect)] -> IO (Int, Bool)
+replayEffs j0 recovery0 done0 crashAt0 effs0 = go False effs0
   where
-    rec' = (1 +) <$> replayEffs j recovery done crashAt rest
+    go shellFailed [] = pure (0, shellFailed)
+    go shellFailed ((i, e) : rest) = do
+      case crashAt0 of
+        Just k | k == i -> do
+          hPutStrLn stderr ("[sol] SOL_CRASH_AT=" ++ show k ++ ": hard exit before effect " ++ show k)
+          hFlush stderr
+          c_hardExit 137
+        _ -> pure ()
+      case e of
+        EWrite p v -> writeAtomic p v >> rec' shellFailed 1 rest
+        ERemove p -> do
+          _ <- try (removeFile p) :: IO (Either IOException ())
+          still <- doesFileExist p
+          if still
+            then failedEff ("rm " ++ p ++ " (still exists)") >> rec' shellFailed 0 rest
+            else rec' shellFailed 1 rest
+        EMkdir p -> createDirectoryIfMissing True p >> rec' shellFailed 1 rest
+        ERmdir p -> do
+          _ <- try (removeDirectory p) :: IO (Either IOException ())
+          still <- doesDirectoryExist p
+          if still
+            then failedEff ("rmdir " ++ p ++ " (still exists — not empty?)") >> rec' shellFailed 0 rest
+            else rec' shellFailed 1 rest
+        EShell cmd
+          | shellFailed -> do
+              putStrLn ("[sol] skipping queued command (an earlier one failed): " ++ cmd)
+              rec' shellFailed 0 rest
+          | recovery0 && i `elem` done0 -> do
+              hPutStrLn stderr ("[sol] redo: skipping already-run command: " ++ cmd)
+              rec' shellFailed 0 rest
+          | otherwise -> do
+              when recovery0 $ hPutStrLn stderr ("[sol] redo: re-running deferred command (at-least-once): " ++ cmd)
+              (code, out) <- txSh cmd
+              markDone j0 i
+              unless (null out) (putStr ("[sol] $ " ++ cmd ++ "\n" ++ out))
+              if code == 0
+                then rec' shellFailed 0 rest
+                else do
+                  putStrLn ("[sol] deferred command FAILED (exit " ++ show code ++ "): " ++ cmd)
+                  putStrLn ("[sol] later queued commands will be skipped; file effects still apply")
+                  rec' True 0 rest
+    failedEff what = putStrLn ("[sol] effect FAILED (not counted): " ++ what)
+    rec' sf k rest = do
+      (n, sf') <- go sf rest
+      pure (k + n, sf')

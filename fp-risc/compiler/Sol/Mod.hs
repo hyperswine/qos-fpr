@@ -27,15 +27,16 @@ module Sol.Mod where
 import Control.Monad (filterM)
 import Data.Bits (xor)
 import Data.Char (ord)
-import Data.List (foldl', isSuffixOf)
+import Data.List (foldl', isPrefixOf, isSuffixOf, partition)
 import Data.Word (Word64)
 import Sol.Lang (STop, program, stripPosTops)
+import Sol.Txn (childCommitMarker)
 import Numeric (showHex)
 import System.Directory (doesFileExist)
-import System.Environment (getExecutablePath)
+import System.Environment (getEnvironment, getExecutablePath)
 import System.Exit (ExitCode (..))
 import System.FilePath ((</>))
-import System.Process (readCreateProcessWithExitCode, proc)
+import System.Process (CreateProcess (..), readCreateProcessWithExitCode, proc)
 import Text.Megaparsec (errorBundlePretty, parse)
 
 -- FNV-1a 64 over the printed AST: deterministic, dependency-free.
@@ -92,7 +93,13 @@ resolveModule prefExt baseDir spec = do
 
 -- spawn `sol <path>` with `str x` on stdin; capture stdout. Hash
 -- re-verified so a pinned module can never run drifted code.
-runModule :: FilePath -> String -> String -> IO (Either String String)
+--
+-- The child runs under SOL_REPORT_COMMIT=1 so its commit names the
+-- paths it wrote on stderr (Txn.childCommitMarker); they come back to
+-- the caller, which refuses when they overlap this transaction's own
+-- read/write sets — the read-before-run shape can never validate and
+-- would re-run the child once per retry (see Txn.txChildOverlap).
+runModule :: FilePath -> String -> String -> IO (Either String (String, [FilePath]))
 runModule path wantHash stdinStr = do
   r <- parseModuleFile path
   case r of
@@ -102,8 +109,14 @@ runModule path wantHash stdinStr = do
           pure (Left ("run: module " ++ path ++ " changed since `use` (was #" ++ wantHash ++ ", now #" ++ h ++ ")"))
       | otherwise -> do
           self <- getExecutablePath
-          (code, out, err) <- readCreateProcessWithExitCode (proc self ["sol", path]) stdinStr -- the merged binary: sol is a subcommand of fpr
+          baseEnv <- getEnvironment
+          let cp = (proc self ["sol", path]) -- the merged binary: sol is a subcommand of fpr
+                     { env = Just (("SOL_REPORT_COMMIT", "1") : filter ((/= "SOL_REPORT_COMMIT") . fst) baseEnv) }
+          (code, out, err) <- readCreateProcessWithExitCode cp stdinStr
+          let (markers, errRest) = partition (childCommitMarker `isPrefixOf`) (lines err)
+              cpaths = concat [ps | m <- markers, (ps, _) <- reads (drop (length childCommitMarker) m)]
+              err' = unlines errRest
           pure $ case code of
-            ExitSuccess -> Right out
+            ExitSuccess -> Right (out, cpaths)
             ExitFailure n ->
-              Left ("run: module " ++ path ++ " exited with code " ++ show n ++ (if null err then "" else ":\n" ++ err) ++ (if null out then "" else "\npartial stdout:\n" ++ out))
+              Left ("run: module " ++ path ++ " exited with code " ++ show n ++ (if null errRest then "" else ":\n" ++ err') ++ (if null out then "" else "\npartial stdout:\n" ++ out))

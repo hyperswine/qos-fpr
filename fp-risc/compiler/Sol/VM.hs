@@ -29,7 +29,7 @@ import Foreign.Ptr ()
 import Foreign.Storable (peek)
 import qualified Sol.Gpu as Gpu
 import qualified Sol.HandJIT as Hand
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
@@ -73,7 +73,8 @@ data VMEnv = VMEnv
     vmHand :: Maybe Hand.HandCtx, -- SOL_JIT=hand: hand-rolled x86-64, no llvm
     vmHal :: M.Map Name (Int, [Value] -> IO Value),
     vmFuel :: IORef Int,
-    vmPreempts :: IORef Int
+    vmPreempts :: IORef Int,
+    vmTx :: IORef TxState -- the script transaction (run-overlap policy)
   }
 
 fuelQuantum :: Int
@@ -465,6 +466,18 @@ actorSelf = do
       atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
       pure i
 
+-- spawned actors still running (their box has a thread that is not the
+-- asking thread; finished actors deregister themselves). The commit
+-- checkpoint asks so it can say, loudly, that effects those actors
+-- produce from here land in a dead transaction.
+liveSpawnedActors :: IO [Int]
+liveSpawnedActors = do
+  me <- myThreadId
+  reg <- readIORef actorReg
+  fmap concat . forM (IM.toList reg) $ \(i, b) -> do
+    mt <- readIORef (abTid b)
+    pure [i | mt /= Just me]
+
 actorEnqueue :: Int -> Int -> Value -> IO ()
 actorEnqueue to from m = do
   reg <- readIORef actorReg
@@ -567,9 +580,24 @@ modCall env "use" [VStr spec] = do
         putStrLn ("[sol] use: " ++ spec ++ " resolves to " ++ spec ++ "#" ++ h ++ " (pin this)")
       pure (VMod p h)
 modCall _ "use" [v] = vmPanic ("use: expected a module spec string, got " ++ render v)
-modCall _ "run" [VMod p h, x] = do
+modCall env "run" [VMod p h, x] = do
   r <- runModule p h (render x)
-  either vmPanic (pure . VStr) r
+  case r of
+    Left e -> vmPanic e
+    Right (out, cpaths) -> do
+      -- the read-before-run shape can NEVER commit: the child's write
+      -- invalidates our snapshot, the retry re-runs the child, forever
+      -- (amplifying its effects). Refuse deterministically instead.
+      overlap <- txChildOverlap (vmTx env) cpaths
+      if null overlap
+        then pure (VStr out)
+        else
+          vmPanic
+            ( "run: the child module committed to " ++ show overlap
+                ++ ", which this transaction already read, listed, or wrote —"
+                ++ " that can never validate (every retry re-runs the child)."
+                ++ " Read those paths AFTER run, or pass data via stdin/stdout"
+            )
 modCall _ "run" [v, _] = vmPanic ("run: not a module: " ++ render v)
 modCall _ g _ = vmPanic (g ++ ": bad arguments")
 
@@ -847,7 +875,13 @@ mkHal cons tx preempts rt =
                     pure (VData 4 0 [sl, v])))),
       ("BStr.free", (1, \[v] -> consumeBStr v >> pure vUnit)),
       ("error", (1, \[v] -> vmPanic (render v))),
-      ("parseInt", (1, parseIntH)),
+      -- ---- the Ok/Err tier: fallible work returns Result, chained with |>? --
+      -- These are the PRIMITIVES; the panicking spellings (parseInt,
+      -- readPath) are prelude sugar: `unwrap (Try.parseInt s)`. Anything
+      -- fallible added to the HAL from here on returns Ok/Err and gets its
+      -- panicking twin for free.
+      ("Try.parseInt", (1, tryParseIntH)),
+      ("Try.readPath", (1, tryReadPathH)),
       -- Numeric prims: the doors into inexact arithmetic. Num.div is TRUE
       -- division (always inexact); ordinary +,-,*,/ then propagate
       -- inexactness by promotion in `arith`. floor/round land back on Int.
@@ -896,7 +930,9 @@ mkHal cons tx preempts rt =
 
     readIoH v
       | Just p <- unPath v = case p of
-          "/dev/in" -> VStr <$> hGetContents' stdin
+          -- stdin is a read like any other: snapshotted once, replayed
+          -- to every later call and every RETRY (Txn.txInput)
+          "/dev/in" -> VStr <$> txInput
           "/dev/fuel" -> VInt . fromIntegral <$> readIORef preempts
           _ -> VStr <$> txReadWhole p
     readIoH (VData t g [q])
@@ -939,7 +975,13 @@ mkHal cons tx preempts rt =
         VStr s -> txWriteWhole p s
         VData t g []
           | isCon "Dir" t g -> txMkdirp tx p >> pure vUnit
-          | isCon "Rm" t g -> txRm tx p >> pure vUnit
+          | isCon "Rm" t g -> do
+              -- refuse at issue time, not silently at replay: removeFile
+              -- can never remove a directory, so queueing it is a lie
+              isD <- txIsDir tx p
+              if isD
+                then vmPanic ("rm: " ++ p ++ " is a directory — use rmdir")
+                else txRm tx p >> pure vUnit
           | isCon "RmDir" t g -> txRmdir tx p >> pure vUnit
         -- ---- realtime writes: land on disk before commit ----
         VData t g [sv]
@@ -1027,11 +1069,24 @@ mkHal cons tx preempts rt =
       Nothing -> vmPanic ("close: not a Handle: " ++ render v)
     closeH _ = vmPanic "close: arity"
 
-    parseIntH [VStr s] = case reads (dropWhile (== ' ') s) :: [(Integer, String)] of
-      [(n, rest)] | all (`elem` " \n\t") rest -> pure (VInt n)
-      _ -> vmPanic ("parseInt: not an integer: " ++ show s)
-    parseIntH [v] = vmPanic ("parseInt: not a string: " ++ render v)
-    parseIntH _ = vmPanic "parseInt: arity"
+    -- Result values: Ok/Err are builtin constructors (tid 3)
+    vOk v = VData 3 0 [v]
+    vErr m = VData 3 1 [VStr m]
+
+    tryParseIntH [v] = do
+      s <- vsStr v
+      case reads (dropWhile (== ' ') s) :: [(Integer, String)] of
+        [(n, rest)] | all (`elem` " \n\t") rest -> pure (vOk (VInt n))
+        _ -> pure (vErr ("parseInt: not an integer: " ++ show s))
+    tryParseIntH _ = vmPanic "Try.parseInt: arity"
+
+    tryReadPathH [v] = withP v $ \p -> do
+      r <- txTryRead tx p
+      pure $ case r of
+        TxText s -> vOk (VStr s)
+        TxMissing -> vErr ("readPath: no such file: " ++ p)
+        TxNonText -> vErr ("readPath: not a UTF-8 text file: " ++ p)
+    tryReadPathH _ = vmPanic "Try.readPath: arity"
 
     charAtH [sv, VInt i]
       | isStrVal sv = do
