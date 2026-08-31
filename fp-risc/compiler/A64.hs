@@ -64,7 +64,7 @@ import Data.Word (Word64)
 
 -- bump when the lowering changes (unit-cache tag component; see X64.hs)
 a64Rev :: Int
-a64Rev = 9 -- v3: qa64/qa64mac hart read is `mov xd, x28` (Darwin-TLS-free)
+a64Rev = 10 -- scalar F32/F64 lowering for qa64
 
 lowerA64 :: Bool -> String -> String
 lowerA64 mach =
@@ -300,6 +300,17 @@ instr mach body = case parts body of
   ("slli", [rd, rs, n]) -> ["lsl " ++ xreg rd ++ ", " ++ xreg rs ++ ", #" ++ n]
   ("srai", [rd, rs, n]) -> ["asr " ++ xreg rd ++ ", " ++ xreg rs ++ ", #" ++ n]
   ("sll", [rd, r1, r2]) -> [rrr "lsl" rd r1 r2]
+  -- scalar floats travel through the integer ABI as raw bits
+  ("fmv.d.x", [fd, rs]) -> ["fmov " ++ freg "d" fd ++ ", " ++ xreg rs]
+  ("fmv.x.d", [rd, fs]) -> ["fmov " ++ xreg rd ++ ", " ++ freg "d" fs]
+  ("fmv.w.x", [fd, rs]) -> ["fmov " ++ freg "s" fd ++ ", " ++ wreg rs]
+  ("fmv.x.w", [rd, fs]) -> ["fmov " ++ wreg rd ++ ", " ++ freg "s" fs]
+  (op, [fd, f1, f2])
+    | Just (aop, width) <- floatBin op ->
+        [aop ++ " " ++ freg width fd ++ ", " ++ freg width f1 ++ ", " ++ freg width f2]
+  (op, [rd, f1, f2])
+    | Just (cond, width) <- floatCmp op ->
+        ["fcmp " ++ freg width f1 ++ ", " ++ freg width f2, "cset " ++ xreg rd ++ ", " ++ cond]
   -- comparisons materialized to a register (flags dead outside each)
   ("slt", [rd, r1, r2]) -> cmpSet rd r1 r2 "lt"
   ("seqz", [rd, rs]) -> ["cmp " ++ xreg rs ++ ", #0", "cset " ++ xreg rd ++ ", eq"]
@@ -326,6 +337,27 @@ instr mach body = case parts body of
     cmpBr r1 r2 b l = ["cmp " ++ xreg r1 ++ ", " ++ xreg r2, b ++ " " ++ l]
     cmpSet rd r1 r2 cond =
       ["cmp " ++ xreg r1 ++ ", " ++ xreg r2, "cset " ++ xreg rd ++ ", " ++ cond]
+    freg width = \case
+      'f' : 't' : n | all isDigit n -> width ++ n
+      r -> error ("A64: unmapped float register " ++ r)
+    floatBin op = case break (== '.') op of
+      ("fadd", ".d") -> Just ("fadd", "d")
+      ("fsub", ".d") -> Just ("fsub", "d")
+      ("fmul", ".d") -> Just ("fmul", "d")
+      ("fdiv", ".d") -> Just ("fdiv", "d")
+      ("fadd", ".s") -> Just ("fadd", "s")
+      ("fsub", ".s") -> Just ("fsub", "s")
+      ("fmul", ".s") -> Just ("fmul", "s")
+      ("fdiv", ".s") -> Just ("fdiv", "s")
+      _ -> Nothing
+    floatCmp op = case break (== '.') op of
+      ("flt", ".d") -> Just ("mi", "d")
+      ("fle", ".d") -> Just ("ls", "d")
+      ("feq", ".d") -> Just ("eq", "d")
+      ("flt", ".s") -> Just ("mi", "s")
+      ("fle", ".s") -> Just ("ls", "s")
+      ("feq", ".s") -> Just ("eq", "s")
+      _ -> Nothing
     -- a64 logical immediates are bitmask-encoded; sidestep the encoder
     -- entirely by materializing (the IR only uses small masks anyway)
     logImm op rd rs n =
