@@ -21,7 +21,7 @@
 -- docs/MEMORY-V2-PLAN.md's "de-fork the frontend" item made real.
 module Sol.Infer (inferTops) where
 
-import Infer (IProf (..), TEnv, Type (..), inferTopsWith, mono, scheme, sv, tBool, tInt, tList, tStr, tUnit)
+import Infer (IProf (..), TEnv, Type (..), inferTopsWith, mono, scheme, sv, tBool, tInt, tList, tStr, tUnit, tcon)
 import qualified Data.Map.Strict as M
 import FPRISC (Name, STop)
 import Struct (Sigs, Structs)
@@ -50,7 +50,11 @@ solBuiltins =
       ("strlen", mono (TFn tStr tInt)),
       ("String.len", mono (TFn tStr tInt)),
       ("error", scheme [0] (TFn tStr (sv 0))),
-      ("parseInt", mono (TFn tStr tInt)),
+      -- the Ok/Err tier: fallible primitives return Result, chained
+      -- with |>?; the panicking spellings (parseInt, readPath) are
+      -- PRELUDE sugar over these and type by inference
+      ("Try.parseInt", mono (TFn tStr (tcon "Result" [tInt, tStr]))),
+      ("Try.readPath", mono (TFn tStr (tcon "Result" [tStr, tStr]))),
       ("charAt", mono (TFn tStr (TFn tInt tInt))), -- returns the char CODE
       ("substr", mono (TFn tStr (TFn tInt (TFn tInt tStr)))),
       ("chr", mono (TFn tInt tStr)),

@@ -13,6 +13,7 @@
 module Sol.Main where
 
 import Sol.Bytecode
+import Control.Exception (IOException, try)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
 import Data.IORef
@@ -30,6 +31,8 @@ import Sol.JIT (JitCtx, initJIT)
 import System.Environment (getArgs, lookupEnv)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import System.Exit (exitFailure)
+import System.IO (hPutStrLn, stderr)
+import System.IO.Error (ioeGetErrorString, isUserError)
 import System.FilePath (dropExtension, takeDirectory, takeExtension)
 import Text.Megaparsec (errorBundlePretty, parse)
 import Sol.Txn
@@ -205,7 +208,17 @@ main = do
   rt <- newRtCounts
   -- heal first: a previous run of this script may have crashed mid-commit
   unless dumpAsm $ recoverJournal True journalFile
-  unless dumpAsm $ runTxLoop (takeDirectory path) dataFile journalFile consTV shapeNames bprog prog (jc, hand) cons runList rt 0
+  -- a panic ends the run with the clean SOL PANIC line and exit 1 — not
+  -- the raw `fpr: user error (...)` wrapper. Nothing was committed: the
+  -- exception propagates out of runTxLoop before its commit call.
+  unless dumpAsm $ do
+    r <- try (runTxLoop (takeDirectory path) dataFile journalFile consTV shapeNames bprog prog (jc, hand) cons runList rt 0) :: IO (Either IOException ())
+    case r of
+      Right () -> pure ()
+      Left e -> do
+        let msg = if isUserError e then ioeGetErrorString e else show e
+        hPutStrLn stderr (if "*** SOL PANIC" `isPrefixOf` msg then msg else "*** SOL PANIC: " ++ msg ++ " ***")
+        exitFailure
 
 -- run every `>` statement in order inside one transaction, then commit;
 -- on read-set conflict, reset and re-run the whole script

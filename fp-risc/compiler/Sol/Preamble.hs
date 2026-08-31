@@ -31,7 +31,19 @@ prelude =
       "readAll : Handle -> (String, Handle).",
       "writeAll : Handle -> String -> Handle.",
       "close : Handle -> Unit.",
-      "readPath p = read p.",
+      -- ---- the Ok/Err default pattern -------------------------------------
+      -- Fallible work returns `Ok x | Err msg` and chains with |>?. The
+      -- HAL's fallible primitives are the Try.* family; the PANICKING
+      -- spellings below are one `unwrap` away — sugar over the honest
+      -- tier, not a separate mechanism. `readPath` of a missing file is
+      -- therefore a PANIC now (absence is not ""): reach for exists,
+      -- readPathOr, or Try.readPath when absence is an expected case.
+      "unwrap r = case r of Ok x -> x | Err e -> error e.",
+      "okOr d r = case r of Ok x -> x | Err e -> d.",
+      "mapOk f r = case r of Ok x -> Ok (f x) | Err e -> Err e.",
+      "parseInt s = unwrap (Try.parseInt s).",
+      "readPath p = unwrap (Try.readPath p).",
+      "readPathOr d p = okOr d (Try.readPath p).",
       "writePath p s = write p s.",
       "mkdirp p = write p Dir.",
       "rm p = write p Rm.",
@@ -163,7 +175,8 @@ halArities :: M.Map Name Int
 halArities =
   M.fromList
     [ ("str", 1), ("strcat", 2), ("String.len", 1), ("strlen", 1),
-      ("error", 1), ("parseInt", 1), ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
+      ("error", 1), ("Try.parseInt", 1), ("Try.readPath", 1),
+      ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
       ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1),
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),
       ("BStr.append", 2), ("BStr.cat", 2), ("BStr.len", 1),

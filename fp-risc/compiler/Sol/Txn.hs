@@ -50,10 +50,10 @@ import System.Directory
     removePathForcibly,
     renamePath,
   )
-import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Data.Time.Clock.POSIX (getPOSIXTime, utcTimeToPOSIXSeconds)
 import System.Exit (ExitCode (..))
 import System.IO (readFile')
-import System.IO (hFlush, hIsEOF, hGetLine, stderr, stdin, stdout, hPutStrLn)
+import System.IO (hFlush, hGetContents', hIsEOF, hGetLine, stderr, stdin, stdout, hPutStrLn)
 import System.Process (createProcess, readCreateProcessWithExitCode, shell, waitForProcess)
 
 -- The transaction's pending effect on the world, IN DECLARATION ORDER.
@@ -124,15 +124,30 @@ snapshot ref p = do
       atomicModifyIORef' ref (\st -> (st {txReads = M.insert p d (txReads st)}, ()))
       pure d
 
--- transactional read: in-txn view > read snapshot > disk (snapshotting)
+-- transactional read, absence observable: in-txn view > read snapshot >
+-- disk (snapshotting). Nothing = the file does not exist (or was removed
+-- earlier in this txn). The Ok/Err surface (Try.readPath) reports it;
+-- the plain surface (readPath/readAll) treats it as a panic.
+txTryRead :: IORef TxState -> FilePath -> IO (Maybe String)
+txTryRead ref p = do
+  s <- readIORef ref
+  case M.lookup p (txView s) of
+    Just (Just w) -> pure (Just w)
+    Just Nothing -> pure Nothing -- removed earlier in this txn
+    Nothing -> snapshot ref p
+
+-- ABSENCE IS NOT EMPTY: a missing file used to read as "", which made
+-- read-modify-write silently fabricate empty state. The plain read now
+-- refuses; existence questions go through exists/stat/Try.readPath.
 txHRead :: IORef TxState -> Int -> IO String
 txHRead ref h = do
   p <- txPathOf ref h
-  s <- readIORef ref
-  case M.lookup p (txView s) of
-    Just (Just w) -> pure w
-    Just Nothing -> pure "" -- removed earlier in this txn
-    Nothing -> maybe "" id <$> snapshot ref p
+  r <- txTryRead ref p
+  case r of
+    Just w -> pure w
+    Nothing ->
+      ioError (userError ("*** SOL PANIC: read: no such file: " ++ p
+                            ++ " — guard with `exists`, or use Try.readPath ***"))
 
 txHWrite :: IORef TxState -> Int -> String -> IO ()
 txHWrite ref h v = do
@@ -205,16 +220,37 @@ txIsDir ref p = do
     Just b -> pure b
     Nothing -> doesDirectoryExist p
 
--- (exists, size, mtime-seconds); content snapshotted for validation
+-- (exists, size, mtime-seconds). The transaction's own view answers
+-- first — a file this txn wrote EXISTS, sized by its pending content
+-- (UTF-8 bytes, matching what commit will put on disk), mtime = now
+-- (it has no disk mtime yet). Only a view miss consults the snapshot
+-- (content joins the read set for validation) and the disk metadata.
 txStat :: IORef TxState -> FilePath -> IO (Bool, Integer, Integer)
 txStat ref p = do
-  snap <- snapshot ref p
-  case snap of
-    Nothing -> pure (False, 0, 0)
-    Just _ -> do
-      sz <- getFileSize p
-      mt <- getModificationTime p
-      pure (True, sz, floor (utcTimeToPOSIXSeconds mt))
+  s <- readIORef ref
+  case M.lookup p (txView s) of
+    Just Nothing -> pure (False, 0, 0) -- removed earlier in this txn
+    Just (Just w) -> do
+      now <- getPOSIXTime
+      pure (True, fromIntegral (utf8Len w), floor now)
+    Nothing -> do
+      snap <- snapshot ref p
+      case snap of
+        Nothing -> pure (False, 0, 0)
+        Just _ -> do
+          sz <- getFileSize p
+          mt <- getModificationTime p
+          pure (True, sz, floor (utcTimeToPOSIXSeconds mt))
+
+-- byte length of the string as commit will encode it
+utf8Len :: String -> Int
+utf8Len = sum . map w
+  where
+    w c
+      | fromEnum c < 0x80 = 1
+      | fromEnum c < 0x800 = 2
+      | fromEnum c < 0x10000 = 3
+      | otherwise = 4
 
 -- ---- external commands -----------------------------------------------------
 
@@ -320,6 +356,29 @@ rtLine = do
   hFlush stdout
   eof <- hIsEOF stdin
   if eof then pure "" else hGetLine stdin
+
+-- ---- the stdin snapshot ----------------------------------------------------
+--
+-- `input` is transactional the same way a file read is: the FIRST call
+-- slurps stdin into a process-wide snapshot and every later call — and
+-- every RETRY — answers from it. (Before this, a retry re-slurped a
+-- consumed handle and died with a raw hGetContents' error: stdin was the
+-- one read the transaction forgot to snapshot.) The cache survives
+-- resetTx on purpose: the retried script must see the same input.
+
+{-# NOINLINE stdinSnap #-}
+stdinSnap :: IORef (Maybe String)
+stdinSnap = unsafePerformIO (newIORef Nothing)
+
+txInput :: IO String
+txInput = do
+  c <- readIORef stdinSnap
+  case c of
+    Just s -> pure s
+    Nothing -> do
+      s <- hGetContents' stdin
+      writeIORef stdinSnap (Just s)
+      pure s
 
 -- ---- commit protocol ------------------------------------------------------
 --
@@ -583,6 +642,13 @@ lockArtifact n =
 -- the rest re-run (loudly — this is the at-least-once window). crashAt
 -- is the SOL_CRASH_AT hook: die like kill -9 just before applying that
 -- effect index, so the crash windows are deterministically testable.
+--
+-- The count that comes back is what the receipt reports, so it counts
+-- FILE effects whose goal state holds afterwards — nothing else. A
+-- removal whose target still exists (rm of a directory, rmdir of a
+-- non-empty one) is a FAILED effect and says so; on the redo path the
+-- goal check is exactly what makes re-application idempotent (a file
+-- already gone is success, not a warning).
 replayEffs :: FilePath -> Bool -> [Int] -> Maybe Int -> [(Int, Effect)] -> IO Int
 replayEffs _ _ _ _ [] = pure 0
 replayEffs j recovery done crashAt ((i, e) : rest) = do
@@ -593,28 +659,35 @@ replayEffs j recovery done crashAt ((i, e) : rest) = do
       c_hardExit 137
     _ -> pure ()
   case e of
-    EWrite p v -> writeAtomic p v >> rec'
+    EWrite p v -> writeAtomic p v >> rec' 1
     ERemove p -> do
       _ <- try (removeFile p) :: IO (Either IOException ())
-      rec'
-    EMkdir p -> createDirectoryIfMissing True p >> rec'
+      still <- doesFileExist p
+      if still
+        then failedEff ("rm " ++ p ++ " (still exists)") >> rec' 0
+        else rec' 1
+    EMkdir p -> createDirectoryIfMissing True p >> rec' 1
     ERmdir p -> do
       _ <- try (removeDirectory p) :: IO (Either IOException ())
-      rec'
+      still <- doesDirectoryExist p
+      if still
+        then failedEff ("rmdir " ++ p ++ " (still exists — not empty?)") >> rec' 0
+        else rec' 1
     EShell cmd
       | recovery && i `elem` done -> do
           hPutStrLn stderr ("[sol] redo: skipping already-run command: " ++ cmd)
-          rec'
+          rec' 0
       | otherwise -> do
           when recovery $ hPutStrLn stderr ("[sol] redo: re-running deferred command (at-least-once): " ++ cmd)
           (code, out) <- txSh cmd
           markDone j i
           unless (null out) (putStr ("[sol] $ " ++ cmd ++ "\n" ++ out))
           if code == 0
-            then rec'
+            then rec' 0
             else do
               putStrLn ("[sol] deferred command FAILED (exit " ++ show code ++ "): " ++ cmd)
               putStrLn ("[sol] " ++ show (length rest) ++ " queued effect(s) after it did NOT run")
-              pure 1
+              pure 0
   where
-    rec' = (1 +) <$> replayEffs j recovery done crashAt rest
+    failedEff what = putStrLn ("[sol] effect FAILED (not counted): " ++ what)
+    rec' k = (k +) <$> replayEffs j recovery done crashAt rest
