@@ -40,6 +40,31 @@ Consequences, each of which is checked in the sweep:
    runtime prints a notice when a run used one, because the word
    "atomically" in the commit line is only true of the journaled set.
 
+## External processes
+
+Structured processes carry raw argv, cwd, environment overrides, stdin,
+and a timeout.  They do not pass through a shell, and stdout and stderr
+remain separate.  Their execution spelling states the retry contract:
+
+* `Proc.query spec` runs while evaluating the script.  It is for read-only
+   queries and runs again if the whole transaction retries.
+* `Proc.afterCommit spec` enters the redo journal.  Validation happens
+   before it runs, so an ordinary conflict never executes it.  A nonzero
+   exit stops later queued processes, the run exits unsuccessfully, and
+   already-validated file effects still reach their goal states.
+* `Proc.runNow spec` is an explicit realtime escape.  It runs immediately,
+   survives rollback, and runs again on retry.  The runtime names this loss
+   of atomicity.
+
+Deferred processes have **at-least-once crash recovery**, not exactly-once
+delivery.  The journal records a durable done marker after a process
+returns.  A hard crash between the external effect and that marker can
+therefore re-run the process during recovery.  Wrappers should use
+idempotent operations, compare-and-swap guards such as Git
+`--force-with-lease`, or application-level idempotency keys where this
+window matters.  No API should describe a deferred external process as
+rollback-safe.
+
 ## Why one commit and not one per eval
 
 Per-eval commits would make `>` a semantic boundary: moving a binding

@@ -31,7 +31,7 @@ import Data.IORef
 import Data.Maybe (mapMaybe)
 import Foreign.C.String (CString, withCString)
 import Foreign.C.Types (CInt (..))
-import System.Environment (lookupEnv)
+import System.Environment (getEnvironment, lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Text.Read (readMaybe)
 import qualified Data.ByteString as BS
@@ -56,8 +56,18 @@ import System.Directory
 import Data.Time.Clock.POSIX (getPOSIXTime, utcTimeToPOSIXSeconds)
 import System.Exit (ExitCode (..))
 import System.IO (readFile')
-import System.IO (hFlush, hGetContents', hIsEOF, hGetLine, stderr, stdin, stdout, hPutStrLn)
-import System.Process (createProcess, readCreateProcessWithExitCode, shell, waitForProcess)
+import System.IO (hFlush, hGetContents', hIsEOF, hGetLine, stderr, stdin, stdout, hPutStr, hPutStrLn)
+import System.Process (CreateProcess (..), createProcess, proc, readCreateProcessWithExitCode, shell, waitForProcess)
+import System.Timeout (timeout)
+
+data ProcessSpec = ProcessSpec
+  { psArgv :: [String],
+    psCwd :: Maybe FilePath,
+    psEnv :: [(String, String)],
+    psStdin :: String,
+    psTimeoutMs :: Maybe Int
+  }
+  deriving (Show, Read)
 
 -- The transaction's pending effect on the world, IN DECLARATION ORDER.
 -- File writes, removals, mkdirs, and QUEUED external commands interleave
@@ -68,6 +78,7 @@ data Effect
   | EMkdir FilePath
   | ERmdir FilePath
   | EShell String
+  | EProcess ProcessSpec
   deriving (Show, Read)
 
 data TxState = TxState
@@ -105,6 +116,7 @@ pushEffect ref e = do
     effectBrief (EMkdir p) = "mkdirp " ++ p
     effectBrief (ERmdir p) = "rmdir " ++ p
     effectBrief (EShell c) = "shq " ++ c
+    effectBrief (EProcess spec) = "Proc.afterCommit " ++ displayProcess spec
 
 -- Files are read as BYTES and decoded here, so a non-UTF-8 file is a
 -- fact we can report — it used to throw inside the locale decoder, get
@@ -322,6 +334,38 @@ txSh cmd = do
 -- On retry the queue is discarded: the world was never touched.
 txShq :: IORef TxState -> String -> IO ()
 txShq ref cmd = pushEffect ref (EShell cmd)
+
+-- Structured process execution. Unlike sh/shq, argv never crosses a shell,
+-- stdout and stderr stay separate, and environment entries override rather
+-- than replace the inherited environment. A non-positive timeout means none.
+runProcessSpec :: ProcessSpec -> IO (Either String (Int, String, String))
+runProcessSpec spec = case psArgv spec of
+  [] -> pure (Left "process argv is empty")
+  exe : args -> do
+    inherited <- getEnvironment
+    let overrides = M.fromList (psEnv spec)
+        mergedEnv = M.toList (M.union overrides (M.fromList inherited))
+        cp =
+          (proc exe args)
+            { cwd = psCwd spec,
+              env = if null (psEnv spec) then Nothing else Just mergedEnv
+            }
+        run = readCreateProcessWithExitCode cp (psStdin spec)
+        timed = case psTimeoutMs spec of
+          Just ms | ms > 0 -> timeout (ms * 1000) run
+          _ -> Just <$> run
+    result <- try timed :: IO (Either IOException (Maybe (ExitCode, String, String)))
+    pure $ case result of
+      Left e -> Left (show e)
+      Right Nothing -> Left ("timed out after " ++ show (maybe 0 id (psTimeoutMs spec)) ++ "ms")
+      Right (Just (code, out, err)) ->
+        Right (case code of ExitSuccess -> 0; ExitFailure n -> n, out, err)
+
+txProcessAfterCommit :: IORef TxState -> ProcessSpec -> IO ()
+txProcessAfterCommit ref spec = pushEffect ref (EProcess spec)
+
+displayProcess :: ProcessSpec -> String
+displayProcess spec = unwords (map show (psArgv spec))
 
 -- ---- REALTIME ESCAPES (outside the transaction) ---------------------------
 --
@@ -635,6 +679,7 @@ effectPath (ERemove p) = Just p
 effectPath (EMkdir p) = Just p
 effectPath (ERmdir p) = Just p
 effectPath (EShell _) = Nothing
+effectPath (EProcess _) = Nothing
 
 -- lock (sorted) -> validate reads AND dir listings -> journal the effect
 -- log (fsynced; the commit point) -> replay it in order -> clear the
@@ -789,6 +834,31 @@ replayEffs j0 recovery0 done0 crashAt0 effs0 = go False effs0
                   putStrLn ("[sol] deferred command FAILED (exit " ++ show code ++ "): " ++ cmd)
                   putStrLn ("[sol] later queued commands will be skipped; file effects still apply")
                   rec' True 0 rest
+        EProcess spec
+          | shellFailed -> do
+              putStrLn ("[sol] skipping queued process (an earlier one failed): " ++ displayProcess spec)
+              rec' shellFailed 0 rest
+          | recovery0 && i `elem` done0 -> do
+              hPutStrLn stderr ("[sol] redo: skipping already-run process: " ++ displayProcess spec)
+              rec' shellFailed 0 rest
+          | otherwise -> do
+              when recovery0 $ hPutStrLn stderr ("[sol] redo: re-running deferred process (at-least-once): " ++ displayProcess spec)
+              result <- runProcessSpec spec
+              markDone j0 i
+              case result of
+                Left err -> do
+                  putStrLn ("[sol] deferred process FAILED: " ++ displayProcess spec ++ ": " ++ err)
+                  putStrLn "[sol] later queued commands will be skipped; file effects still apply"
+                  rec' True 0 rest
+                Right (code, out, err) -> do
+                  unless (null out) (putStr out)
+                  unless (null err) (hPutStr stderr err)
+                  if code == 0
+                    then rec' shellFailed 0 rest
+                    else do
+                      putStrLn ("[sol] deferred process FAILED (exit " ++ show code ++ "): " ++ displayProcess spec)
+                      putStrLn "[sol] later queued commands will be skipped; file effects still apply"
+                      rec' True 0 rest
     failedEff what = putStrLn ("[sol] effect FAILED (not counted): " ++ what)
     rec' sf k rest = do
       (n, sf') <- go sf rest

@@ -261,6 +261,7 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
         kinds <- rtReport rt
         putStrLn ("[sol] NOT atomic overall: " ++ show total
                     ++ " realtime escape(s) — " ++ intercalate ", " kinds)
+      when sfail exitFailure
     Conflict stale
       | attempt + 1 >= maxRetries -> do
           putStrLn ("[sol] giving up after " ++ show maxRetries ++ " attempts (conflicts on " ++ show stale ++ ")")

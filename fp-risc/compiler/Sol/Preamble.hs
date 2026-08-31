@@ -86,6 +86,14 @@ prelude =
       "BStr.at : BStr -> Int -> (Int, BStr).",
       "BStr.sub : BStr -> Int -> Int -> (BStr, BStr).",
       "BStr.free : BStr -> Unit.",
+      -- Structured processes use raw argv, never shell parsing. Empty cwd
+      -- inherits the script's cwd; env entries override inherited values;
+      -- timeoutMs <= 0 means no timeout.
+      "ProcessSpec = Type (ProcessSpec (List String) String (List (String, String)) String Int).",
+      "ProcessResult = Type (ProcessResult Int String String).",
+      "Proc.query : ProcessSpec -> Result ProcessResult String.",
+      "Proc.afterCommit : ProcessSpec -> Unit.",
+      "Proc.runNow : ProcessSpec -> Result ProcessResult String.",
       "readNow p = read (Now p).",
       "writeNow p s = write p (NowSet s).",
       "appendNow p s = write p (NowAdd s).",
@@ -181,6 +189,7 @@ halArities =
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),
       ("BStr.append", 2), ("BStr.cat", 2), ("BStr.len", 1),
       ("BStr.at", 2), ("BStr.sub", 3), ("BStr.free", 1),
+      ("Proc.query", 1), ("Proc.afterCommit", 1), ("Proc.runNow", 1),
       ("read", 1), ("write", 2),
       ("myself", 1), ("spawn", 1), ("send", 2), ("sendLinear", 2), ("sendArc", 2), ("receive", 1), ("receiveFrom", 2),
       ("kill", 1), ("yield", 1), ("drop", 1), ("keep", 1), ("device", 1), ("reg32", 2),

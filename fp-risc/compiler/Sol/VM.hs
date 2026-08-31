@@ -882,6 +882,9 @@ mkHal cons tx preempts rt =
       -- panicking twin for free.
       ("Try.parseInt", (1, tryParseIntH)),
       ("Try.readPath", (1, tryReadPathH)),
+      ("Proc.query", (1, procQueryH)),
+      ("Proc.afterCommit", (1, procAfterCommitH)),
+      ("Proc.runNow", (1, procRunNowH)),
       -- Numeric prims: the doors into inexact arithmetic. Num.div is TRUE
       -- division (always inexact); ordinary +,-,*,/ then propagate
       -- inexactness by promotion in `arith`. floor/round land back on Int.
@@ -919,6 +922,8 @@ mkHal cons tx preempts rt =
     bst = globalBst
     (pathT, handleT) = (tidOf "Path", tidOf "Handle")
     bstrT = tidOf "BStr"
+    processSpecT = tidOf "ProcessSpec"
+    processResultT = tidOf "ProcessResult"
     mkBStr r = do k <- bstInsert bst r; pure (VData bstrT 0 [VInt (fromIntegral k)])
     withBStr (VData t 0 [VInt k]) f | t == bstrT = bstLookup bst (fromIntegral k) >>= f
     withBStr v _ = vmPanic ("BStr op: not a BStr: " ++ render v)
@@ -1087,6 +1092,56 @@ mkHal cons tx preempts rt =
         TxMissing -> vErr ("readPath: no such file: " ++ p)
         TxNonText -> vErr ("readPath: not a UTF-8 text file: " ++ p)
     tryReadPathH _ = vmPanic "Try.readPath: arity"
+
+    procQueryH [v] = decodeProcessSpec v >>= runProcessH
+    procQueryH _ = vmPanic "Proc.query: arity"
+
+    procAfterCommitH [v] = do
+      spec <- decodeProcessSpec v
+      txProcessAfterCommit tx spec
+      pure vUnit
+    procAfterCommitH _ = vmPanic "Proc.afterCommit: arity"
+
+    procRunNowH [v] = do
+      spec <- decodeProcessSpec v
+      noteEscape rt "Proc.runNow"
+        ("runs " ++ displayProcess spec ++ " immediately; it survives rollback "
+          ++ "and runs again on every retry (deferred: Proc.afterCommit)")
+      runProcessH spec
+    procRunNowH _ = vmPanic "Proc.runNow: arity"
+
+    runProcessH spec = do
+      result <- runProcessSpec spec
+      pure $ case result of
+        Left err -> vErr ("process " ++ displayProcess spec ++ ": " ++ err)
+        Right (code, out, err) ->
+          vOk (VData processResultT 0 [VInt (fromIntegral code), VStr out, VStr err])
+
+    decodeProcessSpec (VData t 0 [argvV, VStr cwdV, envV, VStr stdinV, VInt timeoutV])
+      | t == processSpecT = do
+          argv <- stringValues "argv" argvV
+          envPairs <- envValues envV
+          pure ProcessSpec
+            { psArgv = argv,
+              psCwd = if null cwdV then Nothing else Just cwdV,
+              psEnv = envPairs,
+              psStdin = stdinV,
+              psTimeoutMs = if timeoutV <= 0 then Nothing else Just (fromIntegral timeoutV)
+            }
+    decodeProcessSpec bad = vmPanic ("process: expected ProcessSpec, got " ++ render bad)
+
+    stringValues label = go
+      where
+        go (VData t 1 [VStr x, rest]) | t == listT = (x :) <$> go rest
+        go (VData t 0 []) | t == listT = pure []
+        go bad = vmPanic ("process " ++ label ++ ": expected List String, got " ++ render bad)
+
+    envValues = go
+      where
+        go (VData t 1 [VData 4 0 [VStr key, VStr value], rest]) | t == listT =
+          ((key, value) :) <$> go rest
+        go (VData t 0 []) | t == listT = pure []
+        go bad = vmPanic ("process env: expected List (String, String), got " ++ render bad)
 
     charAtH [sv, VInt i]
       | isStrVal sv = do
