@@ -230,12 +230,20 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
   gpu <- Gpu.initGPU
   tabFlag <- lookupEnv "SOL_TABLE"
   tab <- if tabFlag == Just "0" then pure Nothing else Just <$> newIORef M.empty
-  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons tx preempts rt) fuel preempts
+  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons tx preempts rt) fuel preempts tx
   forM_ topNames $ \n -> do
     v <- execFn env n []
     unless (isUnit v) $ putStrLn ("=> " ++ VM.render v)
   statsFlag <- lookupEnv "SOL_TABLE_STATS"
   when (statsFlag == Just "1") $ VM.dumpTabStats env
+  -- commit reads the effect log at ONE instant; a spawned actor still
+  -- running can only add to a dead transaction from here. Say so — the
+  -- join idiom (actor sends done, main receives it) is the fix.
+  liveA <- VM.liveSpawnedActors
+  unless (null liveA) $
+    putStrLn ("[sol] WARNING: " ++ show (length liveA) ++ " spawned actor(s) still running at commit — "
+                ++ "effects they produce from here are NOT part of this commit "
+                ++ "(join first: have each send a done message and receive it before the script ends)")
   forceN <- lookupEnv "SOL_FORCE_RETRY"
   let force = maybe 0 read forceN :: Int
   res <-
@@ -243,8 +251,9 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
       then pure (Conflict ["<forced>"]) -- discard this attempt's effects
       else commit tx journalFile
   case res of
-    Committed n -> do
-      when (n > 0) $ putStrLn ("[sol] committed " ++ show n ++ " file(s) atomically (whole-script transaction)")
+    Committed n sfail -> do
+      when (n > 0 && not sfail) $ putStrLn ("[sol] committed " ++ show n ++ " file(s) atomically (whole-script transaction)")
+      when sfail $ putStrLn ("[sol] committed " ++ show n ++ " file(s); NOT atomic: a deferred command failed (later queued commands skipped; file effects all applied)")
       -- if the run left the transaction at any point, say so plainly: the
       -- word "atomically" above is only true of the file set it names
       total <- rtTotal rt

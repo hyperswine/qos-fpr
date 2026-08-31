@@ -29,7 +29,7 @@ import Foreign.Ptr ()
 import Foreign.Storable (peek)
 import qualified Sol.Gpu as Gpu
 import qualified Sol.HandJIT as Hand
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
@@ -73,7 +73,8 @@ data VMEnv = VMEnv
     vmHand :: Maybe Hand.HandCtx, -- SOL_JIT=hand: hand-rolled x86-64, no llvm
     vmHal :: M.Map Name (Int, [Value] -> IO Value),
     vmFuel :: IORef Int,
-    vmPreempts :: IORef Int
+    vmPreempts :: IORef Int,
+    vmTx :: IORef TxState -- the script transaction (run-overlap policy)
   }
 
 fuelQuantum :: Int
@@ -465,6 +466,18 @@ actorSelf = do
       atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
       pure i
 
+-- spawned actors still running (their box has a thread that is not the
+-- asking thread; finished actors deregister themselves). The commit
+-- checkpoint asks so it can say, loudly, that effects those actors
+-- produce from here land in a dead transaction.
+liveSpawnedActors :: IO [Int]
+liveSpawnedActors = do
+  me <- myThreadId
+  reg <- readIORef actorReg
+  fmap concat . forM (IM.toList reg) $ \(i, b) -> do
+    mt <- readIORef (abTid b)
+    pure [i | mt /= Just me]
+
 actorEnqueue :: Int -> Int -> Value -> IO ()
 actorEnqueue to from m = do
   reg <- readIORef actorReg
@@ -567,9 +580,24 @@ modCall env "use" [VStr spec] = do
         putStrLn ("[sol] use: " ++ spec ++ " resolves to " ++ spec ++ "#" ++ h ++ " (pin this)")
       pure (VMod p h)
 modCall _ "use" [v] = vmPanic ("use: expected a module spec string, got " ++ render v)
-modCall _ "run" [VMod p h, x] = do
+modCall env "run" [VMod p h, x] = do
   r <- runModule p h (render x)
-  either vmPanic (pure . VStr) r
+  case r of
+    Left e -> vmPanic e
+    Right (out, cpaths) -> do
+      -- the read-before-run shape can NEVER commit: the child's write
+      -- invalidates our snapshot, the retry re-runs the child, forever
+      -- (amplifying its effects). Refuse deterministically instead.
+      overlap <- txChildOverlap (vmTx env) cpaths
+      if null overlap
+        then pure (VStr out)
+        else
+          vmPanic
+            ( "run: the child module committed to " ++ show overlap
+                ++ ", which this transaction already read, listed, or wrote —"
+                ++ " that can never validate (every retry re-runs the child)."
+                ++ " Read those paths AFTER run, or pass data via stdin/stdout"
+            )
 modCall _ "run" [v, _] = vmPanic ("run: not a module: " ++ render v)
 modCall _ g _ = vmPanic (g ++ ": bad arguments")
 
@@ -1054,7 +1082,10 @@ mkHal cons tx preempts rt =
 
     tryReadPathH [v] = withP v $ \p -> do
       r <- txTryRead tx p
-      pure (maybe (vErr ("readPath: no such file: " ++ p)) (vOk . VStr) r)
+      pure $ case r of
+        TxText s -> vOk (VStr s)
+        TxMissing -> vErr ("readPath: no such file: " ++ p)
+        TxNonText -> vErr ("readPath: not a UTF-8 text file: " ++ p)
     tryReadPathH _ = vmPanic "Try.readPath: arity"
 
     charAtH [sv, VInt i]
