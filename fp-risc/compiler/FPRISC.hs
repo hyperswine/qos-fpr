@@ -17,7 +17,7 @@ import Data.Bits (shiftR, xor)
 import qualified Data.Bits
 import GHC.Float (castDoubleToWord64, castFloatToWord32)
 import Data.Char (isAlphaNum, isLetter, isLower, isUpper, ord)
-import Data.List (foldl', intercalate, nub, sort, sortOn)
+import Data.List (foldl', intercalate, isPrefixOf, nub, sort, sortOn)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Data.Maybe (fromMaybe)
@@ -35,6 +35,16 @@ type Name = String
 
 data SExpr
   = SVar Name
+  | SMark !Int SExpr -- source position wrapper (spans step 3): the Int
+                     -- is the SOURCE OFFSET in the defining file,
+                     -- attached by the parser at block-statement and
+                     -- case-arm granularity.  INVISIBLE to semantics:
+                     -- shape-sensitive matchers look through it
+                     -- (unmark), stripPosTops erases it before module
+                     -- hashing, the desugarer drops it at the Core
+                     -- boundary.  Infer stamps the innermost enclosing
+                     -- mark into its diagnostics ("@OFF~ "), which the
+                     -- error sinks resolve to file:line:col.
   | SInt Integer
   | SAtom Name
   | SStrI [Seg]
@@ -439,7 +449,7 @@ caseE = do
     -- self-delimiting (every stmt ends in ';' behind a try), so the
     -- arm still stops cleanly at '|' or the clause terminator --
     -- the doX/doX2 helper-splitting idiom is retired.
-    arm = do p <- pattern'; _ <- symbol "->"; (p,) <$> block
+    arm = do p <- pattern'; _ <- symbol "->"; o <- getOffset; b <- block; pure (p, SMark o b)
 
 stringLit :: P SExpr
 stringLit = lexeme $ do
@@ -632,6 +642,7 @@ aritySpill tops = (map top tops, notes)
     refG vs (GBool e) = any (\v -> refE' v e) vs
     refG vs (GPat _ e) = any (\v -> refE' v e) vs
     refE' v e = case e of
+      SMark _ e' -> refE' v e'
       SVar x -> x == v
       SApp a b -> refE' v a || refE' v b
       SLam _ b -> refE' v b
@@ -669,6 +680,7 @@ aritySpill tops = (map top tops, notes)
     unspine e = (e, [])
     respine h = foldl SApp h
     descend e = case e of
+      SMark o a -> SMark o (goE a)
       SApp a b -> SApp (goE a) (goE b)
       SLam x b -> SLam x (goE b)
       SBlock ss fin -> SBlock (map stmt ss) (goE fin)
@@ -732,6 +744,7 @@ autoDrop tops = (tops', concat notess)
                    all (resultIsOrigin known) bs ]
        in if S.null step then known else fixOrigins (S.union known step)
     resultIsOrigin known e = case e of
+      SMark _ e' -> resultIsOrigin known e'
       SBlock _ fin -> resultIsOrigin known fin
       SCase _ arms -> not (null arms) && all (resultIsOrigin known . snd) arms
       _ -> case adHeadName e of
@@ -749,7 +762,8 @@ autoDrop tops = (tops', concat notess)
     -- (fpr_drop_park), where copy-on-retain says every borrow is dead.
     goStmts n (SBind m [] rhs : rest) fin
       | isReceive rhs,
-        (SBindPat p (SVar m') : after) <- rest,
+        (SBindPat p rhsP : after) <- rest,
+        SVar m' <- unmark rhsP,
         m' == m,
         not (refStmts m after || refE m fin),
         not (droppedIn m rest fin) =
@@ -801,9 +815,10 @@ autoDrop tops = (tops', concat notess)
     -- statement itself, a case scrutinee (arms checked recursively),
     -- or a DIRECT argument of a borrowing builtin.  Anything else
     -- containing a bare m refuses shape 3.
-    okUse m (SBindPat _ (SVar x)) | x == m = True
+    okUse m (SBindPat _ rhsP) | SVar x <- unmark rhsP, x == m = True
     okUse m st = all (okE m) (stmtEs st)
     okE m e = case e of
+      SMark _ e' -> okE m e'
       SVar x -> x /= m
       SCase (SVar x) arms | x == m -> all (okE m . snd) arms
       _ | (SVar h, as@(_ : _)) <- adSpine e [],
@@ -821,6 +836,7 @@ autoDrop tops = (tops', concat notess)
       SList es -> all (okE m) es
       SStrI segs -> and [okE m e' | SegExpr e' <- segs]
       _ -> True
+    adSpine (SMark _ e) acc = adSpine e acc
     adSpine (SApp f a) acc = adSpine f (a : acc)
     adSpine e acc = (e, acc)
     dropInto m b =
@@ -850,6 +866,7 @@ autoDrop tops = (tops', concat notess)
       SVar x -> x == m
       _ -> anySub (refE m) e
     anySub f e = case e of
+      SMark _ a -> f a
       SApp a b -> f a || f b
       SLam _ b -> f b
       SBlock ss fin -> any f (concatMap stmtEs ss) || f fin
@@ -864,6 +881,7 @@ autoDrop tops = (tops', concat notess)
       _ -> False
 
 adHeadName :: SExpr -> Maybe Name
+adHeadName (SMark _ e) = adHeadName e
 adHeadName (SVar n) = Just n
 adHeadName (SApp f _) = adHeadName f
 adHeadName _ = Nothing
@@ -1081,15 +1099,17 @@ block = do
       n <- pName
       ps <- many lowerName
       eqSign
+      o <- getOffset
       e <- expr
       _ <- symbol ";"
-      pure (SBind n ps e)
+      pure (SBind n ps (SMark o e))
     patStmt = do
       p <- pattern'
       eqSign
+      o <- getOffset
       e <- expr
       _ <- symbol ";"
-      pure (SBindPat p e)
+      pure (SBindPat p (SMark o e))
 
 --------------------------------------------------------------------------------
 -- Desugaring
@@ -1178,6 +1198,7 @@ collectShapes tops = M.fromList [(fs, shapeIdFor fs) | fs <- allShapes]
       PTup ps -> concatMap patShapes ps
       _ -> []
     exprShapes = \case
+      SMark _ e -> exprShapes e
       SRec fs -> [sort (map fst fs)] ++ concatMap (exprShapes . snd) fs
       SApp a b -> exprShapes a ++ exprShapes b
       SLam _ e -> exprShapes e
@@ -1325,6 +1346,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
     parseLeaf _ v = v
 
     children e = case e of
+      SMark _ a -> [a]
       SApp a b -> [a, b]
       SLam _ b -> [b]
       SBlock ss fin -> concatMap sChildren ss ++ [fin]
@@ -1342,6 +1364,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
         sChildren (SBindPat _ x) = [x]
 
     descend e = case e of
+      SMark o a -> SMark o (goE a)
       SApp a b -> SApp (goE a) (goE b)
       SLam x b -> SLam x (goE b)
       SBlock ss fin -> SBlock (map stmt ss) (goE fin)
@@ -1362,6 +1385,7 @@ expandPathLits tbl tops = (nub (concatMap errsTop tops), map top tops)
 
 dExpr :: SExpr -> D Core
 dExpr = \case
+  SMark _ e -> dExpr e -- positions stop at the Core boundary
   SVar n -> do
     cons <- gets dCons
     pure $ case M.lookup n cons of
@@ -1525,6 +1549,7 @@ matchPat :: Core -> SPat -> Core -> Core -> D Core
 matchPat scrut p ok fail' = case p of
   PWild -> pure ok
   PVar x -> pure (CLet x scrut ok)
+  PSig x _ -> pure (CLet x scrut ok) -- erased by erasePSig; PVar behavior if one survives
   PInt n -> pure (CIf (CApp (CApp (CVar "==") scrut) (CInt n)) ok fail')
   PStr s -> pure (CIf (CApp (CApp (CVar "==") scrut) (CStr s)) ok fail')
   PCon c ps -> do
@@ -1722,19 +1747,157 @@ pretty = go 0
 prettyProg :: Prog -> [Name] -> String
 prettyProg prog names = unlines [n ++ " " ++ unwords ps ++ " =\n  " ++ pretty b ++ "\n" | n <- names, Just (ps, b) <- [M.lookup n prog]]
 
---------------------------------------------------------------------------------
--- Evaluator (host-side; the target uses Codegen instead)
---------------------------------------------------------------------------------
+-- ---- source anchors (spans, step 1: bind-level) -----------------------------
+--
+-- The compiler's post-parse diagnostics were location-free strings.
+-- Step 1 anchors every "in NAME: ..." message to file:line of NAME's
+-- definition, with NO change to the AST (so nothing downstream moves
+-- and no pinned module hash churns):
+--
+--   * top declarations start at COLUMN 0 by the grammar, so a bind's
+--     anchor is the first col-0 line beginning with its name -- the
+--     signature line when one precedes the clauses, which is the
+--     better anchor anyway;
+--   * the map is keyed by the (possibly splice-renamed) top name; the
+--     scan token strips the @hash suffix module splicing appends, so
+--     unit anchors survive qualification.
+--
+-- Step 3 (statement-level SMark wrappers) replaces the scan with real
+-- parser positions; stripPosTops below is already the seam that keeps
+-- module identity blind to them.
 
-data Value
-  = VInt Integer
-  | VStr String
-  | VData Int Int [Value]
-  | VPap PapRef [Value] Int
-  deriving (Show)
+-- the SPAN-PROOFING seam (spans, step 0): module identity is the hash
+-- of the POSITIONLESS tree.  Any future source-position node (an SMark
+-- wrapper, a located bind) is erased HERE before Modules.hs hashes, so
+-- spans can never churn pinned module hashes.  Today no such node
+-- exists and this is the identity -- the hash string stays
+-- bit-compatible with every existing pin.
+stripPosTops :: [STop] -> [STop]
+stripPosTops = map stripTop
+  where
+    stripTop = \case
+      TBind n ps g b -> TBind n ps (map (mapGuardE stripE) g) (stripE b)
+      TEval e -> TEval (stripE e)
+      TStruct n sigs fs -> TStruct n sigs [(f, stripE e) | (f, e) <- fs]
+      t -> t
 
-data PapRef = PGlobal Name | PPrim Name deriving (Show)
+-- erase every position wrapper (module identity, and any consumer that
+-- needs the pure syntactic tree)
+stripE :: SExpr -> SExpr
+stripE = \case
+  SMark _ e -> stripE e
+  SApp a b -> SApp (stripE a) (stripE b)
+  SLam ps e -> SLam ps (stripE e)
+  SBlock ss e -> SBlock (map stripS ss) (stripE e)
+  SCase s arms -> SCase (stripE s) [(p, stripE e) | (p, e) <- arms]
+  SBin o a b -> SBin o (stripE a) (stripE b)
+  SProj e fs -> SProj (stripE e) fs
+  SRec fs -> SRec [(f, stripE e) | (f, e) <- fs]
+  SUpd m as -> SUpd (stripE m) [(p, stripE e) | (p, e) <- as]
+  STup es -> STup (map stripE es)
+  SList es -> SList (map stripE es)
+  SStrI segs -> SStrI [case sg of SegExpr e -> SegExpr (stripE e); s -> s | sg <- segs]
+  e -> e
+  where
+    stripS (SBind n ps e) = SBind n ps (stripE e)
+    stripS (SBindPat p e) = SBindPat p (stripE e)
 
+-- look through position wrappers: every SHAPE-SENSITIVE match (a pass
+-- recognizing a special form by syntax) goes through this first
+unmark :: SExpr -> SExpr
+unmark (SMark _ e) = unmark e
+unmark e = e
+
+type Anchors = M.Map Name (FilePath, Int)
+
+bindAnchors :: FilePath -> String -> [STop] -> Anchors
+bindAnchors file src tops =
+  M.fromList [(n, (file, ln)) | n <- names, Just ln <- [findLn (baseName n)]]
+  where
+    names = nub ([n | TBind n _ _ _ <- tops] ++ [n | TSig n _ _ <- tops])
+    baseName = takeWhile (/= '@')
+    srcLines = zip [1 :: Int ..] (lines src)
+    findLn tok =
+      case [i | (i, l) <- srcLines, tok `isPrefixOf` l, defLike (drop (length tok) l)] of
+        (i : _) -> Just i
+        [] -> Nothing -- struct fields etc. define off-column: no anchor, graceful
+    defLike (c : _) = c `elem` (" \t:=(" :: String)
+    defLike [] = True
+
+type Sources = M.Map FilePath String
+
+-- rewrite one diagnostic (spans steps 1-3, best available precision):
+--
+--   "in NAME: @OFF~ msg"  -> "file:line:col: in NAME: msg"   (step 3:
+--       Infer stamped the enclosing statement mark's source offset)
+--   "in NAME: ...'tok'..." -> "file:line:col: in NAME: ..."  (step 2:
+--       the first word-boundary occurrence of the token the message
+--       names, scanned within NAME's definition range)
+--   "in NAME: msg"         -> "file:line: in NAME: msg"      (step 1:
+--       NAME's definition line)
+--
+-- messages without a known "in NAME:" prefix pass through untouched.
+anchorMsg :: Sources -> Anchors -> String -> String
+anchorMsg srcs anchors msg = case msg of
+  'i' : 'n' : ' ' : rest
+    | (n, ':' : ' ' : body) <- break (== ':') rest,
+      Just (f, bindLn) <- M.lookup n anchors ->
+        let cleaned = "in " ++ n ++ ": " ++ dropMark body
+         in case markPos f body of
+              Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
+              Nothing -> case tokenPos f n bindLn body of
+                Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
+                Nothing -> f ++ ":" ++ show bindLn ++ ": " ++ cleaned
+  _ -> msg
+  where
+    -- step 3: "@OFF~ " stamp from the inference engine
+    markPos f ('@' : b)
+      | (ds@(_ : _), '~' : ' ' : _) <- span (`elem` ("0123456789" :: String)) b =
+          offsetPos f (read ds)
+    markPos _ _ = Nothing
+    dropMark ('@' : b)
+      | (_ : _, '~' : ' ' : real) <- span (`elem` ("0123456789" :: String)) b = real
+    dropMark b = b
+    offsetPos f off = do
+      src <- M.lookup f srcs
+      let pre = take off src
+          l = 1 + length (filter (== '\n') pre)
+          c = 1 + length (takeWhile (/= '\n') (reverse pre))
+      pure (l, c)
+    -- step 2: the token the message names, found in the bind's range
+    tokenPos f n bindLn body = do
+      src <- M.lookup f srcs
+      tok <- msgToken body
+      let endLn = case [l | (_, (f', l)) <- M.toList anchors, f' == f, l > bindLn] of
+            [] -> length (lines src)
+            ls -> minimum ls - 1
+          slice = take (endLn - bindLn + 1) (drop (bindLn - 1) (lines src))
+      case [ (bindLn + i, c)
+             | (i, l) <- zip [0 ..] slice,
+               c <- take 1 (wordHits tok l)
+           ] of
+        (p : _) -> Just p
+        [] -> Nothing
+    msgToken body = case break (== '\'') body of
+      (_, '\'' : q) | (tok@(_ : _), '\'' : _) <- break (== '\'') q -> Just tok
+      _
+        | Just r <- afterStr "application of " body -> Just (takeWhile identChar r)
+        | otherwise -> Nothing
+    afterStr pat s
+      | pat `isPrefixOf` s = Just (drop (length pat) s)
+      | otherwise = case s of (_ : t) -> afterStr pat t; [] -> Nothing
+    wordHits tok l =
+      [ i + 1
+        | i <- [0 .. length l - length tok],
+          take (length tok) (drop i l) == tok,
+          i == 0 || not (identChar (l !! (i - 1))),
+          i + length tok >= length l || not (identChar (l !! (i + length tok)))
+      ]
+    identChar c = c `elem` ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.'@" :: String)
+
+-- the primitive names the lambda lifter must not treat as free
+-- variables (the host-side evaluator this list once served is gone --
+-- both its copies; the Sol VM and Codegen are the executors)
 primNames :: [Name]
 primNames =
   [ "+",
@@ -1755,110 +1918,6 @@ primNames =
     "error"
   ]
 
-primArity :: Name -> Int
-primArity n
-  | n `elem` ["print", "String.len", "str", "error"] = 1
-  | otherwise = 2
-
-vTrue, vFalse, vUnit :: Value
-vTrue = VData boolT 1 []
-vFalse = VData boolT 0 []
-vUnit = VData 0 0 []
-
-eval :: Prog -> M.Map Name Value -> Core -> IO Value
-eval prog env = go
-  where
-    go = \case
-      CInt i -> pure (VInt i)
-      CStr s -> pure (VStr s)
-      CErr m -> errorWithoutStackTrace ("fpr: " ++ m)
-      CVar n -> case M.lookup n env of
-        Just v -> pure v
-        Nothing -> case M.lookup n prog of
-          Just ([], body) -> eval prog M.empty body
-          Just (ps, _) -> pure (VPap (PGlobal n) [] (length ps))
-          Nothing
-            | n `elem` primNames -> pure (VPap (PPrim n) [] (primArity n))
-            | otherwise -> errorWithoutStackTrace ("unbound: " ++ n)
-      CApp f a -> do
-        fv <- go f
-        av <- go a
-        apply prog fv av
-      CLam {} -> errorWithoutStackTrace "internal: CLam survived lifting"
-      CLet x a b -> do
-        av <- go a
-        eval prog (M.insert x av env) b
-      CIf c t e ->
-        go c >>= \case
-          VData t' v' _ | t' == boolT -> if v' == 1 then go t else go e
-          other -> errorWithoutStackTrace ("if: non-bool " ++ show other)
-      CMk t v fs -> VData t v <$> mapM go fs
-      CTagEq t v e ->
-        go e >>= \case
-          VData t' v' _ -> pure (if t == t' && v == v' then vTrue else vFalse)
-          _ -> pure vFalse
-      CProj i e ->
-        go e >>= \case
-          VData _ _ fs | i < length fs -> pure (fs !! i)
-          other -> errorWithoutStackTrace ("proj: bad value " ++ show other)
-
-apply :: Prog -> Value -> Value -> IO Value
-apply prog (VPap ref args 1) a = call prog ref (reverse (a : args))
-apply prog (VPap ref args n) a = pure (VPap ref (a : args) (n - 1))
-apply _ v _ = errorWithoutStackTrace ("apply: not a function: " ++ show v)
-
-call :: Prog -> PapRef -> [Value] -> IO Value
-call prog (PGlobal n) args = case M.lookup n prog of
-  Just (ps, body) -> eval prog (M.fromList (zip ps args)) body
-  Nothing -> errorWithoutStackTrace ("no global: " ++ n)
-call prog (PPrim n) args = prim prog n args
-
-prim :: Prog -> Name -> [Value] -> IO Value
-prim _ "print" [v] = putStrLn (render v) >> pure vUnit
-prim _ "str" [v] = pure (VStr (render v))
-prim _ "strcat" [VStr a, VStr b] = pure (VStr (a ++ b))
-prim _ "String.len" [VStr s] = pure (VInt (fromIntegral (length s)))
-prim _ "error" [VStr m] = errorWithoutStackTrace ("fpr: " ++ m)
-prim _ "+" [VInt a, VInt b] = pure (VInt (a + b))
-prim _ "-" [VInt a, VInt b] = pure (VInt (a - b))
-prim _ "*" [VInt a, VInt b] = pure (VInt (a * b))
-prim _ "/" [VInt a, VInt b] = if b == 0 then errorWithoutStackTrace "fpr: division by zero" else pure (VInt (a `div` b))
-prim _ "==" [a, b] = pure (bool (veq a b))
-prim _ "!=" [a, b] = pure (bool (not (veq a b)))
-prim _ "<" [VInt a, VInt b] = pure (bool (a < b))
-prim _ ">" [VInt a, VInt b] = pure (bool (a > b))
-prim _ "<=" [VInt a, VInt b] = pure (bool (a <= b))
-prim _ ">=" [VInt a, VInt b] = pure (bool (a >= b))
-prim _ "!" [VData t v fs, VInt i] | t == listT = index (VData t v fs) i
-  where
-    index (VData _ 1 [x, rest]) 1 = pure x
-    index (VData _ 1 [_, rest]) k = index rest (k - 1)
-    index _ _ = errorWithoutStackTrace "fpr: index out of range"
-prim _ n args = errorWithoutStackTrace ("prim " ++ n ++ ": bad args (typeid dispatch found no case): " ++ show args)
-
-bool :: Bool -> Value
-bool b = if b then vTrue else vFalse
-
-veq :: Value -> Value -> Bool
-veq (VInt a) (VInt b) = a == b
-veq (VStr a) (VStr b) = a == b
-veq (VData t v fs) (VData t' v' fs') = t == t' && v == v' && length fs == length fs' && and (zipWith veq fs fs')
-veq _ _ = False
-
-render :: Value -> String
-render (VInt i) = show i
-render (VStr s) = s
-render (VData t 1 [x, rest]) | t == listT = "[" ++ intercalate ", " (renderList (VData t 1 [x, rest])) ++ "]"
-  where
-    renderList (VData _ 1 [y, r]) = render y : renderList r
-    renderList _ = []
-render (VData t 0 []) | t == listT = "[]"
-render (VData 1 0 []) = "False"
-render (VData 1 1 []) = "True"
-render (VData 6 0 [VStr a]) = ":" ++ a
-render (VData 0 0 []) = "()"
-render (VData t v fs) = "<" ++ show t ++ "." ++ show v ++ (if null fs then "" else " " ++ unwords (map render fs)) ++ ">"
-render (VPap ref args n) = "<fn " ++ show ref ++ "/" ++ show n ++ ">"
 
 --------------------------------------------------------------------------------
 -- Linearity checker (static, pre-desugar).
@@ -1890,10 +1949,17 @@ shapeOfTy lin = \case
 buildLinInfo :: [STop] -> LinInfo
 buildLinInfo tops = LinInfo lin sigs conSh conAr
   where
-    lin = [n | TType n True _ _ <- tops]
+    -- TAlias resolves here too (the sol profile's module aliasing):
+    -- an alias of a linear type is linear, and its constructors carry
+    -- the target's shapes/arities
+    aliases = [(t, tgt) | TAlias t tgt <- tops]
+    lin0 = [n | TType n True _ _ <- tops]
+    lin = lin0 ++ [t | (t, tgt) <- aliases, tgt `elem` lin0]
     sigs = M.fromList [(n, (map sh ps, sh r)) | TSig n (ps, r) _ <- tops]
-    conSh = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
-    conAr = M.fromList [(c, length tys) | TType _ _ _ cs <- tops, (c, tys) <- cs]
+    conSh0 = M.fromList [(c, (if linear then LL else LU, map sh tys)) | TType _ linear _ cs <- tops, (c, tys) <- cs]
+    conSh = foldl' (\m (t, tgt) -> maybe m (\e -> M.insert t e m) (M.lookup tgt m)) conSh0 aliases
+    conAr0 = M.fromList [(c, length tys) | TType _ _ _ cs2 <- tops, (c, tys) <- cs2]
+    conAr = foldl' (\m (t, tgt) -> maybe m (\e -> M.insert t e m) (M.lookup tgt m)) conAr0 aliases
     sh = shapeOfTy lin
 
 type Cnt = M.Map Name Int
@@ -1936,7 +2002,11 @@ lcheck li tops = concatMap checkGroup groups
           useErrs = case bc of
             Nothing -> []
             Just c -> ["in " ++ n ++ ": linear variable '" ++ v ++ "' used " ++ show (M.findWithDefault 0 v c) ++ " time(s), expected exactly 1" | v <- linear, M.findWithDefault 0 v c /= 1]
-       in wildErrs ++ ge ++ be ++ guardErr ++ useErrs
+          -- EVERY linearity error names its bind (spans step 1: the
+          -- "in NAME:" prefix is what the error sinks anchor to
+          -- file:line) -- body/guard errors from linExpr gain it here
+          pre e = if ("in " ++ n ++ ":") `isPrefixOf` e then e else "in " ++ n ++ ": " ++ e
+       in map pre (wildErrs ++ ge ++ be ++ guardErr ++ useErrs)
       where
         lin' = linExpr li
 
@@ -1956,6 +2026,7 @@ wildLinErrs p s = case p of
 bindPat :: LinInfo -> SPat -> LShape -> [(Name, LShape)]
 bindPat li p s = case p of
   PVar x -> [(x, s)]
+  PSig x _ -> [(x, s)] -- erased by erasePSig; PVar behavior if one survives
   PWild -> []
   PInt _ -> []
   PStr _ -> []
@@ -1977,6 +2048,7 @@ linExpr li env0 = go env0
 
     go :: M.Map Name LShape -> SExpr -> LRes
     go env = \case
+      SMark _ e -> go env e
       SVar v -> case M.lookup v env of
         Just s | isLin s -> ([], Just (M.singleton v 1), s)
         Just s -> ([], Just zero, s)
@@ -2127,6 +2199,7 @@ sFree :: SExpr -> [Name]
 sFree = nub . go
   where
     go = \case
+      SMark _ e -> go e
       SVar v -> [v]
       SApp a b -> go a ++ go b
       SLam ps e -> filter (`notElem` ps) (go e)
@@ -2172,6 +2245,7 @@ transformEP :: (S.Set Name -> SExpr -> SExpr) -> (SPat -> SPat) -> S.Set Name ->
 transformEP f pf = go
   where
     go bs e0 = f bs $ case e0 of
+      SMark o e -> SMark o (go bs e)
       SApp a b -> SApp (go bs a) (go bs b)
       SLam ps b -> SLam ps (go (bs `S.union` S.fromList ps) b)
       SBlock stmts fin ->

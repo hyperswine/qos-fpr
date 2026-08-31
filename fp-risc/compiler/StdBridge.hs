@@ -103,6 +103,7 @@ liftSurfaceLams tops = concat (evalState (mapM liftTop tops) (0 :: Int, []))
     -- state: (fresh counter across the file, lifted tops of the current group)
     goE :: Name -> SExpr -> State (Int, [STop]) SExpr
     goE host e = case e of
+      SMark o x -> SMark o <$> goE host x
       SApp f a -> SApp <$> goE host f <*> goA host a
       SLam ps b -> SLam ps <$> goE host b -- head-position lambda: leave it
       SBlock ss fin -> SBlock <$> mapM goS ss <*> goE host fin
@@ -179,6 +180,7 @@ bridgeE = \case
         et <- bridgeE t
         ef <- bridgeE f
         pure (SC.If <$> ec <*> et <*> ef)
+  SMark _ x -> bridgeE x
   SBlock stmts final -> bridgeBlock stmts final
   app@(SApp _ _) ->
     let (hd, args) = spine app []

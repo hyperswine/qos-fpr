@@ -125,7 +125,8 @@ tabEligible prog g = case M.lookup g prog of
   Just (ps, body) -> length ps <= 4 && ok body
   Nothing -> False
   where
-    pureOps = ["+", "-", "*", "/", "==", "/=", "<", "<=", ">", ">=", "imod", "mod", "and2", "or2", "not"]
+    -- ops from the ONE vocabulary (Bytecode.arithOps) + the pure helpers
+    pureOps = M.keys arithOps ++ ["imod", "mod", "and2", "or2", "not"]
     ok c = case c of
       Lang.CInt _ -> True
       Lang.CVar v -> v `elem` pureOps || v == g || isParamish v
@@ -367,7 +368,7 @@ builtinArities :: M.Map Name Int
 builtinArities =
   M.union schemeArities $
     M.fromList
-      [ ("myself", 1), ("spawn", 1), ("send", 2), ("receive", 1), ("receiveFrom", 2),
+      [ ("myself", 1), ("spawn", 1), ("send", 2), ("sendLinear", 2), ("sendArc", 2), ("receive", 1), ("receiveFrom", 2),
         ("kill", 1), ("yield", 1), ("drop", 1), ("keep", 1), ("device", 1), ("reg32", 2),
         ("Sys.poolReset", 1), ("Sys.sleepUs", 1), ("Sys.logAt", 2), ("Sys.memStats", 1),
         ("use", 1), ("run", 2), ("View.serve", 5),
@@ -497,7 +498,7 @@ mtimeT = 9977 -- runtime-range tid for the shim's mtime handle
 actorNames :: S.Set Name
 actorNames =
   S.fromList
-    [ "myself", "spawn", "send", "receive", "receiveFrom", "kill", "yield",
+    [ "myself", "spawn", "send", "sendLinear", "sendArc", "receive", "receiveFrom", "kill", "yield",
       "drop", "keep", "device", "reg32",
       "Sys.poolReset", "Sys.sleepUs", "Sys.logAt", "Sys.memStats"
     ]
@@ -523,6 +524,13 @@ actorCall _ "send" [VInt to, m] = do
   from <- actorSelf
   actorEnqueue (fromIntegral to) from m
   pure vUnit
+-- sendLinear: MOVE semantics.  In this profile values are immutable
+-- Haskell terms, so the move IS a send -- the verb exists for grammar
+-- parity with the AOT tiers, where it transfers the message slab
+-- (hal/core/actors.c a_send_linear) and the checker consumes the arg.
+actorCall e "sendLinear" [to, m] = actorCall e "send" [to, m]
+-- sendArc: SHARE semantics; immutable values make sharing == sending
+actorCall e "sendArc" [to, m] = actorCall e "send" [to, m]
 actorCall _ "receive" [VInt _me] = actorTake (const True)
 actorCall _ "receiveFrom" [VInt _me, VInt from] = actorTake (== fromIntegral from)
 actorCall _ "kill" [VInt i] = do
@@ -773,9 +781,9 @@ withFuelCell env body = alloca $ \p -> do
 -- tids are passed in because the front-end assigns user-type ids in
 -- declaration order (prelude declares them first).
 
--- VBStr is an IORef; we can't put it directly in a VData field, so the
+-- a BStr's store is an IORef, which can't ride in a VData field, so the
 -- runtime uses a table of refs keyed by a fresh Int id -- the same bridge
--- Handle uses.
+-- Handle uses.  (This table IS the BStr representation.)
 type BStrTable = IORef (IM.IntMap (IORef BStrStore))
 
 newBStrTable :: IO BStrTable
@@ -1047,13 +1055,6 @@ mkHal cons tx preempts rt =
           pure (VStr (take l (drop (o - 1) s)))
     substrH _ = vmPanic "substr: bad args"
 
-    bsSubH [VBStr r, VInt i, VInt j] = do
-      s <- bsContent r
-      let lo = fromIntegral i; hi = fromIntegral j
-      if lo < 1 || hi > length s || lo > hi
-        then vmPanic "BStr.sub: index out of range"
-        else bstrFromString (take (hi - lo + 1) (drop (lo - 1) s))
-    bsSubH _ = vmPanic "BStr.sub: bad args"
     indexH [xs, VInt i] = idx xs i
       where
         idx (VVec r) k = getVec r (fromIntegral k - 1) -- O(1); consumes the vector (linearity) — Vec.get keeps it

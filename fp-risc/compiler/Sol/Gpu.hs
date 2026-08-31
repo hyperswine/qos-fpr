@@ -33,6 +33,7 @@ import Foreign.Ptr (Ptr)
 import Foreign.Marshal.Alloc (allocaBytes)
 import Foreign.Storable (peekElemOff)
 import Sol.Lang (Core (..), Prog, Name)
+import Sol.Bytecode (cmpNames)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 
@@ -109,7 +110,9 @@ glslOfFn prog g nCap = do
         bin env op a b = do
           a' <- go env a; b' <- go env b
           pure ("(" ++ a' ++ " " ++ op ++ " " ++ b' ++ ")")
-        cmps = [("<", "<"), ("<=", "<="), (">", ">"), (">=", ">="), ("==", "=="), ("/=", "!=")]
+        -- the ONE vocabulary (Bytecode.arithOps); GLSL's spellings for
+        -- every comparison coincide with sol's, != included
+        cmps = [(n, n) | n <- cmpNames]
 
 -- run one map over doubles (captured scalars as uniforms); Nothing on
 -- any backend failure (caller falls to the JIT — the tier never fails

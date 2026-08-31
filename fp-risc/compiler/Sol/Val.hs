@@ -63,10 +63,9 @@ data Value
   -- is preserved — using the BSU.decode loop only when the character boundary
   -- doesn't land on a 7-bit ASCII byte.
   --
-  -- Haskell String and VBStr are INTEROPERABLE: all builtins accept either
-  -- (vsStr extracts a Haskell String from either), so existing code that mixes
-  -- VStr results from system calls with VBStr buffers is not a type error.
-  | VBStr (IORef BStrStore)
+  -- The BStr VALUE lives in VM.hs's table (VData bstrT 0 [key]); the
+  -- store below is its backing.  (A VBStr value constructor once lived
+  -- here too -- two representations, one dead: deleted.)
   | VData !Int !Int [Value]
   | VPap String [Value] !Int -- global or HAL symbol, collected args, remaining
   | VVec (IORef VecStore) -- the linear SoA vector
@@ -93,12 +92,6 @@ veq (VNum a) (VNum b) = a == b
 veq (VInt a) (VNum b) = fromIntegral a == b -- Numeric: 1 == 1.0
 veq (VNum a) (VInt b) = a == fromIntegral b
 veq (VStr a) (VStr b) = a == b
-veq (VBStr ra) (VBStr rb) = unsafePerformIO $ do
-  a <- bsContent ra; b <- bsContent rb; pure (a == b)
-veq (VStr a) (VBStr rb) = unsafePerformIO $ do
-  b <- bsContent rb; pure (a == b)
-veq (VBStr ra) (VStr b) = unsafePerformIO $ do
-  a <- bsContent ra; pure (a == b)
 veq (VData t v fs) (VData t' v' fs') =
   t == t' && v == v' && length fs == length fs' && and (zipWith veq fs fs')
 veq _ _ = False
@@ -107,7 +100,6 @@ render :: Value -> String
 render (VInt i) = show i
 render (VNum d) = renderNum d
 render (VStr s) = s
-render (VBStr r) = unsafePerformIO (bsContent r)
 render v@(VData t 1 [_, _]) | t == listT = "[" ++ intercalate ", " (renderList v) ++ "]"
   where
     renderList (VData _ 1 [y, r]) = render y : renderList r
@@ -146,21 +138,6 @@ data BStrStore = BStrStore
 
 initialBsCap :: Int
 initialBsCap = 64
-
-newBStr :: IO Value
-newBStr = VBStr <$> newIORef (BStrStore initialBsCap 0 (BS.replicate initialBsCap 0))
-
--- allocate a VBStr from an existing Haskell String
-bstrFromString :: String -> IO Value
-bstrFromString s = do
-  let bs = BSU.fromString s
-      n  = BS.length bs
-      cap = max initialBsCap (nextPow2 n)
-      -- pad to capacity so we can append in-place
-      buf = bs <> BS.replicate (cap - n) 0
-  VBStr <$> newIORef (BStrStore cap n buf)
-  where
-    nextPow2 x = head (dropWhile (< x) (iterate (* 2) initialBsCap))
 
 -- decode back to Haskell String for API compat; O(n) but rarely needed
 bsContent :: IORef BStrStore -> IO String
@@ -214,30 +191,16 @@ bsAppendStr ref s = do
              pure st { bsUsed = need, bsBuf = buf' }
   writeIORef ref st'
 
--- concatenate two VBStr/VStr values; always returns a VBStr
-bsConcat :: Value -> Value -> IO Value
-bsConcat (VBStr ra) (VBStr rb) = do
-  a <- bsContent ra; b <- bsContent rb
-  bstrFromString (a ++ b)
-bsConcat (VBStr ra) (VStr b) = do
-  a <- bsContent ra
-  bstrFromString (a ++ b)
-bsConcat (VStr a) (VBStr rb) = do
-  b <- bsContent rb
-  bstrFromString (a ++ b)
-bsConcat (VStr a) (VStr b) = bstrFromString (a ++ b)
-bsConcat a b = ioError (userError ("BStr.cat: not strings: " ++ render a ++ ", " ++ render b))
+-- (bsConcat and the VBStr constructors are gone with the dead variant)
 
--- extract a Haskell String from EITHER VStr or VBStr
+-- extract a Haskell String from a string value
 vsStr :: Value -> IO String
 vsStr (VStr s) = pure s
-vsStr (VBStr r) = bsContent r
 vsStr v = ioError (userError ("string op: not a string: " ++ render v))
 
 -- is a Value any string variant?
 isStrVal :: Value -> Bool
 isStrVal (VStr _) = True
-isStrVal (VBStr _) = True
 isStrVal _ = False
 
 data ColKind = KInt | KNum | KBox deriving (Eq)

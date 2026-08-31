@@ -328,6 +328,7 @@ goE tab caller = go
         pure (SBin "/" a' b')
       SBin "|>" _ _ -> goSpine sh facts e
       SApp _ _ -> goSpine sh facts e
+      SMark o e -> SMark o <$> go sh facts e
       SBin op a b -> SBin op <$> go sh facts a <*> go sh facts b
       SLam ps b ->
         let sh' = S.union sh (S.fromList ps)

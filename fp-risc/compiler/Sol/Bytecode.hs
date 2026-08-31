@@ -65,6 +65,17 @@ arithOps =
       ("==", OEq), ("!=", ONe)
     ]
 
+-- THE fragment vocabulary.  Every acceleration tier's "is this pure
+-- arithmetic" judgment (tabling in VM.hs, HandJIT's kernel emitter,
+-- the GLSL tier, the LLVM drivers) derives its operator set from the
+-- ONE table above -- a spelling that is not a key there does not
+-- exist, which is what killed the drift class where three tiers
+-- whitelisted "/=" while the language's operator is "!=" (so !=
+-- silently declined them all).
+arithNames, cmpNames :: [Name]
+arithNames = [n | (n, op) <- M.toList arithOps, op `elem` [OAdd, OSub, OMul, ODiv]]
+cmpNames = [n | (n, op) <- M.toList arithOps, op `notElem` [OAdd, OSub, OMul, ODiv]]
+
 data Fn = Fn
   { fnArity :: !Int,
     fnSlots :: !Int, -- frame size, computed at compile time

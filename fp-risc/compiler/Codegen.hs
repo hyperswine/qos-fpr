@@ -916,7 +916,7 @@ vFkinds t = 8 + 5 * tgtW t -- bit i: column i holds raw IEEE float bits
 vCols0 t = 8 + 6 * tgtW t
 
 colBlk0 :: Target -> Int
-colBlk0 = tgtW -- col_t: nblk at 0, blk[] from W
+colBlk0 = tgtW -- col_t: cap at 0, base (the one contiguous span) at W
 
 logW :: Target -> Int
 logW t = if tgtW t == 8 then 3 else 2
@@ -1751,21 +1751,18 @@ specFuel tgt = do
       ok ++ ":"
     ]
 
--- shared: t0 = min(16 << s3, s1 - s2); block base pointer -> s5
+-- shared: contiguous column -- read cursor s5 = base + done*W, chunk
+-- s6 = everything remaining (the outer loop's "next block" arm never
+-- fires; it stays only as the loop's exit-recheck path).  s3 (the old
+-- block index) is dead but the emitters still zero it: one register,
+-- zero cost, and the loop shape stays identical across all five.
 specBlock :: Target -> G [String]
-specBlock tgt = do
-  lmin <- freshL "vmin"
+specBlock tgt =
   pure
-    [ "    slli t0, s3, " ++ show (logW tgt),
-      "    add t0, t0, s4",
-      "    " ++ tgtLd tgt ++ " s5, " ++ show (colBlk0 tgt) ++ "(t0)",
-      "    li t0, 16",
-      "    sll t0, t0, s3",
-      "    sub t1, s1, s2",
-      "    bgeu t1, t0, " ++ lmin,
-      "    mv t0, t1",
-      lmin ++ ":",
-      "    mv s6, t0"
+    [ "    " ++ tgtLd tgt ++ " s5, " ++ show (colBlk0 tgt) ++ "(s4)",
+      "    slli t0, s2, " ++ show (logW tgt),
+      "    add s5, s5, t0",
+      "    sub s6, s1, s2"
     ]
 
 -- entry guard: a<reg> must be an object with tid T_VEC; leaves reps in t0
@@ -1943,10 +1940,8 @@ emitFilterSpec tgt sym p = do
            "    li s3, 0",
            "    " ++ ld ++ " s4, " ++ show (vCols0 tgt) ++ "(s0)",
            "    li s10, 0", -- kept count
-           "    beqz s1, " ++ ldone, -- empty: blk[0] may not exist
-           "    li s7, 0", -- write block index
-           "    " ++ ld ++ " s8, " ++ show (colBlk0 tgt) ++ "(s4)", -- write ptr = blk[0]
-           "    li s9, 16" -- write capacity left in block
+           "    beqz s1, " ++ ldone, -- empty: base may not exist
+           "    " ++ ld ++ " s8, " ++ show (colBlk0 tgt) ++ "(s4)" -- write ptr = base
          ]
       ++ [louter ++ ":", "    bgeu s2, s1, " ++ ldone]
       ++ fuel
@@ -1957,17 +1952,10 @@ emitFilterSpec tgt sym p = do
            "    mv a0, s11",
            "    call fpr_ufn_" ++ mangle f, -- raw 0/1
            "    beqz a0, " ++ lskip,
-           "    bnez s9, " ++ lwadv, -- write block full? advance
-           "    addi s7, s7, 1",
-           "    slli t0, s7, " ++ show (logW tgt),
-           "    add t0, t0, s4",
-           "    " ++ ld ++ " s8, " ++ show (colBlk0 tgt) ++ "(t0)",
-           "    li s9, 16",
-           "    sll s9, s9, s7",
-           lwadv ++ ":",
+           -- contiguous column: the write cursor never runs out (kept
+           -- count can't exceed len), so it just advances
            "    " ++ st ++ " s11, 0(s8)",
            "    addi s8, s8, " ++ show w,
-           "    addi s9, s9, -1",
            "    addi s10, s10, 1",
            lskip ++ ":",
            "    addi s5, s5, " ++ show w,
@@ -2047,9 +2035,9 @@ emitMvMapSpec tgt sym p = do
       cursorLoads =
         concat
           [ [ "    " ++ ld ++ " t0, " ++ show (vCols0 tgt + k * w) ++ "(s0)",
-              "    slli t1, s3, " ++ show (logW tgt),
-              "    add t0, t0, t1",
-              "    " ++ ld ++ " t0, " ++ show (colBlk0 tgt) ++ "(t0)",
+              "    " ++ ld ++ " t0, " ++ show (colBlk0 tgt) ++ "(t0)", -- base
+              "    slli t1, s2, " ++ show (logW tgt),
+              "    add t0, t0, t1", -- + done elements
               "    " ++ st ++ " t0, " ++ show (k * w) ++ "(sp)"
             ]
             | k <- [0 .. n - 1]
@@ -2306,12 +2294,12 @@ emitFoldSpec tgt rvv sym p = do
             ++ [anb ++ ":", "    addi s3, s3, 1", "    j " ++ ao]
           where
             blk2' =
-              blk2 -- count math; its s5 (cols[0] blk[j]) load is simply unused here
+              blk2 -- count math; its s5 (cols[0] base) load is simply unused here
                 ++ concat
                   [ [ "    " ++ ld ++ " t0, " ++ show (vCols0 tgt + k * w) ++ "(s0)", -- col_t* for column k
-                      "    slli t1, s3, " ++ show (logW tgt),
-                      "    add t0, t0, t1",
-                      "    " ++ ld ++ " t0, " ++ show (colBlk0 tgt) ++ "(t0)", -- blk[j]
+                      "    " ++ ld ++ " t0, " ++ show (colBlk0 tgt) ++ "(t0)", -- base
+                      "    slli t1, s2, " ++ show (logW tgt),
+                      "    add t0, t0, t1", -- + done elements
                       "    " ++ st ++ " t0, " ++ show (q * w) ++ "(sp)" -- cursor slot
                     ]
                     | (q, k) <- zip [0 :: Int ..] ks

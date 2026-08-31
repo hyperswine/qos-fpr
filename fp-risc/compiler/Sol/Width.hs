@@ -126,6 +126,7 @@ collectSeeds tops = M.mapWithKey trim (foldl' top M.empty tops)
              in foldl' (flip goE) (M.insertWith (zipWith joinIv) f ivs acc0) args
       (h, args) -> foldl' (flip goE) (goH h acc0) args
     goH = \case
+      SMark _ e -> goE e
       SLam _ b -> goE b
       SBlock stmts fin -> \a -> goE fin (foldl' (\ac st -> case st of SBind _ _ x -> goE x ac; SBindPat _ x -> goE x ac) a stmts)
       SCase s as -> \a -> foldl' (\ac (_, x) -> goE x ac) (goE s a) as
@@ -169,6 +170,7 @@ analyze tops =
              in (r, sa <> sb <> site)
         | otherwise ->
             let (_, sa) = goE env a; (_, sb) = goE env b in (TopIv, sa <> sb)
+      SMark _ e -> goE env e
       SApp f x -> (TopIv, snd (goE env f) <> snd (goE env x))
       SLam ps b ->
         let env' = M.union (M.fromList [(p, TopIv) | p <- ps]) env

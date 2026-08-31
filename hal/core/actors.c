@@ -159,8 +159,8 @@ static void *big_block(uw n) {
  *           send-to-dead reads), so they cannot be recycled -- but a
  *           bump arena carves many acbs from one grant instead of
  *           wasting a 64 KiB minimum grant on each 8 KiB acb. */
-static void *stack_pool;
-static fpr_lock_t stack_lock;
+static fpr_freelist_t stack_fl; /* the one freelist discipline (fpr.h) */
+static fpr_lock_t acb_lock;     /* the acb bump arena below */
 static char *acb_hp, *acb_end;
 
 /* pool telemetry, always on, PULL-based (Sys.memStats reads them):
@@ -170,12 +170,9 @@ static void stack_recycle(void *p);
 static V spawn_on_pid(uw hart, V f, uw pin, uw pid);
 static void *stack_block(void) {
   if (!fpr_is_process) return buddy_alloc(STACK_SZ);
-  fpr_lock(&stack_lock);
-  void *p = stack_pool;
-  if (p) stack_pool = *(void **)p;
-  else fpr_stk_misses++;
-  fpr_unlock(&stack_lock);
+  void *p = fpr_fl_take(&stack_fl, STACK_SZ);
   if (p) return p;
+  __atomic_add_fetch(&fpr_stk_misses, 1, __ATOMIC_RELAXED);
   /* SELF-TOPPING on a miss: take two, keep one warm.  A miss means
    * live+in-flight actors exceeded pool depth, so depth converges to
    * the real concurrency and each level is paid for at most once --
@@ -188,11 +185,8 @@ static void *stack_block(void) {
 }
 
 static void stack_recycle(void *p) {
-  fpr_lock(&stack_lock);
-  *(void **)p = stack_pool;
-  stack_pool = p;
-  fpr_stk_pushes++;
-  fpr_unlock(&stack_lock);
+  fpr_fl_put(&stack_fl, p, STACK_SZ);
+  __atomic_add_fetch(&fpr_stk_pushes, 1, __ATOMIC_RELAXED);
 }
 
 static acb_t *acb_block(void) {
@@ -202,13 +196,13 @@ static acb_t *acb_block(void) {
    * posix heap in ~1000 spawns on a Pi 4.  Carving packs ~250 acbs
    * into each floor-sized block. */
   uw sz = (sizeof(acb_t) + 15) & ~(uw)15;
-  fpr_lock(&stack_lock);
+  fpr_lock(&acb_lock);
   if (acb_hp + sz > acb_end) {
     uw want = 16 * sz;
     char *p;
     uw got;
     if (fpr_is_process && fpr_grow_memory) {
-      /* no growlog here: this runs under stack_lock, and the trace
+      /* no growlog here: this runs under acb_lock, and the trace
        * print is a uart SYSCALL under qosp -- printing inside an
        * allocator lock stalls the world and poisons the very numbers
        * the trace exists to collect (a lesson measured the hard way) */
@@ -220,7 +214,7 @@ static acb_t *acb_block(void) {
       got = p ? buddy_block_usable_size(p) : 0;
     }
     if (!p || got < sz) {
-      fpr_unlock(&stack_lock);
+      fpr_unlock(&acb_lock);
       return 0;
     }
     acb_hp = p;
@@ -228,7 +222,7 @@ static acb_t *acb_block(void) {
   }
   acb_t *a = (acb_t *)acb_hp;
   acb_hp += sz;
-  fpr_unlock(&stack_lock);
+  fpr_unlock(&acb_lock);
   return a;
 }
 
@@ -256,8 +250,12 @@ typedef struct chblk {
   struct chblk *nx;
   uw stamp[FPR_NHARTS];
 } chblk_t;
-static chblk_t *chb_free, *chb_limbo;
-static fpr_lock_t chb_lock;
+static fpr_freelist_t chb_fl; /* never-referenced carve extras ONLY --
+                               * reaped blocks go to limbo and are
+                               * reused from there, so the flnode
+                               * overlay can't race a stale send */
+static chblk_t *chb_limbo;
+static fpr_lock_t chb_lock; /* the limbo list + its epoch stamps */
 
 static int chb_matured(chblk_t *b) {
   for (uw i = 0; i < fpr_live_harts; i++)
@@ -278,11 +276,8 @@ static chan_t *chb_take(void) {
     }
     pp = &(*pp)->nx;
   }
-  if (!b && chb_free) {
-    b = chb_free;
-    chb_free = b->nx;
-  }
   fpr_unlock(&chb_lock);
+  if (!b) b = (chblk_t *)fpr_fl_take(&chb_fl, sizeof(chblk_t));
   if (!b) {
     /* fresh backing: the floor-sized block carves several channel
      * blocks; the extras seed the free list (type-stable forever) */
@@ -294,12 +289,8 @@ static chan_t *chb_take(void) {
     uw got = fpr_is_process ? want : buddy_block_usable_size(p);
     if (got < sz) got = sz;
     b = (chblk_t *)p;
-    fpr_lock(&chb_lock);
-    for (char *q = p + sz; q + sz <= p + got; q += sz) {
-      ((chblk_t *)q)->nx = chb_free;
-      chb_free = (chblk_t *)q;
-    }
-    fpr_unlock(&chb_lock);
+    for (char *q = p + sz; q + sz <= p + got; q += sz)
+      fpr_fl_put(&chb_fl, q, sz);
   }
   for (int i = 0; i < MAXSND; i++) {
     b->ch[i].sender = 0;
@@ -987,12 +978,9 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   ledger_push(&main_acb);
   char *stk = (char *)stack_block();
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
-  main_acb.pool.cur = 0;
-  main_acb.pool.bigfree = 0;
-  main_acb.drop_pending = 0;
-  main_acb.pool.allocated = 0;
   static void *main_bkts[FPR_NBUCKETS]; /* actor 0 lives forever */
-  main_acb.pool.buckets = main_bkts;
+  fpr_pool_init(&main_acb.pool, main_bkts);
+  main_acb.drop_pending = 0;
   main_acb.stack = stk;
   for (int i = 0; i < 16; i++) main_acb.ctx[i] = 0;
   fpr_ctx_fabricate(main_acb.ctx, (void (*)(void))trampoline,
@@ -1024,11 +1012,8 @@ static V spawn_on_pid(uw hart, V f, uw pin, uw pid) {
   acb_t *a = (acb_t *)acb_block();
   char *stk = (char *)stack_block();
   if (!a || !stk) fpr_cpanic("spawn: buddy has no free block");
-  a->pool.cur = 0;
-  a->pool.bigfree = 0;
+  fpr_pool_init(&a->pool, fpr_bkt_take()); /* zeroed; teardown returns it */
   a->drop_pending = 0;
-  a->pool.allocated = 0;
-  a->pool.buckets = fpr_bkt_take(); /* zeroed; teardown returns it */
   if (!a->pool.buckets) fpr_cpanic("spawn: no memory for a bucket array");
   f = fpr_msg_copy(f); /* the entry closure crosses like any message:
                         * deep-copied, so captures never dangle into
@@ -1109,6 +1094,55 @@ V fpr_send_as(uw sender_key, V av, V m) {
 
 static V a_send(V av, V m) {
   return fpr_send_as((uw)fpr_hart()->current, av, m);
+}
+
+/* sendLinear: MOVE the message (docs/MEMORY.md v2, the send triad).
+ * The compiler's linearity checker consumes the payload argument, so
+ * the sender's binding is unusable afterward -- send_linear IS the
+ * value's release.  Mechanism, two cases:
+ *
+ *   TRANSFER -- the value is a received message root (ownerless slab,
+ *   tracked in the ARC table, fpr_arc_movable_root): enqueue the SAME
+ *   pointer.  No copy, no incref -- the one standing count changes
+ *   hands, and the receiver's ordinary drop parks the slab exactly as
+ *   if it had been sent fresh.  A relay chain (the frames ping-pong)
+ *   is zero-copy end to end.
+ *
+ *   COPY+CONSUME -- anything else (a locally built value, a child of
+ *   a still-held message): deep-copy like send, then release what the
+ *   sender owned.  A Vector root is freed on the spot (its columns
+ *   are the bulk); other locals stay pool-scoped, consumed in the
+ *   checker's eyes and reclaimed with the pool as ever.
+ *
+ * A dead target still consumes: the contract is "this value left me",
+ * so it is released exactly as a received-then-dropped message would
+ * be, never silently retained. */
+static V a_send_linear(V av, V m) {
+  if (fpr_sched) return fpr_sched->send_as((uw)fpr_hart()->current, av, m);
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("sendLinear: target is not an actor");
+  acb_t *a = (acb_t *)av;
+  int movable = fpr_arc_movable_root(m);
+  if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD) {
+    if (movable) fpr_arc_decref(m); /* the drop the receiver would have done */
+    else if (!ISINT(m) && fpr_in_heap(m) && TID(m) == T_VEC)
+      fpr_vec_release(m);
+    return (V)&fpr_unit;
+  }
+  chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
+  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP)
+    fpr_cpanic("sendLinear: per-sender channel full");
+  if (!movable) {
+    V orig = m;
+    m = fpr_msg_copy(m);
+    fpr_arc_incref(m);
+    if (!ISINT(orig) && fpr_in_heap(orig) && TID(orig) == T_VEC)
+      fpr_vec_release(orig); /* the bulk case: consume frees it now */
+  }
+  c->ring[c->rt % RING_CAP] = m;
+  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
+  wake(a);
+  return (V)&fpr_unit;
 }
 
 /* ---- the SYSCALL MAILBOX (process.c's trampoline) -------------------
@@ -1267,7 +1301,37 @@ static V g_fuel_preempts(V d) {
 /* ---- the discoverable-symbol table ------------------------------------ */
 FPR_FN(fpr_g_spawn, a_spawn, 1);
 FPR_FN(fpr_g_spawnOn, a_spawn_at, 2);
+/* sendArc: SHARE by explicit promotion (docs/MEMORY.md v2) -- the
+ * only path by which an object becomes cross-actor shared.  The
+ * pointer itself crosses (no copy); the object is FROZEN BY CONTRACT
+ * from this send onward (writes after sharing are races the runtime
+ * cannot see -- which is why a Vector, linear bulk whose whole point
+ * is mutation, is refused: move it or copy it).  Every holder,
+ * sender included, releases with `drop`; the last drop reclaims.
+ * Deep trees reclaim shallowly at zero (children are pool-scoped) --
+ * share flat records/tuples, or accept pool lifetime for the rest. */
+static V a_send_arc(V av, V m) {
+  if (fpr_sched) return fpr_sched->send_as((uw)fpr_hart()->current, av, m);
+  if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("sendArc: target is not an actor");
+  if (!ISINT(m) && fpr_in_heap(m) && TID(m) == T_VEC)
+    fpr_cpanic("sendArc: a Vector is linear bulk -- sendLinear moves it, send copies it");
+  acb_t *a = (acb_t *)av;
+  if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD)
+    return (V)&fpr_unit; /* no promotion happened; sender keeps sole ownership */
+  chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
+  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP)
+    fpr_cpanic("sendArc: per-sender channel full");
+  fpr_arc_promote_share(m);
+  c->ring[c->rt % RING_CAP] = m;
+  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
+  wake(a);
+  return (V)&fpr_unit;
+}
+
 FPR_FN(fpr_g_send, a_send, 2);
+FPR_FN(fpr_g_sendLinear, a_send_linear, 2);
+FPR_FN(fpr_g_sendArc, a_send_arc, 2);
 FPR_FN(fpr_g_receive, a_receive, 1);
 FPR_FN(fpr_g_receiveFrom, a_receive_from, 2);
 FPR_FN(fpr_g_receiveRes, a_receive_res, 1);

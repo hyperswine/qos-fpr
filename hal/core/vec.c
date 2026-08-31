@@ -1,15 +1,17 @@
-/* vec.c — the LINEAR SoA VList vector.
+/* vec.c — the LINEAR SoA vector, CONTIGUOUS columns.
  *
- * Storage model
- * -------------
- * A Vector is columns; a column is a VList: a directory of geometrically
- * growing blocks (16, 32, 64, ... words).  Blocks are never reallocated
- * and never copied — push is O(1), a grown vector's old data stays where
- * it was, and every block up to the allocator's 8 KiB free-list ceiling
- * recycles exactly (no realloc-and-leak under this bump+freelist
- * allocator: that is WHY it's a VList and not a doubling array here).
- * Iteration is contiguous within a block, which is what the compiler's
- * specialized/vectorized loops stride over.
+ * Storage model (docs/MEMORY.md v2)
+ * ---------------------------------
+ * A Vector is columns; a column is ONE contiguous span of machine
+ * words, grown by realloc-by-doubling (fpr_realloc: the freed
+ * predecessor recycles exactly through the pool's ladder, so the
+ * doubling sequence reuses its own history).  Push is amortized O(1);
+ * the copy a growth pays is attributed to the push that grew, which
+ * keeps the WCET story compositional.  Indexing is base + i — no
+ * block directory, no per-index log2 — and the compiler's
+ * specialized/vectorized loops stride the whole column as one run.
+ * (The old VList block directory is gone: it existed only because the
+ * allocator had no realloc.)
  *
  * Layout is fixed by the FIRST push (the Sol PoC rule, verbatim):
  *   Int                    -> 1 unboxed column           (rep VR_INT)
@@ -30,68 +32,36 @@
 #include "fpr.h"
 #include <limits.h>
 
-#define VL_B0 16 /* words in block 0; block j holds VL_B0 << j */
-#define VL_DIR 24
-#define VMAXCOLS 8
+#define VL_B0 16 /* words in a fresh column's first allocation */
 
-/* VR_FLT: one raw FLOAT column.  It is a DECLARED rep, never inferred:
- * a float V is its bit pattern, so the runtime cannot tell one from a
- * pointer -- fix_layout's first-push rule is undecidable for floats
- * (the documented v1 hazard, here turned into an API instead of a
- * guess).  Vec.newAs declares the layout up front. */
-enum { VR_UNSET = 0, VR_INT = 1, VR_BOX = 2, VR_SOA = 3, VR_FLT = 4 };
+/* The layout lives in vec_layout.h (single source, shared with the
+ * runtime's deep copier and the host-side gfx walker; Codegen.hs
+ * mirrors the offsets).  VR_FLT there is a DECLARED rep, never
+ * inferred: a float V is its bit pattern, so the runtime cannot tell
+ * one from a pointer -- fix_layout's first-push rule is undecidable
+ * for floats (the documented v1 hazard, turned into an API instead of
+ * a guess).  Vec.newAs declares the layout up front. */
+#include "vec_layout.h"
 
-typedef struct {
-  uw nblk;
-  uw *blk[VL_DIR];
-} col_t;
+/* ---- column access ---------------------------------------------------- */
 
-/* field offsets here are mirrored by Codegen.hs (vec specialization):
- * len 8+0W | eltid 8+1W | elvar 8+2W | ncols 8+3W | kinds 8+4W
- * | fkinds 8+5W | cols 8+6W
- * kinds bit i: column i is RAW (untagged machine word, not a V)
- * fkinds bit i: that raw word is IEEE FLOAT BITS -- stored and read
- * verbatim, never tagged.  fkinds is always a subset of kinds. */
-typedef struct {
-  uint32_t tid, var; /* var = rep */
-  uw len, eltid, elvar, ncols, kinds, fkinds;
-  col_t *cols[VMAXCOLS];
-} vec_t;
+static inline uw *vl_slot(col_t *c, uw i) { return &c->base[i]; }
 
-/* ---- VList index math ------------------------------------------------ */
-
-/* elements below block j: VL_B0 * (2^j - 1) */
-static inline uw vl_cap(uw nblk) { return VL_B0 * (((uw)1 << nblk) - 1); }
-
-/* floor(log2 q), q >= 1 — by hand: -nostdlib means no libgcc __clzdi2,
- * and the loop runs at most VL_DIR times */
-static inline int vl_log2(uw q) {
-  int j = 0;
-  while (q >>= 1) j++;
-  return j;
-}
-
-static inline uw *vl_slot(col_t *c, uw i) {
-  int j = vl_log2(i / VL_B0 + 1);
-  uw off = i - VL_B0 * (((uw)1 << j) - 1);
-  return &c->blk[j][off];
-}
-
-static void vl_grow(col_t *c) {
-  if (c->nblk >= VL_DIR) fpr_cpanic("Vec: vector too large");
-  uw words = (uw)VL_B0 << c->nblk;
-  c->blk[c->nblk++] = (uw *)fpr_alloc(words * sizeof(uw));
+static void col_grow(col_t *c) {
+  uw ncap = c->cap ? c->cap * 2 : (uw)VL_B0;
+  c->base = (uw *)fpr_realloc((V)c->base, ncap * sizeof(uw));
+  c->cap = ncap;
 }
 
 static col_t *col_new(void) {
   col_t *c = (col_t *)fpr_alloc(sizeof(col_t));
-  c->nblk = 0;
-  for (int j = 0; j < VL_DIR; j++) c->blk[j] = 0;
+  c->cap = 0;
+  c->base = 0;
   return c;
 }
 
 static void col_free(col_t *c) {
-  for (uw j = 0; j < c->nblk; j++) fpr_free((V)c->blk[j]); /* >8KiB: bigfree LIFO */
+  if (c->base) fpr_free((V)c->base); /* >8KiB: bigfree LIFO */
   fpr_free((V)c);
 }
 
@@ -102,40 +72,26 @@ static vec_t *vchk(V v, const char *who) {
   return (vec_t *)v;
 }
 
-/* ---- copy-on-write sharing (rc in var bits 8+) -----------------------
- * var packs [rc:24 | rep:8].  rc is BIASED: 0 means one owner, n means
- * n+1 references.  Vec.dup and message deep-copy share by rc++ (O(1));
- * every WRITING op calls cow_wr first (private full copy when shared),
- * every consume goes through cow_rel (rc-- when shared, real free at
- * the last reference).  Reads (get, fold, gather's src) touch nothing.
- * The old law -- "one copy per CONSUMER, aliasing is silent corruption"
- * -- is gone: aliasing is now the mechanism.  Handles still follow
- * their owning POOL's lifetime, exactly as before.  Known hole: the
- * compiler's SPECIALIZED map/fold column loops write storage directly
- * without this check; the C fallbacks below own first.  Sharing today
- * happens via dup and messages, whose values feed the fixed-function
- * tier -- specialized sites on shared vectors are documented unsound
- * until the emitted layout guard also tests rc. */
-#define VREP(x) ((x)->var & 0xffu)
-static uw cow_rc(vec_t *x) { return __atomic_load_n(&x->var, __ATOMIC_ACQUIRE) >> 8; }
-static void cow_inc(vec_t *x) { __atomic_add_fetch(&x->var, 256u, __ATOMIC_ACQ_REL); }
-/* returns nonzero if this was the LAST reference (caller owns/frees) */
-static int cow_dec(vec_t *x) {
-  return (__atomic_fetch_sub(&x->var, 256u, __ATOMIC_ACQ_REL) >> 8) == 0 ? 1
-         : 0;
-}
+/* ---- ownership: ONE owner, real copies (MEMORY.md v2 phase 3) ------
+ * The CoW rc that used to ride var's high bits is GONE.  `send` deep-
+ * copies vectors into the message slab like every other value (no
+ * exceptions), `Vec.dup` is an honest copy, and mutation needs no
+ * ownership test anywhere -- which makes the compiler's specialized
+ * column loops (which write storage directly) sound BY CONSTRUCTION
+ * instead of "documented unsound on shared vectors".  It also closes
+ * the lifetime hole CoW had: a shared handle's storage died with the
+ * SENDER's pool (poolReset/death frees slabs regardless of rc); a
+ * receiver's copy is its own. */
 static void vfree(vec_t *x); /* fwd */
 static col_t *col_new(void);
 static col_t *col_copy(col_t *c, uw len) {
   col_t *n = col_new();
-  n->nblk = c->nblk;
-  uw rem = len;
-  for (uw j = 0; j < c->nblk; j++) {
-    uw bn = ((uw)VL_B0 << j) < rem ? ((uw)VL_B0 << j) : rem;
-    uw bytes = ((uw)VL_B0 << j) * sizeof(uw);
-    n->blk[j] = (uw *)fpr_alloc(bytes);
-    for (uw i = 0; i < bn; i++) n->blk[j][i] = c->blk[j][i];
-    rem -= bn;
+  if (len) {
+    uw cap = VL_B0;
+    while (cap < len) cap *= 2;
+    n->base = (uw *)fpr_alloc(cap * sizeof(uw));
+    n->cap = cap;
+    __builtin_memcpy(n->base, c->base, len * sizeof(uw));
   }
   return n;
 }
@@ -149,21 +105,13 @@ static vec_t *vcopy(vec_t *x) {
     n->cols[i] = x->cols[i] ? col_copy(x->cols[i], x->len) : 0;
   return n;
 }
-/* own before writing: shared -> private copy, rc-- on the original */
-static vec_t *cow_wr(vec_t *x) {
-  if (cow_rc(x) == 0) return x;
-  vec_t *n = vcopy(x);
-  cow_dec(x);
-  return n;
-}
-/* release a consumed input: last ref really frees */
-static void cow_rel(vec_t *x) {
-  if (cow_dec(x)) vfree(x);
-}
-
-/* the deep copier's vec hook: sharing IS the copy for vectors */
-void fpr_vec_share(V v) { cow_inc((vec_t *)v); }
-void fpr_vec_release(V v) { cow_rel((vec_t *)v); }
+/* one owner: writes need no ownership test, release IS the free.
+ * vfree no-ops on slab-resident pieces (fpr_free ignores ownerless
+ * slabs) and really frees pool-resident ones, so it is the universal
+ * release for local, message-copied, and post-receive-grown vectors
+ * alike.  fpr_vec_release stays exported: the deep copier's root-drop
+ * path (dc_release) uses it. */
+void fpr_vec_release(V v) { vfree((vec_t *)v); }
 
 static V h_new(V unit) {
   (void)unit;
@@ -190,15 +138,11 @@ static V h_range(V lov, V hiv) {
   fix_layout(x, lov); /* one raw Int column */
   col_t *c = x->cols[0];
   uw n = (uw)(hi - lo + 1);
+  while (c->cap < n) col_grow(c);
   sw v = lo;
-  while (x->len < n) {
-    if (x->len == vl_cap(c->nblk)) vl_grow(c);
-    uw lim = vl_cap(c->nblk);
-    if (lim > n) lim = n;
-    uw *slot = vl_slot(c, x->len); /* blocks are contiguous arrays */
-    for (uw i = x->len; i < lim; i++) *slot++ = (uw)v++;
-    x->len = lim;
-  }
+  uw *slot = c->base;
+  for (uw i = 0; i < n; i++) *slot++ = (uw)v++;
+  x->len = n;
   return (V)x;
 }
 
@@ -326,10 +270,10 @@ static V h_new_like(vec_t *src) {
 }
 
 static V h_push(V v, V vec) {
-  vec_t *x = cow_wr(vchk(vec, "Vec.push: not a Vector"));
+  vec_t *x = vchk(vec, "Vec.push: not a Vector");
   if (VREP(x) == VR_UNSET) fix_layout(x, v);
   for (uw k = 0; k < x->ncols; k++)
-    if (x->len == vl_cap(x->cols[k]->nblk)) vl_grow(x->cols[k]);
+    if (x->len == x->cols[k]->cap) col_grow(x->cols[k]);
   switch (VREP(x)) {
     case VR_INT:
       if (!ISINT(v)) fpr_cpanic("Vec.push: Int vector got a non-Int");
@@ -395,7 +339,7 @@ static V h_get(V iv, V vec) {
 }
 
 static V h_set(V iv, V v, V vec) {
-  vec_t *x = cow_wr(vchk(vec, "Vec.set: not a Vector"));
+  vec_t *x = vchk(vec, "Vec.set: not a Vector");
   if (!ISINT(iv)) fpr_cpanic("Vec.set: index not an Int");
   sw i = UNTAG(iv);
   if (i < 1 || (uw)i > x->len) fpr_cpanic("Vec.set: index out of range");
@@ -420,7 +364,7 @@ static void vfree(vec_t *x) {
 }
 
 static V h_free(V vec) {
-  cow_rel(vchk(vec, "Vec.free: not a Vector"));
+  vfree(vchk(vec, "Vec.free: not a Vector"));
   return (V)&fpr_unit;
 }
 
@@ -441,19 +385,18 @@ V fpr_vec_map(V f, V vec) {
    * shape really changes. */
   V out = x->fkinds ? h_new_like(x) : h_new((V)&fpr_unit);
   for (uw i = 0; i < x->len; i++) out = h_push(fpr_apply(f, row_at(x, i)), out);
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return out;
 }
 
-/* filter is EAGER COMPACTION, deliberately (the design decision, made
- * explicit): under linearity there is no sharing to preserve, so the
- * kept rows slide down IN PLACE with two cursors and len shrinks --
- * zero allocation, and every later map/fold/zip/axpb stays dense and
- * mask-free.  Tombstones + bitmask + incremental GC would only win
- * when filters vastly outnumber scans; that is not this machine's
- * workload, and masked lanes would poison the whole SIMD tier.
- * Blocks beyond the new length stay attached (they recycle with the
- * vector; a VList never returns capacity early).  docs/VEC.md. */
+/* filter is EAGER COMPACTION today: the kept rows slide down in place
+ * with two cursors and len shrinks -- zero allocation, later scans
+ * stay dense.  MEMORY.md v2 names the branch-light end-state (a mask
+ * column that scans fuse, compaction deferred to Vec.compact or
+ * Sys.poolReset); until that lands with the mask-fusing loops, eager
+ * compaction is the correct simple thing.  Capacity beyond the new
+ * length stays attached (it recycles with the column).  In-place is
+ * sound unconditionally now: no CoW, one owner, real copies. */
 V fpr_vec_filter(V f, V vec) {
   vec_t *x = vchk(vec, "Vec.filter: not a Vector");
   uw j = 0;
@@ -510,7 +453,7 @@ static V h_toList(V vec) {
     *(V *)((char *)c + 8 + sizeof(uw)) = acc;
     acc = (V)c;
   }
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return acc;
 }
 
@@ -528,7 +471,7 @@ static V h_split(V nv, V vec) {
   V hi = x->fkinds ? h_new_like(x) : h_new((V)&fpr_unit);
   for (uw i = 0; i < (uw)n; i++) lo = h_push(row_at(x, i), lo);
   for (uw i = (uw)n; i < x->len; i++) hi = h_push(row_at(x, i), hi);
-  cow_rel(x);
+  vfree(x); /* consumed input */
   return mktup2(lo, hi);
 }
 
@@ -605,9 +548,10 @@ static vec_t *vnum(V v, const char *who) {
 }
 
 /* Optional hosted GPU tier.  A strong backend definition may replace
- * this default.  It must leave blocks untouched when returning zero. */
-__attribute__((weak)) int fpr_gpu_vec_axpb(uw *const *blocks, uw len, sw a, sw b) {
-  (void)blocks; (void)len; (void)a; (void)b;
+ * this default.  It must leave the column untouched when returning
+ * zero.  Contiguous columns: the hook takes the raw span directly. */
+__attribute__((weak)) int fpr_gpu_vec_axpb(uw *col, uw len, sw a, sw b) {
+  (void)col; (void)len; (void)a; (void)b;
   return 0;
 }
 
@@ -621,34 +565,24 @@ static int gpu_axpb_exact(vec_t *x, sw a, sw b) {
   if (x->len < 65536 || a < INT32_MIN || a > INT32_MAX ||
       b < INT32_MIN || b > INT32_MAX)
     return 0;
-  uw rem = x->len;
-  for (uw j = 0; rem; j++) {
-    uw n = ((uw)VL_B0 << j) < rem ? ((uw)VL_B0 << j) : rem;
-    sw *p = (sw *)x->cols[0]->blk[j];
-    for (uw i = 0; i < n; i++) {
-      if (p[i] < INT32_MIN || p[i] > INT32_MAX) return 0;
-      int64_t product = (int64_t)(int32_t)a * (int64_t)(int32_t)p[i];
-      if (product < INT32_MIN || product > INT32_MAX) return 0;
-      int64_t result = product + (int64_t)(int32_t)b;
-      if (result < INT32_MIN || result > INT32_MAX) return 0;
-    }
-    rem -= n;
+  sw *p = (sw *)x->cols[0]->base;
+  for (uw i = 0; i < x->len; i++) {
+    if (p[i] < INT32_MIN || p[i] > INT32_MAX) return 0;
+    int64_t product = (int64_t)(int32_t)a * (int64_t)(int32_t)p[i];
+    if (product < INT32_MIN || product > INT32_MAX) return 0;
+    int64_t result = product + (int64_t)(int32_t)b;
+    if (result < INT32_MIN || result > INT32_MAX) return 0;
   }
-  return fpr_gpu_vec_axpb(x->cols[0]->blk, x->len, a, b);
+  return fpr_gpu_vec_axpb(x->cols[0]->base, x->len, a, b);
 }
 
-/* iterate one column's blocks: sw *p over contiguous runs of n words,
- * block index in j (VL_B0<<j words at base vl_cap(j)) */
+/* one column, one contiguous run: sw *p over all n words */
 #define VS_BLOCKS(x, BODY)                                           \
   do {                                                               \
-    uw _rem = (x)->len;                                              \
-    for (uw j = 0; _rem; j++) {                                      \
-      uw n = ((uw)VL_B0 << j) < _rem ? ((uw)VL_B0 << j) : _rem;      \
-      sw *p = (sw *)(x)->cols[0]->blk[j];                            \
-      (void)p;                                                       \
-      BODY;                                                          \
-      _rem -= n;                                                     \
-    }                                                                \
+    uw n = (x)->len;                                                 \
+    sw *p = (sw *)(x)->cols[0]->base;                                \
+    (void)p;                                                         \
+    if (n) { BODY; }                                                 \
   } while (0)
 
 static V h_iota(V nv) {
@@ -661,12 +595,13 @@ static V h_iota(V nv) {
 
 static V h_dup(V vec) {
   vec_t *x = vchk(vec, "Vec.dup: not a Vector");
-  cow_inc(x); /* CoW: both names share until one writes */
-  return mktup2((V)x, (V)x);
+  /* an HONEST copy (v2): two independent owners from this point --
+   * the cost is visible at the dup, not smuggled into the next write */
+  return mktup2((V)vcopy(x), (V)x);
 }
 
 static V h_axpb(V av, V bv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.axpb: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.axpb: not a Vector");
   sw a = UNTAG(av), b = UNTAG(bv);
   if (gpu_axpb_exact(x, a, b)) return (V)x;
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = a * p[i] + b; });
@@ -674,50 +609,46 @@ static V h_axpb(V av, V bv, V vec) {
 }
 
 static V h_sar(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.sar: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.sar: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] >>= k; });
   return (V)x;
 }
 
 static V h_minS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.minS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.minS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < k ? p[i] : k; });
   return (V)x;
 }
 
 static V h_maxS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.maxS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.maxS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] > k ? p[i] : k; });
   return (V)x;
 }
 
 static V h_ges(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.ges: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.ges: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] >= k; });
   return (V)x;
 }
 
-/* zips: dst op= src, contiguously over the shared block partition */
+/* zips: dst op= src, one contiguous run each */
 static vec_t *vzip2(V dv, V sv, const char *who) {
   vec_t *d = vnum(dv, who), *s = vnum(sv, who);
   if (d->len != s->len) fpr_cpanic("SIMD tier: zip length mismatch");
-  return s; /* caller pairs blocks itself */
+  return s;
 }
 #define VS_ZIP(dv, sv, WHO, EXPR)                                            \
   do {                                                                       \
-    vec_t *_d = cow_wr(vnum(dv, WHO)), *_s = vzip2(dv, sv, WHO);             \
-    uw _r = _d->len;                                                         \
-    for (uw _j = 0; _r; _j++) {                                              \
-      uw _n = ((uw)VL_B0 << _j) < _r ? ((uw)VL_B0 << _j) : _r;               \
-      sw *p = (sw *)_d->cols[0]->blk[_j], *q = (sw *)_s->cols[0]->blk[_j];   \
-      for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
-      _r -= _n;                                                              \
-    }                                                                        \
-    cow_rel(_s);                                                             \
+    vec_t *_d = vnum(dv, WHO), *_s = vzip2(dv, sv, WHO);             \
+    uw _n = _d->len;                                                         \
+    sw *p = (sw *)_d->cols[0]->base, *q = (sw *)_s->cols[0]->base;           \
+    for (uw _i = 0; _i < _n; _i++) { sw A = p[_i], B = q[_i]; p[_i] = (EXPR); } \
+    vfree(_s);                                                               \
     return (V)_d;                                                            \
   } while (0)
 
@@ -729,7 +660,7 @@ static V h_zipDiv(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipDiv", B == 0 ? 0 : A / B)
 
 /* gather: idx[i] := src[idx[i]] (out of range -> 0); src threads back */
 static V h_gather(V iv, V sv) {
-  vec_t *x = cow_wr(vnum(iv, "Vec.gather: not a Vector"));
+  vec_t *x = vnum(iv, "Vec.gather: not a Vector");
   vec_t *s = vnum(sv, "Vec.gather: not a Vector");
   VS_BLOCKS(x, {
     for (uw i = 0; i < n; i++) {
@@ -744,17 +675,15 @@ static V h_gather(V iv, V sv) {
 static V h_blend(V mv, V sv, V dv) {
   vec_t *m = vnum(mv, "Vec.blend: not a Vector");
   vec_t *s = vnum(sv, "Vec.blend: not a Vector");
-  vec_t *d = cow_wr(vnum(dv, "Vec.blend: not a Vector"));
+  vec_t *d = vnum(dv, "Vec.blend: not a Vector");
   if (m->len != d->len || s->len != d->len) fpr_cpanic("Vec.blend: length mismatch");
-  uw r = d->len;
-  for (uw j = 0; r; j++) {
-    uw n = ((uw)VL_B0 << j) < r ? ((uw)VL_B0 << j) : r;
-    sw *pd = (sw *)d->cols[0]->blk[j], *pm = (sw *)m->cols[0]->blk[j],
-       *ps = (sw *)s->cols[0]->blk[j];
+  {
+    uw n = d->len;
+    sw *pd = (sw *)d->cols[0]->base, *pm = (sw *)m->cols[0]->base,
+       *ps = (sw *)s->cols[0]->base;
     for (uw i = 0; i < n; i++) pd[i] = pm[i] ? ps[i] : pd[i];
-    r -= n;
   }
-  cow_rel(m); cow_rel(s);
+  vfree(m); vfree(s);
   return (V)d;
 }
 
@@ -772,15 +701,15 @@ static V h_slice(V ov, V nv, V vec) {
 /* burst: dst[off..] := src, contiguously; src consumed */
 static V h_burst(V ov, V sv, V dv) {
   vec_t *s = vnum(sv, "Vec.burst: not a Vector");
-  vec_t *d = cow_wr(vnum(dv, "Vec.burst: not a Vector"));
+  vec_t *d = vnum(dv, "Vec.burst: not a Vector");
   if (!ISINT(ov)) fpr_cpanic("Vec.burst: offset not an Int");
   sw off = UNTAG(ov);
   if (off < 0 || (uw)off + s->len > d->len) fpr_cpanic("Vec.burst: out of range");
   VS_BLOCKS(s, {
-    uw base = vl_cap(j); /* first index of block j */
-    for (uw i = 0; i < n; i++) *(sw *)vl_slot(d->cols[0], (uw)off + base + i) = p[i];
+    sw *pd = (sw *)d->cols[0]->base + off;
+    for (uw i = 0; i < n; i++) pd[i] = p[i];
   });
-  cow_rel(s);
+  vfree(s);
   return (V)d;
 }
 
@@ -794,13 +723,13 @@ static V h_zipEq(V dv, V sv)  { VS_ZIP(dv, sv, "Vec.zipEq", A == B); }
 static V h_zipMax(V dv, V sv) { VS_ZIP(dv, sv, "Vec.zipMax", A > B ? A : B); }
 
 static V h_absv(V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.absv: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.absv: not a Vector");
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] < 0 ? -p[i] : p[i]; });
   return (V)x;
 }
 
 static V h_eqS(V kv, V vec) {
-  vec_t *x = cow_wr(vnum(vec, "Vec.eqS: not a Vector"));
+  vec_t *x = vnum(vec, "Vec.eqS: not a Vector");
   sw k = UNTAG(kv);
   VS_BLOCKS(x, { for (uw i = 0; i < n; i++) p[i] = p[i] == k; });
   return (V)x;

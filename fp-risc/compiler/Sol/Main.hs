@@ -52,6 +52,9 @@ main = do
   src <- readFile path
   ptops <- parseOrDie "<prelude>" prelude
   utops <- parseOrDie path src
+  -- spans step 1: "in NAME:" diagnostics anchor to NAME's definition
+  -- line in the script (spliced-module binds keep their module-naming)
+  let anchored = map (anchorMsg (M.singleton path src) (bindAnchors path src utops))
 
   -- compile-time FILE-module expansion: `m = use "spec".` splices the module's
   -- definitions in, renamed under the alias; `m.f` references and
@@ -107,7 +110,7 @@ main = do
             userNames = S.fromList [n | TBind n _ _ _ <- topsExp]
         unless (null terrs) $ do
           putStrLn "=== TYPE ERRORS ==="
-          mapM_ (putStrLn . ("  * " ++)) terrs
+          mapM_ (putStrLn . ("  * " ++)) (anchored terrs)
           exitFailure
         let namedHoles = [(n, t) | (n, t) <- holes, not (null n)]
         unless (null namedHoles) $ do
@@ -120,7 +123,7 @@ main = do
         noSafety <- (== Just "1") <$> lookupEnv "SOL_NO_SAFETY"
         unless (noSafety || null serrs) $ do
           putStrLn "=== SAFETY: the safe/unsafe line ==="
-          mapM_ (putStrLn . ("  * " ++)) serrs
+          mapM_ (putStrLn . ("  * " ++)) (anchored serrs)
           sug <- lookupEnv "FPR_UNSAFE_SUGGEST"
           when (sug == Just "1") $ mapM_ (putStrLn . ("SUGGEST " ++)) ssug
           exitFailure
@@ -162,12 +165,15 @@ main = do
       lerrs = lcheck li tops
   unless (null lerrs) $ do
     putStrLn "=== LINEARITY: ERRORS ==="
-    mapM_ (putStrLn . ("  * " ++)) lerrs
+    mapM_ (putStrLn . ("  * " ++)) (anchored lerrs)
     exitFailure
 
   let cons = collectCons tops
       shapes = collectShapes tops
-      (prog, _) = runState (compileTop tops >>= liftFix) (DEnv 0 cons shapes [])
+      -- the shared desugar keeps string literals as UTF-8 bytes (the
+      -- AOT codegen contract); the VM speaks Chars -- decode once here
+      (prog0, _) = runState (compileTop tops >>= liftFix) (DEnv 0 cons shapes [])
+      prog = decodeProgStrings prog0
       bprog = compileProg halArities prog
 
   when dumpAsm $ do
@@ -402,6 +408,7 @@ topVars _ = []
 exprVars :: SExpr -> [Name]
 exprVars = go
   where
+    go (SMark _ e) = go e
     go (SVar n) = [n]
     go (SApp a b) = go a ++ go b
     go (SLam _ b) = go b

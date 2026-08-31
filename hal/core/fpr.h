@@ -111,6 +111,20 @@ typedef struct fpr_pool {
                      * payload word.  Cleared at teardown/reset:
                      * the blocks die with their slabs. */
 } fpr_pool_t;
+
+/* THE pool constructor.  fpr_pool_t is created in five places (hart
+ * init, actor 0, spawn, process entry, Sys.arena); a stack-built pool
+ * that hand-initializes fields WILL eventually miss one (Sys.arena
+ * shipped with bigfree uninitialized -- a wild-pointer walk on any
+ * above-ceiling alloc inside an arena).  Every creation site goes
+ * through here; buckets must be zeroed by the caller's source
+ * (fpr_bkt_take and the static boot arrays both are). */
+static inline void fpr_pool_init(fpr_pool_t *p, void **buckets) {
+  p->cur = 0;
+  p->buckets = buckets;
+  p->allocated = 0;
+  p->bigfree = 0;
+}
 void **fpr_bkt_take(void);   /* runtime.c: bucket-array recycler */
 void fpr_bkt_put(void **b);
 
@@ -156,6 +170,8 @@ extern char *fpr_static_lo, *fpr_static_hi;
 fpr_slab_t *fpr_slab_new(uw want);   /* runtime.c: buddy-backed pool slab */
 void fpr_pool_reset_c(void);         /* runtime.c: Sys.poolReset, C-callable */
 uw fpr_arc_live_count(void);         /* runtime.c: the arc gauge */
+int fpr_arc_movable_root(V v);       /* runtime.c: sendLinear's transfer test */
+void fpr_arc_promote_share(V v);     /* runtime.c: sendArc's promotion */
 V fpr_receive_res_c(V me);           /* actors.c: receiveRes, C-callable */
 void fpr_fuel_exhausted(void);       /* actors.c: the fuel trap */
 
@@ -172,6 +188,11 @@ void fpr_slab_release(fpr_slab_t *sl);   /* runtime.c: grant/buddy */
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a); /* actors.c: &a->pool */
 void fpr_pool_reclaim(struct fpr_acb *a);    /* runtime.c: death teardown */
 void *buddy_alloc(uw bytes);                 /* buddy.c */
+void *buddy_realloc(void *p, uw bytes);      /* grow/shrink; in-place when
+                                              * the buddy structure allows
+                                              * (see buddy.c), else
+                                              * alloc+copy+free.  NULL on
+                                              * exhaustion, original intact. */
 void buddy_free(void *p);
 uw buddy_block_usable_size(void *p);
 uw buddy_free_bytes(void);
@@ -295,17 +316,46 @@ static inline fpr_hart_t *fpr_hart(void) {
 }
 #endif
 
-/* test-and-test-and-set spinlock (AMO acquire/release; A is in imac) */
+/* test-and-test-and-set with EXPONENTIAL BACKOFF (AMO acquire/release;
+ * A is in imac).  The concurrency rule (docs/MEMORY.md): no spin site
+ * may burn a hart at full rate -- a loser backs off exponentially
+ * (capped) before retrying, so contention degrades bandwidth instead
+ * of livelocking a core.  These locks are TRANSITIONAL: the end-state
+ * moves each one behind an owning actor's mailbox (Memory.qa for
+ * buddy/grants, ARC.qa for promotion) and deletes it -- see
+ * docs/MEMORY-V2-PLAN.md.  Until then, backoff is the law here too. */
 typedef struct { volatile uw v; } fpr_lock_t;
+#define FPR_BACKOFF_CAP 1024 /* max pause iterations between retries */
+static inline void fpr_backoff(uw *delay) {
+  for (uw i = 0; i < *delay; i++) __asm__ volatile("nop");
+  if (*delay < FPR_BACKOFF_CAP) *delay <<= 1;
+}
 static inline void fpr_lock(fpr_lock_t *l) {
+  uw delay = 1;
   for (;;) {
     if (!__atomic_exchange_n(&l->v, 1, __ATOMIC_ACQUIRE)) return;
-    while (__atomic_load_n(&l->v, __ATOMIC_RELAXED)) __asm__ volatile("nop");
+    while (__atomic_load_n(&l->v, __ATOMIC_RELAXED)) fpr_backoff(&delay);
   }
 }
 static inline void fpr_unlock(fpr_lock_t *l) {
   __atomic_store_n(&l->v, 0, __ATOMIC_RELEASE);
 }
+
+/* ---- the ONE freelist discipline (docs/MEMORY-V2-PLAN.md phase 1) --
+ * Every recycled-block pool in the runtime is the same structure: a
+ * locked LIFO of free blocks, each node carrying its capacity, taken
+ * first-fit.  Fixed-size users (stacks, bucket arrays, channel
+ * blocks) match every node trivially; the grant pool's variable
+ * sizes use the capacity for real.  What stays at each call site is
+ * POLICY: where a miss is filled from (buddy on a machine boot, the
+ * loader's grant in process mode), telemetry, and any deferred-reuse
+ * discipline layered on top (the chblk epoch limbo).  The node rides
+ * the free block's first two words -- callers must not hand out
+ * blocks smaller than one node. */
+typedef struct fpr_flnode { struct fpr_flnode *next; uw cap; } fpr_flnode_t;
+typedef struct { fpr_flnode_t *head; fpr_lock_t mu; } fpr_freelist_t;
+void *fpr_fl_take(fpr_freelist_t *fl, uw want); /* first-fit; NULL = miss */
+void fpr_fl_put(fpr_freelist_t *fl, void *p, uw cap);
 
 /* ---- process loading (docs/PROCESS-LOADING.md) ------------------------
  * buddy.c: a power-of-two allocator over the reserved process arena
@@ -314,6 +364,7 @@ static inline void fpr_unlock(fpr_lock_t *l) {
  */
 void buddy_init(void *base, uw size);
 void *buddy_alloc(uw bytes);   /* NULL on exhaustion */
+void *buddy_realloc(void *p, uw bytes);
 void buddy_free(void *p);
 uw buddy_arena_size(void);
 uw buddy_free_bytes(void);
@@ -392,10 +443,11 @@ void fpr_ctx_fabricate(uw *ctx, void (*entry)(void), uw stack_top16,
                        fpr_hart_t *owner); /* ctx layer (virt/posix) */ /* process.c: buddy_init over _proc_arena_start.._end */
 
 V fpr_alloc(V raw_bytes); /* bump + free list; arg is a RAW byte count, not tagged */
+V fpr_realloc(V obj, V raw_bytes); /* grow to a new payload size (copy-based;
+                                    * the freed block recycles exactly) */
 void fpr_free(V obj);     /* returns to the free list (sizes <= 8 KiB) */
 int fpr_in_heap(V v);     /* heap pointer (promotable) vs int/immortal static */
 V fpr_msg_copy(V v);      /* deep copy into one ownerless message slab */
-void fpr_vec_share(V v);  /* CoW rc++ (vec.c) */
 void fpr_arc_incref(V v);
 void fpr_arc_decref(V v);
 uw fpr_arc_live(void);

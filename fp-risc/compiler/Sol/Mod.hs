@@ -29,7 +29,7 @@ import Data.Bits (xor)
 import Data.Char (ord)
 import Data.List (foldl', isSuffixOf)
 import Data.Word (Word64)
-import Sol.Lang (STop, program)
+import Sol.Lang (STop, program, stripPosTops)
 import Numeric (showHex)
 import System.Directory (doesFileExist)
 import System.Environment (getExecutablePath)
@@ -40,10 +40,12 @@ import Text.Megaparsec (errorBundlePretty, parse)
 
 -- FNV-1a 64 over the printed AST: deterministic, dependency-free.
 -- (A real registry would use SHA-256 over a canonical serialization.)
+-- Source positions (SMark) are stripped first: where code sits in the
+-- file is layout, not identity — same rule as whitespace and comments.
 hashAST :: [STop] -> String
 hashAST tops = pad (showHex h "")
   where
-    h = foldl' step 0xcbf29ce484222325 (show tops) :: Word64
+    h = foldl' step 0xcbf29ce484222325 (show (stripPosTops tops)) :: Word64
     step acc c = (acc `xor` fromIntegral (ord c)) * 0x100000001b3
     pad s = replicate (16 - length s) '0' ++ s
 

@@ -117,6 +117,9 @@ data IEnv = IEnv
     iNextSite :: !Int,
     iSites :: IM.IntMap (Name, Type), -- operator sites awaiting resolution
     iCarriers :: IM.IntMap (Name, Name), -- carrier var -> (param, sig)
+    iHere :: Maybe Int, -- spans step 3: the innermost enclosing SMark's
+                        -- source offset while inference walks under it;
+                        -- report stamps it into diagnostics as "@OFF~ "
     iLinSigs :: [(Name, ([LShape], LShape))] -- INFERRED linearity shapes
       -- per user bind (zonked types -> LShape): the linearity checker
       -- consumes these for functions WITHOUT an explicit sig, closing
@@ -133,7 +136,11 @@ freshR :: I Row
 freshR = do s <- get; put s {iFresh = iFresh s + 1}; pure (RV (iFresh s))
 
 report :: String -> I ()
-report e = modify (\s -> s {iErrs = iErrs s ++ [e]})
+report e = modify (\s -> s {iErrs = iErrs s ++ [stamp (iHere s) e]})
+  where
+    -- the error sinks resolve "@OFF~ " to file:line:col (anchorMsg)
+    stamp (Just o) msg = "@" ++ show o ++ "~ " ++ msg
+    stamp Nothing msg = msg
 
 -- ---- zonking (chase solutions) ----------------------------------------------
 
@@ -384,6 +391,8 @@ builtinEnv =
       -- SMP actors: messages are polymorphic; an actor id is an Int.
       -- send : Actor -> msg -> Unit ; receive : Actor -> msg
       ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
       ("receive", scheme [0] (TFn tInt (sv 0))),
       ("receiveRes", scheme [0, 1] (TFn tInt (tcon "Result" [sv 0, sv 1]))),
       ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
@@ -667,10 +676,32 @@ inferPat cons = \case
 
 -- ---- expression inference ---------------------------------------------------
 
+-- ---- profile parameterization ----------------------------------------------
+-- ONE inference engine, per-profile surfaces (the un-forking of
+-- Sol/Infer.hs): everything that genuinely differs between the AOT
+-- tiers and HostedBytecode rides here.  The float story needs no flag
+-- -- float literals splice to f64frombits/f32frombits calls, and the
+-- PROFILE'S TABLE types those (F64/F32 for AOT, Int-is-Numeric for
+-- sol), so the width sites resolve to plain ops under sol's table and
+-- the rewritten AST comes out exactly as sol's old engine produced.
+data IProf = IProf
+  { ipBuiltins :: TEnv, -- the profile's primitive surface
+    ipTopEvals :: Bool, -- infer + rewrite `> expr.` tops (HostedBytecode;
+                        -- the AOT driver handles TEval itself)
+    ipPathStr :: Bool, -- @Path literals type as String (HostedBytecode;
+                       -- AOT expands them structurally before inference)
+    ipMat4 :: Bool -- Mat4/Vec4 `*` elaboration -- only where the prelude
+                   -- defines mulMM/mulMV (the AOT tiers)
+  }
+
+aotProf :: IProf
+aotProf = IProf builtinEnv False False True
+
 data ICtx = ICtx
   { icEnv :: TEnv, -- values in scope
     icCons :: TEnv, -- constructor schemes (for patterns)
-    icSigs :: Sigs
+    icSigs :: Sigs,
+    icProf :: IProf
   }
 
 extend :: TEnv -> ICtx -> ICtx
@@ -733,6 +764,18 @@ recFields _ = Nothing
 
 inferE :: ICtx -> SExpr -> I (Type, SExpr)
 inferE ctx e0 = case e0 of
+  -- position wrapper: remember the statement we are inside (errors
+  -- reported below it carry its offset), infer through, keep the mark
+  SMark o e -> do
+    old <- gets iHere
+    modify (\s -> s {iHere = Just o})
+    (t, e') <- inferE ctx e
+    modify (\s -> s {iHere = old})
+    pure (t, SMark o e')
+  -- @paths (parsed by the shared grammar as (Path "…")) are URL strings
+  -- in the HostedBytecode profile; the AOT tiers expand them
+  -- structurally before inference (expandPathLits) and never reach here
+  SApp (SVar "Path") (SStrI [SegStr _]) | ipPathStr (icProf ctx) -> pure (tStr, e0)
   -- ?name / ?? — typed holes (parsed as this shape).  A fresh var lets
   -- everything AROUND the hole typecheck.  Named holes are recorded and
   -- REFUSE compilation later (with the zonked type); ?? elaborates to a
@@ -915,10 +958,11 @@ inferBin ctx op a b = case op of
         -- to fused multiply-add column loops (the axpb shape).
         za <- zonk ta
         zb <- zonk tb
-        let isShape ns t = maybe False ((== ns) . sortNames) (recFields t)
-            matL = isShape mat4Fields za
-            matR = isShape mat4Fields zb
-            vecR = isShape vec4Fields zb
+        let m4 = ipMat4 (icProf ctx) -- only where the prelude has mulMM/mulMV
+            isShape ns t = maybe False ((== ns) . sortNames) (recFields t)
+            matL = m4 && isShape mat4Fields za
+            matR = m4 && isShape mat4Fields zb
+            vecR = m4 && isShape vec4Fields zb
         case op of
           "*" | matL && matR -> do
                 (tr, _) <- inferE ctx (SApp (SApp (SVar "mulMM") a) b)
@@ -1048,6 +1092,7 @@ applySites tgts = go
               OpGlobal g -> SApp (SApp (SVar g) (go a)) (go b)
               OpProj s o -> SApp (SApp (SProj (SVar s) [o]) (go a)) (go b)
         | otherwise -> SBin op (go a) (go b)
+      SMark o e -> SMark o (go e)
       SApp a b -> SApp (go a) (go b)
       SLam ps b -> SLam ps (go b)
       SBlock stmts fin -> SBlock (map goS stmts) (go fin)
@@ -1099,6 +1144,11 @@ linShapeT linNs = go
 -- are TFn and shape LU, exactly right).
 builtinLinShapes :: [Name] -> M.Map Name ([LShape], LShape)
 builtinLinShapes linNs =
+  -- sendLinear MOVES its payload: the polymorphic type would derive LU
+  -- (a quantified var is never the carrier), but move semantics is the
+  -- verb's whole meaning, so the consume is declared here explicitly --
+  -- passing a linear value consumes it exactly like Vec.free does.
+  M.insert "sendLinear" ([LU, LL], LU) $
   M.fromList
     [ (n, (map (linShapeT linNs) ps, linShapeT linNs r))
       | (n, Forall _ _ t) <- M.toList builtinEnv,
@@ -1109,8 +1159,11 @@ builtinLinShapes linNs =
     peelFn t = ([], t)
 
 inferTops :: Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
-inferTops sigs structs tops =
-  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty [])
+inferTops = inferTopsWith aotProf
+
+inferTopsWith :: IProf -> Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
+inferTopsWith prof sigs structs tops =
+  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty Nothing [])
    in (iErrs st, iNotes st, iHolesP st, iLinSigs st, tops')
   where
     aliases = M.fromList [(n, fs) | TShape n fs <- tops]
@@ -1118,10 +1171,14 @@ inferTops sigs structs tops =
     run = do
       cons <- (\u -> M.union u builtinCons') <$> consEnv aliases tops
       declared <- sigAnnEnv aliases tops
-      let env0 = M.union declared builtinEnv
+      let env0 = M.union declared (ipBuiltins prof)
       -- group multi-clause binds under one name, preserving first-seen order
       let bindNames = nub [n | TBind n _ _ _ <- tops]
           clausesOf n = [(ps, g, b) | TBind n' ps g b <- tops, n' == n]
+          -- `> expr.` top-level effects: inferred and rewritten in the
+          -- HostedBytecode profile; the AOT driver owns them otherwise
+          -- (empty list = rebuild leaves every TEval untouched)
+          evals = if ipTopEvals prof then [e | TEval e <- tops] else []
           topSet = S.fromList bindNames
           nodes =
             [ (n, n, nub (concatMap refs (clausesOf n)))
@@ -1140,6 +1197,7 @@ inferTops sigs structs tops =
           (\(e, acc) ns -> do (e', rws) <- inferSCC cons e ns; pure (e', acc ++ rws))
           (env0, [])
           [ns | scc <- sccs, let ns = flat scc]
+      rwEvals <- forM evals $ \e -> snd <$> inferE (ICtx env cons sigs prof) e
       -- typed struct conformance
       checkStructConformance sigs structs env
       -- ?? markers -> traps: eta-wrap by the hole's ZONKED type so the
@@ -1188,6 +1246,7 @@ inferTops sigs structs tops =
             where
               go' e = f (step' e)
               step' e = case e of
+                SMark o x -> SMark o (go' x)
                 SApp a b -> SApp (go' a) (go' b)
                 SLam ps x -> SLam ps (go' x)
                 SBlock stmts fin -> SBlock (map goS stmts) (go' fin)
@@ -1202,13 +1261,16 @@ inferTops sigs structs tops =
                 other -> other
               goS (SBind n ps x) = SBind n ps (go' x)
               goS (SBindPat p x) = SBindPat p (go' x)
-      let rebuild bnds t = case t of
+      let rebuild (evs, bnds) t = case t of
+            TEval _ -> case evs of
+              (e : rest) -> ((rest, bnds), TEval (apE e))
+              [] -> ((evs, bnds), t)
             TBind n _ _ _ -> case M.lookup n bnds of
               Just ((ps, g, b) : more) ->
-                (M.insert n more bnds, TBind n ps (map (mapGuardE apE) g) (apE b))
-              _ -> (bnds, t)
-            _ -> (bnds, t)
-          (_, tops') = foldl' (\(st', acc) t -> let (st2, t') = rebuild st' t in (st2, acc ++ [t'])) (fmap reverse rwMap, []) tops
+                ((evs, M.insert n more bnds), TBind n ps (map (mapGuardE apE) g) (apE b))
+              _ -> ((evs, bnds), t)
+            _ -> ((evs, bnds), t)
+          (_, tops') = foldl' (\(st', acc) t -> let (st2, t') = rebuild st' t in (st2, acc ++ [t'])) ((rwEvals, fmap reverse rwMap), []) tops
       pure tops'
     flat (AcyclicSCC n) = [n]
     flat (CyclicSCC ns) = ns
@@ -1223,7 +1285,7 @@ inferTops sigs structs tops =
           nerrs0 <- gets (length . iErrs)
           -- params: PSig gets its sig's record type; others infer
           (ptys, penvs) <- unzip <$> mapM (inferParam cons) ps
-          let ctx = ICtx (M.union (M.unions penvs) recEnv) cons sigs
+          let ctx = ICtx (M.union (M.unions penvs) recEnv) cons sigs prof
           -- guards run left to right; a pattern guard's binds are in
           -- scope for the guards to its right and for the body
           (ctx2, g') <-
@@ -1332,6 +1394,7 @@ inferTops sigs structs tops =
     topRefs2 topSet bound e = [n | n <- coll bound e, S.member n topSet]
       where
         coll bs = \case
+          SMark _ x -> coll bs x
           SVar v | not (S.member v bs) -> [v]
           SApp a b -> coll bs a ++ coll bs b
           SLam ps x -> coll (bs <> S.fromList ps) x
