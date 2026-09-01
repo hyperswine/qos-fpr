@@ -23,10 +23,6 @@ base = use "../lib/base".
 Opt = Type (Nope | Got x).
 
 # ---------- generic helpers ----------
-append : unsafe List h93 -> List h93 -> List h93 .
-append xs ys | xs == [] = ys.
-append xs ys = case xs of x :: r -> x :: append r ys.
-
 member : unsafe i93 -> List i93 -> Bool .
 member _ [] = False.
 member x (y :: _) | x == y = True.
@@ -37,21 +33,12 @@ lookupA _ [] = Nope.
 lookupA k ((k2, v) :: _) | k2 == k = Got v.
 lookupA k (_ :: r) = lookupA k r.
 
-rev2 : unsafe List l93 -> List l93 -> List l93 .
-rev2 acc xs | xs == [] = acc.
-rev2 acc xs = case xs of x :: r -> rev2 (x :: acc) r.
-reverse : unsafe List s98 -> List s98 .
-reverse xs = rev2 [] xs.
-
 pad3 : unsafe String -> String .
 pad3 s | Str.len s >= 3 = s.
 pad3 s = pad3 " {s}".
 pad4 : unsafe String -> String .
 pad4 s | Str.len s >= 4 = s.
 pad4 s = pad4 " {s}".
-
-iabs n | n < 0 = 0 - n.
-iabs n = n.
 
 # ---------- tokenizing ----------
 nonEmpty s = s != "".
@@ -87,7 +74,7 @@ parseKind k nm ws n =
 
 parseNetlist : unsafe List String -> List _ .
 parseNetlist ls | ls == [] = [].
-parseNetlist ls = case ls of l :: r -> append (parseLine l) (parseNetlist r).
+parseNetlist ls = case ls of l :: r -> List.append (parseLine l) (parseNetlist r).
 
 isSource c = base.or2 (c.kind == 86) (c.kind == 73).
 notSource c = base.not2 (isSource c).
@@ -168,7 +155,7 @@ scoreCand na nb sA st =
       + 100 * base.boolInt (ownB == Got nb)
       - 40 * base.boolInt (base.and2 (netStrips na st.netstr != []) (base.not2 (ownA == Got na)))
       - 40 * base.boolInt (base.and2 (netStrips nb st.netstr != []) (base.not2 (ownB == Got nb)))
-      - iabs (sRow sA - 14).
+      - Numeric.abs (sRow sA - 14).
 
 allKeys : unsafe Int -> List Int .
 allKeys r | r > 28 = [].
@@ -196,7 +183,7 @@ track net k netstr =
   ss = netStrips net netstr;
   case member k ss of
     True -> netstr
-  | False -> (net, append ss [k]) :: dropKey net netstr.
+  | False -> (net, List.append ss [k]) :: dropKey net netstr.
 
 dropKey : unsafe l95 -> List (l95, k95) -> List (l95, k95) .
 dropKey _ [] = [].
@@ -222,7 +209,7 @@ commit c sA st =
   {st | holes = (sA, cA) :: (sB, cB) :: st.holes,
         owners = own sB c.nb (own sA c.na st.owners),
         netstr = track c.nb sB (track c.na sA st.netstr),
-        places = append st.places [(c.nm, c.kind, sA, cA, cB)]}.
+      places = List.append st.places [(c.nm, c.kind, sA, cA, cB)]}.
 
 placeAll : unsafe List _ -> _ -> _ .
 placeAll cs st | cs == [] = st.
@@ -254,7 +241,7 @@ jumpDo net s1 s2 more ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   (lb, ws3) = allocLbl s2 "W{wsA.k}b" ws2;
-  jumpNet net (s2 :: more) {ws3 | wires = append ws3.wires [(net, la, lb, "JUMPER")]}.
+  jumpNet net (s2 :: more) {ws3 | wires = List.append ws3.wires [(net, la, lb, "JUMPER")]}.
 
 # rail wire: from the net's first strip to the given rail
 railWire : unsafe f103 -> g103 -> List Int -> _ -> _ .
@@ -265,7 +252,7 @@ railDo net rail s1 ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   {ws2 | rails = (rail, (sRow s1, "W{wsA.k}b")) :: ws2.rails,
-         wires = append ws2.wires [(net, la, rail, "RAIL")]}.
+      wires = List.append ws2.wires [(net, la, rail, "RAIL")]}.
 
 wireNets : unsafe List String -> List String -> List (String, x103) -> _ -> _ .
 wireNets nets pwrs netstr ws | nets == [] = ws.
@@ -400,7 +387,7 @@ runBoard title ls =
   comps = parseNetlist ls;
   placeable = List.filter notSource comps;
   pwrs = pwrNetsOf comps;
-  nets = reverse (netsOf placeable);
+  nets = List.rev (netsOf placeable);
   st = placeAll placeable st0;
   ws = wireNets nets pwrs st.netstr (mkWs st.holes);
   u2 = print "-- components --";
@@ -414,7 +401,7 @@ runBoard title ls =
   ua = print "  {checkNets nets st.netstr ws.wires}";
   ub = print "";
   uc = print header;
-  cm = append (cellMapOf st.places) ws.labels;
+  cm = List.append (cellMapOf st.places) ws.labels;
   renderRows cm ws.rails 1.
 
 ex1 = [

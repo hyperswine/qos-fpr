@@ -1,5 +1,8 @@
 # The safe/unsafe line
 
+Source style, including the builtin-first rule that normally avoids custom
+recursive helpers in the first place, is defined in `STYLE.md`.
+
 FP-RISC draws a compiler-enforced line through every program:
 
 **Safe code** is code whose worst-case execution time the compiler can

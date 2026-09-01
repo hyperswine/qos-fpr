@@ -22,9 +22,6 @@ L = use "../std/lens".
 Style = {fg : Int, tag : String}.
 Model = {hp : Int, name : String, ui : Style, ks : List Int}.
 
-lenL : unsafe List a -> Int .
-lenL l = case l of Nil -> 0 | x :: r -> 1 + lenL r.
-
 joinSegs : unsafe List String -> String -> String .
 joinSegs l acc = case l of
     Nil -> acc
@@ -61,4 +58,4 @@ main =
       Ok m -> "ACCEPTED?!"
     | Err e -> e;                     # refused, model untouched
 
-  "paths: OK hp={hpP.get m3} name={nameP.get m5} fg={fgP.get m5} comp-fg={compFg} via-str hp={gotHp} tag={tagP.get m5} segs={joinSegs fgP.segs ""} leaves={lenL sch} bad={bad}".
+  "paths: OK hp={hpP.get m3} name={nameP.get m5} fg={fgP.get m5} comp-fg={compFg} via-str hp={gotHp} tag={tagP.get m5} segs={joinSegs fgP.segs ""} leaves={List.len sch} bad={bad}".

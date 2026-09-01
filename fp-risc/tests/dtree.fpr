@@ -39,9 +39,6 @@ Tree = Type (Leaf c | Split col thr l r).
 
 # ---- small helpers ----------------------------------------------------------
 
-imod a b = a - (a / b) * b.
-minI a b = case a < b of True -> a | False -> b.
-maxI a b = case a > b of True -> a | False -> b.
 neqB a b = case a of True -> (case b of True -> False | False -> True) | False -> b.
 cvec n v = Vec.axpb 0 v (Vec.iota n).
 
@@ -50,8 +47,6 @@ fminf a b = case b < a of True -> b | False -> a.
 fmaxf : F64 -> F64 -> F64 .
 fmaxf a b = case b > a of True -> b | False -> a.
 
-lenL : unsafe List a -> Int .
-lenL l = case l of Nil -> 0 | x :: r -> 1 + lenL r.
 iotaL : unsafe Int -> Int -> List Int .
 iotaL i n = case i >= n of True -> Nil | False -> i :: iotaL (i + 1) n.
 
@@ -204,7 +199,7 @@ B = Type (B lo0 w0 lo1 w1).
 build : unsafe P -> B -> Vector -> Vector -> Vector -> Int -> List Int -> _ .
 build ps bn c0 c1 ys depth idxs =
   P bins md mg ml k = ps;
-  n = lenL idxs;
+  n = List.len idxs;
   (counts, ys2) = ccounts ys idxs k;
   case depth >= md of
     True -> (Leaf (argmaxL counts), c0, c1, ys2)
@@ -272,7 +267,7 @@ binGo col i n lo w nb acc = case i >= n of
 binPut : unsafe Vector -> Int -> Int -> F64 -> F64 -> Int -> Vector -> _ .
 binPut col i n lo w nb acc =
   (x, col2) = Vec.get (i + 1) col;
-  binGo col2 (i + 1) n lo w nb (Vec.push (minI (nb - 1) (F64.toInt ((x - lo) / w))) acc).
+  binGo col2 (i + 1) n lo w nb (Vec.push (Int.min (nb - 1) (F64.toInt ((x - lo) / w))) acc).
 
 # ---- prediction + accuracy --------------------------------------------------
 
@@ -309,14 +304,14 @@ sizeT (Leaf c) = 1.
 sizeT (Split col thr l r) = 1 + sizeT l + sizeT r.
 depthT : unsafe Tree -> Int .
 depthT (Leaf c) = 0.
-depthT (Split col thr l r) = 1 + maxI (depthT l) (depthT r).
+depthT (Split col thr l r) = 1 + Int.max (depthT l) (depthT r).
 
 # ---- the demo dataset: noisy XOR, LCG uniforms ------------------------------
 # us = tail (iterate (\s -> (1103515245*s + 12345) mod 2^31) seed):
 # first n are x, next n are z (both mapped to [-1,1)), next n the
 # label-noise draws.  5% of labels flip.
 
-lcgN s = imod (1103515245 * s + 12345) 2147483648.
+lcgN s = Int.mod (1103515245 * s + 12345) 2147483648.
 
 fillM : unsafe Int -> Int -> Vector -> _ .
 fillM cnt s v = case cnt == 0 of

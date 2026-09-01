@@ -156,12 +156,9 @@ ambientP env p =
 doPlay : unsafe Int -> _ -> _ .
 doPlay i g =
   p = me g;
-  case and2 (i >= 1) (i <= listLen p.hand) of
+  case and2 (i >= 1) (i <= List.len p.hand) of
     False -> addLog "no such card" g
   | True -> playCard i (p.hand ! i) g.
-
-listLen xs = List.fold lenAdd 0 xs.
-lenAdd a x = a + 1.
 
 playCard : unsafe Int -> _ -> _ -> _ .
 playCard i c g =
@@ -394,7 +391,7 @@ playerPanel g p isActive =
       ui.el "span" [ui.Style.fontbold] [ui.text p.nm],
       ui.el "span" [ui.Style.badge] [ui.text "HQ {p.hq}"],
       ui.el "span" [ui.Style.badge] [ui.text "supply {p.supply}"],
-      ui.el "span" [ui.Style.textsm, ui.Style.textmuted] [ui.text "deck {listLen p.deck}"]
+      ui.el "span" [ui.Style.textsm, ui.Style.textmuted] [ui.text "deck {List.len p.deck}"]
     ],
     ui.el "div" [ui.Style.textsm, ui.Style.fontbold] [ui.text "rear"],
     zoneRow isActive "rear" p.rear,

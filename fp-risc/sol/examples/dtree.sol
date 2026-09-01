@@ -36,8 +36,6 @@ fill : unsafe Vector -> Int -> Int -> Vector .
 fill v s k | k == 0 = v.
 fill v s k = fill (Vec.push (mkRow (Rand.next (s + k * 100003))) v) s (k - 1).
 
-imod a b = a - (a / b) * b.
-
 # the packed counting fold: (feat, th) captured; four counts in one i64
 cnt feat th acc p =
   xv = case feat == 1 of True -> p.x1 | False -> p.x2;
@@ -48,14 +46,11 @@ cnt feat th acc p =
 
 posCnt acc p = acc + (case p.y > 0 of True -> 1 | False -> 0).
 
-imin a b | a < b = a.
-imin _ b = b.
-
 # misclassification score of a split: each side predicts its majority
 scoreOf c =
-  lp = c / 1073741824; ln = imod (c / 1048576) 1024;
-  rp = imod (c / 1024) 1024; rn = imod c 1024;
-  imin lp ln + imin rp rn.
+  lp = c / 1073741824; ln = Numeric.mod (c / 1048576) 1024;
+  rp = Numeric.mod (c / 1024) 1024; rn = Numeric.mod c 1024;
+  Numeric.min lp ln + Numeric.min rp rn.
 
 # scan candidates, threading the linear vec; returns (feat, th, score, v)
 scan : unsafe List (Int, Int) -> Int -> Int -> Int -> Vector -> (Int, Int, Int, Vector) .
@@ -80,11 +75,7 @@ cands1 : unsafe p45 -> List q45 -> List (p45, q45) .
 cands1 f ts | ts == [] = [].
 cands1 f ts = case ts of t :: r -> (f, t) :: cands1 f r.
 allCands : unsafe List (Int, Int) .
-allCands = cands1 1 (grid (0 - 6)) `append` cands1 2 (grid (0 - 6)).
-
-append : unsafe List r45 -> List r45 -> List r45 .
-append xs ys | xs == [] = ys.
-append xs ys = case xs of x :: r -> x :: append r ys.
+allCands = List.append (cands1 1 (grid (0 - 6))) (cands1 2 (grid (0 - 6))).
 
 pick 1 p = p.x1.
 pick _ p = p.x2.

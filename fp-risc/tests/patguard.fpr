@@ -20,8 +20,7 @@ expect name got want = case got == want of
 
 # ---- the basic form --------------------------------------------------------
 
-half n = case imod n 2 of 0 -> Some (n / 2) | _ -> None.
-imod a b = a - (a / b) * b.
+half n = case Int.mod n 2 of 0 -> Some (n / 2) | _ -> None.
 
 evenHalf n | Some h <- half n = h.
 evenHalf n = 0 - 1.

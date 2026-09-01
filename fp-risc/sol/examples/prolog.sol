@@ -98,15 +98,9 @@ runProgram : unsafe q157 -> List String -> Int .
 runProgram title extra =
   u0 = print "";
   u1 = print "=== {title} ===";
-  (db, qs, syms) = pl.loadProgram (appendL cpuRules extra);
-  u2 = print "({lenL db} clauses loaded)";
+  (db, qs, syms) = pl.loadProgram (List.append cpuRules extra);
+  u2 = print "({List.len db} clauses loaded)";
   runQs db syms qs.
-
-appendL : unsafe List j157 -> List j157 -> List j157 .
-appendL xs ys | xs == [] = ys.
-appendL xs ys = case xs of x :: r -> x :: appendL r ys.
-lenL xs = List.fold l1 0 xs.
-l1 a x = a + 1.
 
 > runProgram "program A: 45 + 200 = 245" progA.
 > runProgram "program B: countdown 5 -> 0 (dec/jnz loop)" progB.

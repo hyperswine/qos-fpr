@@ -90,10 +90,6 @@ aboutTab =
       :: Nil ).
 
 # ---- harness: the MVU cycle, observable --------------------------------------
-lenL : unsafe List z84 -> Int .
-lenL Nil = 0.
-lenL (x :: r) = 1 + lenL r.
-
 main =
   m0 = init;
   (s0, d0) = G.render (view m0);
@@ -105,7 +101,7 @@ main =
   _ = print (pageOf s0 d0 0);
   _ = print "</body></html>";
   _ = print "MAEND";
-  _ = print "ma: statics={lenL s0} dynamics={lenL d0}";
+  _ = print "ma: statics={List.len s0} dynamics={List.len d0}";
   m1 = update m0 "bump" 1;
   (s1, d1) = G.render (view m1);
   _ = print "ma: bump same-statics={G.sameStatics s0 s1} delta={G.deltaJson d0 d1}";

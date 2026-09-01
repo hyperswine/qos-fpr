@@ -20,8 +20,6 @@ yspan = Numeric.div 24 10.
 dx = Numeric.div xspan w.
 dy = Numeric.div yspan h.
 
-imod a b = a - (a / b) * b.
-
 mand : Int -> Int -> Int -> Int -> (k : Int | measure k) -> Int .
 mand cr ci zr zi k | k <= 0 = 0.
 mand cr ci zr zi k =
@@ -33,7 +31,7 @@ mand cr ci zr zi k =
 
 pix : Int -> Int .
 pix i =
-  col = imod (i - 1) w;
+  col = Numeric.mod (i - 1) w;
   row = (i - 1) / w;
   mand (xmin + col * dx) (ymin + row * dy) 0 0 maxIter.
 

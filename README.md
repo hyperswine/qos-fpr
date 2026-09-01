@@ -37,6 +37,7 @@ compile and an up-to-date one costs nothing.
                         side), std.sol (sol side), checkdemo.fpr (the
                         proof-pass demo).  sol USES std; std needs no sol.
       core/             the bare tier (prelude.fpr) — unsafe by license
+      docs/STYLE.md     source style: builtin-first, abstraction exceptions
       targets/qos.fpr   the Struct QOS-targeted programs link against
                         (thin re-export of Svc/Caps/IoV: re-homing the
                         definition would churn pinned content hashes)

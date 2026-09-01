@@ -2,13 +2,11 @@
 # push to the browser (no client events). Total sign-ins persist in KV;
 # the live series is runtime state, abandoned on restart by design.
 
-# ideally should use syntax X.y like Sig.field rather than xY so pI could be Parse.intToStr
-# unwrapU would be Unwrap.persistentUser
+# Ideally unwrapU would be a standard Persistent projection.
 
 base = use "../lib/base".
 ui = use "../lib/ui".
 
-pI s = case s == "" of True -> 0 | False -> Str.parse s.
 # infers as Persistent String.
 unwrapU model = case model.user of Persistent u -> u.
 
@@ -37,15 +35,10 @@ doReg v model = (u, p) = base.splitFirst v; ({model | pendu = u, pendp = p}, Get
 doRegchk stored model | stored == "" = (model, Batch [Put "user:{model.pendu}" model.pendp, Msg "setuser" model.pendu]).
 doRegchk stored model | stored != "" = ({model | note = "user already exists"}, None).
 
-takeN : unsafe Int -> List e125 -> List e125 .
-takeN n xs | n == 0 = [].
-takeN n xs | xs == [] = [].
-takeN n xs = case xs of x :: r -> x :: takeN (n - 1) r.
-
 init tok = {user = Persistent "", pendu = "", pendp = "", note = "", series = [], reqs = 0, logins = ""}.
 
 # technically could match directly on the string in the clause head
-update : unsafe (String, String) -> _ -> (_, Cmd) .
+update : (String, String) -> _ -> (_, Cmd) .
 update msg model =
   case msg of
     ("login", v) -> doLogin v model
@@ -53,13 +46,13 @@ update msg model =
   | ("register", v) -> doReg v model
   | ("regchk", v) -> doRegchk v model
   | ("setuser", u) -> ({model | user = Persistent u, note = ""}, Batch [Msg "refresh" "", Get "logins" "bump"])
-  | ("bump", v) -> (model, Batch [Put "logins" (str (pI v + 1)), Msg "gotlogins" (str (pI v + 1))])
+  | ("bump", v) -> (model, Batch [Put "logins" (str (base.pI v + 1)), Msg "gotlogins" (str (base.pI v + 1))])
   | ("logout", v) -> ({model | user = Persistent ""}, None)
   | ("connected", v) -> (model, Msg "refresh" "")
   | ("refresh", v) -> (model, case unwrapU model == "" of True -> None | False -> Get "logins" "gotlogins")
   | ("gotlogins", v) -> ({model | logins = v}, None)
   | ("tick", v) -> (model, case unwrapU model == "" of True -> None | False -> Rng 20 95 "sample")
-  | ("sample", v) -> ({model | reqs = Str.parse v, series = takeN 10 (Str.parse v :: model.series)}, None)
+  | ("sample", v) -> ({model | reqs = Str.parse v, series = base.takeN 10 (Str.parse v :: model.series)}, None)
   | _ -> (model, None).
 
 

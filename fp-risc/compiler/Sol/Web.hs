@@ -1,7 +1,8 @@
 {-# LANGUAGE LambdaCase #-}
 {-# OPTIONS_GHC -Wno-missing-export-lists #-}
 
--- IDEALLY THIS WOULD BE COMPLETELY a LIB IN PURE SOL
+-- IDEALLY THIS WOULD BE COMPLETELY a LIB IN PURE SOL. With sockets exposed by haskell runtime
+-- everything else would just be built from std.socket
 
 -- Web.hs — gen_view v2: MVU with event-sourced persistence, Cmds, and subs.
 --
