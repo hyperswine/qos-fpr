@@ -19,6 +19,13 @@ fi
 grep -Fq 'deferred process FAILED (exit 1)' /tmp/sol-proc-fail.out
 grep -Fq 'skipping queued process' /tmp/sol-proc-fail.out
 
+rm -f /tmp/sol-proc-order.log
+order_output=$(./fpr sol tests/procorder.sol 2>&1)
+printf '%s\n' "$order_output" | grep -Fq 'runNow: Err'
+printf '%s\n' "$order_output" | grep -Fq 'queued effect(s) that only happen at commit'
+# the immediate process was refused; the queued one still committed
+[ "$(cat /tmp/sol-proc-order.log)" = queued ]
+
 rm -rf /tmp/sol-git-wrap /tmp/sol-git-remote.git
 mkdir -p /tmp/sol-git-wrap
 printf '%s\n' 'hello from sol' > /tmp/sol-git-wrap/hello.txt
@@ -46,5 +53,13 @@ push_output=$(./fpr sol tests/gitpush.sol 2>&1)
 printf '%s\n' "$push_output" | grep -Fq '[sol] REALTIME: Proc.runNow'
 printf '%s\n' "$push_output" | grep -Fq 'push: Ok <'
 [ "$(git -C /tmp/sol-git-wrap rev-parse main)" = "$(git --git-dir=/tmp/sol-git-remote.git rev-parse refs/heads/main)" ]
+
+printf '%s\n' fourth > /tmp/sol-git-wrap/fourth.txt
+remote_before=$(git --git-dir=/tmp/sol-git-remote.git rev-parse refs/heads/main)
+order_push=$(./fpr sol tests/gitorder.sol 2>&1)
+printf '%s\n' "$order_push" | grep -Fq 'push: Err'
+# the queued commit landed locally; the stale push never reached the remote
+[ "$(git -C /tmp/sol-git-wrap log -1 --format=%s)" = 'fourth commit' ]
+[ "$(git --git-dir=/tmp/sol-git-remote.git rev-parse refs/heads/main)" = "$remote_before" ]
 
 echo "sol structured process + git wrappers: OK"

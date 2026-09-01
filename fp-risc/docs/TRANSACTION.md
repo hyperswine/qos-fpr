@@ -56,6 +56,16 @@ remain separate.  Their execution spelling states the retry contract:
    survives rollback, and runs again on retry.  The runtime names this loss
    of atomicity.
 
+Immediacy is also an ORDERING claim, and that is the trap the runtime now
+closes.  Queued effects -- file writes, `shq`, `Proc.afterCommit` -- happen
+at commit, so a realtime escape necessarily runs *before* all of them.  A
+script that queued a Git commit and then pushed in the same run published
+the pre-commit head and reported success.  So `Proc.runNow` refuses while
+any effect is pending, returning an `Err` that names what is still queued,
+and `shNow` -- which answers an exit code and cannot refuse -- prints the
+same inversion to stderr.  Either queue the operation as well, or split the
+work into two script runs.
+
 Deferred processes have **at-least-once crash recovery**, not exactly-once
 delivery.  The journal records a durable done marker after a process
 returns.  A hard crash between the external effect and that marker can
