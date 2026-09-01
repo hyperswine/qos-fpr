@@ -4,6 +4,15 @@
 #   Git.repo "." |> Git.add Git.all |> Git.commit "message"
 # Queries run immediately and return Result. Push is deliberately realtime:
 # it is externally visible, cannot be rolled back, and the runtime says so.
+#
+# ORDER MATTERS, and the runtime enforces it. Queued mutations only run at
+# commit, so anything immediate -- push, and every query -- sees the state
+# from BEFORE them. Pushing in the same script that queues a commit would
+# publish the pre-commit head, so Proc.runNow refuses while effects are
+# pending and push returns that Err. Commit in one run, push in the next:
+#
+#   run 1:  Git.repo "." |> Git.add Git.all |> Git.commit "message"
+#   run 2:  Git.push "origin" "main" (Git.repo ".")
 
 P = use "proc".
 

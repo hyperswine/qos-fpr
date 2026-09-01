@@ -960,6 +960,12 @@ mkHal cons tx preempts rt =
           noteEscape rt "shNow"
             ("streams `" ++ c ++ "` live and re-runs on every retry "
               ++ "(transactional: shq, which runs once inside the commit)")
+          -- shNow answers an exit code, so it cannot refuse the way
+          -- Proc.runNow does; it still says when it is running ahead of
+          -- the transaction's own queued effects
+          pending <- txPendingBrief tx
+          unless (null pending) $
+            hPutStrLn stderr ("[sol] ORDER: " ++ pendingOrderBrief ("shNow `" ++ c ++ "`") "shq" pending)
           VInt . fromIntegral <$> rtShell c)
     -- the actor shim's mtime handle: native 10MHz tick unit on wall clock
     readIoH (VData t 0 []) | t == mtimeT = VInt . round . (* 1e7) <$> getMonotonicTime
@@ -1104,10 +1110,20 @@ mkHal cons tx preempts rt =
 
     procRunNowH [v] = do
       spec <- decodeProcessSpec v
-      noteEscape rt "Proc.runNow"
-        ("runs " ++ displayProcess spec ++ " immediately; it survives rollback "
-          ++ "and runs again on every retry (deferred: Proc.afterCommit)")
-      runProcessH spec
+      -- ORDER, not just atomicity: everything this transaction has queued
+      -- happens at COMMIT, so an immediate process would run before all of
+      -- it -- publishing a state the script has already described
+      -- differently (a `Git.commit |> Git.push` in one script pushed the
+      -- PRE-commit head and answered Ok). Refuse instead, in the Result the
+      -- caller already handles.
+      pending <- txPendingBrief tx
+      if not (null pending)
+        then pure (vErr (pendingOrderMsg ("Proc.runNow " ++ displayProcess spec) "Proc.afterCommit" pending))
+        else do
+          noteEscape rt "Proc.runNow"
+            ("runs " ++ displayProcess spec ++ " immediately; it survives rollback "
+              ++ "and runs again on every retry (deferred: Proc.afterCommit)")
+          runProcessH spec
     procRunNowH _ = vmPanic "Proc.runNow: arity"
 
     runProcessH spec = do

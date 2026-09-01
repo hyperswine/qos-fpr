@@ -110,13 +110,52 @@ pushEffect ref e = do
   when sealed $
     hPutStrLn stderr ("[sol] effect AFTER COMMIT (lost): " ++ effectBrief e
                         ++ " — join actors before the script ends")
-  where
-    effectBrief (EWrite p _) = "write " ++ p
-    effectBrief (ERemove p) = "rm " ++ p
-    effectBrief (EMkdir p) = "mkdirp " ++ p
-    effectBrief (ERmdir p) = "rmdir " ++ p
-    effectBrief (EShell c) = "shq " ++ c
-    effectBrief (EProcess spec) = "Proc.afterCommit " ++ displayProcess spec
+
+-- one-line description of a queued effect, for the diagnostics that have
+-- to name what is still pending
+effectBrief :: Effect -> String
+effectBrief (EWrite p _) = "write " ++ p
+effectBrief (ERemove p) = "rm " ++ p
+effectBrief (EMkdir p) = "mkdirp " ++ p
+effectBrief (ERmdir p) = "rmdir " ++ p
+effectBrief (EShell c) = "shq " ++ c
+effectBrief (EProcess spec) = "Proc.afterCommit " ++ displayProcess spec
+
+-- The effects this transaction has queued but NOT yet applied, in
+-- declaration order. A realtime escape runs BEFORE all of them (they
+-- wait for commit), so anything that steps outside the transaction asks
+-- this first and reports the inversion rather than acting on a world
+-- the script has already described differently.
+txPendingBrief :: IORef TxState -> IO [String]
+txPendingBrief ref = do
+  s <- readIORef ref
+  pure (map effectBrief (reverse (txEffects s)))
+
+-- compact form, for the escapes that can only warn (they answer a value,
+-- not a Result, so they cannot refuse)
+pendingOrderBrief :: String -> String -> [String] -> String
+pendingOrderBrief what deferredSpelling pending =
+  what
+    ++ " runs before this transaction's "
+    ++ show (length pending)
+    ++ " queued effect(s), which land at commit — queue it too ("
+    ++ deferredSpelling
+    ++ "), or split the run"
+
+-- the pending-effect refusal message shared by the realtime escapes:
+-- what was asked for, what is still queued, and the two ways out
+pendingOrderMsg :: String -> String -> [String] -> String
+pendingOrderMsg what deferredSpelling pending =
+  what
+    ++ " runs NOW, but this transaction has "
+    ++ show (length pending)
+    ++ " queued effect(s) that only happen at commit:\n"
+    ++ unlines ["      " ++ b | b <- take 5 pending]
+    ++ (if length pending > 5 then "      ... and " ++ show (length pending - 5) ++ " more\n" else "")
+    ++ "    Running now would act on the world BEFORE those land."
+    ++ " Queue it too ("
+    ++ deferredSpelling
+    ++ "), or move it to a separate script run."
 
 -- Files are read as BYTES and decoded here, so a non-UTF-8 file is a
 -- fact we can report — it used to throw inside the locale decoder, get
