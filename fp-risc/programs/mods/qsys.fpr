@@ -40,6 +40,7 @@
 AK  = use "appkit".
 QL  = use "qlog".
 SVC = use "svc".
+Core = use "coreutil".
 
 Rpc     = SVC.Rpc.
 Read    = AK.Read.
@@ -60,15 +61,7 @@ Qsys = Type (Qsys sys st vfs log apps).
 
 # ---- small helpers ----------------------------------------------------------
 
-strEqGo : unsafe String -> String -> Int -> Int -> Bool .
-strEqGo a b i n = case i > n of
-    True -> True
-  | False -> case charAt a i == charAt b i of
-      True -> strEqGo a b (i + 1) n
-    | False -> False.
-strEq a b = case strlen a == strlen b of
-    True -> strEqGo a b 1 (strlen a)
-  | False -> False.
+strEq a b = Core.strEq a b.
 
 okOr r alt = case r of Ok s -> s | Err e -> alt.
 emptyAs s alt = case strlen s == 0 of True -> alt | False -> s.
@@ -85,25 +78,12 @@ hasPrefix s pre = case strlen s < strlen pre of
 
 # newline-split, used on apps/index ("id1\nid2\n")
 lines : unsafe String -> List String .
-lines s = linesGo s 1 (strlen s) "".
-linesGo : unsafe String -> Int -> Int -> String -> List String .
-linesGo s i n acc = case i > n of
-    True -> linesEnd acc
-  | False -> linesCh s i n acc (charAt s i).
-linesCh : unsafe String -> Int -> Int -> String -> Int -> List String .
-linesCh s i n acc c = case c == 10 of
-    True -> linesNl s i n acc
-  | False -> linesGo s (i + 1) n (strcat acc (chr c)).
-linesNl : unsafe String -> Int -> Int -> String -> List String .
-linesNl s i n acc = case strlen acc == 0 of
-    True -> linesGo s (i + 1) n ""
-  | False -> acc :: linesGo s (i + 1) n "".
-linesEnd acc = case strlen acc == 0 of True -> Nil | False -> acc :: Nil.
+lines s = Core.lines s.
 
 cat : unsafe List a -> List a -> List a .
-cat l b = case l of Nil -> b | x :: r -> x :: cat r b.
+cat l b = Core.listAppend l b.
 lenL : unsafe List a -> Int .
-lenL l = case l of Nil -> 0 | x :: r -> 1 + lenL r.
+lenL l = Core.listLen l.
 
 # ---- QAR2 manifest reading --------------------------------------------------
 # "QAR2\n" <table lines "NAME off len"> "\n" <payloads>.  We only need
@@ -111,30 +91,10 @@ lenL l = case l of Nil -> 0 | x :: r -> 1 + lenL r.
 # comes from the archive, not from a hardcoded list.
 
 takeWord : unsafe String -> Int -> Int -> (String, Int) .
-takeWord s i n = twGo s i n "".
-twGo : unsafe String -> Int -> Int -> String -> (String, Int) .
-twGo s i n acc = case i > n of
-    True -> (acc, i)
-  | False -> twCh s i n acc (charAt s i).
-twCh : unsafe String -> Int -> Int -> String -> Int -> (String, Int) .
-twCh s i n acc c = case c == 32 of
-    True -> (acc, i + 1)
-  | False -> case c == 10 of
-      True -> (acc, i + 1)
-    | False -> twGo s (i + 1) n (strcat acc (chr c)).
+takeWord s i n = Core.wordAt s i n.
 
 parseNum : unsafe String -> Int .
-parseNum w = pnGo w 1 (strlen w) 0.
-pnGo : unsafe String -> Int -> Int -> Int -> Int .
-pnGo w i n acc = case i > n of
-    True -> acc
-  | False -> pnCh w i n acc (charAt w i).
-pnCh : unsafe String -> Int -> Int -> Int -> Int -> Int .
-pnCh w i n acc c = case c >= 48 of
-    False -> acc
-  | True -> case c <= 57 of
-      True -> pnGo w (i + 1) n (acc * 10 + (c - 48))
-    | False -> acc.
+parseNum w = Core.parseDigits w.
 
 # section table walk: from pos 6 (past "QAR2\n"), lines until the blank
 # line; returns (off, len, found) for `name`, and the payload0 pos

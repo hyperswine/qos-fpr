@@ -63,8 +63,9 @@
 # are stable across separately compiled units by construction.
 # ============================================================================
 
-# ---- small self-contained helpers (module units see only the prelude) ------
+# ---- format helpers over the shared pure core -------------------------------
 SVC = use "svc#98bba41cabd0ee7c".
+Core = use "coreutil".
 Rpc = SVC.Rpc.
 
 # the parsed record header: Rec is the v1 shape kept for API compat,
@@ -77,29 +78,15 @@ minI a b = case a < b of True -> a | False -> b.
 ceilDiv a b = (a + b - 1) / b.
 imod a b = a - (a / b) * b.
 
-parseNum w = pnGo w 1 (strlen w) 0.
-pnGo : unsafe String -> Int -> Int -> Int -> Int .
-pnGo w i n acc = case i > n of True -> acc | False -> pnCh w i n acc (charAt w i).
-pnCh : unsafe String -> Int -> Int -> Int -> Int -> Int .
-pnCh w i n acc c =
-  case and2 (c >= 48) (c <= 57) of
-    True -> pnGo w (i + 1) n (acc * 10 + (c - 48))
-  | False -> acc.
-and2 a b = case a of True -> b | False -> False.
+parseNum w = Core.parseDigits w.
+and2 a b = Core.and2 a b.
 
 # "<letter><digits>" superblock/header field -> its number
-fieldNum w = pnGo w 2 (strlen w) 0.
+fieldNum w = Core.parseDigitsAt w 2.
 
 # word starting at i; returns (word, next index past the delimiter)
-takeWord s i n = twGo s i n "".
-twGo : unsafe String -> Int -> Int -> String -> (String, Int) .
-twGo s i n acc = case i > n of True -> (acc, i) | False -> twCh s i n acc (charAt s i).
-twCh : unsafe String -> Int -> Int -> String -> Int -> (String, Int) .
-twCh s i n acc c =
-  case or2 (c == 32) (c == 10) of
-    True -> (acc, i + 1)
-  | False -> twGo s (i + 1) n (strcat acc (chr c)).
-or2 a b = case a of True -> True | False -> b.
+takeWord s i n = Core.wordAt s i n.
+or2 a b = Core.or2 a b.
 
 pgsz = 4096.
 
@@ -148,11 +135,7 @@ parseHdr s = case parseHdrH s of Err e -> Err e | Ok r -> phOld r.
 phOld r =
   RecH tag np pl url hh = r;
   Ok (Rec tag np pl url).
-strEq a b = case strlen a == strlen b of True -> seGo a b 1 (strlen a) | False -> False.
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo a b i n = case i > n of True -> True | False -> seCh a b i n.
-seCh : unsafe String -> String -> Int -> Int -> Bool .
-seCh a b i n = case charAt a i == charAt b i of True -> seGo a b (i + 1) n | False -> False.
+strEq a b = Core.strEq a b.
 
 # ---- the superblock (METADATA partition) ------------------------------------
 # Meta head ver wflag cflag dataEnd swapHead merkleRoot
