@@ -1197,7 +1197,17 @@ inferTopsWith prof sigs structs tops =
           (\(e, acc) ns -> do (e', rws) <- inferSCC cons e ns; pure (e', acc ++ rws))
           (env0, [])
           [ns | scc <- sccs, let ns = flat scc]
-      rwEvals <- forM evals $ \e -> snd <$> inferE (ICtx env cons sigs prof) e
+      -- `> expr.` errors get the same "in NAME:" treatment a clause gets,
+      -- under the eval's ordinal -- otherwise they reach the sinks
+      -- unprefixed, which is also unanchored, which leaked the raw
+      -- statement-offset stamp instead of a file:line:col
+      rwEvals <- forM (zip [1 :: Int ..] evals) $ \(evi, e) -> do
+        nerrs0 <- length <$> gets iErrs
+        r <- snd <$> inferE (ICtx env cons sigs prof) e
+        modify $ \st ->
+          let (old, new) = splitAt nerrs0 (iErrs st)
+           in st {iErrs = old ++ ["in <eval " ++ show evi ++ ">: " ++ m | m <- new]}
+        pure r
       -- typed struct conformance
       checkStructConformance sigs structs env
       -- ?? markers -> traps: eta-wrap by the hole's ZONKED type so the
