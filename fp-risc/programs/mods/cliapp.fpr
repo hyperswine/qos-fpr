@@ -106,17 +106,6 @@ strEqGo a b i n | i > n = True.
 strEqGo a b i n | charAt a i == charAt b i = strEqGo a b (i + 1) n.
 strEqGo a b i n = False.
 strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
-strEq : unsafe String -> String -> Bool .
 strEq a b = strEqS a b.
 
 clWord s = clWordGo s 1.

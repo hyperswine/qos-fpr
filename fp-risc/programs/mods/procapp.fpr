@@ -42,45 +42,15 @@ openCon u = (reg8 (device "uart") 5, reg8 (device "uart") 0).
 openClk u = reg32 (device "clint") 49144.
 
 putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
-putc : unsafe (Int, Int) -> Int -> Unit .
 putc con c = pcW con c.
 pcW con c = case con of (lsr, dat) -> pcV lsr dat c (read lsr).
 pcV lsr dat c v = case isOdd (v / 32) of True -> write dat c | False -> pcV lsr dat c (read lsr).
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
-puts : unsafe (Int, Int) -> String -> Unit .
 puts : unsafe (Int, Int) -> String -> Unit .
 puts con s = psGo con s 1 (strlen s).
 psGo con s i n = case i > n of True -> Unit | False -> putc con (charAt s i) >> psGo con s (i + 1) n.
 nl con = putc con 13 >> putc con 10.
 putLn con s = puts con s >> nl con.
 
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
-getc : unsafe Int -> (Int, Int) -> Int .
 getc : unsafe Int -> (Int, Int) -> Int .
 getc me con = case con of (lsr, dat) -> gcW me lsr dat.
 gcW me lsr dat = gcV me lsr dat (read lsr).

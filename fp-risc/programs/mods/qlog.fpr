@@ -678,8 +678,7 @@ beE2 pay page pl n acc len wp =
   case wp of (uw, i3) ->
     beGo pay page pl (i3 + len) n (append acc ((Ent uw page pl i3 len) :: Nil)).
 
-append : unsafe List t -> List t -> List t .
-append xs ys = case xs of Nil -> ys | h :: t -> h :: append t ys.
+append xs ys = Core.listAppend xs ys.
 dropUrlE : unsafe List Ent -> String -> List Ent .
 dropUrlE idx u =
   case idx of

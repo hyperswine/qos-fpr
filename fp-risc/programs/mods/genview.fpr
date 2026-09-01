@@ -29,6 +29,8 @@
 # used anywhere in it are emitted, so the stylesheet is a function of
 # the view, not a 3MB file you filter later.
 
+Core = use "coreutil".
+
 Attr = Type (Cls String | Att String String | Local String String
            | OnClick String String | OnSet String String | ShowIf String
            | OnBoth String String String String).
@@ -215,22 +217,7 @@ jCh 9 = " ".
 jCh c | c < 32 = " ".
 jCh c = chr c.
 
-strEq a b = case strlen a == strlen b of True -> seGo a b 1 (strlen a) | False -> False.
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo : unsafe String -> String -> Int -> Int -> Bool .
-seGo a b i n | i > n = True.
-seGo a b i n | charAt a i == charAt b i = seGo a b (i + 1) n.
-seGo a b i n = False.
+strEq a b = Core.strEq a b.
 
 splitSp : unsafe String -> List String .
 splitSp s = spGo s 1 (strlen s) "" Nil.
@@ -250,9 +237,7 @@ memS x Nil = False.
 memS x (y :: r) | strEq x y = True.
 memS x (y :: r) = memS x r.
 
-append : unsafe List m84 -> List m84 -> List m84 .
-append Nil ys = ys.
-append (x :: r) ys = x :: append r ys.
+append xs ys = Core.listAppend xs ys.
 rev : unsafe List t84 -> List t84 .
 rev l = rvGo l Nil.
 rvGo : unsafe List o84 -> List o84 -> List o84 .

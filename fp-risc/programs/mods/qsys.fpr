@@ -41,6 +41,7 @@ AK  = use "appkit".
 QL  = use "qlog".
 SVC = use "svc".
 Core = use "coreutil".
+QAR = use "qar".
 
 Rpc     = SVC.Rpc.
 Read    = AK.Read.
@@ -90,34 +91,6 @@ lenL l = Core.listLen l.
 # the MANIFEST section and only its id/name fields -- app identity
 # comes from the archive, not from a hardcoded list.
 
-takeWord : unsafe String -> Int -> Int -> (String, Int) .
-takeWord s i n = Core.wordAt s i n.
-
-parseNum : unsafe String -> Int .
-parseNum w = Core.parseDigits w.
-
-# section table walk: from pos 6 (past "QAR2\n"), lines until the blank
-# line; returns (off, len, found) for `name`, and the payload0 pos
-qaSect : unsafe String -> String -> (Int, Int, Int) .
-qaSect bytes name = qsGo bytes name 6 (strlen bytes) 0 0 0.
-qsGo : unsafe String -> String -> Int -> Int -> Int -> Int -> Int -> (Int, Int, Int) .
-qsGo bytes name i n off ln f = case i > n of
-    True -> (0, 0, 0)
-  | False -> case charAt bytes i == 10 of
-      True -> qsDone off ln f (i + 1)
-    | False -> qsLine bytes name i n off ln f.
-qsDone off ln f pay0 = case f == 1 of
-    True -> (pay0 + off, ln, 1)
-  | False -> (0, 0, 0).
-qsLine : unsafe String -> String -> Int -> Int -> Int -> Int -> Int -> (Int, Int, Int) .
-qsLine bytes name i n off ln f =
-  (w1, i1) = takeWord bytes i n;
-  (w2, i2) = takeWord bytes i1 n;
-  (w3, i3) = takeWord bytes i2 n;
-  case strEq w1 name of
-    True -> qsGo bytes name i3 n (parseNum w2) (parseNum w3) 1
-  | False -> qsGo bytes name i3 n off ln f.
-
 # `key = "value"` line scan inside the manifest slice
 mfField : unsafe String -> String -> String .
 mfField man key = mfGo man (strcat key " = ") 1 (strlen man).
@@ -150,10 +123,9 @@ mfQ man i n acc = case i > n of
 
 # (id, name) from the .qa bytes; ("", "") when unreadable
 qaManifest bytes =
-  (off, ln, f) = qaSect bytes "MANIFEST";
-  case f == 1 of
-    False -> ("", "")
-  | True -> qaMan2 (substr bytes off ln).
+  case QAR.manifestOf bytes of
+    Err e -> ("", "")
+  | Ok man -> qaMan2 man.
 qaMan2 man = (mfField man "id", mfField man "name").
 
 # ---- the registry: one loop, forever ----------------------------------------

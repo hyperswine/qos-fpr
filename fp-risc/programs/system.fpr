@@ -74,6 +74,7 @@ getcV me lsr dat v =
 # name, only the (hash, fn) identity -- the FPRLive wire shape.
 TimeFmt = use "mods/timefmt#39dff276efd647a1".
 SVCM    = use "mods/svc".
+QAR     = use "mods/qar".
 Caps    = SVCM.Caps.
 Rpc     = SVCM.Rpc.
 Svc  = SVCM.Svc.
@@ -157,71 +158,11 @@ unquote s =
   | False -> s.
 
 # ============================================================================
-# THE .qa PARSER -- section table + manifest (a minimal TOML subset)
+# THE .qa MANIFEST -- application policy over the shared QAR2 parser
 # ============================================================================
 
-# A .qa is:  "QAR2\n" <table lines> "\n" <payloads>   (docs/QA-FORMAT.md)
-# We only need the MANIFEST payload. Parse the table to (off,len), then
-# slice. Offsets in the table are relative to the first payload byte.
-
-# find the byte index just past the "\n\n" that ends the table
-tableEnd : unsafe String -> Int -> Int .
-tableEnd s i =
-  case i >= strlen s of
-    True -> strlen s
-  | False -> case and2 (byteAt s i == 10) (byteAt s (i + 1) == 10) of
-      True -> i                              # index of the FIRST \n of the pair
-    | False -> tableEnd s (i + 1).
-
-# split a whitespace token starting at i: returns (token, nextIndex)
-tokAt : unsafe String -> Int -> (String, Int) .
-tokAt s i =
-  st = ltrim s i;
-  en = tokEnd s st;
-  (slice s st (en - 1), en).
-tokEnd : unsafe String -> Int -> Int .
-tokEnd s i =
-  case or2 (i > strlen s) (or2 (isSpace (byteAt s i)) (isNL (byteAt s i))) of
-    True -> i
-  | False -> tokEnd s (i + 1).
-
-# parse int from a token string
-toInt : unsafe w298 -> Int .
-toInt s = toIntGo s 1 (strlen s) 0.
-toIntGo : unsafe String -> Int -> Int -> Int -> Int .
-toIntGo s i n acc =
-  case i > n of
-    True -> acc
-  | False -> toIntGo s (i + 1) n (acc * 10 + (charAt s i - 48)).
-
-# scan table lines for section NAME; return Ok (off,len) | Err
-# tstart = first char after "QAR2\n"; tend = index of blank-line's first \n
-findSection : unsafe String -> String -> Int -> Int -> Result (Int, Int) String .
-findSection s name tstart tend =
-  case tstart >= tend of
-    True -> Err "no such section"
-  | False -> findSecLine s name tstart tend (tokAt s tstart).
-findSecLine : unsafe String -> String -> Int -> Int -> (String, Int) -> Result (Int, Int) String .
-findSecLine s name tstart tend t0 =
-  case t0 of (nm, a1) ->
-    case tokAt s a1 of (offS, a2) ->
-      case tokAt s a2 of (lenS, a3) ->
-        case strEq nm name of
-          True -> Ok (toInt offS, toInt lenS)
-        | False -> findSection s name (lineNext s a3) tend.
-lineNext : unsafe String -> Int -> Int .
-lineNext s i = case or2 (i > strlen s) (byteAt s i == 10) of True -> i + 1 | False -> lineNext s (i + 1).
-
-# the MANIFEST bytes of a .qa string
-manifestOf : unsafe String -> Result String String .
-manifestOf qa =
-  blank = tableEnd qa 1;                # 1-indexed pos of 1st \n in "\n\n"
-  payload0 = blank + 2;                 # first payload byte (skip both \n)
-  tstart = 6;                           # just past "QAR2\n" (5 bytes) -> byte 6
-  case findSection qa "MANIFEST" tstart blank of
-    Err e -> Err e
-  | Ok r -> case r of (off, ln) ->
-      Ok (slice qa (payload0 + off) (payload0 + off + ln - 1)).
+# QAR owns container validation and section extents. This module interprets
+# the MANIFEST payload's minimal TOML subset and applies launch policy.
 
 # ---- manifest (line-oriented mini-TOML) ------------------------------------
 # We fold the manifest into: (id, entry, requiredPerms, optionalPerms)
@@ -316,7 +257,7 @@ mkManifest id entry req opt mode = Man id entry req opt mode.
 # parse a .qa string all the way to (id, entry, req, opt) | Err
 parseQa : unsafe String -> Result Man String .
 parseQa qa =
-  case manifestOf qa of
+  case QAR.manifestOf qa of
     Err e -> Err e
   | Ok man -> Ok (foldMan (lines man)).
 
@@ -765,19 +706,17 @@ runBuiltin con entry caps =
 # the ELF one).
 runProcess : unsafe (Int, Int) -> String -> v300 -> Unit .
 runProcess con qa blob =
-  blank = tableEnd qa 1;
-  payload0 = blank + 2;
-  case findSection qa "LOAD" 6 blank of
+  case QAR.extent qa "LOAD" of
     Err e -> putLn con (strcat "No LOAD section in this .qa: " e)
-  | Ok l -> case findSection qa "IMAGE" 6 blank of
+  | Ok l -> case QAR.extent qa "IMAGE" of
       Err e -> putLn con (strcat "No IMAGE section in this .qa: " e)
-    | Ok r -> runProcessAt con qa payload0 l r blob.
+    | Ok r -> runProcessAt con qa l r blob.
 
-runProcessAt : unsafe (Int, Int) -> String -> Int -> (Int, Int) -> (Int, Int) -> d302 -> Unit .
-runProcessAt con qa payload0 l r blob =
-  (loff, lln) = l;
-  (ioff, iln) = r;
-  runProcessLoaded con (Sys.loadImageAt qa (payload0 + loff - 1) lln (payload0 + ioff - 1) iln blob).
+runProcessAt : unsafe (Int, Int) -> String -> (Int, Int) -> (Int, Int) -> d302 -> Unit .
+runProcessAt con qa l r blob =
+  (lpos, lln) = l;
+  (ipos, iln) = r;
+  runProcessLoaded con (Sys.loadImageAt qa (lpos - 1) lln (ipos - 1) iln blob).
 
 runProcessLoaded : unsafe (Int, Int) -> (Int, String) -> Unit .
 runProcessLoaded con res =
