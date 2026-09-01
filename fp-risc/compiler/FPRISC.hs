@@ -1673,11 +1673,16 @@ liftProg prog = do
         go env = \case
           CLam ps body -> do
             body' <- go (ps ++ env) body
-            let fvs =
-                  nub
-                    [ v | v <- freeVars body', v `notElem` ps, not (S.member v globals), v `notElem` primNames
-                    ]
-                capture = filter (`elem` (env :: [Name])) fvs
+            -- A LEXICAL BINDER WINS over a global of the same name.
+            -- Testing globals/prims first dropped such a name from the
+            -- capture set, so the lifted body resolved it to the global
+            -- instead of the enclosing parameter -- silently, with a
+            -- wrong value (`wrap tag x = (fn y -> "{tag}-{y}") x` printed
+            -- the global `tag` function). Membership in `env` already
+            -- means "bound out here", which is exactly what to capture;
+            -- anything not in `env` is a global or prim reference and is
+            -- filtered out by that same test.
+            let capture = nub [v | v <- freeVars body', v `notElem` ps, v `elem` (env :: [Name])]
             nm <- fresh "lifted"
             modify (\s -> s {dLifted = (nm, capture ++ ps, body') : dLifted s})
             pure (foldl' CApp (CVar nm) (map CVar capture))
@@ -1837,19 +1842,35 @@ type Sources = M.Map FilePath String
 --       NAME's definition line)
 --
 -- messages without a known "in NAME:" prefix pass through untouched.
+-- The stamp is machinery, never output: EVERY path below drops it, so a
+-- message that cannot be positioned (a bind with no col-0 definition --
+-- prelude, struct-expanded, generated) still reads as prose instead of
+-- leaking "@6~ ".
+-- `> expr.` statements are top-level too, and the sol profile reports
+-- their errors as `in <eval N>:`. They start at column 0 like every other
+-- top declaration, so the same col-0 scan anchors them by ordinal.
+evalAnchors :: FilePath -> String -> Anchors
+evalAnchors file src =
+  M.fromList
+    [ ("<eval " ++ show i ++ ">", (file, ln))
+      | (i, ln) <- zip [1 :: Int ..] [ln | (ln, l) <- zip [1 ..] (lines src), take 1 l == ">"]
+    ]
+
 anchorMsg :: Sources -> Anchors -> String -> String
 anchorMsg srcs anchors msg = case msg of
   'i' : 'n' : ' ' : rest
-    | (n, ':' : ' ' : body) <- break (== ':') rest,
-      Just (f, bindLn) <- M.lookup n anchors ->
+    | (n, ':' : ' ' : body) <- break (== ':') rest ->
         let cleaned = "in " ++ n ++ ": " ++ dropMark body
-         in case markPos f body of
-              Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
-              Nothing -> case tokenPos f n bindLn body of
-                Just (l, c) -> f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ cleaned
-                Nothing -> f ++ ":" ++ show bindLn ++ ": " ++ cleaned
-  _ -> msg
+         in case M.lookup n anchors of
+              Nothing -> cleaned
+              Just (f, bindLn) -> case markPos f body of
+                Just (l, c) -> at f l c cleaned
+                Nothing -> case tokenPos f n bindLn body of
+                  Just (l, c) -> at f l c cleaned
+                  Nothing -> f ++ ":" ++ show bindLn ++ ": " ++ cleaned
+  _ -> dropMark msg
   where
+    at f l c rest' = f ++ ":" ++ show l ++ ":" ++ show c ++ ": " ++ rest'
     -- step 3: "@OFF~ " stamp from the inference engine
     markPos f ('@' : b)
       | (ds@(_ : _), '~' : ' ' : _) <- span (`elem` ("0123456789" :: String)) b =

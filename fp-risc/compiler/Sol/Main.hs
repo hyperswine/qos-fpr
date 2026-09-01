@@ -57,7 +57,12 @@ main = do
   utops <- parseOrDie path src
   -- spans step 1: "in NAME:" diagnostics anchor to NAME's definition
   -- line in the script (spliced-module binds keep their module-naming)
-  let anchored = map (anchorMsg (M.singleton path src) (bindAnchors path src utops))
+  let anchored =
+        map
+          ( anchorMsg
+              (M.singleton path src)
+              (M.union (bindAnchors path src utops) (evalAnchors path src))
+          )
 
   -- compile-time FILE-module expansion: `m = use "spec".` splices the module's
   -- definitions in, renamed under the alias; `m.f` references and

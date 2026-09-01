@@ -25,6 +25,20 @@ half n = case Numeric.mod n 2 of
 > r3 = Try.parseInt "eighty-four" |>? half;
   print "bad input:       {r3}".
 
+# the prelude's combinators: stay on the rails, recover, report, gather
+> up = mapOk (fn n -> n * 10) (Try.parseInt "4");
+  print "mapOk:           {up}".
+> step = andThen half (Try.parseInt "84");
+  print "andThen:         {step}".
+> back = orElse (Ok 0) (Try.parseInt "not-a-number");
+  print "orElse:          {back}".
+> said = context "reading config" (Try.readPath @/tmp/sol-tryops-never.txt);
+  print "context:         {said}".
+> every = collect [Try.parseInt "1", Try.parseInt "2", Try.parseInt "3"];
+  print "collect all Ok:  {every}".
+> stopped = collect [Try.parseInt "1", Try.parseInt "two", Try.parseInt "3"];
+  print "collect first Err: {stopped}".
+
 # collapse a Result when you know what the failure should mean
 > d = okOr 0 (Try.parseInt "not-a-number");
   print "okOr default:    {d}".

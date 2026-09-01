@@ -38,9 +38,27 @@ prelude =
       -- tier, not a separate mechanism. `readPath` of a missing file is
       -- therefore a PANIC now (absence is not ""): reach for exists,
       -- readPathOr, or Try.readPath when absence is an expected case.
+      -- The combinators a railway actually needs, so that every script
+      -- does not reinvent them slightly differently. All of them are
+      -- ordinary Sol over the same two constructors -- the prelude eats
+      -- its own cooking here as it does for readPath.
+      --   consume:  unwrap (insist)  okOr (default)
+      --   stay on:  mapOk (value)    andThen / |>? (fallible step)
+      --   recover:  orElse (fallback)
+      --   report:   mapErr, context (add a label to the failure)
+      --   gather:   collect (List of Results -> Result of List)
       "unwrap r = case r of Ok x -> x | Err e -> error e.",
       "okOr d r = case r of Ok x -> x | Err e -> d.",
       "mapOk f r = case r of Ok x -> Ok (f x) | Err e -> Err e.",
+      "andThen f r = case r of Ok x -> f x | Err e -> Err e.",
+      "mapErr f r = case r of Ok x -> Ok x | Err e -> Err (f e).",
+      "orElse alt r = case r of Ok x -> Ok x | Err e -> alt.",
+      "context label r = mapErr (fn e -> \"{label}: {e}\") r.",
+      "isOk r = case r of Ok x -> True | Err e -> False.",
+      -- the first Err wins and stops the walk; all Ok gives the values in
+      -- order (the traverse a script reaches for when parsing many lines)
+      "collect rs = foldl collectStep (Ok []) rs.",
+      "collectStep acc r = case acc of Err e -> Err e | Ok xs -> (case r of Ok x -> Ok (List.append xs [x]) | Err e -> Err e).",
       "parseInt s = unwrap (Try.parseInt s).",
       "readPath p = unwrap (Try.readPath p).",
       "readPathOr d p = okOr d (Try.readPath p).",
