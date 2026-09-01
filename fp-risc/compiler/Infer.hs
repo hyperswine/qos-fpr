@@ -1009,9 +1009,28 @@ inferBin ctx op a b = case op of
 
 data OpTarget = OpPrim Name | OpGlobal Name | OpProj Name Name -- s.(+)
 
+-- head type constructor: Matrix -> "Matrix", Grid a b -> "Grid"
+headCon :: Type -> Maybe Name
+headCon (TC n) = Just n
+headCon (TAp f _) = headCon f
+headCon _ = Nothing
+
+-- the operator global implementing `op` for type `tyName`: any
+-- `<Struct>.<op>` whose FIRST parameter is that type. Deterministic when
+-- several match (sorted), so a program compiles the same way every run.
+namedOpTarget :: TEnv -> Name -> Name -> Maybe Name
+namedOpTarget env tyName op =
+  case Data.List.sort [g | (g, Forall _ _ t) <- M.toList env, isOpNamed g, firstArgIs t] of
+    (g : _) -> Just g
+    [] -> Nothing
+  where
+    isOpNamed g = ("." ++ op) `Data.List.isSuffixOf` g
+    firstArgIs (TFn a _) = headCon a == Just tyName
+    firstArgIs _ = False
+
 -- decide every site once the substitution is final
-resolveSites :: Sigs -> I (IM.IntMap OpTarget)
-resolveSites sigs = do
+resolveSites :: Sigs -> TEnv -> I (IM.IntMap OpTarget)
+resolveSites sigs env = do
   sites <- gets iSites
   IM.traverseWithKey one sites
   where
@@ -1064,6 +1083,16 @@ resolveSites sigs = do
               -- unconstrained: default to Int (numeric default)
               unify "numeric default" (TV v) tInt
               pure (OpPrim op)
+        -- A CONCRETE TYPE CARRIES ITS OWN OPERATORS. `Str.+` and `List.+`
+        -- above are the two the compiler happens to know by name; every
+        -- other type says so in the operator's own signature, so no
+        -- instance table and no new syntax is needed -- a global named
+        -- `<Anything>.<op>` whose first parameter is this type IS the
+        -- implementation, and the specializer sees an ordinary call.
+        other
+          | Just tn <- headCon other,
+            Just g <- namedOpTarget env tn op ->
+              pure (OpGlobal g)
         other -> do
           p <- prettyT other
           OpPrim op <$ report ("(" ++ op ++ ") is not defined for " ++ p)
@@ -1248,7 +1277,7 @@ inferTopsWith prof sigs structs tops =
           modify (\s -> s {iNotes = iNotes s ++ [(n, p)], iLinSigs = iLinSigs s ++ [(n, lsig)]})
       -- resolve operator sites against the final substitution, then
       -- rebuild the top list with markers rewritten, in original order
-      tgts <- resolveSites sigs
+      tgts <- resolveSites sigs env
       let rwMap = M.fromListWith (++) [(n, [(ps, g, b)]) | (n, ps, g, b) <- rwBinds]
           apE0 = applySites tgts
           apE = everyE fixT . apE0
