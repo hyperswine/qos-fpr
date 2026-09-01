@@ -8,6 +8,7 @@
 # next4-separated streams.
 
 Rand = Struct {
+  # imod is just int modulo
   imod = fn a b -> a - (a / b) * b,
   next = fn s -> Rand.imod (s * 1103515245 + 12345) 2147483648,
 

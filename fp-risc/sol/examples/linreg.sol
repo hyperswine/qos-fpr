@@ -14,6 +14,8 @@
 rnd = use "../lib/rand".
 Rand = rnd.Rand.
 
+# The first part just generates the data, y = 1.75*x1 - 0.5*x2 + 0.25 + noise, with x1,x2 uniform in [0,1)
+
 trueW1 = Numeric.div 7 4.        #  1.75
 trueW2 = 0 - Numeric.div 1 2.    # -0.5
 trueB  = Numeric.div 1 4.        #  0.25
@@ -28,7 +30,9 @@ fill : Vector -> Int -> (k : Int | measure k) -> Vector .
 fill v s k | k <= 0 = v.
 fill v s k = fill (Vec.push (mkRow (Rand.next (s + k * 100003))) v) s (k - 1).
 
+# this is the residual of a single sample, given the current weights and bias
 resid w1 w2 b x1 x2 y = w1 * x1 + w2 * x2 + b - y.
+
 gW1 w1 w2 b acc p = acc + resid w1 w2 b p.x1 p.x2 p.y * p.x1.
 gW2 w1 w2 b acc p = acc + resid w1 w2 b p.x1 p.x2 p.y * p.x2.
 gB  w1 w2 b acc p = acc + resid w1 w2 b p.x1 p.x2 p.y.

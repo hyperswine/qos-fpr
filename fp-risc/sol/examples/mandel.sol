@@ -8,6 +8,9 @@
 # widening into f64 state), with the inexact plane constants folded in as
 # f64 CAFs — and the all-int escape counts take the i64 fold unchanged.
 
+# z(n+1) = (zr(n)^2 - zi(n)^2 + cr, 2*zr(n)*zi(n) + ci)
+# c is the complex plane point (cr, ci) corresponding to the pixel; z(0) = 0.
+
 w = 96.
 h = 36.
 maxIter = 80.
@@ -41,13 +44,19 @@ upto a b = a :: upto (a + 1) b.
 plus a b = a + b.
 
 palette = ["@", "#", "*", "+", "=", "-", ":", ".", " "].
+# The palette is indexed by the escape count divided by 10, with 0 mapping to "@"
 charFor c = case c == 0 of
   True -> "@"
 | False -> palette ! (case c / 10 + 1 > 9 of True -> 9 | False -> c / 10 + 1).
 
+# exemplar, the compiler is able to prove that cs always decreases in length, so the fold is safe
+# it calls charFor c, then calls itself recursively on the rest of the list, until cs is empty
 rowStr : (cs : List Int | measure cs) -> String .
 rowStr cs | cs == [] = "".
 rowStr cs = case cs of c :: r -> "{charFor c}{rowStr r}".
+
+# Review: dropN and takeN are just Vec.drop / Vec.take
+# they are all tail recursive, which is good
 
 dropN : (n : Int | measure n) -> List y29 -> List y29 .
 dropN n xs | n <= 0 = xs.
@@ -63,6 +72,8 @@ printRows : unsafe List Int -> Int .
 printRows cs | cs == [] = 0.
 printRows cs = u = print (rowStr (takeN w cs)); printRows (dropN w cs).
 
+# pix maps 1..(w*h) to the escape count for each pixel. The counts are collected
+# into a Vec, folded to compute the checksum, and printed row by row.
 > v = Vec.fromList (upto 1 (w * h));
   counts = Vec.map pix v;
   (checksum, c2) = Vec.fold plus 0 counts;

@@ -1,3 +1,5 @@
+-- THIS IS THE IDEAL THING TO REPLACE LLVM WITH IN THE SOL TIER, IF IT WERE TO BE REPLACED.
+
 -- Sol/HandJIT.hs — the hand-rolled JIT tier (SOL_JIT=hand).
 --
 -- The LLVM tier is a GENERAL typed compiler; this is not that, and is

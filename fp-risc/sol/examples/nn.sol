@@ -31,6 +31,9 @@ M = mx.M.
 
 # ---- small list algebra (rows are lists at the matmul boundary) ------------
 
+# Review: Most of these are just Vec.map / Vec.fold
+# Should just be extracted out to e.g. std.list
+
 zip2W : (a1 -> b1 -> c1) -> (xs : List a1 | measure xs) -> List b1 -> List c1 .
 zip2W f xs ys | xs == [] = [].
 zip2W f xs ys = x :: xr = xs; y :: yr = ys; f x y :: zip2W f xr yr.
@@ -40,8 +43,10 @@ lSum xs | xs == [] = 0.
 lSum xs = x :: r = xs; x + lSum r.
 
 lScale k xs = map (fn x -> k * x) xs.
+
 lSub : List a2 -> List a2 -> List a2 .
 lSub xs ys = zip2W (fn a b -> a - b) xs ys.
+
 lAdd : List b2 -> List b2 -> List b2 .
 lAdd xs ys = zip2W (fn a b -> a + b) xs ys.
 
@@ -51,6 +56,8 @@ lZeros n = Numeric.inexact 0 :: lZeros (n - 1).
 
 # ---- the net ---------------------------------------------------------------
 
+# Review: initRow and initRows are just Vec.fromList / Vec.push
+
 relu x = case x > 0 of True -> x | False -> Numeric.inexact 0.
 sq x = x * x.
 
@@ -58,6 +65,7 @@ sq x = x * x.
 initRow : Int -> (k : Int | measure k) -> List Int .
 initRow s k | k <= 0 = [].
 initRow s k = Rand.unit s * 0.7 :: initRow (Rand.next s) (k - 1).
+
 initRows : Int -> (r : Int | measure r) -> Int -> List _ .
 initRows s r c | r <= 0 = [].
 initRows s r c = initRow s c :: initRows (Rand.next4 (s + 7919)) (r - 1) c.
@@ -118,7 +126,9 @@ epoch n lr xaug xrows ys w1rows w2 =
 lDot : (xs : List e1 | measure xs) -> List e1 -> e1 .
 lDot xs ys | xs == [] = 0.
 lDot xs ys = x :: xr = xs; y :: yr = ys; x * y + lDot xr yr.
+
 reluGate z g = case z > 0 of True -> g | False -> Numeric.inexact 0.
+
 dropLast : (xs : List f1 | measure xs) -> List f1 .
 dropLast xs | (x :: r) <- xs, r == [] = [].
 dropLast xs = x :: r = xs; x :: dropLast r.
@@ -134,6 +144,7 @@ accumRows rows ds acc =
 lZeros3 : (h : Int | measure h) -> List _ .
 lZeros3 h | h <= 0 = [].
 lZeros3 h = lZeros 3 :: lZeros3 (h - 1).
+
 accumOuter : (dzs : List _ | measure dzs) -> List _ -> List _ -> List _ .
 accumOuter dzs xs acc | dzs == [] = acc.
 accumOuter dzs xs acc =
