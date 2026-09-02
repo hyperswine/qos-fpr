@@ -25,6 +25,8 @@ static struct nconn {
   uint8_t rx[RXCAP];
   uint32_t rxlen;
   int eof; /* peer closed: reported ONCE as an empty read, then dropped */
+  char *tx;           /* unsent tail (malloc'd on first need), FIFO */
+  uint32_t txlen, txcap;
 } conns[MAXCONN];
 static int conns_init;
 static uint32_t poll_rr; /* fair-poll rotation cursor */
@@ -39,11 +41,36 @@ static struct nconn *conn_of(int64_t id) {
   struct nconn *c = &conns[id - 1];
   return c->fd >= 0 ? c : 0;
 }
+static int net_trace = -1; /* QOS_NET_TRACE=1: every accept, EOF, and drop on stderr */
+static void net_log(const char *what, struct nconn *c, int extra) {
+  if (net_trace < 0) net_trace = getenv("QOS_NET_TRACE") ? 1 : 0;
+  if (net_trace) fprintf(stderr, "net: %s slot %d fd %d rx %u eof %d tx %u x %d\n", what,
+                         (int)(c - conns) + 1, c->fd, c->rxlen, c->eof, c->txlen, extra);
+}
 static void conn_drop(struct nconn *c) {
+  net_log("drop", c, 0);
   close(c->fd);
   c->fd = -1;
   c->rxlen = 0;
   c->eof = 0;
+  free(c->tx);
+  c->tx = 0;
+  c->txlen = c->txcap = 0;
+}
+/* push the unsent tail; a write error means the peer is gone */
+static void tx_flush(struct nconn *c) {
+  while (c->txlen && !c->eof) {
+    ssize_t n = write(c->fd, c->tx, c->txlen);
+    if (n > 0) {
+      memmove(c->tx, c->tx + n, c->txlen - (uint32_t)n);
+      c->txlen -= (uint32_t)n;
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EINTR)) return;
+    c->eof = 1;
+    c->rxlen = 0;
+    return;
+  }
 }
 
 void qos_netraw_setup(void) {
@@ -66,7 +93,7 @@ void qos_netraw_setup(void) {
     qos_hostlog("net: bind (port busy?)");
     exit(2);
   }
-  if (listen(lfd, 4)) { qos_hostlog("net: listen"); exit(2); }
+  if (listen(lfd, 128)) { qos_hostlog("net: listen"); exit(2); }
   fcntl(lfd, F_SETFL, O_NONBLOCK);
 }
 
@@ -88,15 +115,19 @@ static void net_pump(void) {
     conns[slot].fd = fd;
     conns[slot].rxlen = 0;
     conns[slot].eof = 0;
+    net_log("accept", &conns[slot], 0);
   }
   for (int i = 0; i < MAXCONN; i++) {
     struct nconn *c = &conns[i];
     if (c->fd < 0) continue;
+    tx_flush(c);
     while (c->rxlen < RXCAP && !c->eof) {
       ssize_t n = read(c->fd, c->rx + c->rxlen, RXCAP - c->rxlen);
       if (n > 0) { c->rxlen += (uint32_t)n; continue; }
-      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR))
-        c->eof = 1; /* peer gone (FIN, or a reset): its bytes are served
+      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) {
+        c->eof = 1;
+        net_log("eof", c, n < 0 ? errno : 0);
+      } /* peer gone (FIN, or a reset): its bytes are served
                      * first, then netPoll names it once more and netRead
                      * answers with NOTHING -- the program's cue that the
                      * connection id is over */
@@ -133,23 +164,44 @@ int64_t qos_netraw_read(int64_t id, char *dst, uint64_t cap) {
 int64_t qos_netraw_write(int64_t id, const char *src, uint64_t len) {
   struct nconn *c = conn_of(id);
   if (!c || c->eof) return 0; /* a gone peer takes nothing more */
+  tx_flush(c);
   uint64_t off = 0;
-  while (off < len) {
-    ssize_t n = write(c->fd, src + off, len - off);
-    if (n > 0) { off += (uint64_t)n; continue; }
-    if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue; /* spin: PoC blocking send */
-    c->eof = 1; /* peer closed under us: reported through netPoll/netRead
-                 * like a FIN, never dropped silently (a silent drop left
-                 * the program's record of the id alive for the NEXT peer) */
-    c->rxlen = 0;
-    return (int64_t)off;
+  if (!c->txlen) { /* nothing queued: the fast path writes straight through */
+    while (off < len) {
+      ssize_t n = write(c->fd, src + off, len - off);
+      if (n > 0) { off += (uint64_t)n; continue; }
+      if (n < 0 && (errno == EAGAIN || errno == EINTR)) break; /* queue the rest */
+      c->eof = 1; /* peer closed under us: reported through netPoll/netRead
+                   * like a FIN, never dropped silently (a silent drop left
+                   * the program's record of the id alive for the NEXT peer) */
+      c->rxlen = 0;
+      return (int64_t)off;
+    }
+  }
+  if (off < len) { /* the kernel is full: keep the tail, never block the hart */
+    uint64_t need = c->txlen + (len - off);
+    if (need > QOS_NET_TXCAP) { /* a reader this slow is gone to us */
+      c->eof = 1;
+      c->rxlen = 0;
+      return (int64_t)off;
+    }
+    if (need > c->txcap) {
+      uint32_t cap = c->txcap ? c->txcap : 4096;
+      while (cap < need) cap *= 2;
+      char *t = realloc(c->tx, cap);
+      if (!t) { c->eof = 1; c->rxlen = 0; return (int64_t)off; }
+      c->tx = t;
+      c->txcap = cap;
+    }
+    memcpy(c->tx + c->txlen, src + off, len - off);
+    c->txlen = (uint32_t)need;
   }
   return (int64_t)len;
 }
 
 int64_t qos_netraw_close(int64_t id) {
   struct nconn *c = conn_of(id);
-  if (c) conn_drop(c);
+  if (c) { net_log("close-by-program", c, 0); conn_drop(c); }
   return 0;
 }
 

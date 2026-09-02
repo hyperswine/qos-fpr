@@ -1,3 +1,4 @@
+#include <errno.h>
 /* haltab.c -- the Initializer stage's product: the HAL table.
  *
  * The bootstrap design's stage-1 job on this "board": build the HAL as
@@ -58,8 +59,12 @@ static void t_putc(char c) {
 static void t_poweroff(int code) { exit(code); }
 
 static void t_wfi(void) { /* poll pace, posix hal.c's value */
-  struct timespec ts = {0, 200 * 1000};
-  nanosleep(&ts, 0);
+  struct timespec ts = {0, 200 * 1000}, t0, t1;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  int r = nanosleep(&ts, 0);
+  clock_gettime(CLOCK_MONOTONIC, &t1);
+  long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+  if (r != 0 || ms > 50) qos_hostlog("qosp: wfi took %ld ms (r=%d errno=%d)", ms, r, errno);
 }
 
 static uint64_t t_mmio_read(uint64_t addr, uint32_t width) {

@@ -28,6 +28,15 @@ RT_VIRT = $(HAL)/virt/crt0.S $(HAL)/virt/ctx.S $(HAL)/virt/ctx_fab.c \
           $(HAL)/virt/hal.c $(HAL)/virt/plic.c $(HAL)/virt/net.c $(HAL)/virt/blk.c $(HAL)/virt/memshim.c
 
 ARCHFLAGS = -march=rv64imafdc_zicsr -mabi=lp64 -mcmodel=medany
+# hosted (qosp) apps grant memory in QOSSLAB-byte slabs: the 256 KiB
+# machine default is a per-actor and per-message floor that caps a
+# thousand-session server at a few dozen; 32 KiB keeps the recycler's
+# exact-fit reuse and makes a session cost what its state weighs
+QOSSLAB ?= 32768
+# the per-actor stack for hosted apps; an app whose loops are accumulator
+# shaped (fprlive) builds with QOSSTACK=65536 for four times the sessions
+QOSSTACK ?= 262144
+QOSCFLAGS_EXTRA ?=
 CFLAGS = $(ARCHFLAGS) -DFPR_NHARTS=$(HARTS) \
          -ffreestanding -nostdlib -nostartfiles -O2 -Wall -Wextra \
          -fno-builtin -fno-stack-protector
@@ -117,7 +126,12 @@ bare-metal-run: bare-metal
 # through the qos_hal_t table (qos/appside/hal.c).  The HOST is built
 # separately: make -C ../qos portable.
 QOS_SLOT_BASE  = 0x400000000
-PROC_ARENA_END = 0x410000000
+# the app's notion of "the heap" (fpr_in_heap) ends where the host's
+# arena ends: MUST agree with qos/Makefile's ARENA_MB, or a grant above
+# the line is mistaken for a static and shared by identity (found as
+# random corruption past ~220 sessions when the host arena grew to 2 GiB)
+ARENA_MB ?= 2048
+PROC_ARENA_END := $(shell printf '0x%x' $$(( $(QOS_SLOT_BASE) + $(ARENA_MB) * 1048576 )))
 QOSHARTS ?= 8
 QOSAPP_RT_COMMON = $(QOS)/appside/entry.c $(QOS)/appside/hal.c $(QOS)/appside/support.c \
 				   $(HAL)/core/runtime.c $(HAL)/core/actors.c $(HAL)/core/bits.c \
@@ -132,7 +146,7 @@ build/qosapp-prog.s: fprc $(PROG) core/prelude.fpr FORCE
 build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOS)/appside/link-qosapp.ld
 	gcc -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic -mcmodel=large \
-	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) \
 	  -I$(HAL)/core -I$(QOS)/appside \
 	  -T $(QOS)/appside/link-qosapp.ld -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
@@ -161,7 +175,7 @@ build/qosapp-a64.elf: build/qosapp-a64.s $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64
 	clang --target=aarch64-none-elf -fuse-ld=lld -O2 -Wall -Wextra \
 	  -ffreestanding -nostdlib -nostartfiles -fno-stack-protector \
 	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x28 \
-	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) \
 	  -I$(HAL)/core -I$(QOS)/appside \
 	  -T $(QOS)/appside/link-qosapp-a64.ld -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
@@ -214,7 +228,7 @@ plugin-qa: fprc core/prelude.fpr
 	LC_ALL=C.UTF-8 ./fprc --target=qx64 --plugin --prelude=core/prelude.fpr $(PROG) build/plug-$(PLUGID).s
 	gcc -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic -mcmodel=large \
-	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -I$(HAL)/core -I$(QOS)/appside \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) -I$(HAL)/core -I$(QOS)/appside \
 	  -T $(QOS)/appside/link-qosplug.ld -T build/plugsyms-x64.ld \
 	  -Wl,--defsym=PLUG_BASE=$(PLUGBASE) -Wl,--build-id=none -Wl,-z,noexecstack \
 	  build/plug-$(PLUGID).s $$(cat build/plug-$(PLUGID).s.units) -o build/plug-$(PLUGID).elf
@@ -230,7 +244,7 @@ plugin-qa-macos: fprc core/prelude.fpr
 	clang --target=aarch64-none-elf -fuse-ld=lld -O2 -Wall -Wextra \
 	  -ffreestanding -nostdlib -nostartfiles -fno-stack-protector \
 	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x28 \
-	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -I$(HAL)/core -I$(QOS)/appside \
+	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) -I$(HAL)/core -I$(QOS)/appside \
 	  -T $(QOS)/appside/link-qosplug.ld -T build/plugsyms-a64.ld \
 	  -Wl,--defsym=PLUG_BASE=$(PLUGBASE) \
 	  build/plug-$(PLUGID)-a64.s $$(cat build/plug-$(PLUGID)-a64.s.units) -o build/plug-$(PLUGID)-a64.elf

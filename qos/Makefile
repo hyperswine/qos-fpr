@@ -18,6 +18,10 @@ FPR    = ../fp-risc
 FPRC   = $(FPR)/fprc
 HARTS ?= 2
 QOSHARTS ?= 8
+# the host arena the app's growth grants come from (mmap'd lazily: only
+# touched pages cost RSS).  Sessions, actors, and message slabs all live
+# here, so this is the "scale to memory" ceiling for a hosted server.
+ARENA_MB ?= 2048
 CROSS  = riscv64-unknown-elf-
 QEMU   = qemu-system-riscv64
 ACCEL  = -accel tcg,thread=multi
@@ -47,7 +51,7 @@ CODEGEN_REV := $(shell grep -m1 '^codegenRev = ' $(FPR)/compiler/Codegen.hs 2>/d
 REV_FLAG := $(if $(CODEGEN_REV),-DQOSP_CODEGEN_REV=$(CODEGEN_REV),)
 
 portable: $(QOSP_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
-	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) $(REV_FLAG) \
+	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
 	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp
 
 portable-run: portable
@@ -61,14 +65,14 @@ portable-run: portable
 # prototypes; Linux needs GL_GLEXT_PROTOTYPES, set in gfx.c).
 QOSP_GL_SRC = $(QOSP_SRC) $(HAL)/unix/gfx.c
 portable-gl: $(QOSP_GL_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
-	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) $(REV_FLAG) \
+	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
 	  -DQOSP_GFX -DFPR_DESKTOP_GL \
 	  $(DESKTOP_GL_CFLAGS) -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_GL_SRC) -o qosp-gl \
 	  $(DESKTOP_GL_LIBS)
 
 # ---- QOS Portable, aarch64 cross (verifies the x28 hart discipline
 portable-a64: $(QOSP_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
-	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) $(REV_FLAG) \
+	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
 	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp-a64 -lpthread
 
 # ---- QOS Native: the kernel --------------------------------------------
