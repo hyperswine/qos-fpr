@@ -72,6 +72,13 @@ function decrements the cell at entry; the VM reconciles on return.
   VM turns the poisoned cell into the interpreter's
   `SOL PANIC: division by zero` on return.  (The LLVM tier's `sdiv`
   by zero was undefined behaviour.)
+* an `error "literal"` inside a kernel (a guard's refusal, `^`'s
+  exponent check) is admitted by the fragment and compiles to a TRAP:
+  a second, deeper poison (`fuelTrap`); the VM panics on return naming
+  the native kernel (rerun with `SOL_JIT=0` for the message).  Before
+  this, one `error` demoted the whole scheme to the interpreter.
+* `%` and `^` are the prelude's `Int.mod` / `Int.pow`, ordinary calls
+  in the fragment, so operator-heavy element functions stay native.
 
 ## Proving the ISA you are not running on
 

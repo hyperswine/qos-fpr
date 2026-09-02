@@ -30,7 +30,7 @@
 module Sol.KIR
   ( Ty (..), CC (..), BinOp (..), Op (..), Fn (..), Unit (..), Label,
     LowerEnv (..), VecAcc (..), lowerVariant, lowerDual,
-    driverList, driverVec, driverVecMapR, mangleV, showUnit, fuelPoison,
+    driverList, driverVec, driverVecMapR, mangleV, showUnit, fuelPoison, fuelTrap,
   ) where
 
 import Control.Monad (forM_, when)
@@ -52,6 +52,11 @@ type Label = String
 -- No legitimate fuel count is anywhere near it.
 fuelPoison :: Int64
 fuelPoison = -4611686018427387904 -- -2^62
+
+-- an `error` reached inside a kernel: a second poison, further below, so
+-- the VM can tell it from a division by zero after any later ticks
+fuelTrap :: Int64
+fuelTrap = -6917529027641081856 -- -(2^62 + 2^61)
 
 data Ty = TI | TD deriving (Eq, Show)
 
@@ -78,6 +83,7 @@ data Op
   | Call Label Int -- call with the top n words as args; push the result
   | Ret -- pop; return it
   | FuelTick -- *fuel -= 1
+  | Trap -- `error` inside a kernel: poison the fuel cell with fuelTrap, push 0
   deriving (Eq, Show)
 
 data Fn = Fn
@@ -142,6 +148,7 @@ data LowerEnv = LowerEnv
 -- promote-only coercion of the word on top of the stack
 coerceTop :: JTy -> JTy -> Gen ()
 coerceTop from to
+  | from == JB = pure () -- a trapped branch: its word is never read
   | isF from == isF to = pure ()
   | not (isF from) = emit IToD
   | otherwise = error ("kir coerce: demotion " ++ show from ++ " -> " ++ show to ++ " (inference bug)")
@@ -162,6 +169,7 @@ lowerExpr le es0 env0 e0 = go es0 env0 e0
   where
     go es env = \case
       CInt i -> emit (PushImm (fromIntegral i)) >> pure JI
+      CApp (CVar "error") (CStr _) -> emit Trap >> pure JB
       CApp (CApp (CVar "f64frombits") (CInt hi)) (CInt lo) -> do
         emit (PushImm (fromIntegral ((fromIntegral hi `shiftL` 32) .|. (fromIntegral lo .&. 0xFFFFFFFF) :: Integer)))
         pure JD

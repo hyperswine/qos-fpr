@@ -132,7 +132,7 @@ fields j = case j of JObj kvs -> Ok kvs | _ -> Err "json: not an object".
 set k v j = case j of
     JObj kvs -> JObj (case List.has k (List.map (fn p -> (k2, _) = p; k2) kvs) of
       True -> List.map (fn p -> (k2, v2) = p; case k2 == k of True -> (k, v) | False -> (k2, v2)) kvs
-    | False -> List.append kvs [(k, v)])
+    | False -> kvs + [(k, v)])
   | _ -> j.
 without k j = case j of
     JObj kvs -> JObj (List.filter (fn p -> (k2, _) = p; k2 != k) kvs)

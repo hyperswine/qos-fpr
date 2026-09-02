@@ -24,7 +24,7 @@ posts = [
 # model: tab + comments are `Persistent` (event-sourced to blog.soldata,
 # replayed on restart); lucky / ticks / motd are runtime-only and reset.
 
-unwrap p = case p of Persistent x -> x.
+unwrapP p = case p of Persistent x -> x.
 
 init tok = {tab = Persistent 1, comments = Persistent [], lucky = 0, ticks = 0, motd = ""}.
 
@@ -32,7 +32,7 @@ update msg model =
   case msg of
     ("tab", v) -> ({model | tab = Persistent (Str.parse v)}, None)
   | ("comment", v) ->
-      ({model | comments = Persistent ((unwrap model.tab, v) :: unwrap model.comments)},
+      ({model | comments = Persistent ((unwrapP model.tab, v) :: unwrapP model.comments)},
        Print "new comment: {v}")
   | ("luck", v) -> (model, Rng 1 100 "lucky")
   | ("lucky", v) -> ({model | lucky = Str.parse v}, None)
@@ -78,8 +78,8 @@ statusBar model =
 
 # the static skeleton renders once; only the dyn slots ever travel again
 view model =
-  tab = unwrap model.tab;
-  comments = unwrap model.comments;
+  tab = unwrapP model.tab;
+  comments = unwrapP model.comments;
   ui.el "div" [ui.Style.container, ui.Style.mxauto, ui.Style.flex, ui.Style.flexcol, ui.Style.gap4, ui.Style.p4] [
     ui.el "header" [ui.Style.flex, ui.Style.flexrow, ui.Style.itemscenter, ui.Style.gap3] [
       ui.el "h1" [ui.Style.text2xl, ui.Style.fontbold] [ui.text "The Sol Blog"],

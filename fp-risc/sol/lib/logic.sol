@@ -156,7 +156,7 @@ unifyStr fa fb m =
   (m2, tfb, vb) = cellAt fb m1;
   case va == vb of
     False -> (m2, False)
-  | True -> unifyArgs 1 (Numeric.mod va 1024) fa fb m2.
+  | True -> unifyArgs 1 (va % 1024) fa fb m2.
 
 unifyArgs k n fa fb m | k > n = (m, True).
 unifyArgs k n fa fb m =
@@ -204,7 +204,7 @@ evalA a m =
 evalStr f m =
   (m1, tf, fv) = cellAt f m;
   s = fv / 1024;
-  ar = Numeric.mod fv 1024;
+  ar = fv % 1024;
   case and (and (s >= 2) (s <= 6)) (ar == 2) of
     False -> (m1, Nope)
   | True -> evalBin s f m1.
@@ -221,7 +221,7 @@ applyOp s x y =
   case s == 3 of True -> Got (x - y) | False ->
   case s == 4 of True -> Got (x * y) | False ->
   case s == 5 of True -> (case y == 0 of True -> Nope | False -> Got (x / y)) | False ->
-  (case y == 0 of True -> Nope | False -> Got (Numeric.mod x y)).
+  (case y == 0 of True -> Nope | False -> Got (x % y)).
 
 # ---------- rendering heap terms ----------
 rend a syms m =
@@ -233,7 +233,7 @@ rend a syms m =
 rendStr f syms m =
   (m1, tf, fv) = cellAt f m;
   s = fv / 1024;
-  ar = Numeric.mod fv 1024;
+  ar = fv % 1024;
   (m2, argsS) = rendArgs 1 ar f syms m1;
   (m2, "({symName s syms}{argsS})").
 

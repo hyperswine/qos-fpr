@@ -82,7 +82,7 @@ lexP2 33 61 ln i = tP "!=" :: toks ln (i + 2).
 lexP2 c _ ln i = tP (Str.fromCode c) :: toks ln (i + 1).
 
 tokAll [] = [].
-tokAll (l :: r) = List.append (tokLine l) (tokAll r).
+tokAll (l :: r) = (tokLine l) + (tokAll r).
 
 # ---------- precedence-climbing parser over the token list ----------
 # every parser returns (result, remainingTokens); errors panic

@@ -20,7 +20,7 @@ main =
 
   # -- 2. structure methods --
   m = Int.max 3 9;
-  d = Int.mod 17 5;
+  d = 17 % 5;
   n = Str.len b;
 
   # -- 3. monomorphized generics: Int sum and Str concat via ONE generic --

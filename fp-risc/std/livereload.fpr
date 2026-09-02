@@ -88,9 +88,9 @@ LRMsg = Type (LiveReload url).
 load : unsafe _ -> Int -> String -> Result Int String .
 load dsk head id =
   before = Mod.plugs 0;
-  bytes = QL.readLatest dsk head (strcat "apps/" (strcat id ".qa"));
+  bytes = QL.readLatest dsk head ("apps/" + id + ".qa");
   case bytes of
-    Err e -> Err (strcat "store: " e)
+    Err e -> Err ("store: " + e)
   | Ok b -> loadAttach before b.
 loadAttach : unsafe Int -> String -> Result Int String .
 loadAttach before b =
@@ -117,7 +117,7 @@ loadRefuse why =
   # into the incompatible code).  The sub-slot is spent -- stated
   # cost of no-unload v1 -- but the registry falls back cleanly.
   _ = Mod.detachLast Unit;
-  Err (strcat "incompatible module refused: " why).
+  Err ("incompatible module refused: " + why).
 
 # tell every worker to re-bind; workers answer nothing (fire-and-forget)
 broadcast : unsafe List Int -> String -> Unit .

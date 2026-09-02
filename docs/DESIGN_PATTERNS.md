@@ -27,6 +27,37 @@ not listed here is situational and can be decided case by case.
 - No two functions in scope should overlap in meaning. If two names could
   plausibly describe the same operation, one of them is wrong.
 
+## 1a. Operators are the default
+
+Every value kind spells its natural operation with the arithmetic
+operators, resolved by the operand types at each site (Elm-style
+`Module.func` stays for everything that is not one of these):
+
+| operator | Int / Numeric | String | List | Vector | Matrix | your type |
+| --- | --- | --- | --- | --- | --- | --- |
+| `+` `-` | arithmetic | concat / drop a matching suffix | append / drop a matching suffix | elementwise (both consumed) | elementwise (both consumed) | a struct field `(+)` / `(-)` |
+| `*` | arithmetic | | | dot product; `k * v` scales | matmul; `m * v` is matrix times vector | `(*)` |
+| `/` | quot on ints, real on inexact | | | | | `(/)` |
+| `%` | truncated remainder (C, RISC-V `rem`), inexact too | | | | | `(%)` |
+| `^` | exact exponentiation by squaring; a fractional or negative exponent is refused by name (`Num.div 1 (a ^ n)` is the inexact reciprocal) | | | | | `(^)` |
+
+- A helper named for one of these operations (`dotProd`, `strConcat`,
+  `listAppend`, `mod2`) is wrong: write the operator.  `List.append`,
+  `Numeric.mod`, `strcat` remain as the operators' definitions, not as
+  the spelling to use.
+- `^` binds tighter than `* / %`, which bind tighter than `+ -`; `^` is
+  right-associative (`2 ^ 3 ^ 2 = 2 ^ 9`).
+- Operators on linear values (Vector, Matrix) CONSUME both operands and
+  return one fresh value; use the `M.mul` / `Vec.mmul` threading forms
+  when an operand is needed again.
+- Mixed operand types (`Matrix * Vector`, `Int * Vector`) resolve to a
+  struct operator whose two parameter types match; same-type sites
+  resolve on the first parameter alone.  Nothing is registered: the
+  operator's own signature is the instance.
+- Inside a native kernel (Vec.map / Vec.fold / list schemes) `%` and `^`
+  compile like any other arithmetic, and an `error "..."` guard compiles
+  to a trap, so operator-heavy element functions stay on the JIT.
+
 ## 2. Argument order
 
 One scheme for everything:
@@ -92,7 +123,13 @@ up into §1–§5 and migrating the corpus in the same change.
 - **D2 One spelling per operation.** `Str.parse` = `parseInt` =
   `unwrap (Try.parseInt s)`; `List.fold` = `foldl`; `List.map` = `map`.
   Proposed: keep the `Try.x` / `x` (unwrapping) pair as the ONLY sanctioned
-  double, retire the third spellings.
+  double, retire the third spellings.  (Pinned for the operator cases in
+  §1a: `+ - * / % ^` are THE spelling; the corpus was migrated.)
+- **D15 Lists under `*`.** Vectors give `*` to the dot product; lists have
+  no `*`.  Options: dot product for numeric lists (mirrors Vector),
+  elementwise, or nothing (lists are sequences, not algebra -- convert to
+  a Vector).  Proposed: nothing; `Vec.fromList a * Vec.fromList b` is
+  one call away and keeps List's operators structural (`+ -` only).
 - **D3 Filesystem verbs.** `readPath writePath mkdirp rm rmdir mv ls stat
   exists isDir` + the `Now` escapes are Unix names, not a module.
   Proposed: `File.read write mkdir rm rmdir mv ls stat exists isDir`,

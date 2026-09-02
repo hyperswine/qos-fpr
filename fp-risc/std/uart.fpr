@@ -129,7 +129,7 @@ readRx h =
   # string must outlive our next receive; the reply root's release is
   # autodrop's (shape 3, after this binding)
   s = case r of
-    UOkS m -> strcat m ""
+    UOkS m -> m + ""
   | UErr e -> error "uart readRx: {e}"
   | o -> error "uart readRx: protocol reply mismatch";
   (s, Uart svc).

@@ -5,7 +5,7 @@
 #   F64.log / F64.log2    atanh-series on [sqrt(1/2), sqrt(2)) + exact
 #                         exponent (log2's integer part is exact)
 #   F64.exp               Cody-Waite ln2 reduction + 14-term Taylor
-#   F64.pow               exp(y ln x); negative base for integer y
+#   exp ^ (y ln x); negative base for integer y
 #   F64.sin / F64.cos     two-word pi/2 reduction + Taylor kernels
 #
 #   make qos-app PROG=tests/fmath.fpr
@@ -36,9 +36,9 @@ main =
   n5 = ck "exp-one" (F64.exp 1.0) e n4;
   n6 = ck "exp-zero" (F64.exp 0.0) 1.0 n5;
   n7 = ck "exp-neg" (F64.exp (0.0 - 20.5)) 0.0000000012501528663867426 n6;
-  n8 = ck "pow-int" (F64.pow 2.0 10.0) 1024.0 n7;
-  n9 = ck "pow-frac" (F64.pow 2.5 3.5) 24.705294220065465 n8;
-  n10 = ck "pow-negbase" (F64.pow (0.0 - 2.0) 3.0) (0.0 - 8.0) n9;
+  n8 = ck "pow-int" (2.0 ^ 10.0) 1024.0 n7;
+  n9 = ck "pow-frac" (2.5 ^ 3.5) 24.705294220065465 n8;
+  n10 = ck "pow-negbase" ((0.0 - 2.0) ^ 3.0) (0.0 - 8.0) n9;
   n11 = ck "sin-one" (F64.sin 1.0) 0.8414709848078965 n10;
   n12 = ck "cos-one" (F64.cos 1.0) 0.5403023058681398 n11;
   n13 = ck "sin-hundred" (F64.sin 100.0) (0.0 - 0.5063656411097588) n12;

@@ -103,6 +103,10 @@ jitOK fnAr = ok
   where
     ok locals = \case
       CInt _ -> True
+      -- a refusal by name inside a kernel: compiles to a TRAP (the fuel
+      -- cell is poisoned and the VM panics on return), so guards that
+      -- `error` out no longer demote the whole scheme to the interpreter
+      CApp (CVar "error") (CStr _) -> True
       CVar v -> v `elem` locals || M.lookup v fnAr == Just 0
       CLet x a b -> ok locals a && ok (x : locals) b
       CIf c t e -> ok locals c && ok locals t && ok locals e
@@ -219,6 +223,7 @@ tyExpr sigs cl = goT
   where
     goT env e = case e of
       CInt _ -> Just (JI, [])
+      CApp (CVar "error") (CStr _) -> Just (JB, []) -- bottom: joins with anything
       CVar v -> case M.lookup v env of
         Just t -> Just (t, [])
         Nothing
@@ -286,6 +291,7 @@ tyExprV :: M.Map VKey JTy -> M.Map Name ([Name], Core) -> Bool -> [JTy] -> S.Set
 tyExprV sigs cl scalar colTys es0 env0 e0 = goV es0 env0 e0
   where
     goV es env e = case e of
+      CApp (CVar "error") (CStr _) -> Just (JB, [])
       CVar v | S.member v es -> if scalar then Just (head colTys, []) else Nothing
       CProj k (CVar v) | S.member v es -> Just (colTys !! k, [])
       CLet x (CVar v) b | S.member v es -> goV (S.insert x es) env b
@@ -385,6 +391,7 @@ jitOKVec fnAr scalar loadable elemP0 locals0 = ok (S.singleton elemP0) locals0
   where
     ok es locals = \case
       CInt _ -> True
+      CApp (CVar "error") (CStr _) -> True
       CVar v | S.member v es -> scalar && loadable == [True]
       CVar v -> v `elem` locals || M.lookup v fnAr == Just 0
       CProj k (CVar v) | S.member v es -> not scalar && k < length loadable && loadable !! k

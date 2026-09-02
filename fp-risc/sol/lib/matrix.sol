@@ -37,7 +37,7 @@ mFromRows rss =
 mFlatten c rss | rss == [] = [].
 mFlatten c rss | (r :: _) <- rss, List.len r != c =
   error "matrix: ragged row ({List.len r} fields vs {c})".
-mFlatten c rss = r :: rest = rss; List.append r (mFlatten c rest).
+mFlatten c rss = r :: rest = rss; r + (mFlatten c rest).
 
 mRep n x | n == 0 = [].
 mRep n x = x :: mRep (n - 1) x.
@@ -163,6 +163,39 @@ mMul a b =
 
 mMulGuard ra ka kb cb | ka == kb = 0.
 mMulGuard ra ka kb cb = error "matrix: mul {ra}x{ka} * {kb}x{cb} inner dims differ".
+
+# ---- the operator surface ------------------------------------------------
+# a + b / a - b   elementwise (same dims), both operands consumed
+# a * b           matmul, both operands consumed (M.mul threads them back)
+# m * v           matrix * Vector -> Vector (M.mulVec is the list form)
+# Found by the operator resolver from the parameter types: no registration.
+mZip f a b =
+  (ra, ca, a2) = mDims a;
+  (rb, cb, b2) = mDims b;
+  u = mZipGuard ra ca rb cb;
+  Mat r1 c1 va = a2;
+  Mat r2 c2 vb = b2;
+  Mat r1 c1 (f va vb).
+mZipGuard ra ca rb cb | ra == rb, ca == cb = 0.
+mZipGuard ra ca rb cb = error "matrix: {ra}x{ca} and {rb}x{cb} differ".
+mMulC a b = (o, a2, b2) = mMul a b; u = mFree a2; u2 = mFree b2; o.
+mMulVecC m v =
+  (r, c, m2) = mDims m;
+  (n, v2) = Vec.len v;
+  u = mLenGuard n c;
+  Mat r1 c1 cells = m2;
+  (vo, cells2, v3) = Vec.mmul r c 1 cells v2;
+  u2 = Vec.free cells2;
+  u3 = Vec.free v3;
+  vo.
+MatOps = Struct {
+  (+) = fn a b -> mZip Vec.zipAdd a b,
+  (-) = fn a b -> mZip Vec.zipSub a b,
+  (*) = fn a b -> mMulC a b
+}.
+MatVec = Struct {
+  (*) = fn m v -> mMulVecC m v
+}.
 
 # column means: Numeric.div is where inexactness (deliberately) enters
 mColMeans m =

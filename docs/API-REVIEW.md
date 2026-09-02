@@ -176,6 +176,17 @@ proved.
 Decision points D13 (guards or booleans-by-case for two-way conditions) and
 D14 (when is `unsafe` acceptable in an example).
 
+## 11. Operators as the default (fixed now)
+
+`%` and `^` are operators in the one grammar; `+ - * / % ^` resolve by
+operand type on numbers, strings, lists, Vectors (`+ -` elementwise, `*`
+dot, `k * v` scale), Matrices (`+ -`, `*` matmul, `m * v`), and user
+structs; mixed operand types resolve to a two-typed struct operator.  The
+corpus migration replaced 43 saturated calls (`Numeric.mod`, `Int.mod`,
+`imod`, `List.append`, `strcat`, `F64.pow`) with operators across 21
+files and retired the `imod` helpers; `sol/examples/algebra.sol` is the
+executable spec and a check-all leg runs it on both profiles.
+
 ## Fixed now
 
 - retired every `base.sol` alias that duplicated a prelude builtin

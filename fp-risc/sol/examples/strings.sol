@@ -56,9 +56,9 @@ expect what got want = case got == want of
 > expect "List.filter"  (List.filter (fn x -> x > 1) [1, 2, 3]) [2, 3].
 > expect "List.fold"    (List.fold (fn a x -> a + x) 0 [1, 2, 3]) 6.
 > expect "List.find"    (List.find (fn x -> x > 1) [1, 2, 3], List.find (fn x -> x > 9) [1, 2, 3]) ([2], []).
-> expect "List.groupby" (List.groupby (fn x -> Numeric.mod x 2) [1, 2, 3, 4]) [(1, [1, 3]), (0, [2, 4])].
+> expect "List.groupby" (List.groupby (fn x -> x % 2) [1, 2, 3, 4]) [(1, [1, 3]), (0, [2, 4])].
 
 # ---- Numeric ----
-> expect "Numeric.mod" (Numeric.mod 7 3) 1.
+> expect "% (Numeric.mod)" (7 % 3) 1.
 > expect "Numeric.abs" (Numeric.abs (0 - 4)) 4.
 > print "strings: OK".

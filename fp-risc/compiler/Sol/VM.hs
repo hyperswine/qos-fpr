@@ -35,7 +35,7 @@ import GHC.Clock (getMonotonicTime)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Sol.HandJIT
-import Sol.KIR (fuelPoison)
+import Sol.KIR (fuelPoison, fuelTrap)
 import Sol.Lang (Name)
 import qualified Sol.Lang as Lang
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
@@ -374,7 +374,8 @@ builtinArities =
         ("use", 1), ("run", 2), ("View.serve", 5),
         ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
-        ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1)
+        ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1),
+        ("Vec.zipAdd", 2), ("Vec.zipSub", 2), ("Vec.zipMul", 2), ("Vec.dot", 2), ("Vec.scale", 2)
       ]
 
 builtinCall :: VMEnv -> Name -> [Value] -> IO Value
@@ -820,7 +821,10 @@ withFuelCell env body = alloca $ \p -> do
   poke p (fromIntegral f0)
   r <- body p
   f1 <- peek p
-  when (f1 <= fuelPoison) (vmPanic "division by zero") -- poisoned, minus any ticks after it
+  -- poisoned cells (minus any ticks after the poison): a trap is the
+  -- deeper value, so test it first
+  when (f1 <= fuelTrap + 1152921504606846976) (vmPanic "error raised inside a native kernel (rerun with SOL_JIT=0 for the message)")
+  when (f1 <= fuelPoison) (vmPanic "division by zero")
   if f1 <= 0
     then do
       modifyIORef' (vmPreempts env) (+ 1)
@@ -1283,6 +1287,13 @@ vecCall env name args = case (name, args) of
     pure (VData 4 0 [x, VVec r])
   ("Vec.set", [VInt i, x, VVec r]) -> setVec r (fromIntegral i - 1) x >> pure (VVec r)
   ("Vec.free", [VVec _]) -> pure vUnit -- ForeignPtr finalizers reclaim
+  -- the operator surface (VecOps in the prelude): elementwise + - *,
+  -- the dot product, and scalar scaling -- both operands are consumed
+  ("Vec.zipAdd", [VVec a, VVec b]) -> vecZip OAdd a b
+  ("Vec.zipSub", [VVec a, VVec b]) -> vecZip OSub a b
+  ("Vec.zipMul", [VVec a, VVec b]) -> vecZip OMul a b
+  ("Vec.dot", [VVec a, VVec b]) -> vecDot a b
+  ("Vec.scale", [k, VVec v]) -> vecScale k v
   ("Vec.toList", [VVec r]) -> do
     xs <- toListVec r
     pure (foldr (\x acc -> VData listT 1 [x, acc]) (VData listT 0 []) xs)
@@ -1351,6 +1362,77 @@ vecMatmul ra ka cb sra srb = do
           pushVec ro s
       pure o
   pure (VData 5 0 [out, VVec sra, VVec srb])
+
+-- elementwise zip of two columns (f64 fast path when both are unboxed
+-- KNum columns; the exact/boxed path goes through `arith`, so integer
+-- vectors stay exact bignums)
+vecZip :: ArithOp -> IORef VecStore -> IORef VecStore -> IO Value
+vecZip op sra srb = do
+  sa <- readIORef sra
+  sb <- readIORef srb
+  let n = vLen sa
+  when (vLen sb /= n) $ vmPanic ("Vec zip: lengths differ (" ++ show n ++ " vs " ++ show (vLen sb) ++ ")")
+  case (vRep sa, vCols sa, vRep sb, vCols sb) of
+    (RScalar KNum, [CD _ fpa], RScalar KNum, [CD _ fpb]) -> do
+      fpo <- mallocForeignPtrArray (max 1 n)
+      withForeignPtr fpa $ \pa -> withForeignPtr fpb $ \pb -> withForeignPtr fpo $ \po ->
+        forM_ [0 .. n - 1] $ \i -> do
+          x <- peekElemOff pa i
+          y <- peekElemOff pb i
+          pokeElemOff po i (case op of OAdd -> x + y; OSub -> x - y; _ -> x * y)
+      VVec <$> newIORef (VecStore n [CD (max 1 n) fpo] (RScalar KNum))
+    _ -> do
+      o <- newVec
+      let VVec ro = o
+      forM_ [0 .. n - 1] $ \i -> do
+        x <- getVec sra i
+        y <- getVec srb i
+        arith op x y >>= pushVec ro
+      pure o
+
+vecDot :: IORef VecStore -> IORef VecStore -> IO Value
+vecDot sra srb = do
+  sa <- readIORef sra
+  sb <- readIORef srb
+  let n = vLen sa
+  when (vLen sb /= n) $ vmPanic ("Vec.dot: lengths differ (" ++ show n ++ " vs " ++ show (vLen sb) ++ ")")
+  case (vRep sa, vCols sa, vRep sb, vCols sb) of
+    (RScalar KNum, [CD _ fpa], RScalar KNum, [CD _ fpb]) ->
+      withForeignPtr fpa $ \pa -> withForeignPtr fpb $ \pb -> do
+        -- k descending from the exact-zero base: the same accumulation
+        -- order as Vec.mmul's inner loop, so a 1xN * Nx1 product agrees
+        let go k acc
+              | k < 0 = pure acc
+              | otherwise = do
+                  x <- peekElemOff pa k
+                  y <- peekElemOff pb k
+                  go (k - 1) (x * y + acc)
+        VNum <$> go (n - 1) (0 :: Double)
+    _ -> do
+      let go k acc
+            | k < 0 = pure acc
+            | otherwise = do
+                x <- getVec sra k
+                y <- getVec srb k
+                xy <- arith OMul x y
+                arith OAdd xy acc >>= go (k - 1)
+      go (n - 1) (VInt 0)
+
+vecScale :: Value -> IORef VecStore -> IO Value
+vecScale k srv = do
+  sv <- readIORef srv
+  let n = vLen sv
+  case (k, vRep sv, vCols sv) of
+    (VNum kd, RScalar KNum, [CD _ fpv]) -> do
+      fpo <- mallocForeignPtrArray (max 1 n)
+      withForeignPtr fpv $ \pv -> withForeignPtr fpo $ \po ->
+        forM_ [0 .. n - 1] $ \i -> peekElemOff pv i >>= pokeElemOff po i . (kd *)
+      VVec <$> newIORef (VecStore n [CD (max 1 n) fpo] (RScalar KNum))
+    _ -> do
+      o <- newVec
+      let VVec ro = o
+      forM_ [0 .. n - 1] $ \i -> getVec srv i >>= arith OMul k >>= pushVec ro
+      pure o
 
 vecScheme :: VMEnv -> String -> Value -> Maybe Value -> IORef VecStore -> IO Value
 vecScheme env scheme f macc r = do

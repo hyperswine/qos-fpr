@@ -8,15 +8,13 @@
 # next4-separated streams.
 
 Rand = Struct {
-  # imod is just int modulo
-  imod = fn a b -> a - (a / b) * b,
-  next = fn s -> Rand.imod (s * 1103515245 + 12345) 2147483648,
+  next = fn s -> (s * 1103515245 + 12345) % 2147483648,
 
   # uniform int in [0, hi)
-  uniform = fn s hi -> Rand.imod (s / 65536) hi,
+  uniform = fn s hi -> (s / 65536) % hi,
 
   # inexact uniform in [-1, 1): take 17 bits, center, scale
-  unit = fn s -> Numeric.div (Rand.imod (s / 1024) 131072 - 65536) 65536,
+  unit = fn s -> Numeric.div ((s / 1024) % 131072 - 65536) 65536,
 
   # rough gaussian: sum of 4 unit uniforms over the chained states
   # s1 = next s, s2 = next s1, s3 = next s2, s4 = next s3 (= next4 s)

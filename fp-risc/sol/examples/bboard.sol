@@ -74,7 +74,7 @@ parseKind k nm ws n =
 
 parseNetlist : unsafe List String -> List _ .
 parseNetlist ls | ls == [] = [].
-parseNetlist ls = case ls of l :: r -> List.append (parseLine l) (parseNetlist r).
+parseNetlist ls = case ls of l :: r -> (parseLine l) + (parseNetlist r).
 
 isSource c = or (c.kind == 86) (c.kind == 73).
 notSource c = not (isSource c).
@@ -183,7 +183,7 @@ track net k netstr =
   ss = netStrips net netstr;
   case member k ss of
     True -> netstr
-  | False -> (net, List.append ss [k]) :: dropKey net netstr.
+  | False -> (net, ss + [k]) :: dropKey net netstr.
 
 dropKey : unsafe l95 -> List (l95, k95) -> List (l95, k95) .
 dropKey _ [] = [].
@@ -209,7 +209,7 @@ commit c sA st =
   {st | holes = (sA, cA) :: (sB, cB) :: st.holes,
         owners = own sB c.nb (own sA c.na st.owners),
         netstr = track c.nb sB (track c.na sA st.netstr),
-      places = List.append st.places [(c.nm, c.kind, sA, cA, cB)]}.
+      places = (st.places + [(c.nm, c.kind, sA, cA, cB)])}.
 
 placeAll : unsafe List _ -> _ -> _ .
 placeAll cs st | cs == [] = st.
@@ -241,7 +241,7 @@ jumpDo net s1 s2 more ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   (lb, ws3) = allocLbl s2 "W{wsA.k}b" ws2;
-  jumpNet net (s2 :: more) {ws3 | wires = List.append ws3.wires [(net, la, lb, "JUMPER")]}.
+  jumpNet net (s2 :: more) {ws3 | wires = (ws3.wires + [(net, la, lb, "JUMPER")])}.
 
 # rail wire: from the net's first strip to the given rail
 railWire : unsafe f103 -> g103 -> List Int -> _ -> _ .
@@ -252,7 +252,7 @@ railDo net rail s1 ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   {ws2 | rails = (rail, (sRow s1, "W{wsA.k}b")) :: ws2.rails,
-      wires = List.append ws2.wires [(net, la, rail, "RAIL")]}.
+      wires = (ws2.wires + [(net, la, rail, "RAIL")])}.
 
 wireNets : unsafe List String -> List String -> List (String, x103) -> _ -> _ .
 wireNets nets pwrs netstr ws | nets == [] = ws.
@@ -401,7 +401,7 @@ runBoard title ls =
   ua = print "  {checkNets nets st.netstr ws.wires}";
   ub = print "";
   uc = print header;
-  cm = List.append (cellMapOf st.places) ws.labels;
+  cm = (cellMapOf st.places) + ws.labels;
   renderRows cm ws.rails 1.
 
 ex1 = [

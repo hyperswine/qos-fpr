@@ -13,7 +13,7 @@ expect what got want = case got == want of
   | False -> error "FAIL {what}: got {got}, wanted {want}".
 
 positive n = case n > 0 of True -> Ok n | False -> Err "not positive: {n}".
-half n = case Numeric.mod n 2 of 0 -> Ok (n / 2) | m -> Err "odd: {n}".
+half n = case n % 2 of 0 -> Ok (n / 2) | m -> Err "odd: {n}".
 
 # ---- the pipe threads Ok, stops at the first Err, never runs later steps ----
 > expect "pipe threads Ok"      (Try.parseInt "84" |>? positive |>? half) (Ok 42).

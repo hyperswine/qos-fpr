@@ -120,6 +120,10 @@ data IEnv = IEnv
     iHere :: Maybe Int, -- spans step 3: the innermost enclosing SMark's
                         -- source offset while inference walks under it;
                         -- report stamps it into diagnostics as "@OFF~ "
+    iPairs :: IM.IntMap (Type, Type), -- operator sites whose operand types
+                                     -- were NOT unified eagerly (both concrete,
+                                     -- at least one user type): resolution may
+                                     -- pick a two-typed operator global
     iLinSigs :: [(Name, ([LShape], LShape))] -- INFERRED linearity shapes
       -- per user bind (zonked types -> LShape): the linearity checker
       -- consumes these for functions WITHOUT an explicit sig, closing
@@ -435,6 +439,8 @@ builtinEnv =
       ("Vec.maxS", mono (TFn tInt (TFn tVector tVector))),
       ("Vec.ges", mono (TFn tInt (TFn tVector tVector))),
       ("Vec.zipAdd", mono (TFn tVector (TFn tVector tVector))),
+      ("Vec.dot", mono (TFn tVector (TFn tVector tInt))),
+      ("Vec.scale", mono (TFn tInt (TFn tVector tVector))),
       ("Vec.zipMul", mono (TFn tVector (TFn tVector tVector))),
       ("Vec.zipMin", mono (TFn tVector (TFn tVector tVector))),
       ("Vec.zipLt", mono (TFn tVector (TFn tVector tVector))),
@@ -949,7 +955,7 @@ inferBin ctx op a b = case op of
     unify "(|>?) source" ta (tcon "Result" [x, err])
     unify "(|>?) fn" tb (TFn x (tcon "Result" [y, err]))
     pure (tcon "Result" [y, err], SBin op a' b')
-  _ | op `elem` ["+", "-", "*", "/"] -> do
+  _ | op `elem` ["+", "-", "*", "/", "%", "^"] -> do
         (ta, a') <- inferE ctx a
         (tb, b') <- inferE ctx b
         -- MATRIX * VECTOR: `*` on the Mat4/Vec4 shapes elaborates to
@@ -974,9 +980,20 @@ inferBin ctx op a b = case op of
                 pure (tr, SApp (SApp (SVar "mulMV") a') b')
           _ -> do
             t <- freshT
-            unify ("(" ++ op ++ ")") ta t
-            unify ("(" ++ op ++ ")") tb t
+            -- MIXED OPERAND TYPES: when both sides are already concrete and
+            -- at least one is a user type (Vector, Matrix, ...), the operator
+            -- may be a two-typed global (`Matrix * Vector`, `Int * Vector`),
+            -- so unification with the site type is deferred to resolution;
+            -- every other site unifies eagerly exactly as before
+            let builtinTy c = c `elem` ["Int", "F64", "F32", "String", "List", "Bool", "Unit"]
+                userTy ty = maybe False (not . builtinTy) (headCon ty)
+                concreteTy ty = headCon ty /= Nothing
             site <- newSite op t
+            if concreteTy za && concreteTy zb && (userTy za || userTy zb)
+              then modify (\st -> st {iPairs = IM.insert site (ta, tb) (iPairs st)})
+              else do
+                unify ("(" ++ op ++ ")") ta t
+                unify ("(" ++ op ++ ")") tb t
             pure (t, SBin (markerPrefix ++ show site ++ "#" ++ op) a' b')
     | op `elem` ["<", "<=", ">", ">="] -> do
         (ta, a') <- inferE ctx a
@@ -1028,13 +1045,42 @@ namedOpTarget env tyName op =
     firstArgIs (TFn a _) = headCon a == Just tyName
     firstArgIs _ = False
 
+-- the two-typed form: `<Struct>.<op>` whose first AND second parameters
+-- are the given types (Matrix * Vector, Int * Vector)
+namedOpTarget2 :: TEnv -> Name -> Name -> Name -> Maybe (Name, Scheme)
+namedOpTarget2 env tyA tyB op =
+  case Data.List.sort [g | (g, Forall _ _ t) <- M.toList env, ("." ++ op) `Data.List.isSuffixOf` g, argsAre t] of
+    (g : _) -> (,) g <$> M.lookup g env
+    [] -> Nothing
+  where
+    argsAre (TFn a (TFn b _)) = headCon a == Just tyA && headCon b == Just tyB
+    argsAre _ = False
+
 -- decide every site once the substitution is final
 resolveSites :: Sigs -> TEnv -> I (IM.IntMap OpTarget)
 resolveSites sigs env = do
   sites <- gets iSites
   IM.traverseWithKey one sites
   where
-    one _ (op, t0) = do
+    one k (op, t0) = do
+      pairs <- gets iPairs
+      case IM.lookup k pairs of
+        Nothing -> one' op t0
+        Just (ta0, tb0) -> do
+          ta <- zonk ta0
+          tb <- zonk tb0
+          case (headCon ta, headCon tb) of
+            (Just ca, Just cb)
+              | Just (g, sc) <- namedOpTarget2 env ca cb op -> do
+                  ft <- instantiate sc
+                  unify ("(" ++ op ++ ") at " ++ g) ft (TFn ta (TFn tb t0))
+                  pure (OpGlobal g)
+            _ -> do
+              -- no two-typed operator: the ordinary same-type site
+              unify ("(" ++ op ++ ")") ta t0
+              unify ("(" ++ op ++ ")") tb t0
+              one' op t0
+    one' op t0 = do
       t <- zonk t0
       if op `elem` ["==", "!="]
         then pure $ case t of
@@ -1061,9 +1107,16 @@ resolveSites sigs env = do
                 OpPrim "" <$ report ("str/print of " ++ p ++ ": render is tid-directed and floats are raw bits -- format float fields individually with F64.str/F32.str (v1)")
             | otherwise -> pure (OpPrim "")
       else case t of
-        TC "Int" -> pure (OpPrim op)
-        TC "F64" -> pure (OpPrim ("F64." ++ op))
-        TC "F32" -> pure (OpPrim ("F32." ++ op))
+        -- % and ^ have no opcode: they are the prelude's Int.mod / Int.pow
+        -- (every backend sees an ordinary call; the JIT inlines it)
+        TC "Int" | op == "%" -> pure (OpGlobal "Int.mod")
+                 | op == "^" -> pure (OpGlobal "Int.pow")
+                 | otherwise -> pure (OpPrim op)
+        TC "F64" | op == "^" -> pure (OpPrim "F64.pow")
+                 | op == "%" -> OpPrim op <$ report "(%) is not defined for F64 (Int/Numeric has it)"
+                 | otherwise -> pure (OpPrim ("F64." ++ op))
+        TC "F32" | op `elem` ["%", "^"] -> OpPrim op <$ report ("(" ++ op ++ ") is not defined for F32")
+                 | otherwise -> pure (OpPrim ("F32." ++ op))
         TC "String"
           | op == "+" -> pure (OpGlobal "Str.+")
           | op == "-" -> pure (OpGlobal "Str.-") -- deconcatenation: suffix removal
@@ -1082,7 +1135,7 @@ resolveSites sigs env = do
             Nothing -> do
               -- unconstrained: default to Int (numeric default)
               unify "numeric default" (TV v) tInt
-              pure (OpPrim op)
+              pure (case op of "%" -> OpGlobal "Int.mod"; "^" -> OpGlobal "Int.pow"; _ -> OpPrim op)
         -- A CONCRETE TYPE CARRIES ITS OWN OPERATORS. `Str.+` and `List.+`
         -- above are the two the compiler happens to know by name; every
         -- other type says so in the operator's own signature, so no
@@ -1192,7 +1245,7 @@ inferTops = inferTopsWith aotProf
 
 inferTopsWith :: IProf -> Sigs -> Structs -> [STop] -> ([String], [(Name, String)], [(String, String)], [(Name, ([LShape], LShape))], [STop])
 inferTopsWith prof sigs structs tops =
-  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty Nothing [])
+  let (tops', st) = runState run (IEnv 0 IM.empty IM.empty [] [] [] [] S.empty 0 IM.empty IM.empty Nothing IM.empty [])
    in (iErrs st, iNotes st, iHolesP st, iLinSigs st, tops')
   where
     aliases = M.fromList [(n, fs) | TShape n fs <- tops]

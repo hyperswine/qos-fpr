@@ -51,12 +51,12 @@ initOn branchName r = u = Proc.afterCommit (initOnSpec branchName r); r.
 add selection r = case selection of
   All -> queue ["add", "--all"] r
 | Updated -> queue ["add", "--update"] r
-| Paths ps -> queue (List.append ["add", "--"] ps) r.
+| Paths ps -> queue (["add", "--"] + ps) r.
 
 unadd selection r = case selection of
   All -> queue ["reset"] r
 | Updated -> queue ["reset"] r
-| Paths ps -> queue (List.append ["reset", "--"] ps) r.
+| Paths ps -> queue (["reset", "--"] + ps) r.
 
 commit message r = queue ["commit", "-m", message] r.
 

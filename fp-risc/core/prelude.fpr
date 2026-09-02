@@ -51,8 +51,20 @@ Int = Struct Arith Eq Ord {
   min = fn a b -> case a < b of True -> a | False -> b,
   max = fn a b -> case a > b of True -> a | False -> b,
   mod = fn a b -> a - (a / b) * b,
-  neg = fn a -> 0 - a
+  neg = fn a -> 0 - a,
+  pow = fn a n -> intPow a n
 }.
+# `^` resolves here: exact exponentiation by squaring.  A negative
+# exponent has no exact answer and is refused by name, as in Sol.
+intPow : unsafe Int -> Int -> Int .
+intPow a n = case n < 0 of
+    True -> error "(^): negative exponent"
+  | False -> case n == 0 of
+      True -> 1
+    | False -> case n - (n / 2) * 2 == 0 of
+        True -> intSq (intPow a (n / 2))
+      | False -> a * intPow a (n - 1).
+intSq x = x * x.
 
 # ---- Str: (+) concatenates; (-) is DEconcatenation --------------------------
 # (a + b) - b == a: removes b when it is a suffix of a, else a unchanged.

@@ -133,6 +133,11 @@ prelude =
       "Vec.toList : Vector -> List a.",
       "Vec.fromList : List a -> Vector.",
       "Vec.free : Vector -> Unit.",
+      "Vec.zipAdd : Vector -> Vector -> Vector.",
+      "Vec.zipSub : Vector -> Vector -> Vector.",
+      "Vec.zipMul : Vector -> Vector -> Vector.",
+      "Vec.dot : Vector -> Vector -> Int.",
+      "Vec.scale : Int -> Vector -> Vector.",
       "Module = Type (Module Int).",
       "use : String -> Module.",
       "run : Module -> a -> String.",
@@ -147,6 +152,30 @@ prelude =
       "Arith = Sig { (+) : t -> t -> t, (-) : t -> t -> t, (*) : t -> t -> t, (/) : t -> t -> t, zero : t }.",
       "Functor = Sig { map : (a -> b) -> t a -> t b }.",
       "StreamOps = Sig { filter : (a -> Bool) -> t a -> t a, fold : (b -> a -> b) -> b -> t a -> b, find : (a -> Bool) -> t a -> t a, any : (a -> Bool) -> t a -> Bool, all : (a -> Bool) -> t a -> Bool }.",
+      -- ---- Int: the operator globals `%` and `^` resolve to.  In Sol the
+      -- surface number is Int (VNum underneath), so these serve floats too:
+      -- % is the truncated remainder (C, RISC-V rem), ^ is exponentiation
+      -- by squaring for an integer exponent (negative -> inexact
+      -- reciprocal); a fractional exponent is refused by name.
+      "Int = Struct {",
+      "  mod = fn a b -> a - Int.trunc (a / b) * b,",
+      "  trunc = fn x -> case x < 0 of True -> 0 - Num.floor (0 - x) | False -> Num.floor x,",
+      "  sq = fn a -> a * a,",
+      "  pow = fn a n -> case n != Num.floor n of True -> error \"(^): the exponent is not an integer\" | False -> (case n < 0 of True -> error \"(^): negative exponent; the inexact reciprocal is Num.div 1 (a ^ n)\" | False -> Int.powGo a n),",
+      "  powGo = fn a n -> case n == 0 of True -> 1 | False -> (case Int.mod n 2 == 0 of True -> Int.sq (Int.powGo a (n / 2)) | False -> a * Int.powGo a (n - 1))",
+      "}.",
+      -- ---- Vector operators: + - are elementwise (both operands consumed,
+      -- one fresh column), * is the dot product; k * v scales.  The
+      -- structs are found by the operator resolver from their parameter
+      -- types alone -- the SAME mechanism operators.sol shows for V2.
+      "VecOps = Struct {",
+      "  (+) = fn a b -> Vec.zipAdd a b,",
+      "  (-) = fn a b -> Vec.zipSub a b,",
+      "  (*) = fn a b -> Vec.dot a b",
+      "}.",
+      "VecScale = Struct {",
+      "  (*) = fn k v -> Vec.scale k v",
+      "}.",
       "Numeric = Struct Arith {",
       "  (+) = fn a b -> a + b,",
       "  (-) = fn a b -> a - b,",
@@ -157,7 +186,7 @@ prelude =
       "  max = fn a b -> case a > b of True -> a | False -> b,",
       "  min = fn a b -> case a < b of True -> a | False -> b,",
       "  clamp = fn lo hi a -> Numeric.min hi (Numeric.max lo a),",
-      "  mod = fn a b -> a - (a / b) * b,",
+      "  mod = fn a b -> Int.mod a b,",
       -- the inexact tier: div is TRUE division (1 `div` 2 = 0.5); sqrt,
       -- floor, round complete the surface. Plain +,-,*,< work on the
       -- results directly — inexactness propagates by promotion, and a
@@ -176,6 +205,7 @@ prelude =
       -- charAt/substr primitives underneath.  All of it is ordinary Sol.
       "Str = Struct Add {",
       "  (+) = fn a b -> strcat a b,",
+      "  (-) = fn a b -> case Str.endsWith b a of True -> substr a 1 (strlen a - strlen b) | False -> a,",
       "  zero = \"\",",
       "  len = fn s -> strlen s,",
       "  cat = fn a b -> strcat a b,",
@@ -216,6 +246,8 @@ prelude =
       "xor a b = case a of True -> not b | False -> b.",
       "List = Struct Add Functor StreamOps {",
       "  (+) = fn a b -> List.append a b,",
+      "  (-) = fn a b -> List.subGo a b (List.len a) (List.len b),",
+      "  subGo = fn a b la lb -> case lb > la of True -> a | False -> (case List.drop (la - lb) a == b of True -> List.take (la - lb) a | False -> a),",
       "  zero = [],",
       "  append = fn a b -> case a of Nil -> b | x :: rest -> x :: (List.append rest b),",
       "  map = fn f xs -> map f xs,",
@@ -263,5 +295,6 @@ halArities =
       ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
       ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
       ("Vec.toList", 1), ("Vec.fromList", 1), ("Vec.free", 1),
+      ("Vec.zipAdd", 2), ("Vec.zipSub", 2), ("Vec.zipMul", 2), ("Vec.dot", 2), ("Vec.scale", 2),
       ("use", 1), ("run", 2), ("View.serve", 5)
     ]
