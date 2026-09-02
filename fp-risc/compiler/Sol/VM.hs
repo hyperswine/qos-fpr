@@ -907,6 +907,7 @@ mkHal cons scriptArgs tx preempts rt =
       -- fallible added to the HAL from here on returns Ok/Err and gets its
       -- panicking twin for free.
       ("Try.parseInt", (1, tryParseIntH)),
+      ("Try.parseNum", (1, tryParseNumH)),
       ("Try.readPath", (1, tryReadPathH)),
       ("Proc.query", (1, procQueryH)),
       ("Proc.afterCommit", (1, procAfterCommitH)),
@@ -1117,6 +1118,21 @@ mkHal cons scriptArgs tx preempts rt =
         [(n, rest)] | all (`elem` " \n\t") rest -> pure (vOk (VInt n))
         _ -> pure (vErr ("parseInt: not an integer: " ++ show s))
     tryParseIntH _ = vmPanic "Try.parseInt: arity"
+
+    -- Try.parseNum: the Numeric surface's reader -- an integer stays an
+    -- exact VInt, a decimal / exponent form becomes a VNum. JSON and CSV
+    -- numbers land here; "1e3" and "-0.5" are numbers, "nan"/"0x10" are not.
+    tryParseNumH [v] = do
+      s <- vsStr v
+      let t = dropWhile (== ' ') s
+          tail' = all (`elem` " \n\t")
+          -- Haskell's reads wants a digit after '-' and before '.', as JSON does
+      case reads t :: [(Integer, String)] of
+        [(n, rest)] | tail' rest -> pure (vOk (VInt n))
+        _ -> case reads t :: [(Double, String)] of
+          [(d, rest)] | tail' rest -> pure (vOk (VNum d))
+          _ -> pure (vErr ("parseNum: not a number: " ++ show s))
+    tryParseNumH _ = vmPanic "Try.parseNum: arity"
 
     tryReadPathH [v] = withP v $ \p -> do
       r <- txTryRead tx p
