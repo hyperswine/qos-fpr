@@ -19,6 +19,21 @@ you actually drive it with:
 Everything delegates to make for staleness, so a fresh tree costs one
 compile and an up-to-date one costs nothing.
 
+## Versions and releases
+
+Three layers, each built from the one below (docs/VERSIONING.md):
+`fpr commit` mints immutable module versions into `fp-risc/.fpr/`
+(tracked); `./qos.py lock` writes `fp-risc/fpr.lock`, every
+`use "x#hash"` pin in the tree resolved to its committed version;
+`./qos.py release X.Y.Z --push` commits the modules named in
+`release.toml`, checks the lock, runs the smoke set, packs the release
+apps as stamped bundles under `dist/qos-fpr-vX.Y.Z/`, and mints the
+annotated tag `vX.Y.Z` -- which `.github/workflows/release.yml` turns
+into a GitHub Release with the same bundles rebuilt from the tag.
+
+    ./qos.py lock --check                 # check-all leg: pins resolvable, lock current
+    ./qos.py release 0.2.0 --push         # cut + publish v0.2.0
+
 ## Layout
 
     fp-risc/            the language project
