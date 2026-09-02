@@ -13,7 +13,7 @@
 module Sol.Main where
 
 import Sol.Bytecode
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, onException, try)
 import Control.Monad (forM, forM_, unless, when)
 import Control.Monad.State.Strict (runState)
 import Data.IORef
@@ -235,26 +235,29 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
   gpu <- Gpu.initGPU
   tabFlag <- lookupEnv "SOL_TABLE"
   tab <- if tabFlag == Just "0" then pure Nothing else Just <$> newIORef M.empty
-  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons tx preempts rt) fuel preempts tx
-  forM_ topNames $ \n -> do
-    v <- execFn env n []
-    unless (isUnit v) $ putStrLn ("=> " ++ VM.render v)
-  statsFlag <- lookupEnv "SOL_TABLE_STATS"
-  when (statsFlag == Just "1") $ VM.dumpTabStats env
-  -- commit reads the effect log at ONE instant; a spawned actor still
-  -- running can only add to a dead transaction from here. Say so — the
-  -- join idiom (actor sends done, main receives it) is the fix.
-  liveA <- VM.liveSpawnedActors
-  unless (null liveA) $
-    putStrLn ("[sol] WARNING: " ++ show (length liveA) ++ " spawned actor(s) still running at commit — "
-                ++ "effects they produce from here are NOT part of this commit "
-                ++ "(join first: have each send a done message and receive it before the script ends)")
-  forceN <- lookupEnv "SOL_FORCE_RETRY"
-  let force = maybe 0 read forceN :: Int
-  res <-
+  actors <- VM.newActorRuntime
+  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons tx preempts rt) fuel preempts tx actors
+      cleanup = VM.shutdownActorRuntime actors
+  res <- (do
+    forM_ topNames $ \n -> do
+      v <- execFn env n []
+      unless (isUnit v) $ putStrLn ("=> " ++ VM.render v)
+    statsFlag <- lookupEnv "SOL_TABLE_STATS"
+    when (statsFlag == Just "1") $ VM.dumpTabStats env
+    -- Every attempt owns its actor world. Actors still live at the boundary
+    -- are cancelled and joined before commit or retry, so they cannot retain
+    -- a discarded TxState or leave messages for the next attempt.
+    liveA <- VM.liveSpawnedActors actors
+    unless (null liveA) $
+      putStrLn ("[sol] WARNING: " ++ show (length liveA) ++ " spawned actor(s) still running at the transaction boundary — "
+                  ++ "cancelling them before the transaction boundary "
+                  ++ "(join first: have each send a done message and receive it before the script ends)")
+    cleanup
+    forceN <- lookupEnv "SOL_FORCE_RETRY"
+    let force = maybe 0 read forceN :: Int
     if attempt < force
       then pure (Conflict ["<forced>"]) -- discard this attempt's effects
-      else commit tx journalFile
+      else commit tx journalFile) `onException` cleanup
   case res of
     Committed n sfail -> do
       when (n > 0 && not sfail) $ putStrLn ("[sol] committed " ++ show n ++ " file(s) atomically (whole-script transaction)")

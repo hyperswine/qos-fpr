@@ -25,7 +25,7 @@
 module Sol.Txn where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (IOException, try)
+import Control.Exception (IOException, finally, mask, onException, throwIO, try)
 import Control.Monad (foldM, forM_, unless, when)
 import Data.IORef
 import Data.Maybe (mapMaybe)
@@ -56,6 +56,7 @@ import System.Directory
 import Data.Time.Clock.POSIX (getPOSIXTime, utcTimeToPOSIXSeconds)
 import System.Exit (ExitCode (..))
 import System.IO (readFile')
+import System.IO.Error (isAlreadyExistsError, isDoesNotExistError)
 import System.IO (hFlush, hGetContents', hIsEOF, hGetLine, stderr, stdin, stdout, hPutStr, hPutStrLn)
 import System.Process (CreateProcess (..), createProcess, proc, readCreateProcessWithExitCode, shell, waitForProcess)
 import System.Timeout (timeout)
@@ -169,7 +170,9 @@ diskReadT :: FilePath -> IO (Maybe (String, Bool))
 diskReadT p = do
   r <- try (BS.readFile p) :: IO (Either IOException BS.ByteString)
   case r of
-    Left _ -> pure Nothing
+    Left e
+      | isDoesNotExistError e -> pure Nothing
+      | otherwise -> throwIO e
     Right bs -> let t = BSU.toString bs in pure (Just (t, BSU.fromString t == bs))
 
 diskRead :: FilePath -> IO (Maybe String)
@@ -221,7 +224,7 @@ snapshot ref p = do
 -- read snapshot > disk (snapshotting). The Ok/Err surface (Try.readPath)
 -- reports the failure cases; the plain surface (readPath/readAll) treats
 -- them as panics.
-data TxRead = TxText String | TxMissing | TxNonText
+data TxRead = TxText String | TxMissing | TxNonText | TxReadError String
 
 txTryRead :: IORef TxState -> FilePath -> IO TxRead
 txTryRead ref p = do
@@ -230,12 +233,15 @@ txTryRead ref p = do
     Just (Just w) -> pure (TxText w) -- this txn's own write: always text
     Just Nothing -> pure TxMissing -- removed earlier in this txn
     Nothing -> do
-      r <- snapshot ref p
-      s2 <- readIORef ref
-      pure $ case r of
-        Nothing -> TxMissing
-        Just w | S.member p (txNonText s2) -> TxNonText
-        Just w -> TxText w
+      result <- try (snapshot ref p) :: IO (Either IOException (Maybe String))
+      case result of
+        Left e -> pure (TxReadError (show e))
+        Right r -> do
+          s2 <- readIORef ref
+          pure $ case r of
+            Nothing -> TxMissing
+            Just w | S.member p (txNonText s2) -> TxNonText
+            Just w -> TxText w
 
 -- ABSENCE IS NOT EMPTY: a missing file used to read as "", which made
 -- read-modify-write silently fabricate empty state (and a binary file
@@ -253,6 +259,8 @@ txHRead ref h = do
     TxNonText ->
       ioError (userError ("*** SOL PANIC: read: not a UTF-8 text file: " ++ p
                             ++ " — sol reads text; drive binary tools with sh/shq ***"))
+    TxReadError e ->
+      ioError (userError ("*** SOL PANIC: read: " ++ p ++ ": " ++ e ++ " ***"))
 
 txHWrite :: IORef TxState -> Int -> String -> IO ()
 txHWrite ref h v = do
@@ -290,7 +298,12 @@ txLs ref dir = do
     Just names -> pure names
     Nothing -> do
       r <- try (listDirectory dir) :: IO (Either IOException [String])
-      let names = sort (filter (not . lockArtifact) (either (const []) id r))
+      names0 <- case r of
+        Left e
+          | isDoesNotExistError e -> pure []
+          | otherwise -> throwIO e
+        Right names -> pure names
+      let names = sort (filter (not . lockArtifact) names0)
       atomicModifyIORef' ref (\st -> (st {txDirReads = M.insert dir names (txDirReads st)}, ()))
       pure names
   s2 <- readIORef ref
@@ -614,7 +627,9 @@ acquireGo recover jpath p = go (0 :: Int)
         Right () -> do
           me <- c_getpid
           writeFile (ownerPath p) (show (fromIntegral me :: Int) ++ "\n" ++ jpath ++ "\n")
-        Left _
+            `onException` removePathForcibly (lockPath p)
+        Left e
+          | not (isAlreadyExistsError e) -> throwIO e
           | n > 5000 -> ioError (userError ("sol: could not lock " ++ p ++ " (live " ++ lockPath p ++ ")"))
           | otherwise -> do
               when (n `mod` 250 == 249) (tryReclaim recover p)
@@ -640,14 +655,24 @@ tryReclaim recover p = do
             Left _ -> pure () -- someone else got it
             Right () -> do
               hPutStrLn stderr ("[sol] reclaimed stale lock on " ++ p ++ " (owner pid " ++ show pid ++ " is dead)")
-              when recover (recoverJournal False jL)
-              removePathForcibly claim
+              when recover (recoverJournal False jL) `finally` removePathForcibly claim
       _ -> pure ()
 
 release :: FilePath -> IO ()
 release p = do
   _ <- try (removePathForcibly (lockPath p)) :: IO (Either IOException ())
   pure ()
+
+withLocks :: (FilePath -> IO ()) -> [FilePath] -> IO a -> IO a
+withLocks takeLock paths action = mask $ \restore -> do
+  acquired <- acquireAll paths
+  restore action `finally` forM_ (reverse acquired) release
+  where
+    acquireAll [] = pure []
+    acquireAll (p : ps) = do
+      takeLock p
+      rest <- acquireAll ps `onException` release p
+      pure (p : rest)
 
 -- ---- the redo journal -----------------------------------------------------
 
@@ -669,7 +694,11 @@ parseJournal txt = case lines txt of
 readDone :: FilePath -> IO [Int]
 readDone j = do
   r <- try (readFile' (donePath j)) :: IO (Either IOException String)
-  pure (either (const []) (mapMaybe readMaybe . lines) r)
+  case r of
+    Left e
+      | isDoesNotExistError e -> pure []
+      | otherwise -> throwIO e
+    Right txt -> pure (mapMaybe readMaybe (lines txt))
 
 markDone :: FilePath -> Int -> IO ()
 markDone j i = do
@@ -697,14 +726,16 @@ recoverJournal takeLocks j = do
         clearJournal j
       Just effs -> do
         let touched = sort (nub [p | e <- effs, Just p <- [effectPath e]])
-        when takeLocks (forM_ touched (acquireGo False j))
-        stillThere <- doesFileExist j -- a concurrent reclaimer may have finished it
-        when stillThere $ do
-          done <- readDone j
-          hPutStrLn stderr ("[sol] recovering interrupted commit from " ++ j ++ " (" ++ show (length effs) ++ " effect(s), " ++ show (length done) ++ " shell(s) already done)")
-          _ <- replayEffs j True done Nothing (zip [0 ..] effs)
-          clearJournal j -- file effects all applied even past a failed shell
-        when takeLocks (forM_ (reverse touched) release)
+            recover = do
+              stillThere <- doesFileExist j -- a concurrent reclaimer may have finished it
+              when stillThere $ do
+                done <- readDone j
+                hPutStrLn stderr ("[sol] recovering interrupted commit from " ++ j ++ " (" ++ show (length effs) ++ " effect(s), " ++ show (length done) ++ " shell(s) already done)")
+                _ <- replayEffs j True done Nothing (zip [0 ..] effs)
+                clearJournal j -- file effects all applied even past a failed shell
+        if takeLocks
+          then withLocks (acquireGo False j) touched recover
+          else recover
 
 -- ---- commit ---------------------------------------------------------------
 
@@ -740,26 +771,30 @@ commit ref jpath = do
                 M.fromList [(p, ()) | e <- effs, Just p <- [effectPath e]]
               ]
           )
-  forM_ touched (acquire jpath) -- sorted: global lock order
-  staleC <-
-    foldM
-      ( \acc (p, snap) -> do
-          now <- diskRead p
-          pure (if now == snap then acc else p : acc)
-      )
-      []
-      (M.toList (txReads s))
-  staleD <-
-    foldM
-      ( \acc (dir, names) -> do
-          r <- try (listDirectory dir) :: IO (Either IOException [String])
-          let now = sort (filter (not . lockArtifact) (either (const []) id r))
-          pure (if now == names then acc else dir : acc)
-      )
-      []
-      (M.toList (txDirReads s))
-  let stale = staleC ++ staleD
-  res <-
+  withLocks (acquire jpath) touched $ do -- sorted: global lock order
+    staleC <-
+      foldM
+        ( \acc (p, snap) -> do
+            now <- diskRead p
+            pure (if now == snap then acc else p : acc)
+        )
+        []
+        (M.toList (txReads s))
+    staleD <-
+      foldM
+        ( \acc (dir, names) -> do
+            r <- try (listDirectory dir) :: IO (Either IOException [String])
+            now0 <- case r of
+              Left e
+                | isDoesNotExistError e -> pure []
+                | otherwise -> throwIO e
+              Right names' -> pure names'
+            let now = sort (filter (not . lockArtifact) now0)
+            pure (if now == names then acc else dir : acc)
+        )
+        []
+        (M.toList (txDirReads s))
+    let stale = staleC ++ staleD
     if null stale
       then do
         crashAt <- (>>= readMaybe) <$> lookupEnv "SOL_CRASH_AT"
@@ -775,8 +810,6 @@ commit ref jpath = do
           hPutStrLn stderr (childCommitMarker ++ show wrotePaths)
         pure (Committed n sfail)
       else pure (Conflict stale)
-  forM_ (reverse touched) release
-  pure res
 
 -- the stderr line a child sol emits (under SOL_REPORT_COMMIT=1) naming
 -- the paths its commit touched; the parent's `run` parses it

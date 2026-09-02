@@ -40,8 +40,8 @@ import Sol.Lang (Name)
 import qualified Sol.Lang as Lang
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
 import qualified Control.Concurrent
-import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newEmptyMVar, newMVar, takeMVar, tryPutMVar)
-import Control.Exception (AsyncException (ThreadKilled), SomeException, fromException, try)
+import Control.Concurrent.MVar (MVar, modifyMVar, modifyMVar_, newEmptyMVar, newMVar, putMVar, takeMVar, tryPutMVar)
+import Control.Exception (AsyncException (ThreadKilled), SomeException, finally, fromException, mask, try)
 import qualified Data.Set as S
 import Data.Int (Int64)
 import qualified Data.IntMap.Strict as IM
@@ -74,7 +74,8 @@ data VMEnv = VMEnv
     vmHal :: M.Map Name (Int, [Value] -> IO Value),
     vmFuel :: IORef Int,
     vmPreempts :: IORef Int,
-    vmTx :: IORef TxState -- the script transaction (run-overlap policy)
+    vmTx :: IORef TxState, -- the script transaction (run-overlap policy)
+    vmActors :: ActorRuntime
   }
 
 fuelQuantum :: Int
@@ -123,25 +124,24 @@ tabMinUs = unsafePerformIO (maybe 500 read <$> lookupEnv "SOL_TABLE_MIN")
 -- the point); calls to anything else -> ineligible, conservatively.
 tabEligible :: Lang.Prog -> Name -> Bool
 tabEligible prog g = case M.lookup g prog of
-  Just (ps, body) -> length ps <= 4 && ok body
+  Just (ps, body) -> length ps <= 4 && ok (S.fromList ps) body
   Nothing -> False
   where
     -- ops from the ONE vocabulary (Bytecode.arithOps) + the pure helpers
-    pureOps = M.keys arithOps ++ ["imod", "mod", "and2", "or2", "not"]
-    ok c = case c of
+    pureOps = S.fromList (M.keys arithOps ++ ["imod", "mod", "and2", "or2", "not"])
+    ok locals c = case c of
       Lang.CInt _ -> True
-      Lang.CVar v -> v `elem` pureOps || v == g || isParamish v
-      Lang.CLet _ a b -> ok a && ok b
-      Lang.CIf a b d -> ok a && ok b && ok d
-      Lang.CTagEq _ _ a -> ok a
-      Lang.CApp a b -> okHead (spineHead c) && ok a && ok b
+      Lang.CVar v -> S.member v pureOps || v == g || S.member v locals
+      Lang.CLet n a b -> ok locals a && ok (S.insert n locals) b
+      Lang.CIf a b d -> ok locals a && ok locals b && ok locals d
+      Lang.CTagEq _ _ a -> ok locals a
+      Lang.CApp a b -> okHead locals (spineHead c) && ok locals a && ok locals b
       _ -> False
       where
         spineHead (Lang.CApp f _) = spineHead f
         spineHead x = x
-        okHead (Lang.CVar v) = v `elem` pureOps || v == g || isParamish v
-        okHead _ = False
-        isParamish v = case M.lookup g prog of Just (ps, _) -> v `elem` ps || all (\ch -> ch `elem` ("_0123456789abcdefghijklmnopqrstuvwxyz" :: String)) v; _ -> False
+        okHead bound (Lang.CVar v) = S.member v pureOps || v == g || S.member v bound
+        okHead _ _ = False
 
 dumpTabStats :: VMEnv -> IO ()
 dumpTabStats env = case vmTab env of
@@ -427,60 +427,71 @@ viewServe _ _ = vmPanic "View.serve: expected port init update view subs"
 data ABox = ABox
   { abQ :: MVar [(Int, Value)],
     abSig :: MVar (),
-    abTid :: IORef (Maybe ThreadId)
+    abTid :: IORef (Maybe ThreadId),
+    abDone :: MVar ()
   }
 
-{-# NOINLINE actorReg #-}
-actorReg :: IORef (IM.IntMap ABox)
-actorReg = unsafePerformIO (newIORef IM.empty)
+data ActorRuntime = ActorRuntime
+  { arReg :: IORef (IM.IntMap ABox),
+    arByTid :: IORef (M.Map ThreadId Int),
+    arNext :: IORef Int
+  }
 
-{-# NOINLINE actorByTid #-}
-actorByTid :: IORef (M.Map ThreadId Int)
-actorByTid = unsafePerformIO (newIORef M.empty)
+newActorRuntime :: IO ActorRuntime
+newActorRuntime = ActorRuntime <$> newIORef IM.empty <*> newIORef M.empty <*> newIORef 1
 
-{-# NOINLINE actorNext #-}
-actorNext :: IORef Int
-actorNext = unsafePerformIO (newIORef 1)
-
-newBox :: IO (Int, ABox)
-newBox = do
-  i <- atomicModifyIORef' actorNext (\n -> (n + 1, n))
+newBox :: ActorRuntime -> IO (Int, ABox)
+newBox actors = do
+  i <- atomicModifyIORef' (arNext actors) (\n -> (n + 1, n))
   q <- newMVar []
   s <- newEmptyMVar
   t <- newIORef Nothing
-  let b = ABox q s t
-  atomicModifyIORef' actorReg (\m -> (IM.insert i b m, ()))
+  done <- newEmptyMVar
+  let b = ABox q s t done
+  atomicModifyIORef' (arReg actors) (\m -> (IM.insert i b m, ()))
   pure (i, b)
 
 -- the calling thread's actor id, registered on first contact (the main
 -- interpreter thread becomes actor 1 the first time it touches the surface)
-actorSelf :: IO Int
-actorSelf = do
+actorSelf :: ActorRuntime -> IO Int
+actorSelf actors = do
   t <- myThreadId
-  m <- readIORef actorByTid
+  m <- readIORef (arByTid actors)
   case M.lookup t m of
     Just i -> pure i
     Nothing -> do
-      (i, b) <- newBox
+      (i, b) <- newBox actors
       writeIORef (abTid b) (Just t)
-      atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
+      atomicModifyIORef' (arByTid actors) (\mm -> (M.insert t i mm, ()))
       pure i
 
 -- spawned actors still running (their box has a thread that is not the
 -- asking thread; finished actors deregister themselves). The commit
 -- checkpoint asks so it can say, loudly, that effects those actors
 -- produce from here land in a dead transaction.
-liveSpawnedActors :: IO [Int]
-liveSpawnedActors = do
+liveSpawnedActors :: ActorRuntime -> IO [Int]
+liveSpawnedActors actors = do
   me <- myThreadId
-  reg <- readIORef actorReg
+  reg <- readIORef (arReg actors)
   fmap concat . forM (IM.toList reg) $ \(i, b) -> do
     mt <- readIORef (abTid b)
     pure [i | mt /= Just me]
 
-actorEnqueue :: Int -> Int -> Value -> IO ()
-actorEnqueue to from m = do
-  reg <- readIORef actorReg
+shutdownActorRuntime :: ActorRuntime -> IO ()
+shutdownActorRuntime actors = do
+  me <- myThreadId
+  reg <- readIORef (arReg actors)
+  spawned <- fmap concat . forM (IM.elems reg) $ \b -> do
+    mt <- readIORef (abTid b)
+    pure [(tid, abDone b) | Just tid <- [mt], tid /= me]
+  forM_ spawned (killThread . fst)
+  forM_ spawned (takeMVar . snd)
+  writeIORef (arReg actors) IM.empty
+  writeIORef (arByTid actors) M.empty
+
+actorEnqueue :: ActorRuntime -> Int -> Int -> Value -> IO ()
+actorEnqueue actors to from m = do
+  reg <- readIORef (arReg actors)
   case IM.lookup to reg of
     Nothing -> pure () -- dead (or never-born) target: the message is lost
     Just b -> do
@@ -488,10 +499,10 @@ actorEnqueue to from m = do
       _ <- tryPutMVar (abSig b) ()
       pure ()
 
-actorTake :: (Int -> Bool) -> IO Value
-actorTake wants = do
-  i <- actorSelf
-  reg <- readIORef actorReg
+actorTake :: ActorRuntime -> (Int -> Bool) -> IO Value
+actorTake actors wants = do
+  i <- actorSelf actors
+  reg <- readIORef (arReg actors)
   case IM.lookup i reg of
     Nothing -> vmPanic "receive: the current actor has no mailbox"
     Just b -> loop b
@@ -517,25 +528,37 @@ actorNames =
     ]
 
 actorCall :: VMEnv -> Name -> [Value] -> IO Value
-actorCall _ "myself" [_] = VInt . fromIntegral <$> actorSelf
+actorCall env "myself" [_] = VInt . fromIntegral <$> actorSelf (vmActors env)
 actorCall env "spawn" [f] = do
-  (i, b) <- newBox
-  tid <- forkIO $ do
-    t <- myThreadId
-    atomicModifyIORef' actorByTid (\mm -> (M.insert t i mm, ()))
-    r <- try (apply env f (VInt (fromIntegral i)))
-    case r of
-      Left e
-        | Just ThreadKilled <- fromException e -> pure ()
-        | otherwise ->
-            putStrLn ("*** SOL PANIC [actor " ++ show i ++ "]: " ++ show (e :: SomeException) ++ " ***")
-      Right _ -> pure ()
-    atomicModifyIORef' actorReg (\m -> (IM.delete i m, ()))
-  writeIORef (abTid b) (Just tid)
+  let actors = vmActors env
+  (i, b) <- newBox actors
+  mask $ \restore -> do
+    start <- newEmptyMVar
+    tid <- forkIO $ do
+      takeMVar start
+      t <- myThreadId
+      atomicModifyIORef' (arByTid actors) (\mm -> (M.insert t i mm, ()))
+      restore
+        (do
+            r <- try (apply env f (VInt (fromIntegral i)))
+            case r of
+              Left e
+                | Just ThreadKilled <- fromException e -> pure ()
+                | otherwise ->
+                    putStrLn ("*** SOL PANIC [actor " ++ show i ++ "]: " ++ show (e :: SomeException) ++ " ***")
+              Right _ -> pure ())
+        `finally` do
+          atomicModifyIORef' (arReg actors) (\m -> (IM.delete i m, ()))
+          atomicModifyIORef' (arByTid actors) (\m -> (M.delete t m, ()))
+          _ <- tryPutMVar (abDone b) ()
+          pure ()
+    writeIORef (abTid b) (Just tid)
+    putMVar start ()
   pure (VInt (fromIntegral i))
-actorCall _ "send" [VInt to, m] = do
-  from <- actorSelf
-  actorEnqueue (fromIntegral to) from m
+actorCall env "send" [VInt to, m] = do
+  let actors = vmActors env
+  from <- actorSelf actors
+  actorEnqueue actors (fromIntegral to) from m
   pure vUnit
 -- sendLinear: MOVE semantics.  In this profile values are immutable
 -- Haskell terms, so the move IS a send -- the verb exists for grammar
@@ -544,16 +567,19 @@ actorCall _ "send" [VInt to, m] = do
 actorCall e "sendLinear" [to, m] = actorCall e "send" [to, m]
 -- sendArc: SHARE semantics; immutable values make sharing == sending
 actorCall e "sendArc" [to, m] = actorCall e "send" [to, m]
-actorCall _ "receive" [VInt _me] = actorTake (const True)
-actorCall _ "receiveFrom" [VInt _me, VInt from] = actorTake (== fromIntegral from)
-actorCall _ "kill" [VInt i] = do
-  reg <- readIORef actorReg
+actorCall env "receive" [VInt _me] = actorTake (vmActors env) (const True)
+actorCall env "receiveFrom" [VInt _me, VInt from] = actorTake (vmActors env) (== fromIntegral from)
+actorCall env "kill" [VInt i] = do
+  let actors = vmActors env
+  reg <- readIORef (arReg actors)
   case IM.lookup (fromIntegral i) reg of
     Nothing -> pure vUnit
     Just b -> do
       mt <- readIORef (abTid b)
-      atomicModifyIORef' actorReg (\m -> (IM.delete (fromIntegral i) m, ()))
-      maybe (pure ()) killThread mt
+      atomicModifyIORef' (arReg actors) (\m -> (IM.delete (fromIntegral i) m, ()))
+      case mt of
+        Nothing -> pure ()
+        Just tid -> killThread tid >> takeMVar (abDone b)
       pure vUnit
 actorCall _ "yield" [_] = Control.Concurrent.yield >> pure vUnit
 actorCall _ "drop" [_] = pure vUnit
@@ -1097,6 +1123,7 @@ mkHal cons tx preempts rt =
         TxText s -> vOk (VStr s)
         TxMissing -> vErr ("readPath: no such file: " ++ p)
         TxNonText -> vErr ("readPath: not a UTF-8 text file: " ++ p)
+        TxReadError e -> vErr ("readPath: " ++ p ++ ": " ++ e)
     tryReadPathH _ = vmPanic "Try.readPath: arity"
 
     procQueryH [v] = decodeProcessSpec v >>= runProcessH
