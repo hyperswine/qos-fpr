@@ -80,7 +80,7 @@ mkData s n =
   ([x1, x2, Numeric.inexact 1] :: rows, x1 * x2 :: ys).
 
 # augment hidden activations with the constant-1 column
-augRows rss = map (fn r -> List.append r [Numeric.inexact 1]) rss.
+augRows rss = map (fn r -> r + [Numeric.inexact 1]) rss.
 
 # ---- forward + backward, one full-batch epoch ------------------------------
 #
@@ -164,7 +164,7 @@ train k n lr xaug xrows ys w1 w2 last =
 predict : List _ -> List Int -> Int -> Int -> Int .
 predict w1rows w2 x1 x2 =
   z1s = map (fn wr -> lDot wr [x1, x2, Numeric.inexact 1]) w1rows;
-  lDot (List.append (map (fn z -> relu z) z1s) [Numeric.inexact 1]) w2.
+  lDot ((map (fn z -> relu z) z1s) + [Numeric.inexact 1]) w2.
 
 chk name got want tol = case Numeric.abs (got - want) < tol of
   True -> print "ok {name} ({got} ~ {want})"
@@ -187,7 +187,7 @@ nestedProbe u =
   # the input rows are LOOP-INVARIANT: extract them once for backprop
   # instead of re-walking the matrix every epoch
   w1 = initRows 977 h 3;
-  w2 = List.append (initRow 5077 h) [Numeric.inexact 0];
+  w2 = (initRow 5077 h) + [Numeric.inexact 0];
   (w1t, w2t, mse, xaug2) = train 220 n 0.3 xaug xrows ys w1 w2 999;
   u0 = print "nn: final MSE {mse}  (linear-best ~ var(y) ~ 0.11)";
   k0 = chk "mse<0.02" mse 0 (Numeric.div 1 50);

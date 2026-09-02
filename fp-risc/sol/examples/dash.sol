@@ -52,7 +52,7 @@ update msg model =
   | ("refresh", v) -> (model, case unwrapU model == "" of True -> None | False -> Get "logins" "gotlogins")
   | ("gotlogins", v) -> ({model | logins = v}, None)
   | ("tick", v) -> (model, case unwrapU model == "" of True -> None | False -> Rng 20 95 "sample")
-  | ("sample", v) -> ({model | reqs = Str.parse v, series = base.takeN 10 (Str.parse v :: model.series)}, None)
+  | ("sample", v) -> ({model | reqs = Str.parse v, series = List.take 10 (Str.parse v :: model.series)}, None)
   | _ -> (model, None).
 
 

@@ -50,7 +50,7 @@ orbit k every x y vx vy =
   x2 = x + vx2 * 0.02;
   y2 = y + vy2 * 0.02;
   rest = orbit (k - 1) every x2 y2 vx2 vy2;
-  case Numeric.mod k every == 0 of
+  case (k % every) == 0 of
     True -> (x, y) :: rest
   | False -> rest.
 

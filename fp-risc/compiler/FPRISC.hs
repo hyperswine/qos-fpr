@@ -168,7 +168,7 @@ lowerName = try $ do
 pName :: P Name
 pName = try (parens operatorName) <|> lowerName
   where
-    operatorName = lexeme (some (oneOf "+-*/=!<>|$?"))
+    operatorName = lexeme (some (oneOf "+-*/%^=!<>|$?"))
 
 -- a lower identifier WITHOUT the reserved-word check: for positions
 -- that are syntactically unambiguous (signature names, use aliases),
@@ -306,12 +306,18 @@ opExpr = dollarChain
           SBin "-" <$ try (lexeme (char '-' <* notFollowedBy (char '>')))
         ]
 
-    mulLayer = chainl1' bangLayer mulOp
+    mulLayer = chainl1' powLayer mulOp
     mulOp =
       choice
         [ SBin "*" <$ symbol "*",
-          SBin "/" <$ symbol "/"
+          SBin "/" <$ symbol "/",
+          SBin "%" <$ symbol "%"
         ]
+
+    -- `^` binds tighter than * / % and is RIGHT-associative: 2 ^ 3 ^ 2 = 2 ^ 9
+    powLayer = do
+      a <- bangLayer
+      option a (symbol "^" *> (SBin "^" a <$> powLayer))
 
     bangLayer = chainl1' btLayer bangOp
     bangOp = SBin "!" <$ try (lexeme (char '!' <* notFollowedBy (char '=')))
@@ -1925,6 +1931,8 @@ primNames =
     "-",
     "*",
     "/",
+    "%",
+    "^",
     "==",
     "!=",
     "<",

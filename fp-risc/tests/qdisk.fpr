@@ -19,7 +19,7 @@ QL = use "../programs/mods/qlog".
 rep : String -> Int -> String .
 rep s n = repGo s n "".
 repGo : String -> (n : Int | measure n) -> String -> String .
-repGo s n acc = case n <= 0 of True -> acc | False -> repGo s (n - 1) (strcat acc s).
+repGo s n acc = case n <= 0 of True -> acc | False -> repGo s (n - 1) (acc + s).
 
 okOr r alt = case r of Ok s -> s | Err e -> alt.
 
@@ -31,8 +31,8 @@ olGo s i n acc = case i > n of True -> acc | False -> olCh s i n acc (charAt s i
 olCh : unsafe String -> Int -> Int -> String -> Int -> String .
 olCh s i n acc c =
   case c == 10 of
-    True -> olGo s (i + 1) n (strcat acc ",")
-  | False -> olGo s (i + 1) n (strcat acc (chr c)).
+    True -> olGo s (i + 1) n (acc + ",")
+  | False -> olGo s (i + 1) n (acc + (chr c)).
 
 main =
   dsk = device "blk";

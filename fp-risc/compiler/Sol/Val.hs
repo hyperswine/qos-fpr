@@ -250,6 +250,9 @@ writeCol :: Col -> Int -> Value -> IO ()
 writeCol (CI _ fp) i (VInt x) = withForeignPtr fp $ \p -> pokeElemOff p i (fromIntegral x)
 writeCol (CI _ _) _ v = ioError (userError ("*** SOL PANIC: Vec: Int column got " ++ render v ++ " (SoA layout is fixed by first push) ***"))
 writeCol (CD _ fp) i (VNum x) = withForeignPtr fp $ \p -> pokeElemOff p i x
+-- numeric contagion: an exact int pushed into an inexact column promotes
+-- on contact, exactly as `+` would ([1.5, 2] is a Numeric column)
+writeCol (CD _ fp) i (VInt x) = withForeignPtr fp $ \p -> pokeElemOff p i (fromIntegral x)
 writeCol (CD _ _) _ v = ioError (userError ("*** SOL PANIC: Vec: Numeric column got " ++ render v ++ " (SoA layout is fixed by first push) ***"))
 writeCol (CB _ a) i v = writeArray a i v
 

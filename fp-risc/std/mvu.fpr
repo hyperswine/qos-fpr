@@ -113,7 +113,6 @@ apnd : unsafe List a -> a -> List a .
 apnd l x = case l of Nil -> x :: Nil | h :: r -> h :: apnd r x.
 revK : unsafe List a -> List a -> List a .
 revK acc l = case l of Nil -> acc | x :: r -> revK (x :: acc) r.
-imod a b = a - (a / b) * b.
 
 # ---- subscriptions: the list, folded to (tickMs, keysOn, port) --------------
 
@@ -434,7 +433,7 @@ trPrintAll l = case l of
 trP1 : unsafe List String -> String -> Int .
 trP1 r s = _ = print "  | {s}"; trPrintAll r.
 trVals : unsafe List String -> Int -> Int -> Int .
-trVals vs sc fr = case imod fr 10 == 0 of
+trVals vs sc fr = case (fr % 10) == 0 of
     True -> trPrintVals vs fr
   | False -> 0.
 trPrintVals : unsafe List String -> Int -> Int .

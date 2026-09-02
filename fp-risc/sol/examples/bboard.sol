@@ -42,7 +42,7 @@ pad4 s = pad4 " {s}".
 
 # ---------- tokenizing ----------
 nonEmpty s = s != "".
-words ln = base.splitCh 32 ln |> List.filter nonEmpty.
+words ln = Str.split 32 ln |> List.filter nonEmpty.
 upC c | c >= 97, c <= 122 = c - 32.
 upC c = c.
 
@@ -57,34 +57,34 @@ parseWs : unsafe List p101 -> List _ .
 parseWs ws =
   nm = ws ! 1;
   k = upC (Str.at nm 1);
-  case base.or2 (k == 42) (k == 46) of  # '*' comment, '.' directive
+  case or (k == 42) (k == 46) of  # '*' comment, '.' directive
     True -> []
-  | False -> parseKind k nm ws (base.listLen ws).
+  | False -> parseKind k nm ws (List.len ws).
 
 placeableKinds = [82, 67, 76, 68, 66].  # R C L D B
 
 parseKind : unsafe Int -> t100 -> u100 -> Int -> List _ .
 parseKind k nm ws n =
-  case base.and2 (member k placeableKinds) (n >= 3) of
+  case and (member k placeableKinds) (n >= 3) of
     True -> [{kind = k, na = ws ! 2, nb = ws ! 3, nm = nm,
               val = (case n >= 4 of True -> ws ! 4 | False -> "")}]
-  | False -> (case base.and2 (member k [86, 73]) (n >= 3) of  # V I sources
+  | False -> (case and (member k [86, 73]) (n >= 3) of  # V I sources
       True -> [{kind = k, na = ws ! 2, nb = ws ! 3, nm = nm, val = "src"}]
     | False -> []).
 
 parseNetlist : unsafe List String -> List _ .
 parseNetlist ls | ls == [] = [].
-parseNetlist ls = case ls of l :: r -> List.append (parseLine l) (parseNetlist r).
+parseNetlist ls = case ls of l :: r -> (parseLine l) + (parseNetlist r).
 
-isSource c = base.or2 (c.kind == 86) (c.kind == 73).
-notSource c = base.not2 (isSource c).
+isSource c = or (c.kind == 86) (c.kind == 73).
+notSource c = not (isSource c).
 
 # ---------- net classification ----------
 pwrNetsOf : unsafe List _ -> List b101 .
 pwrNetsOf comps | comps == [] = [].
 pwrNetsOf comps = case comps of c :: r -> pwStep2 c r.
 pwStep2 : unsafe _ -> List _ -> List d101 .
-pwStep2 c r = case base.and2 (isSource c) (c.nb == "0") of
+pwStep2 c r = case and (isSource c) (c.nb == "0") of
   True -> c.na :: pwrNetsOf r
 | False -> pwrNetsOf r.
 
@@ -148,13 +148,13 @@ scoreCand na nb sA st =
   okB = stripOK sB nb st.owners;
   fA = freeCol sA st.holes;
   fB = freeCol sB st.holes;
-  case base.and2 (base.and2 okA okB) (base.and2 (fA > 0) (fB > 0)) of
+  case and (and okA okB) (and (fA > 0) (fB > 0)) of
     False -> 0 - 1000000
   | True ->
       100 * base.boolInt (ownA == Got na)
       + 100 * base.boolInt (ownB == Got nb)
-      - 40 * base.boolInt (base.and2 (netStrips na st.netstr != []) (base.not2 (ownA == Got na)))
-      - 40 * base.boolInt (base.and2 (netStrips nb st.netstr != []) (base.not2 (ownB == Got nb)))
+      - 40 * base.boolInt (and (netStrips na st.netstr != []) (not (ownA == Got na)))
+      - 40 * base.boolInt (and (netStrips nb st.netstr != []) (not (ownB == Got nb)))
       - Numeric.abs (sRow sA - 14).
 
 allKeys : unsafe Int -> List Int .
@@ -183,7 +183,7 @@ track net k netstr =
   ss = netStrips net netstr;
   case member k ss of
     True -> netstr
-  | False -> (net, List.append ss [k]) :: dropKey net netstr.
+  | False -> (net, ss + [k]) :: dropKey net netstr.
 
 dropKey : unsafe l95 -> List (l95, k95) -> List (l95, k95) .
 dropKey _ [] = [].
@@ -209,7 +209,7 @@ commit c sA st =
   {st | holes = (sA, cA) :: (sB, cB) :: st.holes,
         owners = own sB c.nb (own sA c.na st.owners),
         netstr = track c.nb sB (track c.na sA st.netstr),
-      places = List.append st.places [(c.nm, c.kind, sA, cA, cB)]}.
+      places = (st.places + [(c.nm, c.kind, sA, cA, cB)])}.
 
 placeAll : unsafe List _ -> _ -> _ .
 placeAll cs st | cs == [] = st.
@@ -241,7 +241,7 @@ jumpDo net s1 s2 more ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   (lb, ws3) = allocLbl s2 "W{wsA.k}b" ws2;
-  jumpNet net (s2 :: more) {ws3 | wires = List.append ws3.wires [(net, la, lb, "JUMPER")]}.
+  jumpNet net (s2 :: more) {ws3 | wires = (ws3.wires + [(net, la, lb, "JUMPER")])}.
 
 # rail wire: from the net's first strip to the given rail
 railWire : unsafe f103 -> g103 -> List Int -> _ -> _ .
@@ -252,7 +252,7 @@ railDo net rail s1 ws =
   wsA = {ws | k = ws.k + 1};
   (la, ws2) = allocLbl s1 "W{wsA.k}a" wsA;
   {ws2 | rails = (rail, (sRow s1, "W{wsA.k}b")) :: ws2.rails,
-      wires = List.append ws2.wires [(net, la, rail, "RAIL")]}.
+      wires = (ws2.wires + [(net, la, rail, "RAIL")])}.
 
 wireNets : unsafe List String -> List String -> List (String, x103) -> _ -> _ .
 wireNets nets pwrs netstr ws | nets == [] = ws.
@@ -288,7 +288,7 @@ countWires net wires = case wires of w :: r -> cwStep net w r.
 cwStep : unsafe j97 -> (j97, h97, i97, String) -> List (j97, h97, i97, String) -> Int .
 cwStep net w r =
   (n2, f, t, kd) = w;
-  countWires net r + base.boolInt (base.and2 (n2 == net) (kd == "JUMPER")).
+  countWires net r + base.boolInt (and (n2 == net) (kd == "JUMPER")).
 
 checkNets : unsafe List n97 -> List (n97, k97) -> List (n97, l97, m97, String) -> String .
 checkNets nets netstr wires | nets == [] = "connectivity: OK".
@@ -296,9 +296,9 @@ checkNets nets netstr wires = case nets of n :: r -> cnStep n r netstr wires.
 cnStep : unsafe r97 -> List r97 -> List (r97, o97) -> List (r97, p97, q97, String) -> String .
 cnStep n r netstr wires =
   ss = netStrips n netstr;
-  need = base.listLen ss - 1;
+  need = List.len ss - 1;
   got = countWires n wires;
-  case base.and2 (need > 0) (base.not2 (got == need)) of
+  case and (need > 0) (not (got == need)) of
     True -> "net {n}: {got}/{need} jumpers MISSING"
   | False -> checkNets r netstr wires.
 
@@ -401,7 +401,7 @@ runBoard title ls =
   ua = print "  {checkNets nets st.netstr ws.wires}";
   ub = print "";
   uc = print header;
-  cm = List.append (cellMapOf st.places) ws.labels;
+  cm = (cellMapOf st.places) + ws.labels;
   renderRows cm ws.rails 1.
 
 ex1 = [

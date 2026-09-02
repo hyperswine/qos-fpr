@@ -311,7 +311,7 @@ depthT (Split col thr l r) = 1 + Int.max (depthT l) (depthT r).
 # first n are x, next n are z (both mapped to [-1,1)), next n the
 # label-noise draws.  5% of labels flip.
 
-lcgN s = Int.mod (1103515245 * s + 12345) 2147483648.
+lcgN s = (1103515245 * s + 12345) % 2147483648.
 
 fillM : unsafe Int -> Int -> Vector -> _ .
 fillM cnt s v = case cnt == 0 of

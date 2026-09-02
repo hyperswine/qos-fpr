@@ -121,6 +121,7 @@ opFrag f = \case
   Call l n -> Frag ([0xE8, 0, 0, 0, 0] ++ [0x48, 0x81, 0xC4] ++ imm32 (8 * n) ++ pushRax) [(1, l)]
   Ret -> bytes (popRax ++ epilogue)
   FuelTick -> bytes [0x48, 0x83, 0x2B, 0x01] -- sub qword [rbx], 1
+  Trap -> bytes ([0x48, 0xB8] ++ imm64 fuelTrap ++ [0x48, 0x89, 0x03, 0x6A, 0x00]) -- mov rax,imm64; mov [rbx],rax; push 0
   where
     unD b = bytes (popRax ++ movqXmm0Rax ++ b ++ movqRaxXmm0 ++ pushRax)
     binOp o = case o of

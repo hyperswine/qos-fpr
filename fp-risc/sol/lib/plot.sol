@@ -37,7 +37,7 @@ gridC = "#e7e6e2".
 surfC = "#fcfcfb".
 
 colors = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300"].
-colAt i = colors ! (Numeric.mod (i - 1) (List.len colors) + 1).
+colAt i = colors ! (((i - 1) % (List.len colors)) + 1).
 
 # ---- small numeric helpers -------------------------------------------------
 

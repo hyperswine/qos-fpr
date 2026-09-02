@@ -14,17 +14,17 @@ rows s i field row acc = case peek s i of
   | 44 -> rows s (i + 1) "" (field :: row) acc
   | 10 -> rows s (i + 1) "" [] (close field row acc)
   | 13 -> rows s (i + 1) field row acc
-  | c -> rows s (i + 1) "{field}{chr c}" row acc.
+  | c -> rows s (i + 1) "{field}{Str.fromCode c}" row acc.
 quoted s i field row acc = case peek s i of
     0 -> Err "csv: unterminated quote"
   | 34 -> (case peek s (i + 1) == 34 of
       True -> quoted s (i + 2) "{field}\"" row acc
     | False -> rows s (i + 1) field row acc)
-  | c -> quoted s (i + 1) "{field}{chr c}" row acc.
+  | c -> quoted s (i + 1) "{field}{Str.fromCode c}" row acc.
 close field row acc = case and (field == "") (row == []) of
     True -> acc
   | False -> List.rev (field :: row) :: acc.
-peek s i = case i > strlen s of True -> 0 | False -> charAt s i.
+peek s i = case i > Str.len s of True -> 0 | False -> Str.at s i.
 
 render rs = Str.join "" (List.map (fn r -> "{Str.join "," (List.map field r)}\n") rs).
 field f = case or (Str.contains "," f) (or (Str.contains "\"" f) (Str.contains "\n" f)) of

@@ -1,0 +1,542 @@
+# ============================================================================
+# fprlive.fpr -- FPRLive: LiveView over a real websocket, for FP-RISC apps
+# on the socket tier (qosp / virt).  The browser driver for a
+# per-SESSION MVU app:
+#
+#   main = FL.serve { env = e, css = G.cssFor } (FL.App init update view subs).
+#
+#   init   env                    -> model                (shared by every client)
+#   update env (Ev) model         -> (model, List MC)     Ev = EMsg sid msg arg
+#                                                            | ETick | EGone sid
+#   view   sid model              -> genview tree         rendered PER SESSION
+#   subs   model                  -> List MV.Sub          STick ms drives server ticks
+#
+# A session id (sid) is minted per websocket and never reused; EGone sid
+# arrives when its socket closes (a close frame, or the peer vanishing:
+# the socket tier reports that as an empty read), so update can forget
+# it.  sid 0 renders the page for a browser that has not connected yet.
+#
+# The wire (docs/FPRLIVE.md):
+#   GET /            the page: generated CSS, <div id=lv-root>, the client
+#   GET /ws          RFC 6455 upgrade (Sec-WebSocket-Accept = base64(sha1
+#                    (key ++ GUID)), both implemented here in FPRISC)
+#   client -> server text frames  {"msg":"buy","arg":"2"}
+#   server -> client text frames  {"s":[..],"d":[..]}  full render (on
+#                                 connect and on a reshape)
+#                                 {"d":{"3":"..."}}     a delta, computed
+#                                 against what THIS session last saw
+#   every update (any client's event, or a tick) is PUSHED to every open
+#   session -- one register, many screens, each with its own view.
+#   ping -> pong; close -> close; binary / fragmented / unmasked / oversize
+#   frames are refused with the RFC's close codes (1003 / 1002 / 1009).
+#
+# Limits that are the socket tier's, not this module's: 8 connections
+# (QOS_NET_MAXCONN), 8 KiB receive buffer per connection, 1 KiB per
+# netRead call.  Frames above 4096 bytes are refused (1009).
+# ============================================================================
+
+MV = use "../../std/mvu".
+G  = use "genview".
+LJ = use "fprlivejs".
+Core = use "coreutil".
+
+STick = MV.STick.
+MQuit = MV.MQuit.
+MLog = MV.MLog.
+
+Ev = Type (EMsg sid msg arg | ETick | EGone sid).
+App = Type (App ini upd vw sbs).
+
+# ---- bytes and small helpers ------------------------------------------------
+
+crlf = strcat (chr 13) (chr 10).
+and2 a b = case a of True -> b | False -> False.
+or2 a b = case a of True -> True | False -> b.
+
+# index just PAST pat's first match at/after i; 0 = no match
+findSub s pat i = fsGo s pat i (strlen s) (strlen pat).
+fsGo : unsafe String -> String -> Int -> Int -> Int -> Int .
+fsGo s pat i n pn | i + pn - 1 > n = 0.
+fsGo s pat i n pn | G.strEq (substr s i pn) pat = i + pn.
+fsGo s pat i n pn = fsGo s pat (i + 1) n pn.
+
+digits : unsafe String -> Int -> Int -> Int .
+digits s i acc | i > strlen s = acc.
+digits s i acc = digCh s i acc (charAt s i).
+digCh : unsafe String -> Int -> Int -> Int -> Int .
+digCh s i acc c | and2 (c >= 48) (c <= 57) = digits s (i + 1) (acc * 10 + (c - 48)).
+digCh s i acc c = acc.
+
+# characters until the delimiter, from i
+until : unsafe String -> Int -> Int -> String -> String .
+until s i dl acc | i > strlen s = acc.
+until s i dl acc | charAt s i == dl = acc.
+until s i dl acc = until s (i + 1) dl (strcat acc (chr (charAt s i))).
+
+# ---- HTTP -----------------------------------------------------------------------
+
+headEnd req = findSub req "{crlf}{crlf}" 1.
+method req = until req 1 32 "".
+path req = until req (strlen (method req) + 2) 32 "".
+
+# the value of a header, "" when absent (case-sensitive: browsers send
+# canonical names; a client sending odd casing gets a 400, by design)
+header req name = hAt req (findSub req "{crlf}{name}: " 1).
+hAt req 0 = "".
+hAt req i = until req i 13 "".
+
+httpResp code ctype body =
+  "HTTP/1.1 {code}{crlf}Content-Type: {ctype}{crlf}Content-Length: {strlen body}{crlf}Connection: close{crlf}{crlf}{body}".
+
+# ---- SHA-1 (RFC 3174) over a byte string, for the upgrade handshake ---------------
+# 32-bit arithmetic on the 63-bit Int: every intermediate stays below 2^63
+# because operands are masked to 32 bits before each shift or add.
+
+m32 = 4294967295.
+w32 x = band x m32.
+rotl n x = w32 (bor (BITSHIFTL x n) (BITSHIFTR x (32 - n))).
+add32 a b = w32 (a + b).
+bnot32 x = bxor x m32.
+
+# the padded message as a list of 32-bit words (big-endian)
+padWords s = wordsOf (padded s).
+padded s =
+  n = strlen s;
+  zeros = padZeros ((56 - (n + 1) % 64 + 64) % 64);
+  "{s}{chr 128}{zeros}{be64 (n * 8)}".
+padZeros : unsafe Int -> String .
+padZeros 0 = "".
+padZeros k = strcat (chr 0) (padZeros (k - 1)).
+be64 n = "{chr 0}{chr 0}{chr 0}{chr 0}{chr (band (BITSHIFTR n 24) 255)}{chr (band (BITSHIFTR n 16) 255)}{chr (band (BITSHIFTR n 8) 255)}{chr (band n 255)}".
+wordsOf : unsafe String -> List Int .
+wordsOf s = woGo s 1 (strlen s).
+woGo : unsafe String -> Int -> Int -> List Int .
+woGo s i n | i > n = Nil.
+woGo s i n = (charAt s i * 16777216 + charAt s (i + 1) * 65536 + charAt s (i + 2) * 256 + charAt s (i + 3)) :: woGo s (i + 4) n.
+
+# 80-word schedule from a 16-word block (kept as a reversed list while extending)
+sched : unsafe List Int -> Int -> List Int .
+sched rw 80 = rw.
+sched rw t = sched (rotl 1 (bxor (bxor (nth rw 3) (nth rw 8)) (bxor (nth rw 14) (nth rw 16))) :: rw) (t + 1).
+nth : unsafe List Int -> Int -> Int .
+nth (x :: r) 1 = x.
+nth (x :: r) k = nth r (k - 1).
+nth Nil k = 0.
+
+take16 : unsafe List Int -> Int -> List Int .
+take16 ws 0 = Nil.
+take16 (w :: r) k = w :: take16 r (k - 1).
+take16 Nil k = Nil.
+drop16 : unsafe List Int -> Int -> List Int .
+drop16 ws 0 = ws.
+drop16 (w :: r) k = drop16 r (k - 1).
+drop16 Nil k = Nil.
+rev : unsafe List Int -> List Int -> List Int .
+rev Nil acc = acc.
+rev (x :: r) acc = rev r (x :: acc).
+
+# one block: fold the 80 rounds
+block h ws =
+  w = rev (sched (rev (take16 ws 16) Nil) 16) Nil;
+  rounds h w 0 h.
+rounds : unsafe List Int -> List Int -> Int -> List Int -> List Int .
+rounds h0 Nil t h = addH h0 h.
+rounds h0 (w :: wr) t h =
+  (a, b, c, d, e) = five h;
+  f = fOf t b c d;
+  k = kOf t;
+  temp = add32 (add32 (add32 (add32 (rotl 5 a) f) e) k) w;
+  rounds h0 wr (t + 1) (temp :: a :: rotl 30 b :: c :: d :: Nil).
+five (a :: b :: c :: d :: e :: Nil) = (a, b, c, d, e).
+five _ = (0, 0, 0, 0, 0).
+fOf t b c d | t < 20 = w32 (bor (band b c) (band (bnot32 b) d)).
+fOf t b c d | t < 40 = bxor (bxor b c) d.
+fOf t b c d | t < 60 = w32 (bor (bor (band b c) (band b d)) (band c d)).
+fOf t b c d = bxor (bxor b c) d.
+kOf t | t < 20 = 1518500249.
+kOf t | t < 40 = 1859775393.
+kOf t | t < 60 = 2400959708.
+kOf t = 3395469782.
+addH : unsafe List Int -> List Int -> List Int .
+addH Nil Nil = Nil.
+addH (x :: xr) (y :: yr) = add32 x y :: addH xr yr.
+addH a b = Nil.
+
+sha1 s = shaBlocks (1732584193 :: 4023233417 :: 2562383102 :: 271733878 :: 3285377520 :: Nil) (padWords s).
+shaBlocks : unsafe List Int -> List Int -> List Int .
+shaBlocks h Nil = h.
+shaBlocks h ws = shaBlocks (block h ws) (drop16 ws 16).
+
+# the 20-byte digest as bytes
+digestBytes : unsafe List Int -> String .
+digestBytes Nil = "".
+digestBytes (w :: r) = "{chr (band (BITSHIFTR w 24) 255)}{chr (band (BITSHIFTR w 16) 255)}{chr (band (BITSHIFTR w 8) 255)}{chr (band w 255)}{digestBytes r}".
+
+# ---- base64 ----------------------------------------------------------------------
+
+b64c i = charAt "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" (i + 1).
+base64 s = b64Go s 1 (strlen s) "".
+b64Go : unsafe String -> Int -> Int -> String -> String .
+b64Go s i n acc | i > n = acc.
+b64Go s i n acc | i + 2 <= n =
+  x = charAt s i * 65536 + charAt s (i + 1) * 256 + charAt s (i + 2);
+  b64Go s (i + 3) n "{acc}{chr (b64c (BITSHIFTR x 18))}{chr (b64c (band (BITSHIFTR x 12) 63))}{chr (b64c (band (BITSHIFTR x 6) 63))}{chr (b64c (band x 63))}".
+b64Go s i n acc | i + 1 <= n =
+  x = charAt s i * 65536 + charAt s (i + 1) * 256;
+  "{acc}{chr (b64c (BITSHIFTR x 18))}{chr (b64c (band (BITSHIFTR x 12) 63))}{chr (b64c (band (BITSHIFTR x 6) 63))}=".
+b64Go s i n acc =
+  x = charAt s i * 65536;
+  "{acc}{chr (b64c (BITSHIFTR x 18))}{chr (b64c (band (BITSHIFTR x 12) 63))}==".
+
+acceptKey key = base64 (digestBytes (sha1 (strcat key "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))).
+
+# ---- websocket frames --------------------------------------------------------------
+# a parsed client frame: (state, op, payload, consumed)
+#   state 0 = incomplete (need more bytes), 1 = frame, 2 = protocol error
+#   (unmasked / fragmented / reserved bits), 3 = too big
+
+maxFrame = 4096.
+
+frame b = frHead b (strlen b).
+frHead b n | n < 2 = (0, 0, "", 0).
+frHead b n =
+  b0 = charAt b 1;
+  b1 = charAt b 2;
+  fin = band b0 128;
+  rsv = band b0 112;
+  op = band b0 15;
+  masked = band b1 128;
+  l7 = band b1 127;
+  frLen b n fin rsv op masked l7.
+frLen b n fin rsv op masked l7 | or2 (fin == 0) (or2 (rsv != 0) (or2 (masked == 0) (op == 0))) = (2, op, "", 0).
+frLen b n fin rsv op masked l7 | l7 < 126 = frBody b n op l7 3.
+frLen b n fin rsv op masked l7 | l7 == 126 = frLen16 b n op.
+frLen b n fin rsv op masked l7 = (3, op, "", 0).           # 64-bit length: always over the cap
+frLen16 b n op | n < 4 = (0, 0, "", 0).
+frLen16 b n op = frBody b n op (charAt b 3 * 256 + charAt b 4) 5.
+frBody b n op len hdr | len > maxFrame = (3, op, "", 0).
+frBody b n op len hdr | n < hdr + 3 + len = (0, 0, "", 0).
+frBody b n op len hdr =
+  key = substr b hdr 4;
+  (1, op, unmask (substr b (hdr + 4) len) key 1 "", hdr + 3 + len).
+# unmasked in 32-byte pieces joined pairwise: a byte-at-a-time accumulator
+# on a 4 KiB frame would leave megabytes of garbage in the turn
+unmask : unsafe String -> String -> Int -> String -> String .
+unmask p key i acc = Core.concat (umPieces p key 1 (strlen p) Nil).
+umPieces : unsafe String -> String -> Int -> Int -> List String -> List String .
+umPieces p key i n acc | i > n = revS acc Nil.
+umPieces p key i n acc = umPieces p key (i + 32) n (umRun p key i (min2 (i + 31) n) "" :: acc).
+umRun : unsafe String -> String -> Int -> Int -> String -> String .
+umRun p key i e acc | i > e = acc.
+umRun p key i e acc = umRun p key (i + 1) e (strcat acc (chr (bxor (charAt p i) (charAt key ((i - 1) % 4 + 1))))).
+min2 a b = case a < b of True -> a | False -> b.
+revS : unsafe List String -> List String -> List String .
+revS Nil acc = acc.
+revS (x :: r) acc = revS r (x :: acc).
+
+# a server frame: unmasked, one of text (1), close (8), pong (10)
+wsFrame op payload = "{chr (128 + op)}{lenBytes (strlen payload)}{payload}".
+lenBytes n | n < 126 = chr n.
+lenBytes n | n < 65536 = "{chr 126}{chr (BITSHIFTR n 8)}{chr (band n 255)}".
+lenBytes n = "{chr 127}{chr 0}{chr 0}{chr 0}{chr 0}{chr (band (BITSHIFTR n 24) 255)}{chr (band (BITSHIFTR n 16) 255)}{chr (band (BITSHIFTR n 8) 255)}{chr (band n 255)}".
+closeFrame code reason = wsFrame 8 "{chr (BITSHIFTR code 8)}{chr (band code 255)}{reason}".
+
+# ---- JSON: {"msg":"...","arg":"..."} with the string escapes decoded -----------------
+
+# tolerant of whitespace around the colon (JSON.stringify emits none,
+# other encoders do); a non-string value reads as ""
+jStr s key = jAt s (findSub s "\"{key}\"" 1) (strlen s).
+jAt s 0 n = "".
+jAt s i n = jColon s (skipSp s i n) n.
+jColon s i n | and2 (i <= n) (charAt s i == 58) = jQuote s (skipSp s (i + 1) n) n.
+jColon s i n = "".
+jQuote s i n | and2 (i <= n) (charAt s i == 34) = jRun s (i + 1) n "".
+jQuote s i n = "".
+skipSp : unsafe String -> Int -> Int -> Int .
+skipSp s i n | and2 (i <= n) (charAt s i == 32) = skipSp s (i + 1) n.
+skipSp s i n = i.
+# plain runs are copied whole; only an escape costs a piece
+jRun : unsafe String -> Int -> Int -> String -> String .
+jRun s i n acc = jRunAt s i i n acc.
+jRunAt : unsafe String -> Int -> Int -> Int -> String -> String .
+jRunAt s st i n acc | i > n = strcat acc (substr s st (i - st)).
+jRunAt s st i n acc | charAt s i == 34 = strcat acc (substr s st (i - st)).
+jRunAt s st i n acc | and2 (charAt s i == 92) (i < n) = jEsc s i n (strcat acc (substr s st (i - st))) (charAt s (i + 1)).
+jRunAt s st i n acc = jRunAt s st (i + 1) n acc.
+jEsc : unsafe String -> Int -> Int -> String -> Int -> String .
+jEsc s i n acc 110 = jRun s (i + 2) n (strcat acc (chr 10)).
+jEsc s i n acc 116 = jRun s (i + 2) n (strcat acc (chr 9)).
+jEsc s i n acc 114 = jRun s (i + 2) n (strcat acc (chr 13)).
+jEsc s i n acc 117 | i + 5 <= n = jRun s (i + 6) n (strcat acc (utf8 (hex4 s (i + 2)))).
+jEsc s i n acc 117 = acc.
+jEsc s i n acc c = jRun s (i + 2) n (strcat acc (chr c)).  # \" \\ \/
+hex4 s i = hexv (charAt s i) * 4096 + hexv (charAt s (i + 1)) * 256 + hexv (charAt s (i + 2)) * 16 + hexv (charAt s (i + 3)).
+hexv c | and2 (c >= 48) (c <= 57) = c - 48.
+hexv c | and2 (c >= 97) (c <= 102) = c - 87.
+hexv c | and2 (c >= 65) (c <= 70) = c - 55.
+hexv c = 0.
+# a code point as UTF-8; a lone surrogate (a JSON \uD83D pair half) is marked
+utf8 cp | cp < 128 = chr cp.
+utf8 cp | cp < 2048 = "{chr (192 + cp / 64)}{chr (128 + cp % 64)}".
+utf8 cp | and2 (cp >= 55296) (cp < 57344) = "?".
+utf8 cp = "{chr (224 + cp / 4096)}{chr (128 + (cp / 64) % 64)}{chr (128 + cp % 64)}".
+
+# ---- the page ------------------------------------------------------------------------
+
+page css tree s d =
+  "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>{css tree}</style></head><body><div id=\"lv-root\"></div><script>window.__LV__=\{s:{G.jarr s},d:{G.jarr d}};</script><script>{LJ.src 0}</script></body></html>".
+
+# ---- subscriptions / commands -----------------------------------------------------------
+
+tickMsOf : unsafe List MV.Sub -> Int .
+tickMsOf Nil = 0.
+tickMsOf (s :: r) = tmOne r s.
+tmOne : unsafe List MV.Sub -> MV.Sub -> Int .
+tmOne r s = case s of
+    STick ms -> ms
+  | o -> tickMsOf r.
+
+quitOf : unsafe List MV.MC -> Int -> Int .
+quitOf Nil q = q.
+quitOf (MQuit :: r) q = quitOf r 1.
+quitOf (MLog s :: r) q = _ = Sys.logAt 0 s; quitOf r q.
+quitOf (c :: r) q = quitOf r q.
+
+# ---- connections ----------------------------------------------------------------------
+# one record per live connection id: (cid, mode, buf, lastS, lastD, sid)
+#   mode 0 = http request in progress, 1 = websocket session (sid > 0)
+
+Conn = Type (Conn cid mode buf ls ld sid).
+
+cGet : unsafe List Conn -> Int -> Conn .
+cGet Nil cid = Conn cid 0 "" Nil Nil 0.
+cGet (Conn i m b ls ld sid :: r) cid | i == cid = Conn i m b ls ld sid.
+cGet (c :: r) cid = cGet r cid.
+cPut : unsafe List Conn -> Conn -> List Conn .
+cPut cs (Conn i m b ls ld sid) = Conn i m b ls ld sid :: cDel cs i.
+cDel : unsafe List Conn -> Int -> List Conn .
+cDel Nil cid = Nil.
+cDel (Conn i m b ls ld sid :: r) cid | i == cid = cDel r cid.
+cDel (c :: r) cid = c :: cDel r cid.
+cLen : unsafe List Conn -> Int .
+cLen Nil = 0.
+cLen (c :: r) = 1 + cLen r.
+
+# ---- the server -----------------------------------------------------------------------
+# state: Sv model conns ltt nev ns   (ltt = last tick time, nev = events
+# served, ns = sessions minted so far)
+
+Sv = Type (Sv model conns ltt nev ns).
+St = Type (St mt cfg app sv).      # everything the loop carries across a boundary
+
+serve cfg app =
+  App ini upd vw sbs = app;
+  nic = device "net";
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  m0 = ini cfg.env;
+  srvLoop mt cfg app (Sv m0 Nil (read mt) 0 0).
+
+# THE FRAME BOUNDARY (docs/MEMORY.md): an actor's pool is reclaimed only
+# by a reset, so a server that ran for a day in one pool would keep every
+# rendered string it ever made (~175 KB per event, measured).  Each turn
+# of the loop sends its whole state to itself as a message, resets the
+# pool -- every temporary of the turn dies -- and reads the state back:
+# the MVU driver's soft death, applied to a socket loop.  The copy is a
+# few KB per session; the pool stays flat for the life of the process.
+srvLoop : unsafe Int -> _ -> App -> Sv -> String .
+srvLoop mt cfg app sv =
+  me = myself 0;
+  _ = send me (St mt cfg app sv);   # mt is a Register handle: it must cross too
+  _ = Sys.poolReset 0;
+  srvWake (receiveFrom me me).
+srvWake : unsafe St -> String .
+srvWake m =
+  St mt cfg app sv = keep m;      # the state is the pool's own again (a service reply's
+  _ = drop m;                     # receive would otherwise free the slab under a borrow)
+  srvPoll mt cfg app sv (netPoll 0) 0.
+# (k = naps since the last boundary: idle turns allocate little, so the
+# boundary is taken every 32nd nap rather than every millisecond)
+srvPoll : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String .
+srvPoll mt cfg app sv cid k = case cid == 0 of
+    True -> srvIdle mt cfg app sv k
+  | False -> srvData mt cfg app sv cid.
+
+# idle: a due server-side tick, else a short nap off the socket
+srvIdle : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvIdle mt cfg app sv k =
+  App ini upd vw sbs = app;
+  Sv model conns ltt nev ns = sv;
+  srvTick mt cfg app sv (tickMsOf (sbs model)) (read mt) k.
+srvTick : unsafe Int -> _ -> App -> Sv -> Int -> Int -> Int -> String .
+srvTick mt cfg app sv tickMs now k =
+  Sv model conns ltt nev ns = sv;
+  case and2 (tickMs > 0) (now - ltt >= tickMs * 10000) of
+    True -> srvUpdate mt cfg app (Sv model conns now nev ns) ETick
+  | False -> srvNap mt cfg app sv k.
+srvNap : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvNap mt cfg app sv k | k >= 32 = srvLoop mt cfg app sv.
+srvNap mt cfg app sv k =
+  _ = Sys.sleepUs 1000;
+  srvPoll mt cfg app sv (netPoll 0) (k + 1).
+
+# one event through update, then a push to EVERY session: (state, quit?)
+step : unsafe _ -> App -> Sv -> Ev -> (Sv, Int) .
+step cfg app sv ev =
+  App ini upd vw sbs = app;
+  Sv model conns ltt nev ns = sv;
+  (m2, cs) = upd cfg.env ev model;
+  conns2 = pushAll vw m2 conns Nil;
+  (Sv m2 conns2 ltt (nev + 1) ns, quitOf cs 0).
+
+srvUpdate : unsafe Int -> _ -> App -> Sv -> Ev -> String .
+srvUpdate mt cfg app sv ev =
+  (sv2, q) = step cfg app sv ev;
+  srvAfter mt cfg app sv2 q.
+srvAfter : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvAfter mt cfg app sv 1 = srvBye sv.
+srvAfter mt cfg app sv q = srvLoop mt cfg app sv.
+
+# render per session, ship a delta (same statics) or a full render
+pushAll : unsafe _ -> _ -> List Conn -> List Conn -> List Conn .
+pushAll vw m Nil acc = acc.
+pushAll vw m (Conn cid 1 b ls ld sid :: r) acc = pushAll vw m r (pushOne vw m cid sid b ls ld :: acc).
+pushAll vw m (c :: r) acc = pushAll vw m r (c :: acc).
+# the connection's unread bytes (frames behind the one just handled) stay
+pushOne vw m cid sid b ls ld =
+  (s2, d2) = G.render (vw sid m);
+  _ = case G.sameStatics ls s2 of
+      True -> pushDelta cid (G.deltaJson ld d2)
+    | False -> _ = netWrite cid (wsFrame 1 "\{\"s\":{G.jarr s2},\"d\":{G.jarr d2}}"); 0;
+  Conn cid 1 b s2 d2 sid.
+pushDelta cid dj | G.strEq dj "\{}" = 0.           # nothing changed for this session
+pushDelta cid dj = _ = netWrite cid (wsFrame 1 "\{\"d\":{dj}}"); 0.
+
+# data on a connection: append to its buffer, then act by mode.  An
+# EMPTY read is the socket tier's notice that the peer has gone (its
+# id is free again from here): the session ends without a close frame.
+srvData : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvData mt cfg app sv cid =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  bytes = netRead cid;
+  case strlen bytes == 0 of
+    True -> srvGone mt cfg app (Sv model (cDel conns cid) ltt nev ns) mode sid
+  | False -> srvBytes mt cfg app (Sv model (cPut conns (Conn cid mode (strcat buf bytes) ls ld sid)) ltt nev ns) cid mode.
+srvBytes : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String .
+srvBytes mt cfg app sv cid 1 = srvFrames mt cfg app sv cid.
+srvBytes mt cfg app sv cid m =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  srvHttp mt cfg app sv cid buf (headEnd buf).
+
+# ---- HTTP: the page, the upgrade, or 404 ------------------------------------------------
+
+srvHttp : unsafe Int -> _ -> App -> Sv -> Int -> String -> Int -> String .
+srvHttp mt cfg app sv cid req 0 | strlen req > 8000 = srvHttpBad mt cfg app sv cid "431 Request Header Fields Too Large".
+srvHttp mt cfg app sv cid req 0 = srvLoop mt cfg app sv.      # head still partial
+srvHttp mt cfg app sv cid req he = srvRoute mt cfg app sv cid req (method req) (path req).
+
+srvRoute : unsafe Int -> _ -> App -> Sv -> Int -> String -> String -> String -> String .
+srvRoute mt cfg app sv cid req mth pth | and2 (G.strEq mth "GET") (G.strEq pth "/") = srvPage mt cfg app sv cid.
+srvRoute mt cfg app sv cid req mth pth | and2 (G.strEq mth "GET") (G.strEq pth "/ws") = srvUpgrade mt cfg app sv cid (header req "Sec-WebSocket-Key") (bodyOf req (headEnd req)).
+srvRoute mt cfg app sv cid req mth pth = srvHttpBad mt cfg app sv cid "404 Not Found".
+
+srvHttpBad : unsafe Int -> _ -> App -> Sv -> Int -> String -> String .
+srvHttpBad mt cfg app sv cid code =
+  Sv model conns ltt nev ns = sv;
+  _ = netWrite cid (httpResp code "text/plain" code);
+  _ = netClose cid;
+  srvLoop mt cfg app (Sv model (cDel conns cid) ltt nev ns).
+
+# GET /: the page rendered for a fresh session view (sid 0: "not yet connected")
+srvPage : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvPage mt cfg app sv cid =
+  App ini upd vw sbs = app;
+  Sv model conns ltt nev ns = sv;
+  tree = vw 0 model;
+  (s, d) = G.render tree;
+  _ = netWrite cid (httpResp "200 OK" "text/html" (page cfg.css tree s d));
+  _ = netClose cid;
+  srvLoop mt cfg app (Sv model (cDel conns cid) ltt nev ns).
+
+# GET /ws: the handshake, a fresh sid, the session's first full render;
+# frames a client sent right behind its head are handled at once
+srvUpgrade : unsafe Int -> _ -> App -> Sv -> Int -> String -> String -> String .
+srvUpgrade mt cfg app sv cid key rest | strlen key != 24 = srvHttpBad mt cfg app sv cid "400 Bad Request".
+srvUpgrade mt cfg app sv cid key rest =
+  App ini upd vw sbs = app;
+  Sv model conns ltt nev ns = sv;
+  _ = netWrite cid "HTTP/1.1 101 Switching Protocols{crlf}Upgrade: websocket{crlf}Connection: Upgrade{crlf}Sec-WebSocket-Accept: {acceptKey key}{crlf}{crlf}";
+  c = pushOne vw model cid (ns + 1) rest ("<fresh>" :: Nil) Nil;   # statics never match: a full render
+  srvFrames mt cfg app (Sv model (cPut conns c) ltt nev (ns + 1)) cid.
+bodyOf req he = substr req he (strlen req - he + 1).
+
+# ---- websocket: drain every complete frame in the buffer --------------------------------
+
+srvFrames : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvFrames mt cfg app sv cid =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  (st, op, payload, used) = frame buf;
+  srvFrame mt cfg app sv cid st op payload used.
+srvFrame : unsafe Int -> _ -> App -> Sv -> Int -> Int -> Int -> String -> Int -> String .
+srvFrame mt cfg app sv cid 0 op payload used = srvFrameWait mt cfg app sv cid.
+srvFrame mt cfg app sv cid 2 op payload used = srvClose mt cfg app sv cid 1002 "protocol error".
+srvFrame mt cfg app sv cid 3 op payload used = srvClose mt cfg app sv cid 1009 "frame too big".
+srvFrame mt cfg app sv cid 1 op payload used = srvOp mt cfg app (consume sv cid used) cid op payload.
+
+# an incomplete frame: keep the bytes unless the buffer is already absurd
+srvFrameWait : unsafe Int -> _ -> App -> Sv -> Int -> String .
+srvFrameWait mt cfg app sv cid =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  case strlen buf > maxFrame + 16 of
+    True -> srvClose mt cfg app sv cid 1009 "frame too big"
+  | False -> srvLoop mt cfg app sv.
+
+consume sv cid used =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  Sv model (cPut conns (Conn i mode (substr buf (used + 1) (strlen buf - used)) ls ld sid)) ltt nev ns.
+
+srvOp : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String -> String .
+srvOp mt cfg app sv cid 1 payload = srvEvent mt cfg app sv cid (jStr payload "msg") (jStr payload "arg").
+srvOp mt cfg app sv cid 9 payload = _ = netWrite cid (wsFrame 10 payload); srvFrames mt cfg app sv cid.
+srvOp mt cfg app sv cid 10 payload = srvFrames mt cfg app sv cid.
+srvOp mt cfg app sv cid 8 payload = srvClose mt cfg app sv cid 1000 "bye".
+srvOp mt cfg app sv cid op payload = srvClose mt cfg app sv cid 1003 "text frames only".
+
+# an event: a missing msg is ignored (the frame is consumed), else update + push
+srvEvent : unsafe Int -> _ -> App -> Sv -> Int -> String -> String -> String .
+srvEvent mt cfg app sv cid msg arg | G.strEq msg "" = srvFrames mt cfg app sv cid.
+srvEvent mt cfg app sv cid msg arg =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  (sv2, q) = step cfg app sv (EMsg sid msg arg);
+  srvMore mt cfg app sv2 cid q.
+# after the update the same buffer may hold more frames
+srvMore : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String .
+srvMore mt cfg app sv cid 1 = srvBye sv.
+srvMore mt cfg app sv cid q = srvFrames mt cfg app sv cid.
+
+# close a socket; a websocket's session is reported to update as EGone
+srvClose : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String -> String .
+srvClose mt cfg app sv cid code reason =
+  Sv model conns ltt nev ns = sv;
+  Conn i mode buf ls ld sid = cGet conns cid;
+  _ = netWrite cid (closeFrame code reason);
+  _ = netClose cid;
+  srvGone mt cfg app (Sv model (cDel conns cid) ltt nev ns) mode sid.
+srvGone : unsafe Int -> _ -> App -> Sv -> Int -> Int -> String .
+srvGone mt cfg app sv 1 sid = srvUpdate mt cfg app sv (EGone sid).
+srvGone mt cfg app sv m sid = srvLoop mt cfg app sv.
+
+srvBye sv =
+  Sv model conns ltt nev ns = sv;
+  _ = byeAll conns;
+  "fprlive: server closed after {nev} event(s), {ns} session(s)".
+byeAll : unsafe List Conn -> Int .
+byeAll Nil = 0.
+byeAll (Conn cid 1 b ls ld sid :: r) = _ = netWrite cid (closeFrame 1001 "server going away"); _ = netClose cid; byeAll r.
+byeAll (Conn cid m b ls ld sid :: r) = _ = netClose cid; byeAll r.

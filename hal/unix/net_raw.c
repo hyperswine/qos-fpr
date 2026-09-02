@@ -24,6 +24,7 @@ static struct nconn {
   int fd; /* -1 = free slot */
   uint8_t rx[RXCAP];
   uint32_t rxlen;
+  int eof; /* peer closed: reported ONCE as an empty read, then dropped */
 } conns[MAXCONN];
 static int conns_init;
 static uint32_t poll_rr; /* fair-poll rotation cursor */
@@ -42,6 +43,7 @@ static void conn_drop(struct nconn *c) {
   close(c->fd);
   c->fd = -1;
   c->rxlen = 0;
+  c->eof = 0;
 }
 
 void qos_netraw_setup(void) {
@@ -85,15 +87,20 @@ static void net_pump(void) {
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
     conns[slot].fd = fd;
     conns[slot].rxlen = 0;
+    conns[slot].eof = 0;
   }
   for (int i = 0; i < MAXCONN; i++) {
     struct nconn *c = &conns[i];
     if (c->fd < 0) continue;
-    while (c->rxlen < RXCAP) {
+    while (c->rxlen < RXCAP && !c->eof) {
       ssize_t n = read(c->fd, c->rx + c->rxlen, RXCAP - c->rxlen);
       if (n > 0) { c->rxlen += (uint32_t)n; continue; }
-      if (n == 0 && c->rxlen == 0) conn_drop(c); /* peer gone, drained */
-      break; /* EAGAIN or buffered EOF: serve what we have */
+      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR))
+        c->eof = 1; /* peer gone (FIN, or a reset): its bytes are served
+                     * first, then netPoll names it once more and netRead
+                     * answers with NOTHING -- the program's cue that the
+                     * connection id is over */
+      break; /* EAGAIN or EOF: serve what we have */
     }
   }
 }
@@ -102,7 +109,7 @@ int64_t qos_netraw_poll(void) {
   net_pump();
   for (int k = 0; k < MAXCONN; k++) {
     uint32_t i = (poll_rr + k) % MAXCONN;
-    if (conns[i].fd >= 0 && conns[i].rxlen) {
+    if (conns[i].fd >= 0 && (conns[i].rxlen || conns[i].eof)) {
       poll_rr = i + 1; /* rotate: next poll starts past this id */
       return (int64_t)i + 1;
     }
@@ -119,20 +126,23 @@ int64_t qos_netraw_read(int64_t id, char *dst, uint64_t cap) {
   if (n) {
     memmove(c->rx, c->rx + n, c->rxlen - n);
     c->rxlen -= n;
-  }
+  } else if (c->eof) conn_drop(c); /* the empty read IS the notice; slot freed */
   return (int64_t)n;
 }
 
 int64_t qos_netraw_write(int64_t id, const char *src, uint64_t len) {
   struct nconn *c = conn_of(id);
-  if (!c) return 0;
+  if (!c || c->eof) return 0; /* a gone peer takes nothing more */
   uint64_t off = 0;
   while (off < len) {
     ssize_t n = write(c->fd, src + off, len - off);
     if (n > 0) { off += (uint64_t)n; continue; }
-    if (n < 0 && errno == EAGAIN) continue; /* spin: PoC blocking send */
-    conn_drop(c);
-    return (int64_t)off; /* peer closed under us */
+    if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue; /* spin: PoC blocking send */
+    c->eof = 1; /* peer closed under us: reported through netPoll/netRead
+                 * like a FIN, never dropped silently (a silent drop left
+                 * the program's record of the id alive for the NEXT peer) */
+    c->rxlen = 0;
+    return (int64_t)off;
   }
   return (int64_t)len;
 }

@@ -98,7 +98,7 @@ runProgram : unsafe q157 -> List String -> Int .
 runProgram title extra =
   u0 = print "";
   u1 = print "=== {title} ===";
-  (db, qs, syms) = pl.loadProgram (List.append cpuRules extra);
+  (db, qs, syms) = pl.loadProgram (cpuRules + extra);
   u2 = print "({List.len db} clauses loaded)";
   runQs db syms qs.
 

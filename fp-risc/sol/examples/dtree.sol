@@ -48,8 +48,8 @@ posCnt acc p = acc + (case p.y > 0 of True -> 1 | False -> 0).
 
 # misclassification score of a split: each side predicts its majority
 scoreOf c =
-  lp = c / 1073741824; ln = Numeric.mod (c / 1048576) 1024;
-  rp = Numeric.mod (c / 1024) 1024; rn = Numeric.mod c 1024;
+  lp = c / 1073741824; ln = (c / 1048576) % 1024;
+  rp = (c / 1024) % 1024; rn = c % 1024;
   Numeric.min lp ln + Numeric.min rp rn.
 
 # scan candidates, threading the linear vec; returns (feat, th, score, v)
@@ -75,7 +75,7 @@ cands1 : unsafe p45 -> List q45 -> List (p45, q45) .
 cands1 f ts | ts == [] = [].
 cands1 f ts = case ts of t :: r -> (f, t) :: cands1 f r.
 allCands : unsafe List (Int, Int) .
-allCands = List.append (cands1 1 (grid (0 - 6))) (cands1 2 (grid (0 - 6))).
+allCands = (cands1 1 (grid (0 - 6))) + (cands1 2 (grid (0 - 6))).
 
 pick 1 p = p.x1.
 pick _ p = p.x2.

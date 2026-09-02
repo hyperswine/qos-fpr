@@ -13,7 +13,7 @@
 # the failure is spelled at the call site: unwrap / okOr / a case.
 
 # a fallible step of our own: same shape as any Try.* primitive
-half n = case Numeric.mod n 2 of
+half n = case n % 2 of
   0 -> Ok (n / 2)
   | m -> Err "cannot halve odd {n}".
 

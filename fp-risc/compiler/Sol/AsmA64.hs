@@ -89,6 +89,7 @@ opFrag f = \case
   Call l n -> Frag ([0x94000000] ++ addSp (16 * n) ++ [push 0]) [(0, l, False)]
   Ret -> ws (pop 0 : epilogue)
   FuelTick -> ws [ldrX 0 19, subImm 0 0 1, strX 0 19]
+  Trap -> ws (movImm64 0 fuelTrap ++ [strX 0 19, 0xD2800000, push 0]) -- poison; x0 = 0; push
   where
     unD i = ws [pop 0, fmovDX 0 0, i, fmovXD 0 0, push 0]
     bin o = case o of

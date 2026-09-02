@@ -79,3 +79,21 @@ listAppend : unsafe List a -> List a -> List a .
 listAppend xs ys = case xs of Nil -> ys | x :: rest -> x :: listAppend rest ys.
 listLen : unsafe List a -> Int .
 listLen xs = case xs of Nil -> 0 | _ :: rest -> 1 + listLen rest.
+# Concatenate many strings in O(n log n) bytes of garbage: pairwise
+# passes instead of one growing accumulator (a per-piece `strcat acc x`
+# copies the whole prefix every time -- quadratic in the total length,
+# which a long-lived pool pays for as its high-water mark).
+concat : unsafe List String -> String .
+concat Nil = "".
+concat (x :: Nil) = x.
+concat xs = concat (concatPairs xs).
+concatPairs : unsafe List String -> List String .
+concatPairs (a :: b :: r) = strcat a b :: concatPairs r.
+concatPairs xs = xs.
+
+joinWith : unsafe String -> List String -> String .
+joinWith sep Nil = "".
+joinWith sep (x :: r) = concat (x :: joinSep sep r).
+joinSep : unsafe String -> List String -> List String .
+joinSep sep Nil = Nil.
+joinSep sep (x :: r) = sep :: x :: joinSep sep r.
