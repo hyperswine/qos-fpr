@@ -237,7 +237,15 @@ srvAfterTick mt cfg app sv q = srvLoop mt cfg app sv.
 srvData : unsafe Int -> _ -> App -> Sv -> Int -> String .
 srvData mt cfg app sv cid =
   Sv model sess nsid ltt bufs = sv;
-  req = strcat (bufGet bufs cid) (netRead cid);
+  srvBytes mt cfg app sv cid (netRead cid).
+# an empty read: the peer went away (net tier v7); forget its half request
+srvBytes : unsafe Int -> _ -> App -> Sv -> Int -> String -> String .
+srvBytes mt cfg app sv cid "" =
+  Sv model sess nsid ltt bufs = sv;
+  srvLoop mt cfg app (Sv model sess nsid ltt (bufDel bufs cid)).
+srvBytes mt cfg app sv cid bytes =
+  Sv model sess nsid ltt bufs = sv;
+  req = strcat (bufGet bufs cid) bytes;
   srvHave mt cfg app (Sv model sess nsid ltt (bufPut bufs cid req)) cid req (complete req).
 srvHave : unsafe Int -> _ -> App -> Sv -> Int -> String -> Int -> String .
 srvHave mt cfg app sv cid req 0 = srvLoop mt cfg app sv.
