@@ -386,9 +386,15 @@ compileMain = do
                           (bindNames preludeE') M.empty preludeResolved
             pure [r]
       -- dep module units (hash-qualified; filename carries the prelude
-      -- hash too -- unit code depends on prelude arities)
+      -- hash too -- unit code depends on prelude arities -- AND a hash of
+      -- the whole program's record SHAPES: a unit's row-typed projections
+      -- (`st.uart`) compile to a tag chain over the shapes this program
+      -- declares, so a unit compiled under one program is wrong for
+      -- another with a different shape set (the uartroute/timerroute
+      -- incident: a cached svc unit from a program without the field)
+      let shapesHash = hashAST [TShape (concat fs) [] | fs <- M.keys shapes]
       unitOuts <- forM units' $ \(h, uts) ->
-        emitUnit (unitDir </> ("u-" ++ take 12 h ++ "-p" ++ take 8 preludeHash ++ "-" ++ tag ++ ".s"))
+        emitUnit (unitDir </> ("u-" ++ take 12 h ++ "-p" ++ take 8 preludeHash ++ "-s" ++ take 8 shapesHash ++ "-" ++ tag ++ ".s"))
                  (bindNames uts) extFor (resolveUnit uts)
       -- the root: exports its own binds; modtab (all dep exports) lives
       -- here. Root codegen uses the FULLY specialized+resolved tops
