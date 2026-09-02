@@ -125,13 +125,13 @@ save env m = case env of
 toRec m =
   M rv stock rc ss = m;
   "{rv}\n{joinSp stock}\n{joinNl rc}".
-joinSp ns = Core.joinWith " " (strs ns).
-strs Nil = Nil.
-strs (x :: r) = "{x}" :: strs r.
+joinSp ns = Core.joinWith " " (strs ns Nil).
+strs Nil acc = rev acc Nil.
+strs (x :: r) acc = strs r ("{x}" :: acc).
 joinNl rc = Core.joinWith "\n" rc.
-joinCm cart = Core.joinWith ", " (names cart).
-names Nil = Nil.
-names (k :: r) = nameAt k :: names r.
+joinCm cart = Core.joinWith ", " (names cart Nil).
+names Nil acc = rev acc Nil.
+names (k :: r) acc = names r (nameAt k :: acc).
 
 # ---- update ---------------------------------------------------------------------------
 

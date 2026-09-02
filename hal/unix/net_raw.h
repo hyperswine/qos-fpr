@@ -21,12 +21,15 @@
  *        of a connection with buffered rx bytes, else 0.  Ids rotate
  *        fairly so one busy peer cannot starve the rest.
  * read:  drain up to cap buffered bytes of connection id.
- * write: blocking-full on id; returns bytes placed (< len = peer
- *        closed under us; 0 = no such connection).
+ * write: never blocks: what the kernel will not take now is queued per
+ *        connection (up to QOS_NET_TXCAP) and flushed by later pumps;
+ *        a peer whose queue overflows is dropped (reported as EOF).
+ *        Returns bytes accepted (0 = no such connection / gone).
  * close: drop connection id, keep listening.
  * setup binds/listens on FPR_PORT (default 8000); poll/read/write on a
  * never-setup listener report no-connection rather than faulting. */
-#define QOS_NET_MAXCONN 8
+#define QOS_NET_MAXCONN 1024 /* slots; the rx buffers are static (8 KiB each) */
+#define QOS_NET_TXCAP (256 * 1024) /* per-connection unsent tail; over it = gone */
 void qos_netraw_setup(void); /* idempotent; exits loudly on bind failure */
 int64_t qos_netraw_poll(void);
 int64_t qos_netraw_read(int64_t id, char *dst, uint64_t cap);

@@ -1412,7 +1412,7 @@ dExpr = \case
         rhs' <- dExpr rhs
         s <- fresh "bind"
         k <- go rest
-        body <- matchPat (CVar s) p k (CErr "let pattern: no match")
+        body <- matchPat (CVar s) p k (CErr ("let pattern: no match; pattern was " ++ show p))
         pure (CLet s rhs' body)
   SCase scrut arms -> do
     s <- fresh "scrut"

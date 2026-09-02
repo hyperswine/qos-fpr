@@ -45,10 +45,13 @@ class Server:
         self.out = open("/tmp/fprlive-check.out", "ab")
 
     def start(self):
-        env = dict(os.environ, FPR_PORT=str(PORT), FPR_DISK=DISK)
+        env = dict(os.environ, FPR_PORT=str(PORT), FPR_DISK=DISK, FPR_DISK_MB="64")
         self.p = subprocess.Popen(["./qosp", "--yes", QA], cwd=QOS, env=env,
                                   stdout=self.out, stderr=subprocess.STDOUT)
         for _ in range(100):
+            if "hosting" not in self.log():   # this process's listener, not a predecessor's
+                time.sleep(0.05)
+                continue
             try:
                 socket.create_connection(("127.0.0.1", PORT), 0.2).close()
                 return
@@ -59,6 +62,7 @@ class Server:
     def stop(self):
         if self.p and self.p.poll() is None:
             self.p.kill()
+            self.p.wait()          # gone for real: the next start() must not probe a dying listener
         self.p = None
 
     def wait(self, secs=5):
@@ -540,38 +544,43 @@ async def leg_http():
     say("http: 404/400/431 where due, slow heads served, TLS hello refused")
 
 
-async def leg_capacity():
-    print("== the connection table (8 slots)")
+async def leg_capacity(server):
+    print("== many sessions: an actor per connection")
+    rss0 = server.rss()
     socks = []
-    for i in range(8):
-        socks.append(raw_ws())
     t0 = time.time()
-    try:
-        s9 = socket.create_connection(("127.0.0.1", PORT), 2)
-        s9.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-        s9.settimeout(1.5)
-        got = s9.recv(100)
-    except (socket.timeout, OSError):
-        got = b""
-    ok(got == b"", f"a 9th peer waits in the backlog (nothing after {time.time() - t0:.1f}s)")
-    socks[0].sendall(frame(8, struct.pack(">H", 1000)))
-    close_code(socks[0])
-    socks[0].close()
-    s9.settimeout(3)
-    try:
-        got = s9.recv(100)
-    except (socket.timeout, OSError):
-        got = b""
-    ok(got.startswith(b"HTTP/1.1 200"), "...and is served once a slot frees")
-    s9.close()
+    for i in range(64):
+        socks.append(raw_ws())
+    say(f"64 websockets opened in {time.time() - t0:.2f}s")
+    for k, s in enumerate(socks):
+        s.sendall(frame(1, b'{"msg":"login","arg":"c%d"}' % k))
+        op, p = read_frame(s)
+        ok(op == 1 and b'"s":' in p, f"session {k} logged in (full render)")
+    rss1 = server.rss()
+    per = (rss1 - rss0) // 64
+    say(f"qosp RSS {rss0 // 1024} -> {rss1 // 1024} KiB: ~{per // 1024} KiB per live session (actor stack + pool slabs + state)")
+    findings.append(("measure", f"~{per // 1024} KiB of process memory per live session at 64 sessions; the runtime's fixed per-actor stack and first pool slab dominate, the session itself is ~10 KB"))
+    # one event reaches all 64: the register broadcasts, each actor pushes its own delta
+    socks[0].sendall(frame(1, b'{"msg":"buy","arg":"0"}'))
+    read_frame(socks[0])
+    socks[0].sendall(frame(1, b'{"msg":"checkout","arg":""}'))
+    read_frame(socks[0])
+    got = 0
     for s in socks[1:]:
+        op, p = read_frame(s, 3)
+        got += 1 if (op == 1 and b'"d":' in p) else 0
+    ok(got == 63, f"one checkout reached the other 63 sessions as a delta ({got})")
+    for s in socks:
         s.sendall(frame(9, b"x"))
-        ok(read_frame(s) == (10, b"x"), "each of the other 7 still answers")
-    for s in socks[1:]:
+    ok(all(read_frame(s) == (10, b"x") for s in socks), "all 64 answer a ping")
+    r = http(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    ok(r.startswith(b"HTTP/1.1 200"), "a page load is served with 64 sockets held (no 8-slot starvation)")
+    for s in socks:
+        s.sendall(frame(8, struct.pack(">H", 1000)))
+        close_code(s)
         s.close()
-    time.sleep(0.3)
-    findings.append(("limit", "8 connections per qosp (QOS_NET_MAXCONN): the 8 websockets of 8 open tabs starve every further page load"))
-    say("capacity: 8 sockets held, the 9th queued until one closed")
+    time.sleep(0.5)
+    say(f"RSS after all 64 closed: {server.rss() // 1024} KiB (stacks and slabs return to the free lists)")
 
 
 async def leg_storm(server):
@@ -651,43 +660,37 @@ async def leg_storm(server):
 
 
 async def leg_slow_consumer():
-    print("== a client that never reads (does the server block on it?)")
+    print("== a client that never reads: does anyone else feel it?")
     stall = socket.create_connection(("127.0.0.1", PORT), 3)
     stall.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
     handshake(stall)
     stall.sendall(frame(1, b'{"msg":"login","arg":"stalled"}'))
     time.sleep(0.2)
-    # a driver keeps generating deltas the stalled peer must receive
     d = await Client().open()
     await d.login("driver")
     worst = 0
-    blocked = None
-    for i in range(400):
+    n = 0
+    t_all = time.perf_counter()
+    for i in range(700):                        # restock+buy+checkout: two pushes per cycle, receipts growing
+        k = i % 6
         t0 = time.perf_counter()
-        try:
-            await d.send("restock", i % 6, timeout=3)
-        except asyncio.TimeoutError:
-            blocked = i
-            break
+        await d.send("restock", k, timeout=5)
+        await d.send("buy", k, timeout=5)
+        await d.send("checkout", timeout=5)
         worst = max(worst, time.perf_counter() - t0)
+        n += 3
+    dt = time.perf_counter() - t_all
+    ok(worst < 0.25, f"the driver never waited on the stalled peer (worst cycle {worst * 1000:.1f} ms over {n} events, {n / dt:.0f} ev/s)")
+    # the stalled peer's unsent tail passed 256 KiB: the net tier dropped it, its session is gone
     stall.close()
-    if blocked is not None:
-        findings.append(("edge", f"a peer that stops reading stalls the whole server: netWrite spins once the kernel buffers fill (after {blocked} deltas here); everyone waits until that peer goes away"))
-        say(f"BLOCKED after {blocked} pushes to the stalled peer; freed once it closed")
-        try:
-            await d.drain(1)
-        except Exception:
-            pass
-    else:
-        say(f"400 pushes to a non-reading peer absorbed by the kernel buffers (worst rtt {worst * 1000:.1f} ms); the spin is latent, not hit at this size")
-        findings.append(("edge", "netWrite spins when a peer's socket buffer is full (hal/unix/net_raw.c); not reached at 400 x ~90 B deltas, but a slow tab with a busy register will get there"))
+    c = await Client().open()
+    ok(not c.v.logged_in, "a fresh socket after the stalled peer is a clean sign-in")
+    await c.close()
+    findings.append(("edge", "a peer that stops reading is dropped once 256 KiB is queued for it (QOS_NET_TXCAP); until then its actor alone carries the backlog"))
     await d.drain(0.5)
-    await d.send("logout", reply=False)          # a push to the vanished peer: its write fails
+    await d.send("logout", reply=False)
     await d.drain(0.3)
     await d.close()
-    c = await Client().open()                    # the slot the stalled peer held: a clean sign-in
-    ok(not c.v.logged_in, "a socket that died mid-push (reset, unread data) is gone for the next peer on its slot")
-    await c.close()
 
 
 async def leg_persist(server):
@@ -720,7 +723,7 @@ async def leg_persist(server):
         raise
     await b.login("after")
     ok(b.v.revenue() == rev2 and b.v.receipts() == rc2 and b.v.stock() == st2,
-       f"revenue/receipts/stock survived the restart ({b.v.revenue()}, {len(b.v.receipts())} receipts)")
+       f"revenue/receipts/stock survived the restart (revenue {rev2}->{b.v.revenue()}, receipts {len(rc2)}->{len(b.v.receipts())}, stock {st2}->{b.v.stock()})")
     await b.send("logout")
     await b.close()
 
@@ -737,7 +740,7 @@ async def main():
         await leg_input()
         await leg_frames()
         await leg_http()
-        await leg_capacity()
+        await leg_capacity(server)
         await leg_storm(server)
         await leg_slow_consumer()
         await leg_persist(server)

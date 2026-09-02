@@ -83,17 +83,23 @@ listLen xs = case xs of Nil -> 0 | _ :: rest -> 1 + listLen rest.
 # passes instead of one growing accumulator (a per-piece `strcat acc x`
 # copies the whole prefix every time -- quadratic in the total length,
 # which a long-lived pool pays for as its high-water mark).
+# (accumulator loops throughout: a list as long as a receipt log must
+# not cost a stack frame per element)
 concat : unsafe List String -> String .
 concat Nil = "".
 concat (x :: Nil) = x.
-concat xs = concat (concatPairs xs).
-concatPairs : unsafe List String -> List String .
-concatPairs (a :: b :: r) = strcat a b :: concatPairs r.
-concatPairs xs = xs.
+concat xs = concat (concatPairs xs Nil).
+concatPairs : unsafe List String -> List String -> List String .
+concatPairs (a :: b :: r) acc = concatPairs r (strcat a b :: acc).
+concatPairs (a :: Nil) acc = revS (a :: acc) Nil.
+concatPairs Nil acc = revS acc Nil.
+revS : unsafe List String -> List String -> List String .
+revS Nil acc = acc.
+revS (x :: r) acc = revS r (x :: acc).
 
 joinWith : unsafe String -> List String -> String .
 joinWith sep Nil = "".
-joinWith sep (x :: r) = concat (x :: joinSep sep r).
-joinSep : unsafe String -> List String -> List String .
-joinSep sep Nil = Nil.
-joinSep sep (x :: r) = sep :: x :: joinSep sep r.
+joinWith sep (x :: r) = concat (x :: joinSep sep r Nil).
+joinSep : unsafe String -> List String -> List String -> List String .
+joinSep sep Nil acc = revS acc Nil.
+joinSep sep (x :: r) acc = joinSep sep r (x :: sep :: acc).

@@ -30,7 +30,9 @@
  * built today loads under any qosp built tomorrow.  Everything after
  * the slot is the buddy arena that growth grants come from. */
 #define QOS_ARENA_BASE 0x400000000ul /* 16 GiB (bumped for macOS arm64 mmap compatibility) */
-#define QOS_ARENA_SIZE (256ul << 20)
+#ifndef QOS_ARENA_SIZE
+#define QOS_ARENA_SIZE (256ul << 20) /* the host build sets ARENA_MB (qos/Makefile) */
+#endif
 #define QOS_SLOT_SIZE (16ul << 20) /* matches link-app.ld's SLOT LENGTH */
 #define QOS_SLOT_BASE QOS_ARENA_BASE
 /* the PLUGIN slot: a second, smaller fixed-address window inside the

@@ -23,6 +23,50 @@ The four functions are `std.mvu`'s Elm surface, unchanged — the same
 `App` value a game driver or the long-poll driver runs. What FPRLive
 adds is the wire and the session bookkeeping.
 
+## The shape: an actor per connection
+
+The server is BEAM-shaped. An **acceptor** actor is the only thing that
+touches the socket tier: it polls, hands each connection's bytes to
+that connection's own actor, spawns one on first contact (spread over
+the harts above 0), and closes sockets when their actors post the
+connection id to a close queue. A **connection actor** owns its session
+— buffer, statics, dynamics, session id — parses its own frames, sends
+events to the **register**, and renders and pushes its own delta each
+time the register broadcasts a new model. The register (the main actor)
+is the model's single writer: one `update` per event, then the new model
+to every session actor. A slow or hostile peer stalls only its own
+actor; sessions scale with memory, not with a table.
+
+Every actor takes the frame boundary from `std.mvu` each turn — state to
+itself as a message, `Sys.poolReset`, state read back with `keep` — so
+no loop keeps its garbage.
+
+Measured on qosp (4 harts, this sandbox):
+
+| sessions | per-session process memory | one checkout fanned out to all | login burst |
+|---------:|---------------------------:|-------------------------------:|------------:|
+| 64       | ~263 KiB                   | 63/63 deltas                   | 0.1 s       |
+| 256      | ~345 KiB                   | 255/255, last after 50 ms      | 5 s         |
+| 512      | ~600 KiB                   | 511/511, last after 113 ms     | 23 s        |
+
+The 256 KiB actor stack dominates the floor; the session itself is
+~10 KB. The rise per session, and the login burst time, are the app's
+own shape: the POS keeps every session's cart inside the shared model,
+so each broadcast copies a model that grows with the session count into
+every session actor — O(n²) in sessions. Keeping per-session state in
+the session actor and broadcasting a version or a diff instead of the
+whole model are the next two levers; neither touches the wire.
+
+Knobs, all build-time:
+
+| knob | where | default | meaning |
+|------|-------|---------|---------|
+| `QOS_NET_MAXCONN` | `hal/unix/net_raw.h` | 1024 | connection slots (8 KiB static rx buffer each) |
+| `QOS_NET_TXCAP` | `hal/unix/net_raw.h` | 256 KiB | unsent tail per peer before it is dropped |
+| `ARENA_MB` | `qos/Makefile` **and** `fp-risc/Makefile` | 2048 | the host arena grants come from; both must agree |
+| `QOSSLAB` | `fp-risc/Makefile` | 32 KiB | minimum slab for hosted apps (was 256 KiB) |
+| `QOSSTACK` | `fp-risc/Makefile` | 256 KiB | per-actor stack for hosted apps |
+
 ## The wire
 
 ```
@@ -120,27 +164,74 @@ Fixing what it turned up shaped the final module:
   plain runs whole (`substr`) and join pieces pairwise (`Core.concat`,
   `Core.joinWith`).
 
+Moving to an actor per connection then exercised the actor runtime
+harder than anything before it, and turned up five things in
+`hal/core/actors.c` and the host tier:
+
+- **Eight senders per actor was a hard ceiling.** Every actor had seven
+  dedicated per-sender channels plus one, and a ninth distinct sender
+  panicked — a register with nine sessions could not exist. The eighth
+  slot is now a shared overflow ring: many producers under a lock,
+  entries tagged with the sender so selective `receiveFrom` still works
+  across it. `tests/fanin.fpr` sends 40 clients through one hub and
+  checks every reply is addressed.
+- **A full channel panicked the sender.** A burst that outran a session's
+  render died at 64 queued messages. A full ring is now backpressure:
+  the sender gives its hart away and retries.
+- **A second enqueue of an actor already on a hart's backlog corrupted
+  the list** — a waker's ship racing the receiver's own early un-block,
+  then a yield. The tail could point at itself, and the selector walked
+  the cycle forever with the hart reporting idle. Enqueue is now
+  idempotent (a membership flag), and the walk has a cycle guard that
+  names the ring. `tests/pingpong.fpr` is the cross-hart wake stress
+  that reproduced it.
+- **The deadlock detector was miscalibrated on hosts.** It counted idle
+  passes assuming a 30 ms pacing timer; on qosp that timer is a no-op
+  and a pass is a 200 µs poll, so eight quiet passes was ~1.6 ms — any
+  lull with a cross-hart wake still in flight was declared a deadlock.
+  It now also requires two seconds of quiet by the clock, and when it
+  does fire it dumps every actor's state, wait, held messages and last
+  scheduler transitions, the cross-hart rings, and each hart's phase.
+- **The app image's heap range was a constant.** Raising the host arena
+  to 2 GiB for more sessions put grants above the 256 MiB line the app
+  was linked to treat as heap; values there were mistaken for statics
+  and shared by identity — random corruption past ~220 sessions. The
+  app now derives its arena end from the same `ARENA_MB`.
+
+Two smaller ones in the socket tier: a peer that vanished mid-push (a
+reset, or a failed write) was dropped silently and its slot's record
+lived on for the next peer, so the tier now reports every end as an
+empty read; and the blocking `netWrite` spin is gone — what the kernel
+will not take is queued per connection and flushed by later pumps.
+
 ## Readiness — is this ready to host a full web app?
 
-For a single-box, low-concurrency app (a shop till, a dashboard, an
-admin panel, an internal tool), the shape is there and holds up: real
-websockets, per-session deltas, server push, escape-safe rendering, RFC
-close codes, disk persistence across restarts, sub-2 ms round trips, and
-flat memory under sustained load. The handshake and framing being in
-FPRISC rather than C is a genuine result.
+For a single-box app up to a few hundred concurrent sessions (a shop
+till with many registers, a dashboard, an admin panel, an internal
+tool), the shape is there and holds up: real websockets, an actor per
+connection, per-session deltas, server push to 512 sessions in ~100 ms,
+escape-safe rendering, RFC close codes, disk persistence across
+restarts, sub-2 ms round trips, and flat memory under sustained load.
+The handshake and framing being in FPRISC rather than C is a genuine
+result, and so is what the load did for the runtime.
 
-The limits are the socket tier's, and each is a known edge, not a bug:
+The limits that remain are known edges, not bugs:
 
-- **8 connections** (`QOS_NET_MAXCONN`). Eight open tabs are eight
-  websockets; the ninth page load waits in the listen backlog. This is
-  the first thing to raise for anything public.
-- **One server loop, blocking writes.** `netWrite` spins when a peer's
-  socket buffer fills. A slow reader on a busy register would stall the
-  loop until it drains or goes away; the harness confirms the spin is
-  latent at 400 small deltas but real in principle. A production tier
-  wants non-blocking writes with a per-connection out-queue.
+- **1024 connection slots** (`QOS_NET_MAXCONN`), each with a static
+  8 KiB receive buffer; the listen backlog is 128. Past that the next
+  step is a dynamic table.
+- **A slow reader stalls only itself**, and is dropped once 256 KiB is
+  queued for it (`QOS_NET_TXCAP`).
 - **No read timeout.** A peer that sends half a request head holds its
-  slot until it closes. With 8 slots that is a cheap denial of service.
+  slot and its actor until it closes.
+- **The register is one actor.** Every event serializes through it, and
+  every broadcast copies the model once per session. At 512 sessions a
+  login burst is 23 s of that; the fix is the app's (state per session
+  actor, diffs on the broadcast), not the runtime's.
+- **Persistence writes a whole-state snapshot per checkout**, so the
+  disk cost is quadratic in the receipt log; the harness gives it a
+  64 MB disk. An append-only receipt log with a small state record is
+  the right shape.
 - **4 KiB frame cap, 8 KiB receive buffer, 1 KiB reads.** Fine for MVU
   events; a file upload needs fragmentation, which the parser refuses.
 - **JSON `\u` escapes decode for the BMP only**; a surrogate pair
