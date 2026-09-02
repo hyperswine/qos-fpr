@@ -12,7 +12,7 @@ auth = use "../lib/auth#668a459dce40f198".
 # ---- todos: one per line as "<done> <text>" in KV --------------------------
 parseItem line = (d, x) = base.splitFirst line; (base.pI d, x).
 parseTodos s | s == "" = [].
-parseTodos s = List.map parseItem (base.splitCh 10 s).
+parseTodos s = List.map parseItem (Str.split 10 s).
 
 serItem t = (d, x) = t; "{d} {x}".
 serTodos : unsafe List (p76, q76) -> String .

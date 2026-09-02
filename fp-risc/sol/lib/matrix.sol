@@ -181,8 +181,8 @@ mFold f z m = Mat r c v = m; (x, v2) = Vec.fold f z v; (x, Mat r c v2).
 
 # ---- CSV -------------------------------------------------------------------
 
-mCsvLines s = filter (fn l -> base.not2 (l == "")) (base.splitCh 10 s).
-mParseRow line = map (fn f -> base.pI f) (base.splitCh 44 line).
+mCsvLines s = filter (fn l -> not (l == "")) (Str.split 10 s).
+mParseRow line = map (fn f -> base.pI f) (Str.split 44 line).
 
 # integer cells; blank lines ignored
 mFromCsv s = mFromRows (map (fn l -> mParseRow l) (mCsvLines s)).
@@ -191,7 +191,7 @@ mFromCsv s = mFromRows (map (fn l -> mParseRow l) (mCsvLines s)).
 mFromCsvHeader s | mCsvLines s == [] = ([], mFromRows []).
 mFromCsvHeader s =
   h :: rest = mCsvLines s;
-  (base.splitCh 44 h, mFromRows (map (fn l -> mParseRow l) rest)).
+  (Str.split 44 h, mFromRows (map (fn l -> mParseRow l) rest)).
 
 mJoinC xs | xs == [] = "".
 mJoinC xs | (x :: rest) <- xs, rest == [] = "{x}".

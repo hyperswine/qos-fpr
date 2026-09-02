@@ -46,7 +46,7 @@ parseTodos s =
   k = findNl s 1;
   case k of
     0 -> [parseItem s]
-  | _ -> parseItem (base.substr s 1 (k - 1)) :: parseTodos (base.substr s (k + 1) (Str.len s)).
+  | _ -> parseItem (Str.slice s 1 (k - 1)) :: parseTodos (Str.slice s (k + 1) (Str.len s)).
 
 serItem t = (d, x) = t; "{d} {x}".
 

@@ -32,7 +32,7 @@ initialStock = catalog |> List.map (fn t -> 12).
 encStock : unsafe List f100 -> String .
 encStock ns = ns |> List.map str |> joinWith " ".
 decStock "" = initialStock.
-decStock s = base.splitCh 32 s |> List.map base.pI.
+decStock s = Str.split 32 s |> List.map base.pI.
 
 joinWith : unsafe w99 -> List String -> String .
 joinWith sep [] = "".
@@ -63,9 +63,9 @@ receiptLine n who cart = "{n}|{who}|{cartTotal cart}|{itemNames cart}".
 appendReceipt old line | old == "" = line.
 appendReceipt old line = "{old}{base.nl}{line}".
 receiptCount "" = 0.
-receiptCount s = base.splitCh 10 s |> List.len.
+receiptCount s = Str.split 10 s |> List.len.
 parseReceipts "" = [].
-parseReceipts s = base.splitCh 10 s |> List.rev |> List.map (fn ln -> base.splitCh 124 ln).
+parseReceipts s = Str.split 10 s |> List.rev |> List.map (fn ln -> Str.split 124 ln).
 
 # ---- model -----------------------------------------------------------------
 

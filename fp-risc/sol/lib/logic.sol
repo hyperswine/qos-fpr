@@ -125,7 +125,7 @@ resetTops hmark tmark m =
 # ---------- deref ----------
 deref a m =
   (m2, t, v) = cellAt a m;
-  case base.and2 (t == 0) (base.not2 (v == a)) of
+  case and (t == 0) (not (v == a)) of
     True -> deref v m2
   | False -> (m2, a, t, v).
 
@@ -145,9 +145,9 @@ unify2 a ta va b tb vb m =
     | False -> unifyNV a ta va b tb vb m).
 
 unifyNV a ta va b tb vb m =
-  case base.and2 (ta == tb) (base.or2 (ta == 1) (ta == 2)) of
+  case and (ta == tb) (or (ta == 1) (ta == 2)) of
     True -> (m, va == vb)
-  | False -> (case base.and2 (ta == 3) (tb == 3) of
+  | False -> (case and (ta == 3) (tb == 3) of
       True -> unifyStr va vb m
     | False -> (m, False)).
 
@@ -156,7 +156,7 @@ unifyStr fa fb m =
   (m2, tfb, vb) = cellAt fb m1;
   case va == vb of
     False -> (m2, False)
-  | True -> unifyArgs 1 (base.imod2 va 1024) fa fb m2.
+  | True -> unifyArgs 1 (Numeric.mod va 1024) fa fb m2.
 
 unifyArgs k n fa fb m | k > n = (m, True).
 unifyArgs k n fa fb m =
@@ -174,7 +174,7 @@ inst t vbase m = case t of
 | PC s args -> instC s args vbase m.
 
 instC s args vbase m =
-  n = base.listLen args;
+  n = List.len args;
   (m1, addrs) = instArgs args vbase m;
   (m2, f) = halloc 4 (s * 1024 + n) m1;
   m3 = pushRefs addrs m2;
@@ -204,8 +204,8 @@ evalA a m =
 evalStr f m =
   (m1, tf, fv) = cellAt f m;
   s = fv / 1024;
-  ar = base.imod2 fv 1024;
-  case base.and2 (base.and2 (s >= 2) (s <= 6)) (ar == 2) of
+  ar = Numeric.mod fv 1024;
+  case and (and (s >= 2) (s <= 6)) (ar == 2) of
     False -> (m1, Nope)
   | True -> evalBin s f m1.
 
@@ -221,7 +221,7 @@ applyOp s x y =
   case s == 3 of True -> Got (x - y) | False ->
   case s == 4 of True -> Got (x * y) | False ->
   case s == 5 of True -> (case y == 0 of True -> Nope | False -> Got (x / y)) | False ->
-  (case y == 0 of True -> Nope | False -> Got (base.imod2 x y)).
+  (case y == 0 of True -> Nope | False -> Got (Numeric.mod x y)).
 
 # ---------- rendering heap terms ----------
 rend a syms m =
@@ -233,7 +233,7 @@ rend a syms m =
 rendStr f syms m =
   (m1, tf, fv) = cellAt f m;
   s = fv / 1024;
-  ar = base.imod2 fv 1024;
+  ar = Numeric.mod fv 1024;
   (m2, argsS) = rendArgs 1 ar f syms m1;
   (m2, "({symName s syms}{argsS})").
 
@@ -283,7 +283,7 @@ dispatch db syms m s f g gs fuel qvars sols =
   case s == 13 of True -> solveG db syms m gs fuel qvars sols | False ->  # true
   case s == 14 of True -> (m, fuel, sols) | False ->                      # fail
   case s == 1 of True -> doIs db syms m f gs fuel qvars sols | False ->   # is
-  case base.and2 (s >= 7) (s <= 10) of
+  case and (s >= 7) (s <= 10) of
     True -> doCmp db syms m s f gs fuel qvars sols | False ->             # > < >= <=
   case s == 11 of True -> doUnify db syms m f gs fuel qvars sols | False ->
   case s == 12 of True -> doNeq db syms m f gs fuel qvars sols | False ->

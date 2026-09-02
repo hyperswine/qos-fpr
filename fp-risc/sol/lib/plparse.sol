@@ -33,7 +33,7 @@ tkKind t = (k, s, n) = t; k.
 tkStr t = (k, s, n) = t; s.
 tkNum t = (k, s, n) = t; n.
 
-isP t s2 = (k, s, n) = t; base.and2 (k == 4) (s == s2).
+isP t s2 = (k, s, n) = t; and (k == 4) (s == s2).
 
 # ---------- tokenizer ----------
 isDigit c | c >= 48, c <= 57 = True.
@@ -49,8 +49,8 @@ isIdent c = isDigit c.
 
 # strip comment: cut line at first '#'
 stripC ln =
-  k = base.findCh 35 ln 1;
-  case k == 0 of True -> ln | False -> base.substr ln 1 (k - 1).
+  k = Str.findFrom 35 ln 1;
+  case k == 0 of True -> ln | False -> Str.slice ln 1 (k - 1).
 
 tokLine ln = toks (stripC ln) 1.
 
@@ -69,7 +69,7 @@ lexInt ln i acc | i <= Str.len ln, isDigit (Str.at ln i) =
 lexInt ln i acc = tInt acc :: toks ln i.
 
 lexIdent ln s i mk | i <= Str.len ln, isIdent (Str.at ln i) = lexIdent ln s (i + 1) mk.
-lexIdent ln s i mk = mk (base.substr ln s (i - 1)) :: toks ln i.
+lexIdent ln s i mk = mk (Str.slice ln s (i - 1)) :: toks ln i.
 
 # multi-char puncts: <-  >=  <=  !=  (literal-pattern dispatch on (c, next))
 lexPunct ln i c = lexP2 c (punNxt ln i) ln i.
@@ -110,9 +110,9 @@ pCmp toks =
     t :: r -> pCmp2 l t t1 r
   | _ -> (l, t1).
 pCmp2 l t t1 r =
-  case base.and2 (tkKind t == 2) (tkStr t == "is") of
+  case and (tkKind t == 2) (tkStr t == "is") of
     True -> pCmpRhs "is" l r
-  | False -> (case base.and2 (tkKind t == 4) (cmpName (tkStr t) != "") of
+  | False -> (case and (tkKind t == 4) (cmpName (tkStr t) != "") of
       True -> pCmpRhs (cmpName (tkStr t)) l r
     | False -> (l, t1)).
 pCmpRhs nm l r =
@@ -169,7 +169,7 @@ pArgs toks = case toks of
 pArgs2 t r toks =
   case tkKind t == 1 of True -> pArgsCons (RI (tkNum t)) r | False ->
   case tkKind t == 3 of True -> pArgsCons (RV (tkStr t)) r | False ->
-  case base.and2 (tkKind t == 2) (tkStr t != "is") of True -> pArgsCons (RA (tkStr t)) r | False ->
+  case and (tkKind t == 2) (tkStr t != "is") of True -> pArgsCons (RA (tkStr t)) r | False ->
   case isP t "(" of True -> pArgsParen r | False -> ([], toks).
 pArgsCons a r = (rest, t2) = pArgs r; (a :: rest, t2).
 pArgsParen r =

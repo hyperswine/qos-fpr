@@ -80,8 +80,71 @@ Module.func  <function>  <secondary data> <initializer> <main data>
 
 ## 6. Open / to be pinned (proposed, not yet decided)
 
-- A fixed verb vocabulary: one of `get` / `find` / `lookup`; one of `make` /
-  `new` / `create`; etc.
-- A rule for `Maybe` vs `Result` vs panic as the failure channel.
-- Whether `Module.defaults` is the exact name, and whether config records are
-  open or closed to extension.
+Each item names the decision, what the corpus does today (counts in
+docs/API-REVIEW.md), and a proposed answer.  Pinning one means moving it
+up into §1–§5 and migrating the corpus in the same change.
+
+- **D1 Bare HAL names vs `Module.func`.** Sol has `strlen charAt substr chr
+  strcat` AND `Str.len at sub fromCode cat`; FP-RISC tests use the bare
+  forms 50:2, Sol examples the module forms 8:0.  Proposed: `Str.*` is the
+  API in both profiles; the bare names are the codegen contract
+  (`fpr_g_*`) and never appear in examples.
+- **D2 One spelling per operation.** `Str.parse` = `parseInt` =
+  `unwrap (Try.parseInt s)`; `List.fold` = `foldl`; `List.map` = `map`.
+  Proposed: keep the `Try.x` / `x` (unwrapping) pair as the ONLY sanctioned
+  double, retire the third spellings.
+- **D3 Filesystem verbs.** `readPath writePath mkdirp rm rmdir mv ls stat
+  exists isDir` + the `Now` escapes are Unix names, not a module.
+  Proposed: `File.read write mkdir rm rmdir mv ls stat exists isDir`,
+  `File.readNow` etc.; `@path` literals unchanged.
+- **D4 Two process vocabularies.** `sh` / `shq` (strings, immediate /
+  queued) next to `Proc.query / afterCommit / runNow` (structured).
+  Proposed: `Proc.sh` and `Proc.shq`, documented as the string doors of
+  the same three-way (immediate / queued / realtime) model.
+- **D5 Actor spellings across profiles.** Sol `myself spawn send receive
+  receiveFrom kill yield`; FP-RISC `Actor.self spawn spawnOn send recv
+  recvRes yield`.  Proposed: `Actor.*` in both, `self` and `recv` win
+  (shorter, already the FP-RISC struct).
+- **D6 Index-before-data.** `Vec.get i v` is data-last but `Str.at s i`,
+  `Str.sub s i n`, `Str.findFrom c s i` are data-first, and FP-RISC
+  `List.take l n` is the mirror of Sol `List.take n xs`.  Proposed: indices
+  and counts are secondary data and come BEFORE the main data everywhere;
+  infix `xs ! i` is exempt as an operator.
+- **D7 Failure channels.** In use at once: `Result`, panic, a list as an
+  option (`List.find`), three local `Opt`/`Some|None` unions, and 0 as a
+  sentinel (`Str.find`).  Proposed: ONE prelude `Option (Some x | None)`;
+  `Result` when the failure has something to say, `Option` when absence is
+  ordinary, panic only behind an unwrapping name (`parseInt`, `unwrap`,
+  `!`).
+- **D8 Verb vocabulary.** `get` = by key/index (total or Option); `find` =
+  by predicate (Option); no `lookup`.  `new` = empty container; `fromX` /
+  `toX` = conversions; `parse` = text -> value (Result); `render` = wire
+  text; `pretty` = human text; `show` = debug text.  `len` stays the one
+  size word.
+- **D9 `Module.defaults`.** Zero APIs follow §3 today (`MV.run`'s cfg is
+  half positional, `ProcessSpec` is positional with `with*` builders).
+  Proposed: convert `ProcessSpec` to `{ Proc.defaults | cwd = "/tmp" }` as
+  the reference, then require it for every new configurable function.
+- **D10 One MVU entry shape.** The doc's `MVU.serve {init, update, view}`
+  exists in neither profile: FP-RISC has `MV.run me cfg (MApp init update
+  skey view vals done subs)`, Sol has `View.serve port init update view
+  subs`.  Proposed: the record form, one name in both profiles, `skey /
+  vals / done` as config or scene content.
+- **D11 The one object-method.** Typed path literals are called
+  `p.get m` / `p.set v m` (10 uses) while everything else is
+  `Module.func`.  Proposed: sanction it as the single exception (the
+  literal IS a record of closures) and say so in §1, or add `Path.get`.
+- **D12 Two preludes.** Sol's `Str`/`List` surface is 4x FP-RISC's, so
+  FP-RISC tests re-declare `revL joinBar escLf splitNl lenL catL` per file.
+  Proposed: grow the FP-RISC structs to the Sol names (same grammar, same
+  spellings), accepting that `std` proof obligations gate which ones the
+  AOT tier admits.
+- **D13 Two-way conditions.** Guard clauses versus
+  `case c of True -> a | False -> b` for the same job: Sol 137 / 90,
+  FP-RISC 76 / 65.  Proposed: guards
+  for clause selection on parameters, `case` for a computed condition in
+  a body; never `case` on a literal `True/False` when a guard fits.
+- **D14 `unsafe` in examples.** `unsafe` versus `measure`: FP-RISC tests
+  262 / 43, Sol 176 / 37.  Proposed: an example may carry `unsafe` only with a
+  one-line reason; a plain countdown or list walk uses `measure`.
+- Whether config records are open or closed to extension (unchanged).

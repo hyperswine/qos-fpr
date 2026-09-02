@@ -7,7 +7,7 @@
 # Numbers ride the Numeric surface (Try.parseNum: ints exact, decimals
 # inexact); object keys keep document order, so parse |> render is the
 # identity up to whitespace.  Sol strings are code points, so a \uXXXX
-# escape is just `chr` (no surrogate pairs) and render emits UTF-8;
+# escape is just `Str.fromCode` (no surrogate pairs) and render emits UTF-8;
 # control characters other than \n \t \r \b \f are not re-escaped.
 
 Json = Type (JNull | JBool Bool | JNum Int | JStr String
@@ -16,11 +16,11 @@ Json = Type (JNull | JBool Bool | JNum Int | JStr String
 # ---- parse (recursive descent; i is a 1-based cursor, 0 = end) --------------
 
 parse s = value s (ws s 1) |>? (fn r -> (v, i) = r;
-  case ws s i > strlen s of
+  case ws s i > Str.len s of
     True -> Ok v
   | False -> Err "json: trailing characters at {i}").
 
-peek s i = case i > strlen s of True -> 0 | False -> charAt s i.
+peek s i = case i > Str.len s of True -> 0 | False -> Str.at s i.
 ws s i = case Str.isSpace (peek s i) of True -> ws s (i + 1) | False -> i.
 
 value s i = case peek s i of
@@ -41,9 +41,9 @@ literal s i = case Str.sub s i 4 == "true" of
 number s i =
   j = numEnd s i;
   case j == i of
-    True -> Err "json: unexpected '{chr (peek s i)}' at {i}"
+    True -> Err "json: unexpected '{Str.fromCode (peek s i)}' at {i}"
   | False -> Try.parseNum (Str.slice s i (j - 1)) |> mapOk (fn n -> (JNum n, j)).
-numEnd s i = case Str.contains (chr (peek s i)) "-+0123456789.eE" of
+numEnd s i = case Str.contains (Str.fromCode (peek s i)) "-+0123456789.eE" of
     True -> numEnd s (i + 1)
   | False -> i.
 
@@ -51,16 +51,16 @@ string s i acc = case peek s i of
     0 -> Err "json: unterminated string"
   | 34 -> Ok (acc, i + 1)
   | 92 -> escape s (i + 1) acc
-  | c -> string s (i + 1) "{acc}{chr c}".
+  | c -> string s (i + 1) "{acc}{Str.fromCode c}".
 escape s i acc = case peek s i of
     110 -> string s (i + 1) "{acc}\n"
   | 116 -> string s (i + 1) "{acc}\t"
   | 114 -> string s (i + 1) "{acc}\r"
   | 98 -> string s (i + 1) "{acc}\x08"
   | 102 -> string s (i + 1) "{acc}\x0c"
-  | 117 -> hex4 s (i + 1) 0 0 |>? (fn cp -> string s (i + 5) "{acc}{chr cp}")
+  | 117 -> hex4 s (i + 1) 0 0 |>? (fn cp -> string s (i + 5) "{acc}{Str.fromCode cp}")
   | 0 -> Err "json: unterminated escape"
-  | c -> string s (i + 1) "{acc}{chr c}".                                   # \" \\ \/
+  | c -> string s (i + 1) "{acc}{Str.fromCode c}".                                   # \" \\ \/
 hex4 s i n acc = case n == 4 of
     True -> Ok acc
   | False -> hexDigit (peek s i) |>? (fn d -> hex4 s (i + 1) (n + 1) (acc * 16 + d)).
