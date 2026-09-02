@@ -259,8 +259,12 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
       then pure (Conflict ["<forced>"]) -- discard this attempt's effects
       else commit tx journalFile) `onException` cleanup
   case res of
-    Committed n sfail -> do
-      when (n > 0 && not sfail) $ putStrLn ("[sol] committed " ++ show n ++ " file(s) atomically (whole-script transaction)")
+    Committed n ncmd sfail -> do
+      -- the receipt names every effect class that landed: files AND the
+      -- deferred commands that ran inside the commit (a script that only
+      -- queued commands still did something at commit)
+      let cmds = if ncmd > 0 then " + " ++ show ncmd ++ " deferred command(s)" else ""
+      when ((n > 0 || ncmd > 0) && not sfail) $ putStrLn ("[sol] committed " ++ show n ++ " file(s)" ++ cmds ++ " atomically (whole-script transaction)")
       when sfail $ putStrLn ("[sol] committed " ++ show n ++ " file(s); NOT atomic: a deferred command failed (later queued commands skipped; file effects all applied)")
       -- if the run left the transaction at any point, say so plainly: the
       -- word "atomically" above is only true of the file set it names

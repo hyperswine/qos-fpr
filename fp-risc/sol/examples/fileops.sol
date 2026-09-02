@@ -6,12 +6,15 @@
 # the whole script validates. Read-only tool calls (sh) run immediately;
 # mutating tool calls (shq) queue for commit. If a concurrent process
 # changes a file we read, we abort and re-run — deferred effects never fire.
-
+#
 # mkdirp = create a dir and all its parents if needed, atomically. If the dir already exists, do nothing.
 # writePath = write a file atomically, creating parent dirs if needed. If the file already exists, overwrite it.
 # readPath = read a file into a string. If the file doesn't exist, abort.
 # (absence expected? spell it: readPathOr for a default, Try.readPath for
 #  the Ok/Err chain — see tryops.sol for the pattern.)
+#
+# BUILTINS FIRST: the prelude's Str.* / List.* / booleans cover the
+# everyday shapes, so a script is pipelines over them, not a helper zoo.
 
 base = use "../lib/base".
 
@@ -26,28 +29,17 @@ scaffold root =
 
 # ---- count lines across a directory of files (like wc -l *) ----
 lineCountAll dir =
-  names = ls dir;
-  total = List.fold (addLines dir) 0 names;
+  total = ls dir
+    |> List.filter (fn n -> not (isDir "{dir}/{n}"))
+    |> List.map (fn n -> List.len (Str.lines (readPath "{dir}/{n}")))
+    |> List.sum;
   print "total lines under {dir}: {total}".
-addLines dir acc name =
-  path = "{dir}/{name}";
-  case isDir path of
-    True -> acc
-  | False -> acc + countLines (readPath path).
-countLines s = base.splitCh 10 s |> base.listLen.
 
 # ---- prune: remove all files matching a suffix, transactionally ----
-pruneSuffix : unsafe m35 -> String -> Unit .
 pruneSuffix dir suf =
-  hits = ls dir |> List.filter (endsWith suf);
-  u = pruneList dir hits;
-  print "pruned {base.listLen hits} '{suf}' file(s) from {dir}".
-# (endsWith already excludes dirs here since our .bak names are files)
-pruneList : unsafe h35 -> List i35 -> Int .
-pruneList dir [] = 0.
-pruneList dir (n :: r) = u = rm "{dir}/{n}"; pruneList dir r.
-endsWith suf s | Str.len s < Str.len suf = False.
-endsWith suf s = base.substr s (Str.len s - Str.len suf + 1) (Str.len s) == suf.
+  hits = ls dir |> List.filter (Str.endsWith suf);
+  us = List.map (fn n -> rm "{dir}/{n}") hits;
+  print "pruned {List.len hits} '{suf}' file(s) from {dir}".
 
 > scaffold "/tmp/proj".
 > lineCountAll "/tmp/proj/src".
