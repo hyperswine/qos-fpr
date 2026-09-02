@@ -30,7 +30,7 @@ compile and an up-to-date one costs nothing.
                         JIT, transactional runtime) — ALL Haskell lives
                         under compiler/; compiler/cbits/ holds its C FFI
       sol/              the sol PROFILE'S CONTENT only: lib/ (base, ui,
-                        matrix, rand, …) and examples/ — no source tree,
+            matrix, rand, …), examples/, and scripts/ — no source tree,
                         no separate build.  `fpr sol script.sol` is the
                         profile
       std/              the SAFE TIER — standalone.  std.fpr (FP-RISC
@@ -38,6 +38,7 @@ compile and an up-to-date one costs nothing.
                         proof-pass demo).  sol USES std; std needs no sol.
       core/             the bare tier (prelude.fpr) — unsafe by license
       docs/STYLE.md     source style: builtin-first, abstraction exceptions
+      docs/SCRIPTING.md functional and transactional host scripting patterns
       targets/qos.fpr   the Struct QOS-targeted programs link against
                         (thin re-export of Svc/Caps/IoV: re-homing the
                         definition would churn pinned content hashes)

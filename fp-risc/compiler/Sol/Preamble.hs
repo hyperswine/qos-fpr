@@ -31,6 +31,7 @@ prelude =
       "readAll : Handle -> (String, Handle).",
       "writeAll : Handle -> String -> Handle.",
       "close : Handle -> Unit.",
+      "args : Unit -> List String.",
       -- ---- the Ok/Err default pattern -------------------------------------
       -- Fallible work returns `Ok x | Err msg` and chains with |>?. The
       -- HAL's fallible primitives are the Try.* family; the PANICKING
@@ -247,7 +248,7 @@ halArities =
     [ ("str", 1), ("strcat", 2), ("String.len", 1), ("strlen", 1),
       ("error", 1), ("Try.parseInt", 1), ("Try.readPath", 1),
       ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
-      ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1),
+      ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1), ("args", 1),
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),
       ("BStr.append", 2), ("BStr.cat", 2), ("BStr.len", 1),
       ("BStr.at", 2), ("BStr.sub", 3), ("BStr.free", 1),

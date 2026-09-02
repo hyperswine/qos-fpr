@@ -48,10 +48,10 @@ main :: IO ()
 main = do
   setLocaleEncoding utf8
   as <- getArgs
-  (dumpAsm, path) <- case as of
-    ["--asm", p] -> pure (True, p)
-    [p] -> pure (False, p)
-    _ -> putStrLn "usage: sol [--asm] <script.sol>" >> exitFailure >> pure (False, "")
+  (dumpAsm, path, scriptArgs) <- case as of
+    ("--asm" : p : rest) -> pure (True, p, rest)
+    (p : rest) -> pure (False, p, rest)
+    _ -> putStrLn "usage: sol [--asm] <script.sol> [args]" >> exitFailure >> pure (False, "", [])
   src <- readFile path
   ptops <- parseOrDie "<prelude>" prelude
   utops <- parseOrDie path src
@@ -217,7 +217,7 @@ main = do
   -- the raw `fpr: user error (...)` wrapper. Nothing was committed: the
   -- exception propagates out of runTxLoop before its commit call.
   unless dumpAsm $ do
-    r <- try (runTxLoop (takeDirectory path) dataFile journalFile consTV shapeNames bprog prog (jc, hand) cons runList rt 0) :: IO (Either IOException ())
+    r <- try (runTxLoop (takeDirectory path) scriptArgs dataFile journalFile consTV shapeNames bprog prog (jc, hand) cons runList rt 0) :: IO (Either IOException ())
     case r of
       Right () -> pure ()
       Left e -> do
@@ -227,8 +227,8 @@ main = do
 
 -- run every `>` statement in order inside one transaction, then commit;
 -- on read-set conflict, reset and re-run the whole script
-runTxLoop :: FilePath -> FilePath -> FilePath -> M.Map Name (Int, Int) -> M.Map Int [Name] -> BProg -> Prog -> (Maybe JitCtx, Maybe Hand.HandCtx) -> M.Map Name (Int, Int, Int) -> [Name] -> RtCounts -> Int -> IO ()
-runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt attempt = do
+runTxLoop :: FilePath -> [String] -> FilePath -> FilePath -> M.Map Name (Int, Int) -> M.Map Int [Name] -> BProg -> Prog -> (Maybe JitCtx, Maybe Hand.HandCtx) -> M.Map Name (Int, Int, Int) -> [Name] -> RtCounts -> Int -> IO ()
+runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt attempt = do
   tx <- newTx
   fuel <- newIORef fuelQuantum
   preempts <- newIORef 0
@@ -236,7 +236,7 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
   tabFlag <- lookupEnv "SOL_TABLE"
   tab <- if tabFlag == Just "0" then pure Nothing else Just <$> newIORef M.empty
   actors <- VM.newActorRuntime
-  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons tx preempts rt) fuel preempts tx actors
+  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons scriptArgs tx preempts rt) fuel preempts tx actors
       cleanup = VM.shutdownActorRuntime actors
   res <- (do
     forM_ topNames $ \n -> do
@@ -280,7 +280,7 @@ runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons
           exitFailure
       | otherwise -> do
           putStrLn ("[sol] conflict on " ++ show stale ++ " — retrying (attempt " ++ show (attempt + 2) ++ ")")
-          runTxLoop base dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt (attempt + 1)
+          runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt (attempt + 1)
 
 numberEvals :: [STop] -> ([STop], [Name])
 numberEvals tops = (map fst numbered, [n | (_, Just n) <- numbered])

@@ -861,8 +861,8 @@ bstDelete tbl k = do
   atomicModifyIORef' tbl (\m -> (IM.delete k m, ()))
   pure r
 
-mkHal :: M.Map Name (Int, Int, Int) -> IORef TxState -> IORef Int -> RtCounts -> M.Map Name (Int, [Value] -> IO Value)
-mkHal cons tx preempts rt =
+mkHal :: M.Map Name (Int, Int, Int) -> [String] -> IORef TxState -> IORef Int -> RtCounts -> M.Map Name (Int, [Value] -> IO Value)
+mkHal cons scriptArgs tx preempts rt =
   M.fromList
     [ ("str", (1, \[v] -> pure (VStr (render v)))),
       -- VStr ops: accept VStr; all O(n) due to linked-list backing
@@ -911,6 +911,7 @@ mkHal cons tx preempts rt =
       ("Proc.query", (1, procQueryH)),
       ("Proc.afterCommit", (1, procAfterCommitH)),
       ("Proc.runNow", (1, procRunNowH)),
+      ("args", (1, \[_] -> pure (strList scriptArgs))),
       -- Numeric prims: the doors into inexact arithmetic. Num.div is TRUE
       -- division (always inexact); ordinary +,-,*,/ then propagate
       -- inexactness by promotion in `arith`. floor/round land back on Int.
