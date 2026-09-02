@@ -125,11 +125,9 @@ up into §1–§5 and migrating the corpus in the same change.
   Proposed: keep the `Try.x` / `x` (unwrapping) pair as the ONLY sanctioned
   double, retire the third spellings.  (Pinned for the operator cases in
   §1a: `+ - * / % ^` are THE spelling; the corpus was migrated.)
-- **D15 Lists under `*`.** Vectors give `*` to the dot product; lists have
-  no `*`.  Options: dot product for numeric lists (mirrors Vector),
-  elementwise, or nothing (lists are sequences, not algebra -- convert to
-  a Vector).  Proposed: nothing; `Vec.fromList a * Vec.fromList b` is
-  one call away and keeps List's operators structural (`+ -` only).
+- **D15 Lists under `*` -- DECIDED: none.** Vectors give `*` to the dot
+  product; lists keep only the structural `+ -`.  `Vec.fromList a *
+  Vec.fromList b` is the spelling for a list dot product.
 - **D3 Filesystem verbs.** `readPath writePath mkdirp rm rmdir mv ls stat
   exists isDir` + the `Now` escapes are Unix names, not a module.
   Proposed: `File.read write mkdir rm rmdir mv ls stat exists isDir`,
