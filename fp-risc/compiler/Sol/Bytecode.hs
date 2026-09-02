@@ -67,7 +67,7 @@ arithOps =
 
 -- THE fragment vocabulary.  Every acceleration tier's "is this pure
 -- arithmetic" judgment (tabling in VM.hs, HandJIT's kernel emitter,
--- the GLSL tier, the LLVM drivers) derives its operator set from the
+-- the GLSL tier, the native JIT's lowering) derives its operator set from the
 -- ONE table above -- a spelling that is not a key there does not
 -- exist, which is what killed the drift class where three tiers
 -- whitelisted "/=" while the language's operator is "!=" (so !=

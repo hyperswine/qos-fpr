@@ -28,14 +28,14 @@ import Foreign.Marshal.Array (peekArray)
 import Foreign.Ptr ()
 import Foreign.Storable (peek)
 import qualified Sol.Gpu as Gpu
-import qualified Sol.HandJIT as Hand
 import Control.Monad (forM, forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
-import Sol.JIT
+import Sol.HandJIT
+import Sol.KIR (fuelPoison)
 import Sol.Lang (Name)
 import qualified Sol.Lang as Lang
 import Control.Concurrent (ThreadId, forkIO, killThread, myThreadId, threadDelay)
@@ -70,7 +70,6 @@ data VMEnv = VMEnv
     vmJit :: Maybe JitCtx, -- Nothing = JIT disabled, always interpret
     vmGpu :: Maybe Gpu.GpuCtx, -- Nothing = GPU tier off/unavailable
     vmTab :: Maybe (IORef (M.Map Name TabState)), -- Nothing = tabling off
-    vmHand :: Maybe Hand.HandCtx, -- SOL_JIT=hand: hand-rolled x86-64, no llvm
     vmHal :: M.Map Name (Int, [Value] -> IO Value),
     vmFuel :: IORef Int,
     vmPreempts :: IORef Int,
@@ -325,7 +324,7 @@ arith op (VInt a) (VInt b) = case op of
   OAdd -> pure (VInt (a + b))
   OSub -> pure (VInt (a - b))
   OMul -> pure (VInt (a * b))
-  -- `quot` (truncate toward zero): matches LLVM sdiv, C, and RISC-V DIV —
+  -- `quot` (truncate toward zero): matches x86 idiv, A64 sdiv, C, and RISC-V DIV —
   -- the interpreter follows the hardware, not Haskell's flooring div
   ODiv -> if b == 0 then vmPanic "division by zero" else pure (VInt (a `quot` b))
   OLt -> pure (vBool (a < b))
@@ -821,6 +820,7 @@ withFuelCell env body = alloca $ \p -> do
   poke p (fromIntegral f0)
   r <- body p
   f1 <- peek p
+  when (f1 <= fuelPoison) (vmPanic "division by zero") -- poisoned, minus any ticks after it
   if f1 <= 0
     then do
       modifyIORef' (vmPreempts env) (+ 1)
@@ -1416,30 +1416,7 @@ vecScheme env scheme f macc r = do
                   (_, idxs) <- runVecMapFilter addr pfuel (map fst extras) cols n
                   gatherRows r (map fromIntegral idxs)
     _ -> pure Nothing
-  -- handJIT tier: same generated-function ABI, same runners, no llvm.
-  -- Narrow by design (single scalar column, no extras, map/fold only);
-  -- anything it declines is the interpreter's job.
-  handed <- case jitted of
-    Just _ -> pure jitted
-    Nothing -> case (vmHand env, jitCallable env scheme f, layoutInfo st) of
-      (Just hc, Just (g, []), Just (_, [k], _))
-        | scheme `elem` ["vecmap", "vecfold"],
-          k /= KBox,
-          n >= jitThreshold -> do
-            let ek = if k == KNum then 'd' else 'i'
-                ty = if k == KNum then JD else JI
-            Hand.handCompileVec hc (vmCore env) scheme g ek >>= \case
-              Nothing -> pure Nothing
-              Just addr -> fmap Just $ withColPtrs st $ \cols -> withFuelCell env $ \pfuel ->
-                case scheme of
-                  "vecfold" -> do
-                    let Just a0 = macc
-                    bitsVal ty <$> runVecFold addr pfuel [] cols n (valBits ty a0)
-                  _ -> do
-                    (_, out) <- runVecMapFilter addr pfuel [] cols n
-                    if ek == 'i' then vecFromInts out else vecFromNums (map b2d out)
-      _ -> pure Nothing
-  case handed of
+  case jitted of
     Just v -> finish v
     Nothing -> interp n >>= finish
   where

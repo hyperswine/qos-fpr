@@ -1,301 +1,388 @@
--- THIS IS THE IDEAL THING TO REPLACE LLVM WITH IN THE SOL TIER, IF IT WERE TO BE REPLACED.
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE TupleSections #-}
 
--- Sol/HandJIT.hs — the hand-rolled JIT tier (SOL_JIT=hand).
+-- Sol/HandJIT.hs -- THE native JIT tier of the Sol VM: hand-rolled,
+-- no LLVM, two ISAs.
 --
--- The LLVM tier is a GENERAL typed compiler; this is not that, and is
--- not trying to be.  The Vec schemes only ever need one shape of code:
+--   typed Core  --JitCore-->  typed closure  --KIR-->  kernel IR
+--              --AsmX64 / AsmA64-->  bytes  --hj_alloc-->  callable
 --
---     loop over a single unboxed column, tiny pure arithmetic kernel
+-- What gets compiled (unchanged from the LLVM tier it replaces):
+-- RECURSION SCHEMES ONLY -- list map / filter / foldl and the Vec duals
+-- vecmap / vecfilter / vecfold / vecmapr -- whose element function is a
+-- top-level supercombinator in the pure arithmetic fragment, closed
+-- over other such functions (recursion allowed, fuel-counted), with
+-- captured scalars as typed extras and SoA columns as typed loads.
+-- Everything else is the interpreter's job, by a decline that is
+-- printed under SOL_JIT_DEBUG=1.
 --
--- so handJIT emits exactly that — a few hundred bytes of x86-64
--- (SSE2 scalar for f64, plain integer ops for i64) into an mmap'd
--- page, honoring the SAME generated-function ABI as the LLVM tier:
+-- Bit-identical by construction: i64 ops are the machine's, `/` is
+-- quot, f64 ops are IEEE scalar instructions in the same order the
+-- interpreter evaluates, exact ints promote on contact (sitofp), floor
+-- and round are the ISA's floor / round-to-nearest-even -- the same
+-- split the interpreter's `arith` makes.
 --
---     i64 f(i64* pfuel, i64* extras, i64** cols, i64 n, i64 out/acc0)
---     rdi        rsi         rdx        rcx        r8
---
--- which means runVecMapFilter / runVecFold and everything above them
--- are reused untouched: handJIT is another DISCHARGE of the
--- compileVecScheme contract, not another dispatch path.  No LLVM
--- linkage, no ORC startup price — the whole tier is this file plus a
--- 15-line mmap shim.
---
--- Deliberately narrow (declines fall to the interpreter):
---   * vecmap / vecfold only, single scalar column, no captured extras
---   * kernel fragment: params, int literals, + - * /, comparisons
---     inside `if` conditions, Num.sqrt (f64), let (inlined by
---     substitution — the fragment is pure, duplication is safe)
---   * kernel type = column type throughout; int `/` is quot (idiv),
---     f64 `/` is IEEE divsd — the same split the interpreter's arith
---     makes, so results stay bit-identical
---   * fuel charged in bulk at entry (sub [pfuel], n): the reified
---     per-element decrement collapses to one subtraction because the
---     kernel has no calls to meter
-module Sol.HandJIT (HandCtx, newHandCtx, handCompileVec) where
+-- Cross-checking the OTHER ISA from this host: SOL_HJIT_XCHECK=<dir>
+-- makes every install also assemble the A64 (or x86-64) blob and every
+-- native run dump its inputs + outputs as a case file; tools/hjrun.c
+-- (under qemu-user) executes the foreign blob on those inputs and
+-- compares.  tools/sol-hjit-a64-check.sh drives it.
+module Sol.HandJIT
+  ( JitCtx, initJIT, jitDebug,
+    compileScheme, compileVecScheme, compileVecMapR,
+    runMapFilter, runFold, runVecMapFilter, runVecFold, runVecMapR,
+    module Sol.JitCore,
+  ) where
 
-import Data.Bits (shiftL, (.|.), (.&.))
-import GHC.Float (castWord32ToFloat, castWord64ToDouble)
-import Data.Bits (shiftR, (.&.))
+import Control.Monad (forM_, when)
 import Data.IORef
 import Data.Int (Int64)
+import Data.List (nub)
 import qualified Data.Map.Strict as M
+import qualified Data.Set as S
 import Data.Word (Word8)
-import Foreign.Marshal.Array (withArray)
-import Foreign.Ptr (Ptr, ptrToIntPtr)
-import GHC.Float (castDoubleToWord64)
-import Control.Monad (when)
-import Sol.Lang (Core (..), Prog, Name)
-import Sol.Bytecode (cmpNames)
-import System.Info (arch)
+import Foreign.Marshal.Array (allocaArray, peekArray, withArray, withArrayLen)
+import Foreign.Ptr
+import Foreign.Storable
+import Sol.AsmA64 (assembleA64)
+import Sol.AsmX64 (assembleX64)
+import Sol.JitCore
+import Sol.KIR
+import Sol.Lang (Core (..), Name, Prog)
 import System.Environment (lookupEnv)
+import System.IO (IOMode (..), hPutBuf, withBinaryFile)
+import System.IO.Unsafe (unsafePerformIO)
+import System.Info (arch)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 
 foreign import ccall unsafe "hj_alloc" c_hjAlloc :: Ptr Word8 -> Int -> IO (Ptr Word8)
 
-newtype HandCtx = HandCtx (IORef (M.Map (String, Name, Char) Int64))
+foreign import ccall unsafe "hj_has_sse41" c_hjHasSse41 :: IO Int
 
-newHandCtx :: IO HandCtx
-newHandCtx = HandCtx <$> newIORef M.empty
+data Arch = X64 | A64 deriving (Eq, Show)
 
--- entry: compile scheme+fn for elem kind 'i'/'d'.  Returns the callable
--- address (cached) or Nothing when the kernel leaves the fragment.
-handCompileVec :: HandCtx -> Prog -> String -> Name -> Char -> IO (Maybe Int64)
-handCompileVec (HandCtx ref) prog scheme g ek
-  -- the emitter produces x86-64 SysV bytes; on any other host the tier
-  -- DECLINES (interp takes it) rather than executing wrong-arch code
-  | arch /= "x86_64" = pure Nothing
-handCompileVec (HandCtx ref) prog scheme g ek = do
-  cache <- readIORef ref
-  case M.lookup (scheme, g, ek) cache of
-    Just a -> pure (Just a)
-    Nothing -> case emitKernel prog scheme g ek of
-      Nothing -> do
-        dbg <- lookupEnv "SOL_HJIT_DEBUG"
-        when (dbg == Just "1") $
-          putStrLn ("[hjit] declined " ++ scheme ++ "<" ++ g ++ ">: " ++ maybe "no such fn" (show . snd) (M.lookup g prog))
-        pure Nothing
-      Just bytes -> do
-        p <- withArray bytes $ \pb -> c_hjAlloc pb (length bytes)
-        let a = fromIntegral (ptrToIntPtr p)
-        if a == 0
-          then pure Nothing
-          else do
-            modifyIORef' ref (M.insert (scheme, g, ek) a)
-            putStrLn ("[hjit] compiled " ++ scheme ++ "<" ++ g ++ "> elem=" ++ [ek] ++ " (" ++ show (length bytes) ++ " bytes hand-rolled x86-64, no llvm)")
-            pure (Just a)
+data JitCtx = JitCtx
+  { jcArch :: Arch,
+    jcCache :: IORef (M.Map (String, Name) (Int64, JTy, JTy)),
+    jcMapR :: IORef (M.Map (String, Name) (Int64, Int, [JTy])),
+    jcCount :: IORef Int,
+    jcXcheck :: Maybe FilePath,
+    jcRun :: String -- per-process tag so cross-check dumps from concurrent runs never collide
+  }
 
--- ---------------------------------------------------------------------
--- assembler: flat [Word8] with two-pass label patching kept trivial by
--- emitting only forward jumps whose targets we compute inline
--- ---------------------------------------------------------------------
+jitDebug :: String -> IO ()
+jitDebug msg = do
+  d <- lookupEnv "SOL_JIT_DEBUG"
+  when (d == Just "1") (putStrLn msg)
 
-type Asm = [Word8]
+initJIT :: IO (Maybe JitCtx)
+initJIT = do
+  x <- lookupEnv "SOL_HJIT_XCHECK"
+  t <- getPOSIXTime
+  let run = "r" ++ show (floor (t * 1000000) `mod` (1000000000 :: Integer))
+      mk a = Just <$> (JitCtx a <$> newIORef M.empty <*> newIORef M.empty <*> newIORef 0 <*> pure x <*> pure run)
+  case arch of
+    "x86_64" -> do
+      ok <- c_hjHasSse41
+      if ok /= 0
+        then mk X64
+        else putStrLn "[jit] x86-64 without SSE4.1 (roundsd): native tier disabled, interpreting" >> pure Nothing
+    "aarch64" -> mk A64
+    other -> putStrLn ("[jit] no native backend for " ++ other ++ ": interpreting") >> pure Nothing
 
-imm32 :: Int -> Asm
-imm32 v = [fromIntegral (v `shiftR` s .&. 0xFF) | s <- [0, 8, 16, 24]]
+-- ---- install: assemble, map executable, remember the symbol ----------------
 
-imm64 :: Int64 -> Asm
-imm64 v = [fromIntegral (fromIntegral v `shiftR` s .&. (0xFF :: Integer)) | s <- [0, 8, 16, 24, 32, 40, 48, 56]]
+-- address -> (symbol, unit) for the cross-check dumps
+symTable :: IORef (M.Map Int64 (String, Unit, Int))
+symTable = unsafePerformIO (newIORef M.empty)
+{-# NOINLINE symTable #-}
 
--- fixed encodings (see ABI in the header comment)
-pPushR12, pPushR13, pPopR13, pPopR12 :: Asm
-pPushR12 = [0x41, 0x54]
-pPushR13 = [0x41, 0x55]
-pPopR13 = [0x41, 0x5D]
-pPopR12 = [0x41, 0x5C]
+assembleFor :: Arch -> Unit -> [Word8]
+assembleFor X64 = assembleX64
+assembleFor A64 = assembleA64
 
-movR9ColBase :: Asm
-movR9ColBase = [0x4C, 0x8B, 0x0A] -- mov r9, [rdx]   (cols[0])
+archName :: Arch -> String
+archName X64 = "x86-64"
+archName A64 = "a64"
 
-subFuelN :: Asm
-subFuelN = [0x48, 0x29, 0x0F] -- sub [rdi], rcx  (bulk fuel charge)
-
-zeroR10 :: Asm
-zeroR10 = [0x4D, 0x31, 0xD2] -- xor r10, r10
-
-cmpR10N :: Asm
-cmpR10N = [0x49, 0x39, 0xCA] -- cmp r10, rcx
-
-incR10 :: Asm
-incR10 = [0x49, 0xFF, 0xC2]
-
-loadElemD, loadElemI :: Asm
-loadElemD = [0xF2, 0x43, 0x0F, 0x10, 0x14, 0xD1] -- movsd xmm2, [r9+r10*8]
-loadElemI = [0x4F, 0x8B, 0x2C, 0xD1] -- mov r13, [r9+r10*8]
-
-storeOutD, storeOutI :: Asm
-storeOutD = [0xF2, 0x43, 0x0F, 0x11, 0x04, 0xD0] -- movsd [r8+r10*8], xmm0
-storeOutI = [0x4B, 0x89, 0x04, 0xD0] -- mov [r8+r10*8], rax
-
--- expr-eval scratch: result in xmm0 (d) / rax (i); operand stack = CPU stack
-pushD, popD1 :: Asm
-pushD = [0x48, 0x83, 0xEC, 0x08, 0xF2, 0x0F, 0x11, 0x04, 0x24] -- sub rsp,8; movsd [rsp],xmm0
-popD1 = [0xF2, 0x0F, 0x10, 0x0C, 0x24, 0x48, 0x83, 0xC4, 0x08] -- movsd xmm1,[rsp]; add rsp,8
-
-pushI, popI11 :: Asm
-pushI = [0x50] -- push rax
-popI11 = [0x49, 0x89, 0xC3, 0x58] -- mov r11, rax; pop rax   (L->rax, R->r11)
-
-opD :: String -> Asm -- xmm1 = L, xmm0 = R; result -> xmm0
-opD o =
-  let k = case o of "+" -> 0x58; "-" -> 0x5C; "*" -> 0x59; _ -> 0x5E
-   in [0xF2, 0x0F, k, 0xC8, 0x66, 0x0F, 0x28, 0xC1] -- opsd xmm1,xmm0; movapd xmm0,xmm1
-
-opI :: String -> Asm -- rax = L, r11 = R; result -> rax
-opI "+" = [0x4C, 0x01, 0xD8]
-opI "-" = [0x4C, 0x29, 0xD8]
-opI "*" = [0x49, 0x0F, 0xAF, 0xC3]
-opI _ = [0x48, 0x99, 0x49, 0xF7, 0xFB] -- cqo; idiv r11   (quot: sol's int /)
-
-litD :: Double -> Asm
-litD d = [0x48, 0xB8] ++ imm64 (fromIntegral (castDoubleToWord64 d)) ++ [0x66, 0x48, 0x0F, 0x6E, 0xC0] -- mov rax,bits; movq xmm0,rax
-
-litI :: Int64 -> Asm
-litI v = [0x48, 0xB8] ++ imm64 v -- mov rax, imm
-
-varD :: Int -> Asm -- 0: elem/x (xmm2), 1: acc (xmm3)
-varD 0 = [0x66, 0x0F, 0x28, 0xC2] -- movapd xmm0, xmm2
-varD _ = [0x66, 0x0F, 0x28, 0xC3]
-
-varI :: Int -> Asm
-varI 0 = [0x4C, 0x89, 0xE8] -- mov rax, r13
-varI _ = [0x4C, 0x89, 0xE0] -- mov rax, r12
-
-sqrtD :: Asm
-sqrtD = [0xF2, 0x0F, 0x51, 0xC0] -- sqrtsd xmm0, xmm0
-
--- comparisons: bool result in rax (0/1)
-cmpD, cmpI :: String -> Asm
-cmpD o = [0x66, 0x0F, 0x2E, 0xC8] ++ setcc (fcc o) -- ucomisd xmm1, xmm0
+install :: JitCtx -> String -> Int -> Unit -> IO (Maybe Int64)
+install jc sym nCols unit = do
+  dump <- lookupEnv "SOL_HJIT_DUMP"
+  when (dump == Just "1") (putStr (showUnit unit))
+  let bytes = assembleFor (jcArch jc) unit
+  p <- withArray bytes $ \pb -> c_hjAlloc pb (length bytes)
+  let a = fromIntegral (ptrToIntPtr p)
+  if a == 0
+    then pure Nothing
+    else do
+      modifyIORef' symTable (M.insert a (sym, unit, nCols))
+      forM_ (jcXcheck jc) $ \dir -> do
+        let other = if jcArch jc == X64 then A64 else X64
+        writeWords (dir ++ "/" ++ sym ++ "." ++ archName other ++ ".bin") (assembleFor other unit)
+        writeWords (dir ++ "/" ++ sym ++ "." ++ archName (jcArch jc) ++ ".bin") bytes
+      pure (Just a)
   where
-    fcc c = case c of "<" -> 0x92; "<=" -> 0x96; ">" -> 0x97; ">=" -> 0x93; "==" -> 0x94; _ -> 0x95
-cmpI o = [0x4C, 0x39, 0xD8] ++ setcc (icc o) -- cmp rax, r11
-  where
-    icc c = case c of "<" -> 0x9C; "<=" -> 0x9E; ">" -> 0x9F; ">=" -> 0x9D; "==" -> 0x94; _ -> 0x95
+    writeWords path bs = withBinaryFile path WriteMode $ \h -> withArrayLen bs $ \n pb -> hPutBuf h pb n
 
-setcc :: Word8 -> Asm
-setcc cc = [0x0F, cc, 0xC0, 0x48, 0x0F, 0xB6, 0xC0] -- setcc al; movzx rax, al
+freshSym :: JitCtx -> IO String
+freshSym jc = do
+  k <- atomicModifyIORef' (jcCount jc) (\c -> (c + 1, c))
+  pure (jcRun jc ++ "_t" ++ show k)
 
-testJz :: Int -> Asm
-testJz rel = [0x48, 0x85, 0xC0, 0x0F, 0x84] ++ imm32 rel -- test rax,rax; jz rel32
+-- ---- the list tier: map / filter / foldl over unboxed lists ----------------
 
-jmpRel :: Int -> Asm
-jmpRel rel = [0xE9] ++ imm32 rel
+compileScheme :: JitCtx -> Prog -> String -> Name -> JTy -> JTy -> IO (Maybe (Int64, JTy, JTy))
+compileScheme jc prog scheme root elemTy accTy0 = do
+  let ckey = (scheme ++ "|" ++ [tyChar elemTy] ++ "|" ++ [tyChar accTy0], root)
+  cache <- readIORef (jcCache jc)
+  case M.lookup ckey cache of
+    Just hit -> pure (Just hit)
+    Nothing -> case fmap prepClosure (gatherFns prog root) >>= checkAll of
+      Nothing -> pure Nothing
+      Just closure -> do
+        let Just (rootPs, _) = M.lookup root closure
+            isFold = scheme == "foldl"
+            stab acc n
+              | n <= (0 :: Int) = Nothing
+              | otherwise = do
+                  let rootArgs = if isFold then [acc, elemTy] else [elemTy]
+                      rootTy sigs = do
+                        (ps, body) <- M.lookup root closure
+                        tyExpr sigs closure (M.fromList (zip ps rootArgs)) body
+                  (sigs, rt) <- inferSigs closure rootTy
+                  if isFold && rt /= acc && joinT acc rt /= acc
+                    then stab (joinT acc rt) (n - 1)
+                    else Just (sigs, if isFold then acc else rt, rt)
+        case (length rootPs == (if isFold then 2 else 1), stab accTy0 3) of
+          (False, _) -> pure Nothing
+          (_, Nothing) -> jitDebug ("[jit-debug] " ++ root ++ ": untypeable (JW div / bool / non-convergence)") >> pure Nothing
+          (True, Just (sigs, accTy, retTy))
+            | scheme == "filter" && retTy /= JI -> pure Nothing
+            | retTy == JW -> jitDebug ("[jit-debug] " ++ root ++ ": JW result escapes; interpreter's job") >> pure Nothing
+            | otherwise -> do
+                sym <- freshSym jc
+                let rootKey = (root, if isFold then [accTy, elemTy] else [elemTy])
+                    sigs' = M.insert rootKey retTy sigs
+                    allKeys = nub (rootKey : M.keys sigs)
+                    le = LowerEnv sigs' closure (sym ++ "_") Nothing
+                    fns = [lowerVariant le k (M.findWithDefault JI k sigs') | k <- allKeys]
+                    unit = Unit (driverList sym scheme (mangleV (sym ++ "_") rootKey) accTy retTy : fns)
+                install jc sym 0 unit >>= \case
+                  Nothing -> pure Nothing
+                  Just addr -> do
+                    putStrLn ("[jit] compiled " ++ scheme ++ "<" ++ root ++ "> elem=" ++ [tyChar elemTy] ++ (if isFold then " acc=" ++ [tyChar accTy] else "") ++ " (typed, fuel reified, hand-rolled " ++ archName (jcArch jc) ++ ")")
+                    atomicModifyIORef' (jcCache jc) (\m -> (M.insert ckey (addr, accTy, retTy) m, ()))
+                    pure (Just (addr, accTy, retTy))
 
--- ---------------------------------------------------------------------
--- kernel emission
--- ---------------------------------------------------------------------
+-- ---- the Vec tier: typed duals over SoA columns ----------------------------
 
-callsSelf :: Name -> Core -> Bool
-callsSelf h = go
-  where
-    go c = case c of
-      CVar v -> v == h
-      CApp a b -> go a || go b
-      CIf a b d -> go a || go b || go d
-      CLet _ a b -> go a || go b
-      _ -> False
+compileVecScheme :: JitCtx -> Prog -> String -> Name -> Bool -> [JTy] -> String -> [JTy] -> JTy -> IO (Maybe (Int64, JTy, JTy))
+compileVecScheme jc prog scheme root scalar colTys laySig exTys accTy0 = do
+  let ckey = (scheme ++ "|" ++ laySig ++ "|" ++ map tyChar exTys ++ "|" ++ [tyChar accTy0], root)
+  cache <- readIORef (jcCache jc)
+  case M.lookup ckey cache of
+    Just hit -> pure (Just hit)
+    Nothing -> case fmap prepClosure (gatherFns prog root) of
+      Nothing -> jitDebug ("[jit-debug] " ++ root ++ ": gather failed (call outside prog?)") >> pure Nothing
+      Just closure -> do
+        let ars = M.map (length . fst) closure
+            Just (rootPs, rootBody) = M.lookup root closure
+            helpers = M.delete root closure
+            nEx = length exTys
+            isFold = scheme == "vecfold"
+            needed = nEx + (if isFold then 2 else 1)
+            exPs = take nEx rootPs
+            (accP, elemP) = case (scheme, drop nEx rootPs) of
+              ("vecfold", [a, x]) -> (Just a, x)
+              (_, [x]) -> (Nothing, x)
+              _ -> (Nothing, "?")
+            loadable = map (/= JW) colTys
+            helpersOK = all (uncurry (jitOK ars)) (M.elems helpers)
+            rootOK = length rootPs == needed && jitOKVec ars scalar loadable elemP (exPs ++ maybe [] pure accP) rootBody
+            stab acc n
+              | n <= (0 :: Int) = Nothing
+              | otherwise = do
+                  let env0 = M.fromList (zip exPs exTys ++ maybe [] (\a -> [(a, acc)]) accP)
+                      rootTy sigs = tyExprV sigs closure scalar colTys (S.singleton elemP) env0 rootBody
+                  (sigs, rt) <- inferSigs closure rootTy
+                  if isFold && rt /= acc && joinT acc rt /= acc
+                    then stab (joinT acc rt) (n - 1)
+                    else Just (sigs, if isFold then acc else rt, rt)
+        if not (helpersOK && rootOK)
+          then do
+            jitDebug ("[jit-debug] " ++ root ++ ": helpersOK=" ++ show helpersOK ++ " rootOK=" ++ show rootOK ++ " closure=" ++ show (M.keys closure))
+            jitDebug ("[jit-debug] failing helpers: " ++ show [n | (n, (ps, b)) <- M.toList helpers, not (jitOK ars ps b)])
+            pure Nothing
+          else case stab accTy0 3 of
+            Nothing -> jitDebug ("[jit-debug] " ++ root ++ ": untypeable (JW div / bool / non-convergence)") >> pure Nothing
+            Just (sigs, accTy, retTy)
+              | scheme == "vecfilter" && retTy /= JI -> pure Nothing
+              | retTy == JW -> jitDebug ("[jit-debug] " ++ root ++ ": JW result escapes; interpreter's job") >> pure Nothing
+              | otherwise -> do
+                  sym <- freshSym jc
+                  let le = LowerEnv sigs helpers (sym ++ "_") Nothing
+                      fns = [lowerVariant le k (M.findWithDefault JI k sigs) | k <- nub (M.keys sigs)]
+                      dualLab = sym ++ "_f"
+                      dual = lowerDual le dualLab exPs exTys (fmap (,accTy) accP) elemP scalar colTys rootBody retTy
+                      unit = Unit (driverVec sym scheme dualLab nEx accTy retTy : dual : fns)
+                  install jc sym (length colTys) unit >>= \case
+                    Nothing -> pure Nothing
+                    Just addr -> do
+                      putStrLn ("[jit] compiled " ++ scheme ++ "<" ++ root ++ "> over SoA layout " ++ laySig ++ (if nEx > 0 then " + " ++ show nEx ++ " captured scalar(s)" else "") ++ " (typed dual, fuel reified, hand-rolled " ++ archName (jcArch jc) ++ ")")
+                      atomicModifyIORef' (jcCache jc) (\m -> (M.insert ckey (addr, accTy, retTy) m, ()))
+                      pure (Just (addr, accTy, retTy))
 
-cmpOps :: [String]
-cmpOps = cmpNames -- the ONE vocabulary (Bytecode.arithOps); the setcc
-                  -- tables' catch-all is setne, so != lands right
+-- record-returning map: one typed dual per field, native SoA construction
+compileVecMapR :: JitCtx -> Prog -> Name -> Bool -> [JTy] -> String -> [JTy] -> IO (Maybe (Int64, Int, [JTy]))
+compileVecMapR jc prog root scalar colTys laySig exTys = do
+  let ckey = ("vecmapr|" ++ laySig ++ "|" ++ map tyChar exTys, root)
+  cache <- readIORef (jcMapR jc)
+  case M.lookup ckey cache of
+    Just hit -> pure (Just hit)
+    Nothing -> case fmap prepClosure (gatherFns prog root) of
+      Nothing -> pure Nothing
+      Just closure -> do
+        let ars = M.map (length . fst) closure
+            Just (rootPs, rootBody) = M.lookup root closure
+            helpers = M.delete root closure
+            nEx = length exTys
+            loadable = map (/= JW) colTys
+        case splitMkR rootBody of
+          Just (lets, tid, var, fs)
+            | length rootPs == nEx + 1,
+              let k = length fs,
+              k >= 1 && k <= 8,
+              var == (if tid >= 100 then k else 0),
+              exPs <- take nEx rootPs,
+              elemP <- last rootPs,
+              fbodies <- [foldr (\(x, v) b -> CLet x v b) f lets | f <- fs],
+              all (uncurry (jitOK ars)) (M.elems helpers),
+              all (jitOKVec ars scalar loadable elemP exPs) fbodies -> do
+                let env0 = M.fromList (zip exPs exTys)
+                    inferF fb = inferSigs closure (\sigs -> tyExprV sigs closure scalar colTys (S.singleton elemP) env0 fb)
+                case mapM inferF fbodies of
+                  Just rs
+                    | all (\(_, t) -> t == JI || t == JD) rs -> do
+                        sym <- freshSym jc
+                        let ftys = map snd rs
+                            sigsAll = M.unions (map fst rs)
+                            le = LowerEnv sigsAll helpers (sym ++ "_") Nothing
+                            fns = [lowerVariant le k (M.findWithDefault JI k sigsAll) | k <- nub (M.keys sigsAll)]
+                            labs = [sym ++ "_f" ++ show j | j <- [0 .. length fs - 1]]
+                            duals = [lowerDual le lab exPs exTys Nothing elemP scalar colTys fb fty | (lab, fb, fty) <- zip3 labs fbodies ftys]
+                            unit = Unit (driverVecMapR sym labs nEx : duals ++ fns)
+                        install jc sym (length colTys) unit >>= \case
+                          Nothing -> pure Nothing
+                          Just addr -> do
+                            putStrLn ("[jit] compiled vecmapr<" ++ root ++ "> " ++ show (length ftys) ++ " field dual(s) over " ++ laySig ++ (if nEx > 0 then " + " ++ show nEx ++ " captured scalar(s)" else "") ++ " (native SoA construction, hand-rolled " ++ archName (jcArch jc) ++ ")")
+                            let hit = (addr, tid, ftys)
+                            atomicModifyIORef' (jcMapR jc) (\m -> (M.insert ckey hit m, ()))
+                            pure (Just hit)
+                  _ -> jitDebug ("[jit-debug] " ++ root ++ ": vecmapr fields untypeable") >> pure Nothing
+          _ -> pure Nothing
 
-spine :: Core -> (Core, [Core])
-spine = go []
-  where
-    go acc (CApp f a) = go (a : acc) f
-    go acc h = (h, acc)
+-- ---- native invocation (fuel cell reconciled by the VM) --------------------
+--   list map/filter: i64 drv(fuel*, in*, n, out*)      fold: (fuel*, in*, n, acc0)
+--   vec  map/filter: i64 drv(fuel*, extras*, cols**, n, out*)  fold: (..., n, acc0)
+--   vecmapr:         i64 drv(fuel*, extras*, cols**, n, outs**)
 
--- inline lets by substitution (pure fragment: safe)
-substC :: Name -> Core -> Core -> Core
-substC x v = go
-  where
-    go c = case c of
-      CVar y | y == x -> v
-      CApp a b -> CApp (go a) (go b)
-      CIf a b d -> CIf (go a) (go b) (go d)
-      CLet y a b | y /= x -> CLet y (go a) (go b)
-      CLet y a b -> CLet y (go a) b
-      other -> other
+type Drv4 = Ptr Int64 -> Ptr Int64 -> Int64 -> Ptr Int64 -> IO Int64
 
--- expression codegen; env maps param name -> var slot (0 = elem, 1 = acc).
--- Calls to other one-param functions (guard clauses lift into these)
--- are inlined by substitution when the callee is non-recursive — the
--- fragment stays closed, the tier stays narrow.
-exprAsm :: Prog -> Char -> M.Map Name Int -> Core -> Maybe Asm
-exprAsm prog ek env = goV
-  where
-    goV c = case c of
-      -- inline saturated calls to non-recursive prog functions (guard
-      -- clauses and join points lift into these); spine-collected so
-      -- join-point partial applications inline too
-      _ | (CVar h, args@(_ : _)) <- spine c,
-          Nothing <- M.lookup h env,
-          h `notElem` ["Num.sqrt", "+", "-", "*", "/"] ++ cmpOps,
-          Just (hps, hb) <- M.lookup h prog,
-          length hps == length args,
-          not (callsSelf h hb) ->
-            goV (foldr (\(p, a) acc -> substC p a acc) hb (zip hps args))
-      CVar v | Just slot <- M.lookup v env -> Just (if ek == 'd' then varD slot else varI slot)
-      CInt k -> Just (if ek == 'd' then litD (fromIntegral k) else litI (fromIntegral k))
-      CLet x v b -> goV (substC x v b)
-      -- float-literal splices (parser shape only): a double immediate.
-      -- Guarded on ek == 'd' -- the hand tier is mono-kind, so a float
-      -- literal in an int-kind body declines to the llvm tier (sound).
-      CApp (CApp (CVar "f64frombits") (CInt hi)) (CInt lo)
-        | ek == 'd' ->
-            Just (litD (castWord64ToDouble
-                          ((fromIntegral hi `shiftL` 32)
-                             .|. (fromIntegral lo .&. 0xFFFFFFFF))))
-      CApp (CVar "f32frombits") (CInt bb)
-        | ek == 'd' -> Just (litD (realToFrac (castWord32ToFloat (fromIntegral bb))))
-      CApp (CVar "Num.sqrt") a | ek == 'd' -> (++ sqrtD) <$> goV a
-      CApp (CApp (CVar o) a) b
-        | o `elem` ["+", "-", "*", "/"] -> do
-            la <- goV a
-            lb <- goV b
-            pure $
-              if ek == 'd'
-                then la ++ pushD ++ lb ++ popD1 ++ opD o
-                else la ++ pushI ++ lb ++ popI11 ++ opI o
-      CIf (CApp (CApp (CVar o) a) b) t f
-        | o `elem` cmpOps -> do
-            la <- goV a
-            lb <- goV b
-            lt <- goV t
-            lf <- goV f
-            let cnd = if ek == 'd' then la ++ pushD ++ lb ++ popD1 ++ cmpD o else la ++ pushI ++ lb ++ popI11 ++ cmpI o
-                thenB = lt ++ jmpRel (length lf)
-            pure (cnd ++ testJz (length thenB) ++ thenB ++ lf)
-      _ -> Nothing
+type DrvF = Ptr Int64 -> Ptr Int64 -> Int64 -> Int64 -> IO Int64
 
-emitKernel :: Prog -> String -> Name -> Char -> Maybe Asm
-emitKernel prog scheme g ek = do
-  (ps, body0) <- M.lookup g prog
-  case (scheme, ps) of
-    ("vecmap", [x]) -> do
-      e <- exprAsm prog ek (M.fromList [(x, 0)]) body0
-      let loadE = if ek == 'd' then loadElemD else loadElemI
-          store = if ek == 'd' then storeOutD else storeOutI
-          body = loadE ++ e ++ store ++ incR10
-          -- loop: cmp; jge +body+jmp; body; jmp back
-          jgeF = [0x0F, 0x8D] ++ imm32 (length body + 5)
-          back = negate (length cmpR10N + length jgeF + length body + 5)
-      pure $
-        pPushR12 ++ pPushR13 ++ subFuelN ++ movR9ColBase ++ zeroR10
-          ++ cmpR10N ++ jgeF ++ body ++ jmpRel back
-          ++ [0x48, 0x89, 0xC8] -- mov rax, rcx (k = n)
-          ++ pPopR13 ++ pPopR12 ++ [0xC3]
-    ("vecfold", [a, x]) -> do
-      e <- exprAsm prog ek (M.fromList [(x, 0), (a, 1)]) body0
-      let accInit = if ek == 'd' then [0x66, 0x49, 0x0F, 0x6E, 0xD8] else [0x4D, 0x89, 0xC4] -- movq xmm3,r8 / mov r12,r8
-          loadE = if ek == 'd' then loadElemD else loadElemI
-          accSet = if ek == 'd' then [0x66, 0x0F, 0x28, 0xD8] else [0x49, 0x89, 0xC4] -- movapd xmm3,xmm0 / mov r12,rax
-          accOut = if ek == 'd' then [0x66, 0x48, 0x0F, 0x7E, 0xD8] else [0x4C, 0x89, 0xE0] -- movq rax,xmm3 / mov rax,r12
-          body = loadE ++ e ++ accSet ++ incR10
-          jgeF = [0x0F, 0x8D] ++ imm32 (length body + 5)
-          back = negate (length cmpR10N + length jgeF + length body + 5)
-      pure $
-        pPushR12 ++ pPushR13 ++ subFuelN ++ movR9ColBase ++ accInit ++ zeroR10
-          ++ cmpR10N ++ jgeF ++ body ++ jmpRel back
-          ++ accOut ++ pPopR13 ++ pPopR12 ++ [0xC3]
-    _ -> Nothing
+type Drv5 = Ptr Int64 -> Ptr Int64 -> Ptr Int64 -> Int64 -> Ptr Int64 -> IO Int64
+
+type DrvF5 = Ptr Int64 -> Ptr Int64 -> Ptr Int64 -> Int64 -> Int64 -> IO Int64
+
+foreign import ccall "dynamic" mkDrv4 :: FunPtr Drv4 -> Drv4
+
+foreign import ccall "dynamic" mkDrvF :: FunPtr DrvF -> DrvF
+
+foreign import ccall "dynamic" mkDrv5 :: FunPtr Drv5 -> Drv5
+
+foreign import ccall "dynamic" mkDrvF5 :: FunPtr DrvF5 -> DrvF5
+
+fp :: Int64 -> FunPtr a
+fp addr = castPtrToFunPtr (intPtrToPtr (fromIntegral addr))
+
+runMapFilter :: Int64 -> Ptr Int64 -> [Int64] -> IO (Int64, [Int64])
+runMapFilter addr pfuel xs =
+  withArrayLen xs $ \n pin ->
+    allocaArray (max 1 n) $ \pout -> do
+      k <- mkDrv4 (fp addr) pfuel pin (fromIntegral n) pout
+      out <- peekArray (fromIntegral k) pout
+      xcheck addr 0 [] [xs] (fromIntegral n) 0 (k : out)
+      pure (k, out)
+
+runFold :: Int64 -> Ptr Int64 -> Int64 -> [Int64] -> IO Int64
+runFold addr pfuel acc0 xs =
+  withArrayLen xs $ \n pin -> do
+    r <- mkDrvF (fp addr) pfuel pin (fromIntegral n) acc0
+    xcheck addr 1 [] [xs] (fromIntegral n) acc0 [r]
+    pure r
+
+runVecMapFilter :: Int64 -> Ptr Int64 -> [Int64] -> Ptr (Ptr Int64) -> Int -> IO (Int64, [Int64])
+runVecMapFilter addr pfuel extras cols n =
+  withArrayLen (extras ++ [0]) $ \_ pex ->
+    allocaArray (max 1 n) $ \pout -> do
+      k <- mkDrv5 (fp addr) pfuel pex (castPtr cols) (fromIntegral n) pout
+      out <- peekArray (fromIntegral k) pout
+      colsIn <- colsFor addr cols n
+      xcheck addr 2 extras colsIn (fromIntegral n) 0 (k : out)
+      pure (k, out)
+
+runVecFold :: Int64 -> Ptr Int64 -> [Int64] -> Ptr (Ptr Int64) -> Int -> Int64 -> IO Int64
+runVecFold addr pfuel extras cols n acc0 =
+  withArrayLen (extras ++ [0]) $ \_ pex -> do
+    r <- mkDrvF5 (fp addr) pfuel pex (castPtr cols) (fromIntegral n) acc0
+    colsIn <- colsFor addr cols n
+    xcheck addr 3 extras colsIn (fromIntegral n) acc0 [r]
+    pure r
+
+runVecMapR :: Int64 -> Ptr Int64 -> [Int64] -> Ptr (Ptr Int64) -> Int -> [Ptr Int64] -> IO ()
+runVecMapR addr pfuel extras cols n outs =
+  withArrayLen (extras ++ [0]) $ \_ pex ->
+    withArray outs $ \pouts -> do
+      _ <- mkDrv5 (fp addr) pfuel pex (castPtr cols) (fromIntegral n) (castPtr pouts)
+      colsIn <- colsFor addr cols n
+      outVals <- mapM (peekArray n) outs
+      xcheck addr 4 extras colsIn (fromIntegral n) 0 (fromIntegral (length outs) : concat outVals)
+
+-- ---- cross-check dumps ---------------------------------------------------------
+-- case file, little-endian i64 words:
+--   [magic 0x484A4954, kind, n, nEx, nCols, nExp, acc0, extras.., cols (n words each).., expected..]
+-- kind: 0 list map/filter (expected = k : out), 1 list fold (= [r]),
+--       2 vec map/filter (= k : out), 3 vec fold (= [r]),
+--       4 vecmapr (= nOuts : out columns concatenated)
+
+xcheckDir :: IORef (Maybe FilePath)
+xcheckDir = unsafePerformIO (lookupEnv "SOL_HJIT_XCHECK" >>= newIORef)
+{-# NOINLINE xcheckDir #-}
+
+caseSeq :: IORef Int
+caseSeq = unsafePerformIO (newIORef 0)
+{-# NOINLINE caseSeq #-}
+
+-- the unit's column count is recorded at install time; boxed columns are
+-- null pointers and dump as zeros so indices stay aligned
+colsFor :: Int64 -> Ptr (Ptr Int64) -> Int -> IO [[Int64]]
+colsFor addr cols n = do
+  dir <- readIORef xcheckDir
+  tbl <- readIORef symTable
+  case (dir, M.lookup addr tbl) of
+    (Just _, Just (_, _, nc)) -> do
+      ps <- peekArray nc cols
+      mapM (\p -> if p == nullPtr then pure (replicate n 0) else peekArray n p) ps
+    _ -> pure []
+
+xcheck :: Int64 -> Int -> [Int64] -> [[Int64]] -> Int64 -> Int64 -> [Int64] -> IO ()
+xcheck addr kind extras colsIn n acc0 expected = do
+  dir <- readIORef xcheckDir
+  forM_ dir $ \d -> do
+    tbl <- readIORef symTable
+    forM_ (M.lookup addr tbl) $ \(sym, _, _) -> do
+      k <- atomicModifyIORef' caseSeq (\c -> (c + 1, c))
+      let ws = [0x484A4954, fromIntegral kind, n, fromIntegral (length extras), fromIntegral (length colsIn), fromIntegral (length expected), acc0]
+              ++ extras ++ concat colsIn ++ expected
+      withBinaryFile (d ++ "/" ++ sym ++ "." ++ show k ++ ".case") WriteMode $ \h ->
+        withArrayLen ws $ \cnt p -> hPutBuf h p (cnt * 8)

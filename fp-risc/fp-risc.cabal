@@ -4,11 +4,11 @@ version:            0.12.0
 synopsis:           The FP-RISC compiler: one grammar, five backends, one binary
 description:
   fpr -- AOT (rv32/rv64/a64/a64mac/x64/qx64/qa64), the HostedBytecode
-  profile (sol: VM + LLVM JIT + handJIT + GPU Vec tier + transactional
+  profile (sol: VM + hand-rolled native JIT (x86-64 / A64) + GPU Vec tier + transactional
   runtime), fpr commit/push/pull, and the safety line (Safety.hs).
   .
   The build knowledge that used to live only in the Makefile's fpr
-  recipe is declared here: the four C shims and the native libraries
+  recipe is declared here: the three C shims and the native libraries
   they need.  The Makefile remains the driver for everything cabal was
   never going to do -- cross-compilation, QEMU boots, .qa packaging,
   disk seeding, and the sweep (check-all.sh).  `make fpr-cabal` builds
@@ -43,7 +43,10 @@ executable fpr
       Sol.Gpu
       Sol.HandJIT
       Sol.Infer
-      Sol.JIT
+      Sol.JitCore
+      Sol.KIR
+      Sol.AsmX64
+      Sol.AsmA64
       Sol.Lang
       Sol.Main
       Sol.Mod
@@ -54,18 +57,11 @@ executable fpr
       Sol.Web
       Sol.Width
   c-sources:
-      compiler/cbits/shim.c
       compiler/cbits/fsx.c
       compiler/cbits/vecgpu.c
       compiler/cbits/handjit.c
-  -- llvm-config include dir for shim.c; harmless for the others
-  include-dirs:       /usr/lib/llvm-18/include
-  extra-libraries:    LLVM-18
   if !os(darwin)
     extra-libraries:  EGL GL
-  -- the LLVM libdir is machine-specific: override in
-  -- cabal.project.local (extra-lib-dirs) on other hosts
-  extra-lib-dirs:     /usr/lib/llvm-18/lib
   build-depends:
       base          >=4.16 && <5
     , array

@@ -27,7 +27,7 @@ import Struct (erasePSig, expandStructs, sigTable, specialize, structTable)
 import Safety (safetyCheck)
 import Sol.Infer (inferTops)
 import Sol.Width (widthReport)
-import Sol.JIT (JitCtx, initJIT)
+import Sol.HandJIT (JitCtx, initJIT)
 import System.Environment (getArgs, lookupEnv)
 import GHC.IO.Encoding (setLocaleEncoding, utf8)
 import System.Exit (exitFailure)
@@ -37,7 +37,6 @@ import System.FilePath (dropExtension, takeDirectory, takeExtension)
 import Text.Megaparsec (errorBundlePretty, parse)
 import Sol.Txn
 import qualified Sol.Gpu as Gpu
-import qualified Sol.HandJIT as Hand
 import Sol.VM hiding ()
 import qualified Sol.VM as VM
 
@@ -196,15 +195,14 @@ main = do
   when (null runList && not dumpAsm) $
     putStrLn "[sol] note: no `> expr.` statements and no main; nothing to run"
 
-  -- JIT: one LLJIT per process; the compile cache survives STM retries.
-  -- SOL_JIT=0 disables the tier (interpreter handles everything).
+  -- JIT: one native tier per process (hand-rolled x86-64 / A64, no
+  -- LLVM); the compile cache survives STM retries.  SOL_JIT=0 disables
+  -- it (the interpreter handles everything); any other value, including
+  -- the historical "hand", selects it.
   jitFlag <- lookupEnv "SOL_JIT"
-  -- SOL_JIT: 1/unset = llvm tier, hand = hand-rolled x86-64 (no llvm
-  -- linkage cost, Vec schemes only), 0 = interpreter everywhere
-  (jc, hand) <- case jitFlag of
-    Just "0" -> pure (Nothing, Nothing)
-    Just "hand" -> (,) Nothing . Just <$> Hand.newHandCtx
-    _ -> (,) <$> initJIT <*> pure Nothing
+  jc <- case jitFlag of
+    Just "0" -> pure Nothing
+    _ -> initJIT
 
   let shapeNames = M.fromList [(tid, fields) | (fields, tid) <- M.toList shapes]
       consTV = M.map (\(t, v, _) -> (t, v)) cons
@@ -217,7 +215,7 @@ main = do
   -- the raw `fpr: user error (...)` wrapper. Nothing was committed: the
   -- exception propagates out of runTxLoop before its commit call.
   unless dumpAsm $ do
-    r <- try (runTxLoop (takeDirectory path) scriptArgs dataFile journalFile consTV shapeNames bprog prog (jc, hand) cons runList rt 0) :: IO (Either IOException ())
+    r <- try (runTxLoop (takeDirectory path) scriptArgs dataFile journalFile consTV shapeNames bprog prog jc cons runList rt 0) :: IO (Either IOException ())
     case r of
       Right () -> pure ()
       Left e -> do
@@ -227,8 +225,8 @@ main = do
 
 -- run every `>` statement in order inside one transaction, then commit;
 -- on read-set conflict, reset and re-run the whole script
-runTxLoop :: FilePath -> [String] -> FilePath -> FilePath -> M.Map Name (Int, Int) -> M.Map Int [Name] -> BProg -> Prog -> (Maybe JitCtx, Maybe Hand.HandCtx) -> M.Map Name (Int, Int, Int) -> [Name] -> RtCounts -> Int -> IO ()
-runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt attempt = do
+runTxLoop :: FilePath -> [String] -> FilePath -> FilePath -> M.Map Name (Int, Int) -> M.Map Int [Name] -> BProg -> Prog -> Maybe JitCtx -> M.Map Name (Int, Int, Int) -> [Name] -> RtCounts -> Int -> IO ()
+runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core jc cons topNames rt attempt = do
   tx <- newTx
   fuel <- newIORef fuelQuantum
   preempts <- newIORef 0
@@ -236,7 +234,7 @@ runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc,
   tabFlag <- lookupEnv "SOL_TABLE"
   tab <- if tabFlag == Just "0" then pure Nothing else Just <$> newIORef M.empty
   actors <- VM.newActorRuntime
-  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab hand (mkHal cons scriptArgs tx preempts rt) fuel preempts tx actors
+  let env = VMEnv base dataFile consTV shapeNames bprog core jc gpu tab (mkHal cons scriptArgs tx preempts rt) fuel preempts tx actors
       cleanup = VM.shutdownActorRuntime actors
   res <- (do
     forM_ topNames $ \n -> do
@@ -280,7 +278,7 @@ runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc,
           exitFailure
       | otherwise -> do
           putStrLn ("[sol] conflict on " ++ show stale ++ " — retrying (attempt " ++ show (attempt + 2) ++ ")")
-          runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core (jc, hand) cons topNames rt (attempt + 1)
+          runTxLoop base scriptArgs dataFile journalFile consTV shapeNames bprog core jc cons topNames rt (attempt + 1)
 
 numberEvals :: [STop] -> ([STop], [Name])
 numberEvals tops = (map fst numbered, [n | (_, Just n) <- numbered])
