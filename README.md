@@ -26,8 +26,9 @@ compile and an up-to-date one costs nothing.
                         structs, contracts) + AOT backends (rv64 IR,
                         X64/A64 lowerings) + Target.hs (the profile
                         model) + StdCheck/StdBridge (the std proof pass)
-      compiler/Sol/     the HostedBytecode pipeline (bytecode VM, LLVM
-                        JIT, transactional runtime) — ALL Haskell lives
+      compiler/Sol/     the HostedBytecode pipeline (bytecode VM, the
+                        hand-rolled native JIT for x86-64 and A64 --
+                        no LLVM -- transactional runtime) — ALL Haskell lives
                         under compiler/; compiler/cbits/ holds its C FFI
       sol/              the sol PROFILE'S CONTENT only: lib/ (base, ui,
             matrix, rand, …), examples/, and scripts/ — no source tree,

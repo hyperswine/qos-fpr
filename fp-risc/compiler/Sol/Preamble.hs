@@ -61,6 +61,7 @@ prelude =
       "collect rs = foldl collectStep (Ok []) rs.",
       "collectStep acc r = case acc of Err e -> Err e | Ok xs -> (case r of Ok x -> Ok (List.append xs [x]) | Err e -> Err e).",
       "parseInt s = unwrap (Try.parseInt s).",
+      "parseNum s = unwrap (Try.parseNum s).",
       "readPath p = unwrap (Try.readPath p).",
       "readPathOr d p = okOr d (Try.readPath p).",
       "writePath p s = write p s.",
@@ -246,7 +247,7 @@ halArities :: M.Map Name Int
 halArities =
   M.fromList
     [ ("str", 1), ("strcat", 2), ("String.len", 1), ("strlen", 1),
-      ("error", 1), ("Try.parseInt", 1), ("Try.readPath", 1),
+      ("error", 1), ("Try.parseInt", 1), ("Try.parseNum", 1), ("Try.readPath", 1),
       ("charAt", 2), ("chr", 1), ("substr", 3), ("!", 2),
       ("open", 1), ("readAll", 1), ("writeAll", 2), ("close", 1), ("args", 1),
       ("BStr.new", 1), ("BStr.fromStr", 1), ("BStr.toStr", 1),

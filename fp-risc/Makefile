@@ -56,19 +56,6 @@ all: fpr
 # (the qos/ Makefile): bare flags fall through to `fpr compile`.
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)
-ifeq ($(UNAME_S),Darwin)
-# Homebrew keeps versioned LLVM keg-only, so it is normally absent from
-# PATH.  Ask brew for the active keg instead of assuming /opt/homebrew
-# (Intel Homebrew and custom prefixes live elsewhere).
-LLVMCONF := $(shell prefix="$$(brew --prefix llvm@18 2>/dev/null)"; \
-			 test -x "$$prefix/bin/llvm-config" && echo "$$prefix/bin/llvm-config" || \
-			 command -v llvm-config-18 2>/dev/null || command -v llvm-config 2>/dev/null)
-else
-LLVMCONF := $(shell command -v llvm-config-18 2>/dev/null || command -v llvm-config 2>/dev/null)
-endif
-LLVM_INCLUDE_DIR := $(shell $(LLVMCONF) --includedir 2>/dev/null)
-LLVM_LIB_DIR := $(shell $(LLVMCONF) --libdir 2>/dev/null)
-CABAL_LLVM_FLAGS := --extra-include-dirs=$(LLVM_INCLUDE_DIR) --extra-lib-dirs=$(LLVM_LIB_DIR)
 FPR_HOST_STAMP := build/.fpr-host-$(UNAME_S)-$(UNAME_M)
 ifeq ($(UNAME_S),Darwin)
 GLLIBS :=
@@ -80,16 +67,14 @@ $(FPR_HOST_STAMP):
 	@rm -f build/.fpr-host-*
 	@touch $@
 
-fpr: $(FPR_HOST_STAMP) compiler/*.hs compiler/Sol/*.hs compiler/cbits/shim.c compiler/cbits/fsx.c compiler/cbits/vecgpu.c compiler/cbits/handjit.c
+fpr: $(FPR_HOST_STAMP) compiler/*.hs compiler/Sol/*.hs compiler/cbits/fsx.c compiler/cbits/vecgpu.c compiler/cbits/handjit.c
 	@if command -v cabal >/dev/null 2>&1; then \
-	  cabal build $(CABAL_LLVM_FLAGS) exe:fpr && cp "$$(cabal list-bin fpr)" fpr; \
+	  cabal build exe:fpr && cp "$$(cabal list-bin fpr)" fpr; \
 	else \
-	  gcc -c compiler/cbits/shim.c -o compiler/cbits/shim.o $$($(LLVMCONF) --cflags) && \
 	  gcc -c compiler/cbits/fsx.c -o compiler/cbits/fsx.o && \
 	  gcc -c compiler/cbits/vecgpu.c -o compiler/cbits/vecgpu.o && \
 	  gcc -c compiler/cbits/handjit.c -o compiler/cbits/handjit.o && \
-	  cd compiler && ghc -O0 -i. -o ../fpr Main.hs cbits/shim.o cbits/fsx.o cbits/vecgpu.o cbits/handjit.o \
-	    -L$$($(LLVMCONF) --libdir) -lLLVM-18 $(GLLIBS); \
+	  cd compiler && ghc -O0 -i. -o ../fpr Main.hs cbits/fsx.o cbits/vecgpu.o cbits/handjit.o $(GLLIBS); \
 	fi
 	ln -sf fpr fprc
 
@@ -99,7 +84,7 @@ fpr: $(FPR_HOST_STAMP) compiler/*.hs compiler/Sol/*.hs compiler/cbits/shim.c com
 # index, so it works offline.
 fpr-cabal:
 	@if command -v cabal >/dev/null 2>&1; then \
-	  cabal build $(CABAL_LLVM_FLAGS) exe:fpr && cp "$$(cabal list-bin fpr)" fpr; \
+	  cabal build exe:fpr && cp "$$(cabal list-bin fpr)" fpr; \
 	else \
 	  ghc -o build/Setup Setup.hs >/dev/null && \
 	  ./build/Setup configure --ghc >/dev/null && \

@@ -54,6 +54,7 @@ solBuiltins =
       -- with |>?; the panicking spellings (parseInt, readPath) are
       -- PRELUDE sugar over these and type by inference
       ("Try.parseInt", mono (TFn tStr (tcon "Result" [tInt, tStr]))),
+      ("Try.parseNum", mono (TFn tStr (tcon "Result" [tInt, tStr]))),
       ("Try.readPath", mono (TFn tStr (tcon "Result" [tStr, tStr]))),
       ("charAt", mono (TFn tStr (TFn tInt tInt))), -- returns the char CODE
       ("substr", mono (TFn tStr (TFn tInt (TFn tInt tStr)))),

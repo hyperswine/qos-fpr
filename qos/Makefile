@@ -67,8 +67,8 @@ portable-gl: $(QOSP_GL_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Code
 	  $(DESKTOP_GL_LIBS)
 
 # ---- QOS Portable, aarch64 cross (verifies the x28 hart discipline
-portable-a64: $(QOSP_SRC) appside/qos_abi.h portable/qa.h
-	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) \
+portable-a64: $(QOSP_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
+	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) $(REV_FLAG) \
 	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp-a64 -lpthread
 
 # ---- QOS Native: the kernel --------------------------------------------

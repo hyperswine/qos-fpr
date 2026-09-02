@@ -56,6 +56,39 @@ These are semantic replacements, not line-for-line shell translations. There
 are no pipelines, word splitting, glob interpolation, or `eval`. External
 programs receive explicit argument vectors through `Proc.spec`.
 
+## JSON and CSV
+
+`lib/json.sol` and `lib/csv.sol` treat both formats as values, so a data
+job is one railway pipeline: parse into a value, reshape it with pure
+functions, render it back, and let the transaction land the files.
+
+```
+J = use "../lib/json".   C = use "../lib/csv".
+JStr = J.JStr.  JObj = J.JObj.                # constructors come in by alias
+
+> doc = unwrap (J.parse (readPath "in.json"));
+  city = J.path ["address", "city"] doc |>? J.text;         # Result String
+  out = doc |> J.set "tier" (JStr "gold") |> J.without "tags";
+  writePath "out.json" (J.pretty out).
+
+> recs = C.records (unwrap (C.parse (readPath "orders.csv")));   # (column, value) rows
+  good = List.filter (fn r -> isOk (C.col "amount" r |>? Try.parseNum)) recs;
+  writePath "clean.csv" (C.render (C.table ["order", "amount"] good)).
+```
+
+`J.parse` / `C.parse` return `Result`; `J.get`, `J.at`, `J.path`, `J.num`,
+`J.text`, `J.bool`, `J.items`, `J.fields` and `C.col` are railway steps, so a
+missing key or a non-number derails the chain with a named `Err` instead of
+a panic.  Numbers ride the Numeric surface via `Try.parseNum` (integers stay
+exact, decimals are inexact).  Object keys keep document order, so
+`parse |> render` is the identity up to whitespace; `C.parse |> C.render`
+is the identity including quoted commas, newlines and doubled quotes.
+Inside a Sol string literal `{` and `}` are interpolation, so inline JSON
+text is written with `\{` and `\}`.  `J.ofRecord` lifts a CSV record into
+a JSON object, which is the whole CSV-to-JSON bridge.
+
+`sol/examples/jsoncsv.sol` is the executable spec for both libraries.
+
 ## Boundaries
 
 - Host commands are capabilities of the machine running Sol. Check and report

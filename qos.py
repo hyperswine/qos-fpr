@@ -245,8 +245,7 @@ def cmd_run(a):
 
     if prog.endswith(".sol") or a.on == "sol": # type: ignore
         say(f"sol profile: {prog}")
-        env = {"LD_LIBRARY_PATH": "/usr/lib/llvm-18/lib"}
-        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=env, expect=expect)
+        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, expect=expect)
     if a.on == "virt":
         say(f"bare-metal QEMU virt: {prog}")
         cmd = ["make", "-s", "bare-metal-run", f"PROG={prog}"]
@@ -384,7 +383,6 @@ def cmd_dev(a):
     prog = resolve_prog(a.prog)
     build_fpr()
     e = dict(os.environ)
-    e["LD_LIBRARY_PATH"] = "/usr/lib/llvm-18/lib"
     say(f"dev {prog}: sol profile, rerun on save")
 
     def mt(f):
