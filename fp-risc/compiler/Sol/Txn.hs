@@ -37,7 +37,7 @@ import Text.Read (readMaybe)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.UTF8 as BSU
 import qualified Data.IntMap.Strict as IM
-import Data.List (dropWhileEnd, isInfixOf, isSuffixOf, nub, sort)
+import Data.List (dropWhileEnd, isInfixOf, isPrefixOf, isSuffixOf, nub, sort)
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import System.Directory
@@ -739,9 +739,10 @@ recoverJournal takeLocks j = do
 
 -- ---- commit ---------------------------------------------------------------
 
--- Committed carries (applied file effects, a deferred command failed);
--- the receipt only says "atomically" when the second is False
-data CommitResult = Committed Int Bool | Conflict [FilePath]
+-- Committed carries (applied file effects, deferred commands/processes
+-- that ran, a deferred command failed); the receipt only says
+-- "atomically" when the last is False
+data CommitResult = Committed Int Int Bool | Conflict [FilePath]
 
 effectPath :: Effect -> Maybe FilePath
 effectPath (EWrite p _) = Just p
@@ -789,7 +790,15 @@ commit ref jpath = do
                 | isDoesNotExistError e -> pure []
                 | otherwise -> throwIO e
               Right names' -> pure names'
-            let now = sort (filter (not . lockArtifact) now0)
+            -- taking a lock beside a path whose parent dir does not exist
+            -- yet creates that parent (acquireGo). Such a dir is a
+            -- protocol artifact of THIS commit, not a foreign write: it is
+            -- an ancestor of a touched path and holds nothing but lock
+            -- artifacts. Without this a script that lists a dir and then
+            -- writes into a subdir of it would conflict with itself and
+            -- pay a retry every run.
+            now1 <- filterOutProtocolDirs dir touched now0
+            let now = sort (filter (not . lockArtifact) now1)
             pure (if now == names then acc else dir : acc)
         )
         []
@@ -808,7 +817,8 @@ commit ref jpath = do
         let wrotePaths = nub [p | e <- effs, Just p <- [effectPath e]]
         when (reportC == Just "1" && not (null wrotePaths)) $
           hPutStrLn stderr (childCommitMarker ++ show wrotePaths)
-        pure (Committed n sfail)
+        let ncmd = length [() | e <- effs, Nothing <- [effectPath e]]
+        pure (Committed n ncmd sfail)
       else pure (Conflict stale)
 
 -- the stderr line a child sol emits (under SOL_REPORT_COMMIT=1) naming
@@ -834,6 +844,42 @@ txChildOverlap ref ps = do
           || M.member p (txView s)
           || M.member (dirOf p) (txDirReads s)
   pure (filter hit ps)
+
+-- names in a listing that exist only because this commit's lock protocol
+-- created them: proper ancestors of a touched path, containing nothing
+-- but lock artifacts (recursively). A foreign txn that put real content
+-- there is still a conflict.
+filterOutProtocolDirs :: FilePath -> [FilePath] -> [String] -> IO [String]
+filterOutProtocolDirs dir touched = go
+  where
+    go [] = pure []
+    go (n : rest) = do
+      let full = dir ++ "/" ++ n
+          ancestor = any (\t -> (full ++ "/") `isPrefixOf` t) touched
+      drop' <-
+        if ancestor
+          then do
+            isD <- doesDirectoryExist full
+            if isD then protocolOnly full else pure False
+          else pure False
+      rest' <- go rest
+      pure (if drop' then rest' else n : rest')
+    protocolOnly d = do
+      r <- try (listDirectory d) :: IO (Either IOException [String])
+      case r of
+        Left _ -> pure False
+        Right es -> allM (entryOk d) es
+    entryOk d e
+      | lockArtifact e = pure True
+      | otherwise = do
+          let full = d ++ "/" ++ e
+              ancestor = any (\t -> (full ++ "/") `isPrefixOf` t) touched
+          isD <- doesDirectoryExist full
+          if ancestor && isD then protocolOnly full else pure False
+    allM _ [] = pure True
+    allM f (x : xs) = do
+      ok <- f x
+      if ok then allM f xs else pure False
 
 -- .sol-lock dirs, reclaim renames, and .sol-tmp staging files are
 -- commit-protocol artifacts: invisible to validation and to txLs

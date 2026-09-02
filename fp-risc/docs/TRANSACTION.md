@@ -87,6 +87,16 @@ has one rule instead of a rule per boundary.
 ## The commit line
 
     [sol] committed 2 file(s) atomically (whole-script transaction)
+    [sol] committed 0 file(s) + 3 deferred command(s) atomically (whole-script transaction)
 
 names the unit explicitly so a log reader knows the count covers the
-entire run.
+entire run, and names every effect class that landed: a script that
+only queued `shq` / `Proc.afterCommit` work still did something at
+commit, so it still gets a receipt.  A failed deferred command turns
+the line into `committed N file(s); NOT atomic: ...` and the exit code
+nonzero.
+
+The executable specs for these properties live in
+`sol/examples/{txn_iso,railway,procs,strings}.sol` (one run each) and
+`tools/sol-txn-check.sh` (panic rollback, retry-once, race
+serialization, fenced commands -- the ones that need a harness).
