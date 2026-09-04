@@ -375,12 +375,29 @@ int main(int argc, char **argv) {
            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (arena != (void *)QOS_ARENA_BASE) {
     if (arena != MAP_FAILED) munmap(arena, QOS_ARENA_SIZE);
+#ifdef __APPLE__
+    /* arm64 macOS forces PIE, and occasionally slides this host across the
+     * fixed app arena.  A new exec gets a fresh slide; never MAP_FIXED over
+     * the live image. */
+    const char *retry_s = getenv("QOSP_ARENA_REEXEC");
+    int retry = retry_s ? atoi(retry_s) : 0;
+    if (retry < 8) {
+      char next[16];
+      snprintf(next, sizeof next, "%d", retry + 1);
+      setenv("QOSP_ARENA_REEXEC", next, 1);
+      execvp(argv[0], argv);
+      qos_hostlog("qosp: cannot retry arena mapping: %s", strerror(errno));
+    }
+#endif
     qos_hostlog("qosp: cannot map the arena at %#lx (ASLR collision or RWX "
                 "policy) -- the app image is linked at this address, so "
                 "there is no fallback",
                 QOS_ARENA_BASE);
     return 1;
   }
+#ifdef __APPLE__
+  unsetenv("QOSP_ARENA_REEXEC");
+#endif
   const qos_hal_t *hal = qosp_hal_table();
   TRACE("stage 1: HAL table at %p (abi v%" PRIu64 ")\n", (const void *)hal,
         hal->version);
