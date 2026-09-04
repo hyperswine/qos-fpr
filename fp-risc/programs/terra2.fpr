@@ -1,0 +1,947 @@
+# ============================================================================
+# terra2.fpr -- Terra II, the card game (docs/TERRA2.md), in FP-RISC on QOS.
+#
+# The V1 rules cut down to what proves the POSITIONAL economy on a screen:
+# two zones x five slots a side, supply earned from rear units and drained
+# by heavies, CALL / RETREAT / ADVANCE, attack within +-1 column, cover
+# (a rear unit behind a friendly forward unit cannot be hit), lanes (both
+# slots of a column empty expose the HQ), Overwatch (50% intercept, once
+# per enemy turn), face-down ambush in the rear (full ATK to the first
+# attacker in its column), artillery (charge, then fire past cover), the
+# ENV track, veterancy, HQ at 0 = the game.  Tactics cards, card texts and
+# the Unsupplied rule are out (noted at the bottom).
+#
+# THE SHAPE.  MVU.game -- the elm four over one model record -- against
+# the GLES scene walker as the render service (mods/glsvc.fpr).  view
+# builds the whole board as a Scene every frame: the table, tiles, HQs,
+# units as simple solids (infantry = block + head, heavy = hull + turret,
+# artillery = carriage + barrel, support = tower, ambush = a face-down
+# slab), hand cards as standing slabs with 5x8 glyph text, a HUD and a
+# message line as glyph text too.  The camera is Hearthstone's: behind
+# and above your hand, looking down the board.
+#
+# TIME.  A 40 ms STick drives everything that moves.  Player and AI both
+# ENQUEUE actions; the tick pops one at a time, plays its animation
+# (summon pop, attack lunge, artillery/ambush shot, retreat slide, turn
+# banner) and applies the rule at the animation's midpoint, so what you
+# see is when it happens.  Keys are buffered and taken one per idle tick,
+# so a replayed key file (FPR_EVDEV) drives an identical game.
+#
+# KEYS  arrows: cursor (left/right column or card, up/down zone)
+#       enter: pick card / pick unit / confirm target      esc: cancel
+#       on a selected unit: A attack  O overwatch  R retreat  V advance
+#                           C charge (artillery)  F fire (artillery)
+#       1-5: jump to a column   space or E: end turn   P: screenshot  Q: quit
+#
+#   make qos-app PROG=programs/terra2.fpr
+#   (cd ../qos && make portable-gl && ./qosp-gl --yes ../fp-risc/app.qa)
+#   headless: xvfb-run -a ./qosp-gl ... with FPR_EVDEV=keys.evd (see
+#   qos/tests-host/terra2-check.py: a scripted game, frames read back)
+# ============================================================================
+#: host gl
+#: expect game over
+
+unsafe program.
+
+MV = use "../std/mvu".
+GL = use "mods/glsvc".
+S2 = use "mods/scene2d".
+
+App = MV.App.
+MQuit = MV.MQuit.
+MLog = MV.MLog.
+ETick = MV.ETick.
+EKey = MV.EKey.
+EResize = MV.EResize.
+STick = MV.STick.
+SKeys = MV.SKeys.
+
+Gfx = Type (Scene statics dynamics lights camera
+          | Ent mesh pos yaw scale color).
+
+# ---- little prelude ---------------------------------------------------------
+
+len : unsafe List a -> Int .
+len Nil = 0.
+len (x :: r) = 1 + len r.
+nth : unsafe List a -> Int -> a -> a .
+nth Nil i d = d.
+nth (x :: r) 0 d = x.
+nth (x :: r) i d = nth r (i - 1) d.
+setAt : unsafe List a -> Int -> a -> List a .
+setAt Nil i v = Nil.
+setAt (x :: r) 0 v = v :: r.
+setAt (x :: r) i v = x :: setAt r (i - 1) v.
+delAt : unsafe List a -> Int -> List a .
+delAt Nil i = Nil.
+delAt (x :: r) 0 = r.
+delAt (x :: r) i = x :: delAt r (i - 1).
+rev : unsafe List a -> List a -> List a .
+rev Nil acc = acc.
+rev (x :: r) acc = rev r (x :: acc).
+app : unsafe List a -> List a -> List a .
+app Nil b = b.
+app (x :: r) b = x :: app r b.
+takeAt : unsafe List a -> Int -> (a, List a) .
+takeAt (x :: r) 0 = (x, r).
+takeAt (x :: r) k =
+  (y, rest) = takeAt r (k - 1);
+  (y, x :: rest).
+minI a b | a < b = a.
+minI a b = b.
+maxI a b | a > b = a.
+maxI a b = b.
+absI n | n < 0 = 0 - n.
+absI n = n.
+and2 True b = b.
+and2 False b = False.
+or2 True b = True.
+or2 False b = b.
+not1 True = False.
+not1 False = True.
+bi True = 1.
+bi False = 0.
+rnd s = (s * 1103515245 + 12345) % 2147483648.
+
+# ---- cards ------------------------------------------------------------------
+# Card id name cost atk def gen drain kind soft   kind 0 combat, 1 support,
+# 2 artillery.  soft 1 = Soft (ENV bites), 0 = Hard/Structure.  Names are
+# at most 8 glyphs (the card face).
+
+Card = Type (Card id name cost atk def gen drain kind soft).
+
+# Republic VI
+cardOf 0 = Card 0 "Convoy" 2 0 4 1 0 1 0.
+cardOf 1 = Card 1 "Depot" 3 0 5 2 0 1 0.
+cardOf 2 = Card 2 "EngCorps" 3 0 3 0 0 1 1.
+cardOf 3 = Card 3 "Registry" 1 0 2 0 0 1 0.
+cardOf 4 = Card 4 "Conscrpt" 1 1 3 0 0 0 1.
+cardOf 5 = Card 5 "CivDef" 2 2 3 0 0 0 1.
+cardOf 6 = Card 6 "Medic" 2 0 2 0 0 0 1.
+cardOf 7 = Card 7 "LightInf" 2 2 2 0 0 0 1.
+cardOf 8 = Card 8 "Guard" 3 2 4 0 0 0 1.
+cardOf 9 = Card 9 "Recon" 1 1 1 0 0 0 1.
+cardOf 10 = Card 10 "MechInf" 3 3 4 0 1 0 0.
+cardOf 11 = Card 11 "CombArms" 4 4 5 0 1 0 0.
+cardOf 12 = Card 12 "Coilgun" 4 4 2 0 1 2 0.
+cardOf 13 = Card 13 "AirWing" 5 3 3 0 1 0 0.
+cardOf 14 = Card 14 "CmdrJake" 5 2 5 0 0 0 1.
+# Southern Empire
+cardOf 20 = Card 20 "FwdDepot" 2 0 3 1 0 1 0.
+cardOf 21 = Card 21 "WarInd" 4 0 5 1 0 1 0.
+cardOf 22 = Card 22 "Salvage" 2 0 2 0 0 1 1.
+cardOf 23 = Card 23 "ExplPost" 3 0 2 2 0 1 0.
+cardOf 24 = Card 24 "Levy" 1 2 2 0 0 0 1.
+cardOf 25 = Card 25 "Ironclad" 2 2 4 0 0 0 1.
+cardOf 26 = Card 26 "VetSquad" 2 3 2 0 0 0 1.
+cardOf 27 = Card 27 "Grenadr" 3 3 3 0 0 0 1.
+cardOf 28 = Card 28 "Storm" 3 3 2 0 0 0 1.
+cardOf 29 = Card 29 "Commisar" 2 1 3 0 0 0 1.
+cardOf 30 = Card 30 "AsltGun" 3 4 3 0 1 0 0.
+cardOf 31 = Card 31 "Railgun" 4 5 2 0 1 2 0.
+cardOf 32 = Card 32 "IronCol" 4 4 6 0 1 0 0.
+cardOf 33 = Card 33 "HvyArmor" 5 5 7 0 2 0 0.
+cardOf 34 = Card 34 "Maximlan" 5 3 4 0 0 0 1.
+cardOf 35 = Card 35 "Executrs" 5 4 4 0 0 0 1.
+cardOf k = Card k "?" 99 0 1 0 0 0 0.
+
+cName (Card i n co a d g dr k s) = n.
+cCost (Card i n co a d g dr k s) = co.
+cAtk (Card i n co a d g dr k s) = a.
+cDef (Card i n co a d g dr k s) = d.
+cGen (Card i n co a d g dr k s) = g.
+cDrain (Card i n co a d g dr k s) = dr.
+cKind (Card i n co a d g dr k s) = k.
+cSoft (Card i n co a d g dr k s) = s.
+
+# the decks (tactics cut: 34 cards each), as copies of ids
+reps k n = case n == 0 of True -> Nil | False -> k :: reps k (n - 1).
+deckRep = app (reps 0 3) (app (reps 1 2) (app (reps 2 2) (app (reps 3 3) (app (reps 4 3)
+          (app (reps 5 3) (app (reps 6 3) (app (reps 7 3) (app (reps 8 2) (app (reps 9 2)
+          (app (reps 10 2) (app (reps 11 2) (app (reps 12 2) (app (reps 13 1) (reps 14 1)))))))))))))).
+deckSou = app (reps 20 3) (app (reps 21 2) (app (reps 22 2) (app (reps 23 2) (app (reps 24 3)
+          (app (reps 25 3) (app (reps 26 3) (app (reps 27 3) (app (reps 28 2) (app (reps 29 2)
+          (app (reps 30 2) (app (reps 31 2) (app (reps 32 2) (app (reps 33 1) (app (reps 34 1) (reps 35 1))))))))))))))).
+
+shuffle seed l = shuf seed l Nil.
+shuf seed Nil acc = acc.
+shuf seed l acc =
+  s2 = rnd seed;
+  (x, rest) = takeAt l (s2 % len l);
+  shuf s2 rest (x :: acc).
+
+# ---- units and sides ----------------------------------------------------------
+# A slot holds a unit record; id < 0 is empty.  mode 0 attack / 1 overwatch,
+# ready = may act this turn, down = face-down ambush (rdy = became ready),
+# chg = artillery charged, vet = veterancy tokens, age = turns on board,
+# ow = intercepted already this enemy turn.  flash/born/dead/dt are purely
+# visual (ms).
+
+noU = { id = 0 - 1, hp = 0, atk = 0, mode = 0, ready = 0, down = 0, rdy = 0,
+        chg = 0, vet = 0, age = 0, ow = 0, flash = 0, born = 900, dead = 0, dt = 0 }.
+mkU c down = { id = cId c, hp = cDef c, atk = cAtk c, mode = 0, ready = 0, down = down, rdy = 0,
+               chg = 0, vet = 0, age = 0, ow = 0, flash = 0, born = 0, dead = 0, dt = 0 }.
+cId (Card i n co a d g dr k s) = i.
+alive u = and2 (u.id >= 0) (u.dead == 0).
+uCard u = cardOf u.id.
+uKind u = cKind (uCard u).
+uSoft u = cSoft (uCard u).
+uMax u = cDef (uCard u) + u.vet.
+emptyRow = noU :: noU :: noU :: noU :: noU :: Nil.
+
+# side = { hq, stock, deck, hand, fwd, rear }
+mkSide deck hand = { hq = 15, stock = 0, deck = deck, hand = hand, fwd = emptyRow, rear = emptyRow }.
+rowOf p 1 = p.fwd.
+rowOf p z = p.rear.
+setRow p 1 row = { p | fwd = row }.
+setRow p z row = { p | rear = row }.
+slotOf p z c = nth (rowOf p z) c noU.
+setSlot p z c u = setRow p z (setAt (rowOf p z) c u).
+occ p z c = alive (slotOf p z c).
+
+sideOf m 0 = m.me.
+sideOf m s = m.en.
+setSide m 0 p = { m | me = p }.
+setSide m s p = { m | en = p }.
+
+# supply rate: HQ 2 (1 at ENV 7+) + GEN of face-up rear support - DRAIN of everything
+genRow Nil = 0.
+genRow (u :: r) | and2 (alive u) (and2 (u.down == 0) (uKind u == 1)) = cGen (uCard u) + genRow r.
+genRow (u :: r) = genRow r.
+drainRow Nil = 0.
+drainRow (u :: r) | alive u = cDrain (uCard u) + drainRow r.
+drainRow (u :: r) = drainRow r.
+rate m p = hqGen m + genRow p.rear - drainRow p.fwd - drainRow p.rear.
+hqGen m | m.env >= 7 = 1.
+hqGen m = 2.
+
+# ---- geometry: the board in the walker's milli units ------------------------------
+# z runs from the enemy HQ (far, negative) to your hand (near, positive).
+
+colX c = (c - 2) * 2400.
+zOf 0 1 = 2400.          # my forward
+zOf 0 2 = 5000.          # my rear
+zOf 0 3 = 7300.          # my HQ
+zOf 1 1 = 0 - 2400.
+zOf 1 2 = 0 - 5000.
+zOf 1 3 = 0 - 7600.
+zOf s z = 0.
+zHand = 8300.
+posOf s z c = (colX c, 0, zOf s z).
+hqPos s = (0, 0, zOf s 3).
+dirOf 0 = 0 - 1.          # "toward the enemy" along z
+dirOf s = 1.
+
+lights = ((3000, 14000, 9000), (1000, 1000, 1000)) :: Nil.
+camera = ((0, 12500, 14800), (0, 0, 300), 1000).
+
+white = (1000, 1000, 1000).
+yellow = (1000, 900, 300).
+blue = (250, 450, 950).
+red = (900, 300, 260).
+sideCol 0 = blue.
+sideCol s = red.
+supCol 0 = (330, 640, 520).
+supCol s = (760, 560, 300).
+
+# ---- glyph text -------------------------------------------------------------------
+# 5x8 cells (scene2d's font) as flat cubes standing upright facing +z; (x, y)
+# is the top-left of the first glyph, cell the cell size.
+
+txt es s x y z cell col = tgo es s 1 (strlen s) x y z cell col.
+tgo es s i n x y z cell col | i > n = es.
+tgo es s i n x y z cell col =
+  es2 = glyph es (S2.font (charAt s i)) 0 x y z cell col;
+  tgo es2 s (i + 1) n (x + 6 * cell) y z cell col.
+glyph es 0 b x y z cell col = es.
+glyph es bits b x y z cell col | b == 40 = es.
+glyph es bits b x y z cell col =
+  es2 = cellAt es (band bits 1) (b % 5) (b / 5) x y z cell col;
+  glyph es2 (bits / 2) (b + 1) x y z cell col.
+cellAt es 0 c r x y z cell col = es.
+cellAt es 1 c r x y z cell col =
+  Ent "cube" (x + c * cell + cell / 2, y - r * cell - cell / 2, z) 0 (cell - cell / 8, cell - cell / 8, 40) col :: es.
+# centered on x
+txtC es s x y z cell col = txt es s (x - strlen s * 3 * cell) y z cell col.
+
+# ---- the model --------------------------------------------------------------------
+# sel: SNone | SCard i | SPlace i z | SUnit z c | STarget z c (the attacker)
+# zone: the cursor's zone (0 hand, 1 my fwd, 2 my rear; under STarget 1 enemy
+# fwd, 2 enemy rear, 3 enemy HQ), cur: its index.
+
+Sel = Type (SNone | SCard i | SPlace i z | SUnit z c | STarget z c).
+# actions, queued and played one at a time
+Act = Type (ACall s i z c | AAttack s z c tz tc | AOver s c | ARetreat s c
+          | AAdvance s c | ACharge s c | AFire s c tz tc | AEnd s | AStart s).
+# the animation in flight: kind 0 none, 1 lunge, 2 shot, 3 slide, 4 pause
+An = Type (An kind s fz fc tz tc t done).
+noAn = An 0 0 0 0 0 0 0 0.
+
+initModel =
+  d0 = shuffle 8675309 deckRep;
+  d1 = shuffle 4242 deckSou;
+  (h0, r0) = split d0 5 Nil;
+  (h1, r1) = split d1 5 Nil;
+  { me = mkSide r0 h0, en = mkSide r1 h1, turn = 0, tno = 0, env = 0,
+    anim = noAn, queue = AStart 0 :: Nil, sel = SNone, zone = 0, cur = 0,
+    msg = "Terra II  --  arrows, enter, esc; space ends the turn", keys = Nil,
+    snap = 0, auto = 0, banner = "", bt = 0, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil }.
+note m s = { m | msg = s, log = s :: m.log }.
+split l 0 acc = (rev acc Nil, l).
+split Nil n acc = (rev acc Nil, Nil).
+split (x :: r) n acc = split r (n - 1) (x :: acc).
+
+# ---- rules: validation ------------------------------------------------------------
+
+# a forward unit at column c on side s may hit (tz, tc) on the other side
+targetOk m s c tz tc =
+  o = sideOf m (1 - s);
+  case absI (c - tc) <= 1 of
+    False -> False
+  | True -> targetOk2 o tz tc.
+targetOk2 o 1 tc = occ o 1 tc.
+targetOk2 o 2 tc = and2 (occ o 2 tc) (not1 (occ o 1 tc)).       # cover
+targetOk2 o 3 tc = or2 (lane o (tc - 1)) (or2 (lane o tc) (lane o (tc + 1))).
+targetOk2 o z tc = False.
+lane o c | or2 (c < 0) (c > 4) = False.
+lane o c = and2 (not1 (occ o 1 c)) (not1 (occ o 2 c)).
+# artillery ignores cover, columns and lanes: any rear unit, or the HQ
+fireOk m s tz tc =
+  o = sideOf m (1 - s);
+  case tz == 3 of
+    True -> True
+  | False -> and2 (tz == 2) (occ o 2 tc).
+
+canAct u = and2 (alive u) (and2 (u.ready == 1) (u.down == 0)).
+
+# ---- rules: effects -----------------------------------------------------------------
+
+damageUnit m s z c dmg =
+  p = sideOf m s;
+  u = slotOf p z c;
+  hp2 = u.hp - dmg;
+  u2 = { u | hp = hp2, flash = 250 };
+  m2 = note (setSide m s (setSlot p z c u2)) "{cName (uCard u)} takes {dmg}";
+  case and2 (alive u) (hp2 <= 0) of
+    True -> slay m2 s z c
+  | False -> m2.
+slay m s z c =
+  p = sideOf m s;
+  u = slotOf p z c;
+  m2 = setSide m s (setSlot p z c { u | dead = 1, dt = 0, hp = 0 });
+  note { m2 | env = minI 10 (m2.env + (case uSoft u == 1 of True -> 1 | False -> 2)),
+              fx = sparks m2.fx (posOf s z c) 6 } "{cName (uCard u)} destroyed".
+damageHq m s dmg =
+  p = sideOf m s;
+  hq2 = p.hq - dmg;
+  m2 = setSide m s { p | hq = hq2 };
+  m3 = note { m2 | fx = sparks m2.fx (hqPos s) 8 } "HQ hit for {dmg}: {hq2} left";
+  case hq2 <= 0 of
+    True -> note { m3 | over = 1 + (1 - s), banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil } (case s == 1 of True -> "VICTORY" | False -> "DEFEAT")
+  | False -> m3.
+sparks fx pos n | n == 0 = fx.
+sparks fx pos n =
+  (x, y, z) = pos;
+  sparks ((x + (n * 337) % 900 - 450, 900 + (n * 191) % 500, z + (n * 271) % 700 - 350, 0) :: fx) pos (n - 1).
+
+# the attack itself: overwatch intercept (once per enemy turn) and ambush
+# reveal happen BEFORE the blow lands; a dead attacker lands nothing.
+resolveAttack m s c tz tc =
+  m1 = intercept m s c tc;
+  m2 = ambush m1 s c tz tc;
+  a = slotOf (sideOf m2 s) 1 c;
+  case alive a of
+    False -> note m2 "the attacker fell before striking"
+  | True -> landBlow (spend m2 s 1 c) s c tz tc a.atk.
+landBlow m s c 3 tc dmg = damageHq m (1 - s) dmg.
+landBlow m s c tz tc dmg = damageUnit m (1 - s) tz tc dmg.
+spend m s z c =
+  p = sideOf m s;
+  u = slotOf p z c;
+  setSide m s (setSlot p z c { u | ready = 0, chg = 0 }).
+
+intercept m s c tc = intGo m s c tc (maxI 0 (tc - 1)) (minI 4 (tc + 1)).
+intGo m s c tc k hi | k > hi = m.
+intGo m s c tc k hi =
+  o = sideOf m (1 - s);
+  u = slotOf o 1 k;
+  case and2 (alive u) (and2 (u.mode == 1) (u.ow == 0)) of
+    True -> interceptBy (setSide m (1 - s) (setSlot o 1 k { u | ow = 1 })) s c k (u.atk / 2)
+  | False -> intGo m s c tc (k + 1) hi.
+interceptBy m s c k dmg =
+  m2 = damageUnit m s 1 c dmg;
+  note { m2 | fx = sparks m2.fx (posOf s 1 c) 4 } "overwatch intercepts for {dmg}".
+
+# ambush: attacking the forward unit in a column, or the face-down card
+# itself, wakes a READY face-down rear card: full ATK to the attacker, then
+# it stands face-up in the rear
+ambush m s c tz tc | tz == 3 = m.
+ambush m s c tz tc =
+  o = sideOf m (1 - s);
+  u = slotOf o 2 tc;
+  case and2 (alive u) (and2 (u.down == 1) (u.rdy == 1)) of
+    True -> reveal m s c tc u
+  | False -> m.
+reveal m s c tc u =
+  o = sideOf m (1 - s);
+  m2 = setSide m (1 - s) (setSlot o 2 tc { u | down = 0, born = 0 });
+  m3 = damageUnit m2 s 1 c u.atk;
+  note m3 "AMBUSH! {cName (uCard u)} hits for {u.atk}".
+
+# ---- rules: phases --------------------------------------------------------------------
+
+readyRow row eng = rdyGo row eng.
+rdyGo Nil eng = Nil.
+rdyGo (u :: r) eng = rdyOne u eng :: rdyGo r eng.
+rdyOne u eng | alive u =
+  age2 = u.age + 1;
+  vet2 = case and2 (age2 % 3 == 0) (uKind u != 1) of True -> 1 | False -> 0;
+  { u | ready = 1, ow = 0, age = age2, vet = u.vet + vet2, atk = u.atk + vet2, hp = u.hp + vet2,
+        rdy = u.down }.
+rdyOne u eng = u.
+# repair: combat units in the rear recover 1 (2 with Engineering Corps)
+repairRow Nil amt = Nil.
+repairRow (u :: r) amt = repairOne u amt :: repairRow r amt.
+repairOne u amt | and2 (alive u) (uKind u != 1) = { u | hp = minI (uMax u) (u.hp + amt) }.
+repairOne u amt = u.
+hasId Nil k = False.
+hasId (u :: r) k | and2 (alive u) (u.id == k) = True.
+hasId (u :: r) k = hasId r k.
+
+startTurn m s =
+  p = sideOf m s;
+  eng = bi (hasId p.rear 2);
+  p1 = { p | fwd = readyRow p.fwd 0, rear = repairRow (readyRow p.rear 0) (1 + eng) };
+  m1 = setSide m s p1;
+  r = rate m1 p1;
+  stock2 = maxI 0 (minI p1.stock 3 + r);
+  p2 = { p1 | stock = stock2 };
+  (p3, m2) = draw (setSide m1 s p2) s p2;
+  m3 = note { m2 | turn = s, tno = m2.tno + bi (s == 0),
+              banner = (case s == 0 of True -> "YOUR TURN" | False -> "ENEMY TURN"), bt = 900,
+              sel = SNone, zone = 0, cur = 0 } "turn {m2.tno + bi (s == 0)} side {s}: supply {stock2} (rate {r})";
+  case s == 1 of
+    True -> { m3 | queue = app (aiPlan m3) (AEnd 1 :: Nil) }
+  | False -> m3.
+draw m s p = case p.deck of
+    Nil -> (p, damageHq { m | msg = "deck out: HQ takes 2" } s 2)
+  | k :: r -> drawn m s { p | deck = r, hand = app p.hand (k :: Nil) }.
+drawn m s p = (p, setSide m s p).
+
+endTurn m s =
+  p = sideOf m s;
+  p1 = { p | fwd = envRow p.fwd m.env, rear = envRow p.rear m.env, hand = trim p.hand 7 };
+  m1 = setSide m s p1;
+  m2 = collect m1 s 1 0;
+  m3 = collect m2 s 2 0;
+  { m3 | queue = AStart (1 - s) :: Nil, sel = SNone }.
+envRow row env | env >= 10 = envAll row.
+envRow row env | env >= 4 = envSoft row.
+envRow row env = row.
+envSoft Nil = Nil.
+envSoft (u :: r) | and2 (alive u) (uSoft u == 1) = { u | hp = u.hp - 1, flash = 250 } :: envSoft r.
+envSoft (u :: r) = u :: envSoft r.
+envAll Nil = Nil.
+envAll (u :: r) | alive u = { u | hp = u.hp - 1, flash = 250 } :: envAll r.
+envAll (u :: r) = u :: envAll r.
+# units the ENV took to 0
+collect m s z c | c > 4 = m.
+collect m s z c =
+  u = slotOf (sideOf m s) z c;
+  case and2 (alive u) (u.hp <= 0) of
+    True -> collect (slay m s z c) s z (c + 1)
+  | False -> collect m s z (c + 1).
+trim l n | len l <= n = l.
+trim l n = trim (delAt l (len l - 1)) n.
+
+# ---- rules: the player's and the AI's actions, applied ------------------------------
+
+callCard m s i z c =
+  p = sideOf m s;
+  k = nth p.hand i (0 - 1);
+  cd = cardOf k;
+  down = bi (and2 (z == 2) (cKind cd != 1));
+  cost = cCost cd - down;
+  case and2 (k >= 0) (and2 (p.stock >= cost) (and2 (not1 (occ p z c)) (or2 (z == 1) (z == 2)))) of
+    False -> note m "cannot call {cName cd} there"
+  | True -> called m s p i z c cd (mkU cd down) cost.
+called m s p i z c cd u cost =
+  p2 = setSlot { p | stock = p.stock - cost, hand = delAt p.hand i } z c u;
+  m2 = setSide m s p2;
+  note m2 "{sideName s}: {cName cd} called to {zoneName z} {c + 1}".
+sideName 0 = "you".
+sideName s = "enemy".
+zoneName 1 = "forward".
+zoneName z = "rear".
+
+# ---- the AI (side 1): greedy, positional -----------------------------------------------
+# calls: up to three, dearest affordable first, supports to a covered rear
+# slot, combat to a forward slot in front of its own rear; acts: every ready
+# forward unit hits the HQ through a lane if it can, else an uncovered rear
+# unit, else the weakest forward unit in reach, else goes to overwatch;
+# artillery charges then fires at the richest rear unit (or the HQ).
+
+aiPlan m =
+  p = m.en;
+  (calls, p2) = aiCalls m p 0 Nil 3;
+  acts = aiActs m p2 0 Nil;
+  app calls acts.
+aiCalls m p i acc n | n == 0 = (rev acc Nil, p).
+aiCalls m p i acc n =
+  k = bestCard p.hand p.stock 0 (0 - 1) (0 - 1);
+  case k < 0 of
+    True -> (rev acc Nil, p)
+  | False -> aiCall m p acc n k (cardOf (nth p.hand k 0)).
+aiCall m p acc n k cd =
+  z = case cKind cd == 1 of True -> 2 | False -> 1;
+  c = freeCol p z;
+  case c < 0 of
+    True -> (rev acc Nil, p)
+  | False -> aiCalls m (setSlot { p | stock = p.stock - cCost cd, hand = delAt p.hand k } z c (mkU cd 0))
+                     0 (ACall 1 k z c :: acc) (n - 1).
+# index of the dearest affordable card (support preferred when nothing is in the rear)
+bestCard Nil stock i best bcost = best.
+bestCard (k :: r) stock i best bcost =
+  co = cCost (cardOf k);
+  worth = co + 2 * cGen (cardOf k);
+  case and2 (co <= stock) (worth > bcost) of
+    True -> bestCard r stock (i + 1) i worth
+  | False -> bestCard r stock (i + 1) best bcost.
+# a free column for zone z: forward slots in front of a rear unit first,
+# rear slots behind a forward unit first, centre outward
+freeCol p z = fcGo p z (2 :: 1 :: 3 :: 0 :: 4 :: Nil) (0 - 1).
+fcGo p z Nil best = best.
+fcGo p z (c :: r) best | occ p z c = fcGo p z r best.
+fcGo p z (c :: r) best | occ p (3 - z) c = c.
+fcGo p z (c :: r) best | best < 0 = fcGo p z r c.
+fcGo p z (c :: r) best = fcGo p z r best.
+
+aiActs m p c acc | c > 4 = rev acc Nil.
+aiActs m p c acc =
+  u = slotOf p 1 c;
+  ru = slotOf p 2 c;
+  acc2 = case and2 (canAct ru) (and2 (uKind ru != 1) (not1 (occ p 1 c))) of
+    True -> AAdvance 1 c :: acc
+  | False -> acc;
+  case and2 (canAct u) (u.mode == 0) of
+    True -> aiActs m p (c + 1) (aiUnit m p c u :: acc2)
+  | False -> aiActs m p (c + 1) acc2.
+aiUnit m p c u | uKind u == 2 = aiArt m c u.
+aiUnit m p c u =
+  o = m.me;
+  case targetOk m 1 c 3 c of
+    True -> AAttack 1 1 c 3 c
+  | False -> aiPick m c (bestIn m c 2) (bestIn m c 1).
+aiPick m c rc fc | rc >= 0 = AAttack 1 1 c 2 rc.
+aiPick m c rc fc | fc >= 0 = AAttack 1 1 c 1 fc.
+aiPick m c rc fc = AOver 1 c.
+# the weakest valid target in zone tz within reach of column c, or -1
+bestIn m c tz = biGo m c tz (maxI 0 (c - 1)) (minI 4 (c + 1)) (0 - 1) 999.
+biGo m c tz k hi best bhp | k > hi = best.
+biGo m c tz k hi best bhp =
+  u = slotOf m.me tz k;
+  case and2 (targetOk m 1 c tz k) (u.hp < bhp) of
+    True -> biGo m c tz (k + 1) hi k u.hp
+  | False -> biGo m c tz (k + 1) hi best bhp.
+aiArt m c u | u.chg == 0 = ACharge 1 c.
+aiArt m c u =
+  rc = richest m.me.rear 0 (0 - 1) (0 - 1);
+  case rc < 0 of
+    True -> AFire 1 c 3 0
+  | False -> AFire 1 c 2 rc.
+richest Nil i best bg = best.
+richest (u :: r) i best bg | and2 (alive u) (cGen (uCard u) > bg) = richest r (i + 1) i (cGen (uCard u)).
+richest (u :: r) i best bg = richest r (i + 1) best bg.
+
+# ---- the queue: starting an action = validating it and choosing its animation ------------
+
+startAct m a = case a of
+    AStart s -> pause (startTurn m s) 900
+  | AEnd s -> pause (endTurn m s) 500
+  | ACall s i z c -> pause (callCard m s i z c) 350
+  | AOver s c -> pause (overwatch m s c) 250
+  | ACharge s c -> pause (charge m s c) 250
+  | ARetreat s c -> slide m s 1 c 2 c
+  | AAdvance s c -> slide m s 2 c 1 c
+  | AAttack s z c tz tc -> attack m s c tz tc
+  | AFire s c tz tc -> fire m s c tz tc.
+pause m ms = { m | anim = An 4 0 0 0 0 0 (0 - ms) 1 }.
+
+overwatch m s c =
+  p = sideOf m s;
+  u = slotOf p 1 c;
+  case and2 (canAct u) (uKind u != 2) of
+    False -> { m | msg = "that unit cannot change mode now" }
+  | True -> setSide { m | msg = (case u.mode == 0 of True -> "overwatch" | False -> "back to attack mode") }
+                    s (setSlot p 1 c { u | mode = 1 - u.mode, ready = 0 }).
+charge m s c =
+  p = sideOf m s;
+  u = slotOf p 1 c;
+  case and2 (canAct u) (uKind u == 2) of
+    False -> { m | msg = "only ready artillery charges" }
+  | True -> setSide { m | msg = "charging" } s (setSlot p 1 c { u | chg = 1, ready = 0 }).
+slide m s fz fc tz tc =
+  p = sideOf m s;
+  u = slotOf p fz fc;
+  ok = and2 (canAct u) (and2 (uKind u != 1) (not1 (occ p tz tc)));
+  case ok of
+    False -> { m | msg = "cannot move that unit" }
+  | True -> { m | anim = An 3 s fz fc tz tc 0 0, msg = (case tz == 2 of True -> "retreat" | False -> "advance") }.
+attack m s c tz tc =
+  u = slotOf (sideOf m s) 1 c;
+  ok = and2 (canAct u) (and2 (u.mode == 0) (and2 (uKind u != 2) (targetOk m s c tz tc)));
+  case ok of
+    False -> note m "no valid attack there"
+  | True -> note { m | anim = An 1 s 1 c tz tc 0 0 } "{sideName s}: {cName (uCard u)} attacks {tgtName tz (tc + 1)}".
+tgtName 3 c = "the HQ".
+tgtName z c = "{zoneName z} {c}".
+fire m s c tz tc =
+  u = slotOf (sideOf m s) 1 c;
+  ok = and2 (canAct u) (and2 (u.chg == 1) (and2 (uKind u == 2) (fireOk m s tz tc)));
+  case ok of
+    False -> { m | msg = "artillery must be charged, and aimed at the rear or the HQ" }
+  | True -> note { m | anim = An 2 s 1 c tz tc 0 0 } "{sideName s}: artillery fires at {tgtName tz (tc + 1)}".
+
+# the animation clock: midpoint applies the rule, the end clears it
+durOf 1 = 520.
+durOf 2 = 700.
+durOf 3 = 360.
+durOf k = 0.
+advance m dt =
+  An kind s fz fc tz tc t done = m.anim;
+  t2 = t + dt;
+  m1 = case and2 (done == 0) (t2 >= durOf kind / 2) of
+    True -> { (midpoint m kind s fz fc tz tc) | anim = An kind s fz fc tz tc t2 1, snap = m.snap + m.auto * bi (kind < 4) }
+  | False -> { m | anim = An kind s fz fc tz tc t2 done };
+  case t2 >= (case kind == 4 of True -> 0 | False -> durOf kind) of
+    True -> finishAn m1 kind s fz fc tz tc
+  | False -> m1.
+midpoint m 1 s fz fc tz tc = resolveAttack m s fc tz tc.
+midpoint m 2 s fz fc tz tc =
+  m2 = spend m s 1 fc;
+  a = slotOf (sideOf m s) 1 fc;
+  landBlow m2 s fc tz tc a.atk.
+midpoint m k s fz fc tz tc = m.
+finishAn m 3 s fz fc tz tc =
+  p = sideOf m s;
+  u = slotOf p fz fc;
+  m2 = setSide m s (setSlot (setSlot p fz fc noU) tz tc { u | ready = 0, chg = 0, born = 600, mode = 0 });
+  { m2 | anim = noAn }.
+finishAn m k s fz fc tz tc = { m | anim = noAn }.
+
+# ---- the tick ----------------------------------------------------------------------------
+
+tickMs = 40.
+
+tick m =
+  m1 = ageAll { m | ms = m.ms + tickMs, log = Nil } tickMs;
+  An kind s fz fc tz tc t done = m1.anim;
+  (m2, cs) = case kind != 0 of
+    True -> (advance m1 tickMs, Nil)
+  | False -> idle m1;
+  _ = say (rev m2.log Nil);
+  (m2, cs).
+# the transcript goes straight to stdout: the host's log echo is
+# rate-limited (rings are not), and a scripted game must be readable
+say Nil = 0.
+say (s :: r) = _ = print "[terra2] {s}"; say r.
+idle m = case m.queue of
+    a :: r -> (startAct { m | queue = r } a, Nil)
+  | Nil -> takeKey m.
+takeKey m = case m.keys of
+    Nil -> (m, Nil)
+  | k :: r -> key { m | keys = r } k.
+
+ageAll m dt =
+  { m | me = ageSide m.me dt, en = ageSide m.en dt, bt = maxI 0 (m.bt - dt), fx = ageFx m.fx dt Nil }.
+ageSide p dt = { p | fwd = ageRow p.fwd dt, rear = ageRow p.rear dt }.
+ageRow Nil dt = Nil.
+ageRow (u :: r) dt = ageU u dt :: ageRow r dt.
+ageU u dt | u.id < 0 = u.
+ageU u dt | and2 (u.dead == 1) (u.dt + dt > 420) = noU.
+ageU u dt = { u | flash = maxI 0 (u.flash - dt), born = minI 1000 (u.born + dt), dt = u.dt + dt }.
+ageFx Nil dt acc = acc.
+ageFx ((x, y, z, t) :: r) dt acc | t + dt > 380 = ageFx r dt acc.
+ageFx ((x, y, z, t) :: r) dt acc = ageFx r dt ((x, y, z, t + dt) :: acc).
+
+# ---- keys: the selection state machine ---------------------------------------------------
+# evdev codes: 105 left 106 right 103 up 108 down 28 enter 1 esc 14 bksp
+# 57 space 18 e 16 q 25 p 30 a 24 o 19 r 46 c 33 f 47 v 2..6 columns
+
+key m 16 = (m, MQuit :: Nil).
+key m 25 = ({ m | snap = m.snap + 1 }, Nil).
+key m 31 = ({ m | auto = 1 - m.auto, msg = "auto snapshots {1 - m.auto}" }, Nil).
+key m k | m.over != 0 = (m, Nil).
+key m k | m.turn != 0 = ({ m | msg = "enemy turn" }, Nil).
+key m 57 = ({ m | queue = AEnd 0 :: Nil, sel = SNone, msg = "end of turn" }, Nil).
+key m 18 = key m 57.
+key m 1 = ({ m | sel = SNone, zone = 0, msg = "" }, Nil).
+key m 14 = key m 1.
+key m k | and2 (k >= 2) (k <= 6) = (moveCur m (k - 2), Nil).
+key m 105 = (moveCur m (m.cur - 1), Nil).
+key m 106 = (moveCur m (m.cur + 1), Nil).
+key m 103 = (moveZone m 1, Nil).
+key m 108 = (moveZone m (0 - 1), Nil).
+key m 28 = (confirm m, Nil).
+key m 30 = (unitKey m 30, Nil).
+key m 24 = (unitKey m 24, Nil).
+key m 19 = (unitKey m 19, Nil).
+key m 46 = (unitKey m 46, Nil).
+key m 33 = (unitKey m 33, Nil).
+key m 47 = (unitKey m 47, Nil).
+key m k = (m, Nil).
+
+curMax m = case m.sel of
+    SNone -> (case m.zone == 0 of True -> len m.me.hand - 1 | False -> 4)
+  | SCard i -> len m.me.hand - 1
+  | s -> 4.
+moveCur m c = { m | cur = maxI 0 (minI (curMax m) c) }.
+
+# zones stack bottom to top: hand 0, my rear 2, my forward 1; for a target:
+# enemy forward 1, enemy rear 2, enemy HQ 3
+moveZone m d = case m.sel of
+    STarget z c -> { m | zone = maxI 1 (minI 3 (m.zone + d)), cur = minI 4 m.cur }
+  | SPlace i z -> placeZone m i z d
+  | s -> { m | zone = zoneStep m.zone d, cur = minI (curMax { m | zone = zoneStep m.zone d }) m.cur }.
+zoneStep 0 d | d > 0 = 2.
+zoneStep 2 d | d > 0 = 1.
+zoneStep 1 d | d < 0 = 2.
+zoneStep 2 d | d < 0 = 0.
+zoneStep z d = z.
+placeZone m i z d =
+  cd = cardOf (nth m.me.hand i 0);
+  z2 = case d > 0 of True -> 1 | False -> 2;
+  case and2 (z2 == 1) (cKind cd == 1) of
+    True -> { m | msg = "support units serve in the rear" }
+  | False -> { m | sel = SPlace i z2, zone = z2 }.
+
+confirm m = case m.sel of
+    SNone -> pick m
+  | SCard i -> m
+  | SPlace i z -> { m | queue = ACall 0 i z m.cur :: Nil, sel = SNone, zone = 0, cur = 0 }
+  | SUnit z c -> unitKey m 30
+  | STarget z c -> aim m z c.
+pick m | m.zone == 0 =
+  k = nth m.me.hand m.cur (0 - 1);
+  case k < 0 of
+    True -> { m | msg = "no card there" }
+  | False -> { m | sel = SPlace m.cur (case cKind (cardOf k) == 1 of True -> 2 | False -> 1),
+                   zone = (case cKind (cardOf k) == 1 of True -> 2 | False -> 1), cur = 2,
+                   msg = "place {cName (cardOf k)}: arrows, enter (up/down: forward or rear)" }.
+pick m =
+  u = slotOf m.me m.zone m.cur;
+  case alive u of
+    False -> { m | msg = "empty slot" }
+  | True -> { m | sel = SUnit m.zone m.cur, msg = unitHelp m.zone u }.
+unitHelp 2 u = "rear: V advance to the front".
+unitHelp z u | uKind u == 2 = "artillery: C charge, F fire, R retreat".
+unitHelp z u = "A attack  O overwatch  R retreat".
+
+unitKey m k = case m.sel of
+    SUnit z c -> unitAct m z c k
+  | s -> { m | msg = "select one of your units first" }.
+unitAct m 1 c 30 = { m | sel = STarget 1 c, zone = 1, cur = c, msg = "target: arrows (up/down: forward, rear, HQ), enter" }.
+unitAct m 1 c 33 = { m | sel = STarget 1 c, zone = 2, cur = c, msg = "aim: arrows, enter (rear units or the HQ)" }.
+unitAct m 1 c 24 = { m | queue = AOver 0 c :: Nil, sel = SNone }.
+unitAct m 1 c 19 = { m | queue = ARetreat 0 c :: Nil, sel = SNone }.
+unitAct m 1 c 46 = { m | queue = ACharge 0 c :: Nil, sel = SNone }.
+unitAct m 2 c 47 = { m | queue = AAdvance 0 c :: Nil, sel = SNone }.
+unitAct m z c k = { m | msg = "not that, here" }.
+aim m 1 c =
+  u = slotOf m.me 1 c;
+  case uKind u == 2 of
+    True -> { m | queue = AFire 0 c m.zone m.cur :: Nil, sel = SNone, zone = 0 }
+  | False -> { m | queue = AAttack 0 1 c m.zone m.cur :: Nil, sel = SNone, zone = 0 }.
+aim m z c = { m | sel = SNone }.
+
+# ---- the view: the whole board as a Scene, every frame ------------------------------------
+
+scene m =
+  es0 = Ent "plane" (0, 0, 0) 0 (34000, 1000, 34000) (140, 160, 140) :: Nil;
+  es1 = tiles m es0;
+  es2 = hqEnts (hqEnts es1 m 0) m 1;
+  es3 = rowEnts (rowEnts (rowEnts (rowEnts es2 m 0 1 0) m 0 2 0) m 1 1 0) m 1 2 0;
+  es4 = handEnts m es3;
+  es5 = shotEnts m es4;
+  es6 = fxEnts m.fx es5;
+  es7 = hud m es6;
+  Scene Nil es7 lights camera.
+
+# tiles, lit by the cursor / selection / valid targets
+tiles m es = tileRow (tileRow (tileRow (tileRow es m 0 1) m 0 2) m 1 1) m 1 2.
+tileRow es m s z = trGo es m s z 0.
+trGo es m s z c | c > 4 = es.
+trGo es m s z c = trGo (Ent "cube" (posOf s z c) 0 (2100, 40, 2500) (tileCol m s z c) :: es) m s z (c + 1).
+tileCol m s z c | and2 (s == 0) (isCursor m z c) = (900, 850, 400).
+tileCol m s z c | and2 (s == 1) (isTarget m z c) = (900, 350, 300).
+tileCol m s z c | and2 (s == 1) (isAim m z c) = (700, 250, 250).
+tileCol m s z c | and2 (s == 0) (isSelected m z c) = (700, 700, 300).
+tileCol m 0 1 c = (380, 400, 360).
+tileCol m 0 2 c = (330, 380, 330).
+tileCol m 1 1 c = (400, 360, 380).
+tileCol m 1 2 c = (330, 330, 380).
+tileCol m s z c = (300, 300, 300).
+isCursor m z c = case m.sel of
+    SPlace i pz -> and2 (pz == z) (c == m.cur)
+  | SNone -> and2 (m.zone == z) (c == m.cur)
+  | s -> False.
+isSelected m z c = case m.sel of
+    SUnit uz uc -> and2 (uz == z) (uc == c)
+  | STarget uz uc -> and2 (uz == z) (uc == c)
+  | s -> False.
+isTarget m z c = case m.sel of
+    STarget az ac -> and2 (m.zone == z) (c == m.cur)
+  | s -> False.
+isAim m z c = case m.sel of
+    STarget az ac -> aimOk m ac z c
+  | s -> False.
+aimOk m ac z c | uKind (slotOf m.me 1 ac) == 2 = fireOk m 0 z c.
+aimOk m ac z c = targetOk m 0 ac z c.
+
+hqEnts es m s =
+  p = sideOf m s;
+  (x, y, z) = hqPos s;
+  col = case m.fx of Nil -> sideCol s | f -> sideCol s;
+  hl = case and2 (m.zone == 3) (isTargetHq m) of True -> (1000, 500, 400) | False -> col;
+  es1 = Ent "cube" (x, 600, z) 0 (3600, 1200, 1400) hl ::
+        Ent "cube" (x, 1600, z) 0 (1100, 800, 1000) hl :: es;
+  case s == 1 of
+    True -> txtC es1 "HQ {p.hq}" x 3300 (z + 750) 130 white
+  | False -> es1.
+isTargetHq m = case m.sel of STarget az ac -> True | s -> False.
+
+rowEnts es m s z c | c > 4 = es.
+rowEnts es m s z c =
+  u = slotOf (sideOf m s) z c;
+  es2 = case u.id >= 0 of
+    True -> unitEnts es m s z c u
+  | False -> es;
+  rowEnts es2 m s z (c + 1).
+
+# where a unit is drawn: its slot, plus the animation's offset if it is
+# the one lunging or sliding
+unitPos m s z c =
+  An kind as fz fc tz tc t done = m.anim;
+  (x, y, zz) = posOf s z c;
+  case and2 (as == s) (and2 (fz == z) (and2 (fc == c) (or2 (kind == 1) (kind == 3)))) of
+    True -> lunge kind t (x, y, zz) (tgtPos (1 - s) tz tc s)
+  | False -> (x, y, zz).
+tgtPos s 3 c me = hqPos s.
+tgtPos s z c me = posOf s z c.
+# kind 1: out to 70% of the way at the midpoint and back; kind 3: all the way
+lunge 1 t from to =
+  d = durOf 1;
+  k = case t * 2 < d of True -> t * 2000 / d | False -> maxI 0 ((d - t) * 2000 / d);
+  lerp from to (k * 7 / 10).
+lunge k t from to = lerp from to (minI 1000 (t * 1000 / durOf 3)).
+lerp (ax, ay, az) (bx, by, bz) k = (ax + (bx - ax) * k / 1000, ay + (by - ay) * k / 1000, az + (bz - az) * k / 1000).
+
+# the unit's solids, scaled by its birth pop and its death shrink
+unitEnts es m s z c u =
+  (x, y, zz) = unitPos m s z c;
+  k = case u.dead == 1 of True -> maxI 50 (1000 - u.dt * 1000 / 420) | False -> minI 1000 (200 + u.born * 800 / 300);
+  lift = case u.born < 300 of True -> (300 - u.born) * 4 | False -> 0;
+  col = case u.flash > 0 of True -> white | False -> unitCol s u;
+  d = dirOf s;
+  es1 = case u.down == 1 of
+    True -> Ent "cube" (x, 80, zz) 0 (1700, 120, 2200) (150, 150, 180) ::
+            txtC es "?" x 700 (zz + 600) 120 (600, 600, 700)
+  | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u);
+  case u.down == 1 of
+    True -> es1
+  | False -> labelEnts es1 u x zz.
+unitCol s u | uKind u == 1 = supCol s.
+unitCol s u = sideCol s.
+accent s u = (950, 950, 900).
+
+# each kind: a few primitives placed relative to the slot, scaled by k/1000
+solids es 1 soft x y z d k col acc =
+  Ent "cube" (x, y + 650 * k / 1000, z) 0 (1400 * k / 1000, 1300 * k / 1000, 1400 * k / 1000) col ::
+  Ent "cube" (x, y + 1450 * k / 1000, z) 0 (900 * k / 1000, 300 * k / 1000, 900 * k / 1000) acc :: es.
+solids es 2 soft x y z d k col acc =
+  Ent "cube" (x, y + 300 * k / 1000, z) 0 (1300 * k / 1000, 550 * k / 1000, 900 * k / 1000) col ::
+  Ent "cube" (x, y + 800 * k / 1000, z + d * 500 * k / 1000) 0 (240 * k / 1000, 240 * k / 1000, 1700 * k / 1000) acc :: es.
+solids es kind 1 x y z d k col acc =
+  Ent "cube" (x, y + 500 * k / 1000, z) 0 (700 * k / 1000, 900 * k / 1000, 500 * k / 1000) col ::
+  Ent "sphere" (x, y + 1200 * k / 1000, z) 0 (500 * k / 1000, 500 * k / 1000, 500 * k / 1000) acc :: es.
+solids es kind soft x y z d k col acc =
+  Ent "cube" (x, y + 420 * k / 1000, z) 0 (1500 * k / 1000, 800 * k / 1000, 1100 * k / 1000) col ::
+  Ent "cube" (x, y + 1050 * k / 1000, z - d * 100) 0 (800 * k / 1000, 450 * k / 1000, 800 * k / 1000) acc :: es.
+
+labelEnts es u x z | u.dead == 1 = es.
+labelEnts es u x z =
+  s = case uKind u == 1 of True -> "+{cGen (uCard u)} {u.hp}" | False -> "{u.atk}/{u.hp}";
+  tag = case u.mode == 1 of True -> " OW" | False -> (case u.chg == 1 of True -> " CHG" | False -> "");
+  vet = case u.vet > 0 of True -> " *{u.vet}" | False -> "";
+  txtC es "{s}{tag}{vet}" x 2750 (z - 300) 95 (case u.ready == 1 of True -> yellow | False -> (800, 800, 800)).
+
+# an artillery or ambush shell in flight (kind 2)
+shotEnts m es =
+  An kind s fz fc tz tc t done = m.anim;
+  case kind == 2 of
+    False -> es
+  | True -> shell es (posOf s 1 fc) (tgtPos (1 - s) tz tc s) t.
+shell es from to t =
+  k = minI 1000 (t * 1000 / durOf 2);
+  (x, y, z) = lerp from to k;
+  Ent "sphere" (x, 700 + 6 * k * (1000 - k) / 1000, z) 0 (420, 420, 420) (1000, 800, 300) :: es.
+
+fxEnts Nil es = es.
+fxEnts ((x, y, z, t) :: r) es =
+  fxEnts r (Ent "cube" (x, y + t * 3, z) 0 (160, 160, 160) (1000, 850 - t, 300) :: es).
+
+# the hand: standing slabs, the cursor's lifted
+handEnts m es = hgo m es m.me.hand 0.
+hgo m es Nil i = es.
+hgo m es (k :: r) i = hgo m (cardEnts m es (cardOf k) i) r (i + 1).
+cardEnts m es cd i =
+  n = len m.me.hand;
+  x = (i * 2 - (n - 1)) * 950;
+  sel = case m.sel of SNone -> and2 (m.zone == 0) (m.cur == i) | SPlace j z -> j == i | s -> False;
+  y = case sel of True -> 1600 | False -> 1250;
+  col = case sel of True -> (450, 650, 1000) | False -> (case cKind cd == 1 of True -> (300, 520, 470) | False -> (220, 380, 800));
+  afford = m.me.stock >= cCost cd;
+  es1 = Ent "cube" (x, y, zHand) 0 (1750, 2300, 60) col :: es;
+  es2 = txt es1 (cName cd) (x - 820) (y + 1020) (zHand + 80) 38 white;
+  es3 = txt es2 "CALL {cCost cd}" (x - 780) (y + 450) (zHand + 80) 45 (case afford of True -> yellow | False -> (900, 400, 400));
+  txtC es3 (statLine cd) x (y - 200) (zHand + 80) 75 white.
+statLine cd | cKind cd == 1 = "+{cGen cd} {cDef cd}".
+statLine cd = "{cAtk cd}/{cDef cd}".
+
+# HUD: the score line far behind the enemy HQ, the message line over the
+# hand, the banner in the middle of the board
+hud m es =
+  es1 = txtC es "T{m.tno}   YOU  HQ {m.me.hq}  SUP {m.me.stock}  DECK {len m.me.deck}    ENEMY  HQ {m.en.hq}  SUP {m.en.stock}    ENV {m.env}" 0 4600 (0 - 10200) 105 white;
+  es2 = txtC es1 m.msg 0 3500 (0 - 10200) 100 (950, 950, 700);
+  case m.bt > 0 of
+    True -> txtC es2 m.banner 0 4200 0 420 (1000, 900, 300)
+  | False -> es2.
+
+# ---- the elm four ---------------------------------------------------------------------------
+
+init env = initModel.
+
+update env ev m = case ev of
+    ETick -> tick m
+  | EKey k -> keyIn m k
+  | e -> (m, Nil).
+# buffered; a live window also sends kind-1 chars (negative codes): ignored
+keyIn m k | k < 0 = (m, Nil).
+keyIn m k = ({ m | keys = app m.keys (k :: Nil) }, Nil).
+
+subs m = STick tickMs :: SKeys :: Nil.
+
+view m = (scene m, m.snap).
+
+main =
+  me = myself 0;
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  gl = spawn (GL.serve 960 600 "terra2");
+  cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
+  MV.game me cfg (App init update subs view).
+
+# ---- not in this cut --------------------------------------------------------------------------
+# Tactics cards, every card text (Rally, Last Stand, Breakthrough, Hammer
+# Strike, ...), the Unsupplied rule (negative rate clamps to 0 here), RECALL,
+# redraw / requisition, the mulligan, and Turn 1's skipped Act phase.

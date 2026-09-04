@@ -1,0 +1,82 @@
+# glsvc.fpr -- the GPU tier as an MVU render service.
+#
+# std.MVU draws through ANY actor that answers the Rv protocol (Dims /
+# Render / Poll).  This module is that actor for the GLES scene walker
+# (hal/unix/gfx.c): glInit once, one glRender per frame, inputPoll for
+# the drain.  It is the piece interactive_desktop_gl.fpr hand-rolls as
+# its frameWorker, lifted so a game is the elm four (MVU.game) and
+# nothing else:
+#
+#   gl = spawn (GL.serve 960 600);
+#   cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
+#   MV.game me cfg (App init update subs view)
+#
+# The GL context is thread-bound; gfx.c rebinds on migration, and
+# this ONE actor is the only caller, so the mailbox is the
+# serialization.  Init happens lazily on the first request, in this
+# actor, so the context belongs to the thread that will draw.
+#
+# view's value is (scene, snap): the Scene the walker draws, and a
+# snapshot counter -- when it changes, the frame just drawn is read
+# back to /tmp/<tag>-<snap>.ppm (glSavePpm).  That is how a headless
+# run under Xvfb proves what it drew, and how a key becomes a
+# screenshot in a live window.  snap 0 = never.
+
+unsafe module.
+
+MV = use "../../std/mvu".
+
+Rv = MV.Rv.
+Render = MV.Render.
+Dims = MV.Dims.
+Poll = MV.Poll.
+
+serve : unsafe Int -> Int -> String -> Int -> a .
+serve w h tag me = loop w h tag 0 0 me.
+
+loop : unsafe Int -> Int -> String -> Int -> Int -> Int -> a .
+loop w h tag inited last me =
+  m = receive me;
+  (replyTo, q) = m;
+  r = handle w h tag inited last replyTo q;
+  _ = drop m;
+  (i2, l2) = r;
+  loop w h tag i2 l2 me.
+
+handle : unsafe Int -> Int -> String -> Int -> Int -> Int -> Rv -> (Int, Int) .
+handle w h tag inited last replyTo q = case q of
+    Dims u -> dims w h tag inited last replyTo
+  | Render st vs sc fr -> frame w h tag inited last replyTo vs
+  | Poll u -> poll w h inited last replyTo.
+
+ensure w h inited | inited != 0 = inited.
+ensure w h inited = _ = glInit w h; 1.
+
+dims w h tag inited last replyTo =
+  i = ensure w h inited;
+  _ = send replyTo (w, h);
+  (i, last).
+
+poll w h inited last replyTo =
+  i = ensure w h inited;
+  ev = inputPoll 0;
+  _ = send replyTo ev;
+  _ = drop ev;
+  (i, last).
+
+frame w h tag inited last replyTo vs =
+  i = ensure w h inited;
+  (scene, snap) = vs;
+  r = glRender scene;
+  (draws, bytes) = r;
+  _ = drop r;
+  l2 = shot tag last snap;
+  _ = send replyTo (draws, bytes);
+  (i, l2).
+
+shot tag last snap | snap == last = last.
+shot tag last snap | snap == 0 = last.
+shot tag last snap =
+  rc = glSavePpm "/tmp/{tag}-{snap}.ppm";
+  _ = Sys.logAt 0 "[{tag}] snapshot {snap} -> /tmp/{tag}-{snap}.ppm rc={rc}";
+  snap.
