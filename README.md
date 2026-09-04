@@ -19,6 +19,9 @@ you actually drive it with:
 Everything delegates to make for staleness, so a fresh tree costs one
 compile and an up-to-date one costs nothing.
 
+The exact build tools currently installed on the development Mac are recorded
+in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
+
 ## Layout
 
     fp-risc/            the language project
