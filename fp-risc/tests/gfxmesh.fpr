@@ -31,7 +31,8 @@ dark = (120, 120, 140).
 khaki = (700, 640, 420).
 soldier es x z yaw col =
   Ent "infantry" (x, 0, z) yaw (1300, 1300, 1300) col ::
-  Ent "infantry_kit" (x, 0, z) yaw (1300, 1300, 1300) dark :: es.
+  Ent "infantry_kit" (x, 0, z) yaw (1300, 1300, 1300) dark ::
+  Ent "infantry_rifle" (x, 0, z) yaw (1300, 1300, 1300) dark :: es.
 truck es x z yaw col =
   Ent "truck" (x, 0, z) yaw (1000, 1000, 1000) col ::
   Ent "truck_kit" (x, 0, z) yaw (1000, 1000, 1000) dark ::

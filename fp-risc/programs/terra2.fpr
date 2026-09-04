@@ -878,7 +878,7 @@ unitEnts es m s z c u =
   es1 = case u.down == 1 of
     True -> Ent "cube" (x, 80, zz) 0 (1700, 120, 2200) (150, 150, 180) ::
             txtC es "?" x 700 (zz + 600) 120 (600, 600, 700)
-  | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u) (turretYaw m s z c x zz);
+  | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u) (turretYaw m s z c x zz) m.ms (phaseOf s z c);
   case u.down == 1 of
     True -> es1
   | False -> labelEnts es1 u x zz.
@@ -888,14 +888,36 @@ accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
 accent s u = (950, 950, 900).
 lighter (r, g, b) = (r + (1000 - r) / 3, g + (1000 - g) / 3, b + (1000 - b) / 3).
 
+# ---- idle motion: waves of the clock, each unit on its own phase ----------
+# tri p t: a triangle wave of period p ms, -1000..1000.  sweep p t: the
+# same span with holds -- 35% at each end, 15% moving between -- the
+# "look here, then there" of a scanning turret or a soldier squaring up.
+# phaseOf: a hash of the slot, so neighbours never move in step.
+tri p t =
+  x = ((t % p) + p) % p * 2000 / p;
+  1000 - Int.abs (x - 1000).
+sweep p t =
+  x = ((t % p) + p) % p * 1000 / p;
+  case x < 350 of
+    True -> 0 - 1000
+  | False -> case x < 500 of
+      True -> (x - 425) * 1000 / 75
+    | False -> case x < 850 of
+        True -> 1000
+      | False -> (925 - x) * 1000 / 75.
+phaseOf s z c = (s * 7 + z * 3 + c * 11) * 397.
+
 # the turret's one degree of freedom: forward at rest (yaw 0 faces -z, the
 # player's front; the enemy's tanks sit at yaw pi), swung onto the target
-# while this unit is the one lunging or firing
+# while this unit is the one lunging or firing -- and between actions it
+# scans, two sweeps of different periods summed so it never quite repeats
 turretYaw m s z c x zz =
   An kind as fz fc tz tc t done = m.anim;
   base = case s == 0 of True -> 0 | False -> 3142;
+  ph = phaseOf s z c;
+  idle = sweep 4700 (m.ms + ph) * 260 / 1000 + tri 3100 (m.ms + ph * 2) * 90 / 1000;
   case as == s and fz == z and fc == c and (kind == 1 or kind == 2) of
-    False -> base
+    False -> base + idle
   | True -> aimAt base s (posOf s z c) (tgtPos (1 - s) tz tc s).
 aimAt base s (x, y, z) (tx, ty, tz) =
   base + dirOf s * atanM (tx - x) (Int.abs (tz - z)).
@@ -909,21 +931,29 @@ atanM dx dz =
   case dx < 0 of True -> 0 - a | False -> a.
 
 # each kind: a few primitives placed relative to the slot, scaled by k/1000
-solids es 1 soft x y z d k col acc ty =
+solids es 1 soft x y z d k col acc ty ms ph =
   hy = case d < 0 of True -> 0 | False -> 3142;
-  Ent "truck" (x, y, z) hy (k, k, k) col ::
+  bob = (tri 140 (ms + ph) + 1000) * 8 / 2000;
+  Ent "truck" (x, y + bob, z) hy (k, k, k) col ::
   Ent "truck_kit" (x, y, z) hy (k, k, k) dark ::
-  Ent "truck_canvas" (x, y, z) hy (k, k, k) khaki :: es.
-solids es 2 soft x y z d k col acc ty =
+  Ent "truck_canvas" (x, y + bob + (tri 290 (ms + ph) + 1000) * 6 / 2000, z) hy (k, k, k) khaki :: es.
+solids es 2 soft x y z d k col acc ty ms ph =
   Ent "cube" (x, y + 300 * k / 1000, z) 0 (1300 * k / 1000, 550 * k / 1000, 900 * k / 1000) col ::
   Ent "cube" (x, y + 800 * k / 1000, z + d * 500 * k / 1000) 0 (240 * k / 1000, 240 * k / 1000, 1700 * k / 1000) acc :: es.
-solids es kind 1 x y z d k col acc ty =
+solids es kind 1 x y z d k col acc ty ms ph =
   hy = case d < 0 of True -> 0 | False -> 3142;
   sc = k * 13 / 10;
-  Ent "infantry" (x, y, z) hy (sc, sc, sc) col ::
-  Ent "infantry_kit" (x, y, z) hy (sc, sc, sc) dark :: es.
+  sway = tri 3400 (ms + ph);                      # weight, side to side
+  turn = sweep 6100 (ms + ph * 3);                # squaring up, now and then
+  draw = sweep 5300 (ms + ph * 5);                # the rifle, forward and back
+  bx = x + sway * 40 / 1000;
+  by = hy + sway * 70 / 1000 + turn * 120 / 1000;
+  rz = z + d * (0 - (draw + 1000) * 60 / 2000);   # forward = toward the enemy
+  Ent "infantry" (bx, y, z) by (sc, sc, sc) col ::
+  Ent "infantry_kit" (bx, y, z) by (sc, sc, sc) dark ::
+  Ent "infantry_rifle" (bx, y + (draw + 1000) * 30 / 2000, rz) (by + draw * 160 / 1000) (sc, sc, sc) dark :: es.
 # heavy: the CoScad tank (models/tank), hull + turret, 1 model unit = 1000
-solids es kind soft x y z d k col acc ty =
+solids es kind soft x y z d k col acc ty ms ph =
   hy = case d < 0 of True -> 0 | False -> 3142;
   sc = k * 115 / 100;
   Ent "tank_hull" (x, y, z) hy (sc, sc, sc) col ::

@@ -71,6 +71,18 @@ enemy's down, the game opens on an arpeggio and closes on one; victory
 and defeat have their own.  Cues are queued on the model and played by
 the tick, like the transcript, so a replayed game sounds identical.
 
+Idle motion, so a board between actions is alive: every unit runs on
+its own phase (a hash of its slot) over waves of the model's clock -- a
+triangle wave and a "sweep" that holds at each end and moves briskly
+between.  Soldiers shift their weight side to side, square up now and
+then, and draw the rifle forward and back (the rifle is its own part, so
+it rises, comes forward and swings a little in their hands).  Tank
+turrets scan between actions, two sweeps of different periods summed so
+the pattern never quite repeats, and snap onto the target when the unit
+attacks.  Trucks idle with a fast, tiny bob, the canvas a beat behind.
+The HQ dish turns.  All of it is a function of the clock, so a replayed
+game moves the same way.
+
 With it, the cheap extra dimensions: floating damage numbers (white on
 a dark tag, rising and shrinking in front of the target), a camera
 shake on kills and HQ hits (a hash of the clock, so replays shake the
