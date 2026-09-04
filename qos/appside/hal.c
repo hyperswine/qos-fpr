@@ -276,6 +276,20 @@ static V h_inputPoll(V u) {
   t[1] = TAG((sw)kind); t[2] = TAG((sw)a); t[3] = TAG((sw)c);
   return (V)t;
 }
+/* ---- snd: sndPlay (wave, f0, f1, ms, vol, delay) -> voice slot -------- */
+static V h_sndPlay(V tone) {
+  if (!qos_hal->snd_play)
+    fpr_cpanic("snd: capability not granted by this host (a pre-v7 qosp)");
+  if (ISINT(tone) || TID(tone) != T_TUP6) fpr_cpanic("sndPlay: tone must be (wave, f0, f1, ms, vol, delay)");
+  V *f = (V *)((char *)tone + 8);
+  int64_t a[6];
+  for (int i = 0; i < 6; i++) {
+    if (!ISINT(f[i])) fpr_cpanic("sndPlay: tone fields must be Ints");
+    a[i] = (int64_t)UNTAG(f[i]);
+  }
+  return TAG((sw)qos_hal->snd_play(a[0], a[1], a[2], a[3], a[4], a[5]));
+}
+FPR_FN(fpr_g_sndPlay, h_sndPlay, 1);
 FPR_FN(fpr_g_glInit, h_glInit, 2);
 FPR_FN(fpr_g_glRender, h_glRender, 1);
 FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);

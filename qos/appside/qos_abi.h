@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 6u
+#define QOS_ABI_VERSION 7u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -150,6 +150,13 @@ typedef struct {
   int64_t (*blk_pages)(void);
   int64_t (*blk_read)(uint64_t page, char *dst /* 4096 bytes */);
   int64_t (*blk_write)(uint64_t page, const char *src, uint64_t len);
+
+  /* ---- v7 additions (appended: earlier offsets unchanged) -----------
+   * the sound tier: one procedural voice per call (hal/unix/snd_raw.h:
+   * wave, start/end Hz, ms, milli-volume, ms delay), mixed by the host.
+   * NULL on a host without it; the app-side shim reports the missing
+   * capability the same way gfx does. */
+  int (*snd_play)(int64_t wave, int64_t f0, int64_t f1, int64_t ms, int64_t vol, int64_t delay);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

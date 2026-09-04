@@ -46,6 +46,7 @@ unsafe program.
 MV = use "../std/mvu".
 GL = use "mods/glsvc".
 S2 = use "mods/scene2d".
+Sfx = use "mods/sfx".
 
 App = MV.App.
 MQuit = MV.MQuit.
@@ -260,16 +261,23 @@ Act = Type (ACall s i z c | AAttack s z c tz tc | AOver s c | ARetreat s c
 An = Type (An kind s fz fc tz tc t done).
 noAn = An 0 0 0 0 0 0 0 0.
 
-initModel =
-  d0 = shuffle 8675309 deckRep;
-  d1 = shuffle 4242 deckSou;
+initWith s0 s1 =
+  d0 = shuffle s0 deckRep;
+  d1 = shuffle s1 deckSou;
   (h0, r0) = split d0 5 Nil;
   (h1, r1) = split d1 5 Nil;
   { me = mkSide r0 h0, en = mkSide r1 h1, turn = 0, tno = 0, env = 0,
-    anim = noAn, queue = AStart 0 :: Nil, sel = SNone, zone = 0, cur = 0,
-    msg = "Terra II  --  arrows, enter, esc; space ends the turn", keys = Nil,
-    snap = 0, auto = 0, banner = "", bt = 0, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil }.
+    anim = noAn, queue = Nil, sel = SNone, zone = 0, cur = 0,
+    msg = "arrows, enter, esc; space ends the turn -- press ENTER to begin", keys = Nil,
+    snap = 0, auto = 0, banner = "TERRA II", bt = 100000, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil,
+    sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0 }.
+initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
+# a sound cue: queued on the model, played by the tick (like the log)
+cue m r = { m | sfx = r :: m.sfx }.
+oops m s = cue (note m s) Sfx.refuse.
+# a floating number over a spot on the table
+number m pos s = (x, y, z) = pos; { m | nums = (x, z, s, 0) :: m.nums }.
 split l 0 acc = (rev acc Nil, l).
 split Nil n acc = (rev acc Nil, Nil).
 split (x :: r) n acc = split r (n - 1) (x :: acc).
@@ -304,7 +312,7 @@ damageUnit m s z c dmg =
   u = slotOf p z c;
   hp2 = u.hp - dmg;
   u2 = { u | hp = hp2, flash = 250 };
-  m2 = note (setSide m s (setSlot p z c u2)) "{cName (uCard u)} takes {dmg}";
+  m2 = cue (number (note (setSide m s (setSlot p z c u2)) "{cName (uCard u)} takes {dmg}") (posOf s z c) "-{dmg}") Sfx.hit;
   case alive u and hp2 <= 0 of
     True -> slay m2 s z c
   | False -> m2.
@@ -312,15 +320,18 @@ slay m s z c =
   p = sideOf m s;
   u = slotOf p z c;
   m2 = setSide m s (setSlot p z c { u | dead = 1, dt = 0, hp = 0 });
-  note { m2 | env = Int.min 10 (m2.env + (case uSoft u == 1 of True -> 1 | False -> 2)),
-              fx = sparks m2.fx (posOf s z c) 6 } "{cName (uCard u)} destroyed".
+  cue (note { m2 | env = Int.min 10 (m2.env + (case uSoft u == 1 of True -> 1 | False -> 2)),
+                   fx = sparks m2.fx (posOf s z c) 6, shake = 160 } "{cName (uCard u)} destroyed") Sfx.kill.
 damageHq m s dmg =
   p = sideOf m s;
   hq2 = p.hq - dmg;
   m2 = setSide m s { p | hq = hq2 };
-  m3 = note { m2 | fx = sparks m2.fx (hqPos s) 8 } "HQ hit for {dmg}: {hq2} left";
+  m3 = cue (number (note { m2 | fx = sparks m2.fx (hqPos s) 8, shake = 320 } "HQ hit for {dmg}: {hq2} left") (hqPos s) "-{dmg}") Sfx.hqHit;
   case hq2 <= 0 of
-    True -> note { m3 | over = 1 + (1 - s), banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil } (case s == 1 of True -> "VICTORY" | False -> "DEFEAT")
+    True -> cue (note { m3 | over = 1 + (1 - s), banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil,
+                             msg = "press ENTER for a new game, Q to quit" }
+                      (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"))
+                (case s == 1 of True -> Sfx.victory | False -> Sfx.defeat)
   | False -> m3.
 sparks fx pos n | n == 0 = fx.
 sparks fx pos n =
@@ -353,7 +364,7 @@ intGo m s c tc k hi =
   | False -> intGo m s c tc (k + 1) hi.
 interceptBy m s c k dmg =
   m2 = damageUnit m s 1 c dmg;
-  note { m2 | fx = sparks m2.fx (posOf s 1 c) 4 } "overwatch intercepts for {dmg}".
+  cue (note { m2 | fx = sparks m2.fx (posOf s 1 c) 4 } "overwatch intercepts for {dmg}") Sfx.intercept.
 
 # ambush: attacking the forward unit in a column, or the face-down card
 # itself, wakes a READY face-down rear card: full ATK to the attacker, then
@@ -369,7 +380,7 @@ reveal m s c tc u =
   o = sideOf m (1 - s);
   m2 = setSide m (1 - s) (setSlot o 2 tc { u | down = 0, born = 0 });
   m3 = damageUnit m2 s 1 c u.atk;
-  note m3 "AMBUSH! {cName (uCard u)} hits for {u.atk}".
+  cue (note m3 "AMBUSH! {cName (uCard u)} hits for {u.atk}") Sfx.ambush.
 
 # ---- rules: phases --------------------------------------------------------------------
 
@@ -395,9 +406,10 @@ startTurn m s =
   stock2 = Int.max 0 (Int.min p1.stock 3 + r);
   p2 = { p1 | stock = stock2 };
   (p3, m2) = draw (setSide m1 s p2) s p2;
-  m3 = note { m2 | turn = s, tno = m2.tno + bi (s == 0),
+  m3 = cue (note { m2 | turn = s, tno = m2.tno + bi (s == 0),
               banner = (case s == 0 of True -> "YOUR TURN" | False -> "ENEMY TURN"), bt = 900,
-              sel = SNone, zone = 0, cur = 0 } "turn {m2.tno + bi (s == 0)} side {s}: supply {stock2} (rate {r})";
+              sel = SNone, zone = 0, cur = 0 } "turn {m2.tno + bi (s == 0)} side {s}: supply {stock2} (rate {r})")
+           (case s == 0 of True -> Sfx.yourTurn | False -> Sfx.enemyTurn);
   case s == 1 of
     True -> { m3 | queue = aiPlan m3 + (AEnd 1 :: Nil) }
   | False -> m3.
@@ -441,12 +453,12 @@ callCard m s i z c =
   down = bi (z == 2 and cKind cd != 1);
   cost = cCost cd - down;
   case k >= 0 and p.stock >= cost and not (occ p z c) and (z == 1 or z == 2) of
-    False -> note m "cannot call {cName cd} there"
+    False -> oops m "cannot call {cName cd} there"
   | True -> called m s p i z c cd (mkU cd down) cost.
 called m s p i z c cd u cost =
   p2 = setSlot { p | stock = p.stock - cost, hand = delAt p.hand i } z c u;
   m2 = setSide m s p2;
-  note m2 "{sideName s}: {cName cd} called to {zoneName z} {c + 1}".
+  cue (note m2 "{sideName s}: {cName cd} called to {zoneName z} {c + 1}") Sfx.call.
 sideName 0 = "you".
 sideName s = "enemy".
 zoneName 1 = "forward".
@@ -549,36 +561,36 @@ overwatch m s c =
   p = sideOf m s;
   u = slotOf p 1 c;
   case canAct u and uKind u != 2 of
-    False -> { m | msg = "that unit cannot change mode now" }
-  | True -> setSide { m | msg = (case u.mode == 0 of True -> "overwatch" | False -> "back to attack mode") }
+    False -> oops m "that unit cannot change mode now"
+  | True -> setSide (cue { m | msg = (case u.mode == 0 of True -> "overwatch" | False -> "back to attack mode") } Sfx.toggle)
                     s (setSlot p 1 c { u | mode = 1 - u.mode, ready = 0 }).
 charge m s c =
   p = sideOf m s;
   u = slotOf p 1 c;
   case canAct u and uKind u == 2 of
-    False -> { m | msg = "only ready artillery charges" }
-  | True -> setSide { m | msg = "charging" } s (setSlot p 1 c { u | chg = 1, ready = 0 }).
+    False -> oops m "only ready artillery charges"
+  | True -> setSide (cue { m | msg = "charging" } Sfx.charge) s (setSlot p 1 c { u | chg = 1, ready = 0 }).
 slide m s fz fc tz tc =
   p = sideOf m s;
   u = slotOf p fz fc;
   ok = canAct u and uKind u != 1 and not (occ p tz tc);
   case ok of
-    False -> { m | msg = "cannot move that unit" }
-  | True -> { m | anim = An 3 s fz fc tz tc 0 0, msg = (case tz == 2 of True -> "retreat" | False -> "advance") }.
+    False -> oops m "cannot move that unit"
+  | True -> cue { m | anim = An 3 s fz fc tz tc 0 0, msg = (case tz == 2 of True -> "retreat" | False -> "advance") } Sfx.move.
 attack m s c tz tc =
   u = slotOf (sideOf m s) 1 c;
   ok = canAct u and u.mode == 0 and uKind u != 2 and targetOk m s c tz tc;
   case ok of
-    False -> note m "no valid attack there"
-  | True -> note { m | anim = An 1 s 1 c tz tc 0 0 } "{sideName s}: {cName (uCard u)} attacks {tgtName tz (tc + 1)}".
+    False -> oops m "no valid attack there"
+  | True -> cue (note { m | anim = An 1 s 1 c tz tc 0 0 } "{sideName s}: {cName (uCard u)} attacks {tgtName tz (tc + 1)}") Sfx.attack.
 tgtName 3 c = "the HQ".
 tgtName z c = "{zoneName z} {c}".
 fire m s c tz tc =
   u = slotOf (sideOf m s) 1 c;
   ok = canAct u and u.chg == 1 and uKind u == 2 and fireOk m s tz tc;
   case ok of
-    False -> { m | msg = "artillery must be charged, and aimed at the rear or the HQ" }
-  | True -> note { m | anim = An 2 s 1 c tz tc 0 0 } "{sideName s}: artillery fires at {tgtName tz (tc + 1)}".
+    False -> oops m "artillery must be charged, and aimed at the rear or the HQ"
+  | True -> cue (note { m | anim = An 2 s 1 c tz tc 0 0 } "{sideName s}: artillery fires at {tgtName tz (tc + 1)}") Sfx.shot.
 
 # the animation clock: midpoint applies the rule, the end clears it
 durOf 1 = 520.
@@ -611,13 +623,16 @@ finishAn m k s fz fc tz tc = { m | anim = noAn }.
 
 tickMs = 40.
 
+tick m | m.qt > 0 and m.qt <= tickMs = (m, MQuit :: Nil).
+tick m | m.qt > 0 = ({ m | qt = m.qt - tickMs }, Nil).
 tick m =
-  m1 = ageAll { m | ms = m.ms + tickMs, log = Nil } tickMs;
+  m1 = ageAll { m | ms = m.ms + tickMs, log = Nil, sfx = Nil } tickMs;
   An kind s fz fc tz tc t done = m1.anim;
   (m2, cs) = case kind != 0 of
     True -> (advance m1 tickMs, Nil)
   | False -> idle m1;
   _ = say (rev m2.log Nil);
+  _ = Sfx.playAll (rev m2.sfx Nil);
   (m2, cs).
 # the transcript goes straight to stdout: the host's log echo is
 # rate-limited (rings are not), and a scripted game must be readable
@@ -631,7 +646,11 @@ takeKey m = case m.keys of
   | k :: r -> key { m | keys = r } k.
 
 ageAll m dt =
-  { m | me = ageSide m.me dt, en = ageSide m.en dt, bt = Int.max 0 (m.bt - dt), fx = ageFx m.fx dt Nil }.
+  { m | me = ageSide m.me dt, en = ageSide m.en dt, bt = Int.max 0 (m.bt - dt), fx = ageFx m.fx dt Nil,
+        nums = ageNums m.nums dt Nil, shake = Int.max 0 (m.shake - dt) }.
+ageNums Nil dt acc = acc.
+ageNums ((x, z, s, t) :: r) dt acc | t + dt > 750 = ageNums r dt acc.
+ageNums ((x, z, s, t) :: r) dt acc = ageNums r dt ((x, z, s, t + dt) :: acc).
 ageSide p dt = { p | fwd = ageRow p.fwd dt, rear = ageRow p.rear dt }.
 ageRow row dt = row |> List.map (fn u -> ageU u dt).
 ageU u dt | u.id < 0 = u.
@@ -645,20 +664,24 @@ ageFx ((x, y, z, t) :: r) dt acc = ageFx r dt ((x, y, z, t + dt) :: acc).
 # evdev codes: 105 left 106 right 103 up 108 down 28 enter 1 esc 14 bksp
 # 57 space 18 e 16 q 25 p 30 a 24 o 19 r 46 c 33 f 47 v 2..6 columns
 
-key m 16 = (m, MQuit :: Nil).
+key m 16 = (cue { m | qt = 600, msg = "bye" } Sfx.close, Nil).
 key m 25 = ({ m | snap = m.snap + 1 }, Nil).
 key m 31 = ({ m | auto = 1 - m.auto, msg = "auto snapshots {1 - m.auto}" }, Nil).
-key m k | m.over != 0 = (m, Nil).
+key m 28 | m.title == 1 = (cue { m | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "" } Sfx.open, Nil).
+key m 28 | m.over != 0 =
+  m2 = initWith (rnd m.seed) (rnd (rnd m.seed));
+  (cue { m2 | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "", seed = rnd m.seed, snap = m.snap, auto = m.auto } Sfx.open, Nil).
+key m k | m.title == 1 or m.over != 0 = (m, Nil).
 key m k | m.turn != 0 = ({ m | msg = "enemy turn" }, Nil).
-key m 57 = ({ m | queue = AEnd 0 :: Nil, sel = SNone, msg = "end of turn" }, Nil).
+key m 57 = (cue { m | queue = AEnd 0 :: Nil, sel = SNone, msg = "end of turn" } Sfx.turnOver, Nil).
 key m 18 = key m 57.
-key m 1 = ({ m | sel = SNone, zone = 0, msg = "" }, Nil).
+key m 1 = (cue { m | sel = SNone, zone = 0, msg = "" } Sfx.cancel, Nil).
 key m 14 = key m 1.
-key m k | k >= 2 and k <= 6 = (moveCur m (k - 2), Nil).
-key m 105 = (moveCur m (m.cur - 1), Nil).
-key m 106 = (moveCur m (m.cur + 1), Nil).
-key m 103 = (moveZone m 1, Nil).
-key m 108 = (moveZone m (0 - 1), Nil).
+key m k | k >= 2 and k <= 6 = (cue (moveCur m (k - 2)) Sfx.cursor, Nil).
+key m 105 = (cue (moveCur m (m.cur - 1)) Sfx.cursor, Nil).
+key m 106 = (cue (moveCur m (m.cur + 1)) Sfx.cursor, Nil).
+key m 103 = (cue (moveZone m 1) Sfx.cursor, Nil).
+key m 108 = (cue (moveZone m (0 - 1)) Sfx.cursor, Nil).
 key m 28 = (confirm m, Nil).
 key m 30 = (unitKey m 30, Nil).
 key m 24 = (unitKey m 24, Nil).
@@ -689,11 +712,11 @@ placeZone m i z d =
   cd = cardOf (nth m.me.hand i 0);
   z2 = case d > 0 of True -> 1 | False -> 2;
   case z2 == 1 and cKind cd == 1 of
-    True -> { m | msg = "support units serve in the rear" }
+    True -> oops m "support units serve in the rear"
   | False -> { m | sel = SPlace i z2, zone = z2 }.
 
 confirm m = case m.sel of
-    SNone -> pick m
+    SNone -> cue (pick m) Sfx.pick
   | SCard i -> m
   | SPlace i z -> { m | queue = ACall 0 i z m.cur :: Nil, sel = SNone, zone = 0, cur = 0 }
   | SUnit z c -> unitKey m 30
@@ -701,14 +724,14 @@ confirm m = case m.sel of
 pick m | m.zone == 0 =
   k = nth m.me.hand m.cur (0 - 1);
   case k < 0 of
-    True -> { m | msg = "no card there" }
+    True -> oops m "no card there"
   | False -> { m | sel = SPlace m.cur (case cKind (cardOf k) == 1 of True -> 2 | False -> 1),
                    zone = (case cKind (cardOf k) == 1 of True -> 2 | False -> 1), cur = 2,
                    msg = "place {cName (cardOf k)}: arrows, enter (up/down: forward or rear)" }.
 pick m =
   u = slotOf m.me m.zone m.cur;
   case alive u of
-    False -> { m | msg = "empty slot" }
+    False -> oops m "empty slot"
   | True -> { m | sel = SUnit m.zone m.cur, msg = unitHelp m.zone u }.
 unitHelp 2 u = "rear: V advance to the front".
 unitHelp z u | uKind u == 2 = "artillery: C charge, F fire, R retreat".
@@ -716,14 +739,14 @@ unitHelp z u = "A attack  O overwatch  R retreat".
 
 unitKey m k = case m.sel of
     SUnit z c -> unitAct m z c k
-  | s -> { m | msg = "select one of your units first" }.
+  | s -> oops m "select one of your units first".
 unitAct m 1 c 30 = { m | sel = STarget 1 c, zone = 1, cur = c, msg = "target: arrows (up/down: forward, rear, HQ), enter" }.
 unitAct m 1 c 33 = { m | sel = STarget 1 c, zone = 2, cur = c, msg = "aim: arrows, enter (rear units or the HQ)" }.
 unitAct m 1 c 24 = { m | queue = AOver 0 c :: Nil, sel = SNone }.
 unitAct m 1 c 19 = { m | queue = ARetreat 0 c :: Nil, sel = SNone }.
 unitAct m 1 c 46 = { m | queue = ACharge 0 c :: Nil, sel = SNone }.
 unitAct m 2 c 47 = { m | queue = AAdvance 0 c :: Nil, sel = SNone }.
-unitAct m z c k = { m | msg = "not that, here" }.
+unitAct m z c k = oops m "not that, here".
 aim m 1 c =
   u = slotOf m.me 1 c;
   case uKind u == 2 of
@@ -741,8 +764,27 @@ scene m =
   es4 = handEnts m es3;
   es5 = shotEnts m es4;
   es6 = fxEnts m.fx es5;
-  es7 = hud m es6;
-  Scene Nil es7 lights camera.
+  es7 = numEnts m.nums es6;
+  es8 = hud m es7;
+  Scene Nil es8 lights (cameraOf m).
+# floating damage numbers: white on a dark tag, in front of the target,
+# rising and shrinking over 750 ms
+numEnts Nil es = es.
+numEnts ((x, z, s, t) :: r) es =
+  cell = 190 - t / 6;
+  y = 2100 + t * 3;
+  zz = z + 1500;
+  w = strlen s * 6 * cell + cell;
+  es1 = Ent "cube" (x, y - 4 * cell, zz - 60) 0 (w, 9 * cell, 60) (60, 30, 30) :: es;
+  numEnts r (txtC es1 s x (y + cell / 2) zz cell (1000, 980, 900)).
+# the camera, knocked about while shake > 0 (a hash of the clock, not a
+# random stream: a replayed game shakes the same way)
+cameraOf m | m.shake == 0 = camera.
+cameraOf m =
+  a = m.shake;
+  dx = ((m.ms * 7919) % 400 - 200) * a / 300;
+  dy = ((m.ms * 104729) % 300 - 150) * a / 300;
+  ((dx, 12500 + dy, 14800), (dx, 0, 300), 1000).
 
 # tiles, lit by the cursor / selection / valid targets
 tiles m es = tileRow (tileRow (tileRow (tileRow es m 0 1) m 0 2) m 1 1) m 1 2.
@@ -817,7 +859,8 @@ lerp (ax, ay, az) (bx, by, bz) k = (ax + (bx - ax) * k / 1000, ay + (by - ay) * 
 unitEnts es m s z c u =
   (x, y, zz) = unitPos m s z c;
   k = case u.dead == 1 of True -> Int.max 50 (1000 - u.dt * 1000 / 420) | False -> Int.min 1000 (200 + u.born * 800 / 300);
-  lift = case u.born < 300 of True -> (300 - u.born) * 4 | False -> 0;
+  bob = case s == 0 and (isCursor m z c or isSelected m z c) of True -> 120 - Int.abs ((m.ms % 800) - 400) * 3 / 10 | False -> 0;
+  lift = (case u.born < 300 of True -> (300 - u.born) * 4 | False -> 0) + bob;
   col = case u.flash > 0 of True -> white | False -> unitCol s u;
   d = dirOf s;
   es1 = case u.down == 1 of
@@ -891,7 +934,7 @@ hud m es =
   es1 = txtC es "T{m.tno}   YOU  HQ {m.me.hq}  SUP {m.me.stock}  DECK {List.len m.me.deck}    ENEMY  HQ {m.en.hq}  SUP {m.en.stock}    ENV {m.env}" 0 4600 (0 - 10200) 105 white;
   es2 = txtC es1 m.msg 0 3500 (0 - 10200) 100 (950, 950, 700);
   case m.bt > 0 of
-    True -> txtC es2 m.banner 0 4200 0 420 (1000, 900, 300)
+    True -> txtC es2 m.banner 0 (case m.title == 1 of True -> 5200 | False -> 4200) 0 (case m.title == 1 of True -> 620 | False -> 420) (1000, 900, 300)
   | False -> es2.
 
 # ---- the elm four ---------------------------------------------------------------------------

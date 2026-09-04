@@ -30,9 +30,17 @@ UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 HOST_LDFLAGS :=
 DESKTOP_GL_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null) -framework OpenGL -lpthread -lm
+# the sound tier (hal/unix/snd_raw.c): AudioQueue on macOS
+SND_FLAGS := -DQOSP_SND_AQ
+SND_LIBS := -framework AudioToolbox -framework CoreFoundation
 else
 HOST_LDFLAGS := -no-pie
 DESKTOP_GL_LIBS := $(shell pkg-config --libs glfw3 2>/dev/null) -lGL -lpthread -lm
+# the sound tier: ALSA when its headers are installed (libasound2-dev),
+# else the WAV dump only (FPR_SND_DUMP) -- never a build failure
+ALSA_LIBS := $(shell pkg-config --libs alsa 2>/dev/null)
+SND_FLAGS := $(if $(ALSA_LIBS),-DQOSP_SND_ALSA,)
+SND_LIBS := $(ALSA_LIBS)
 endif
 DESKTOP_GL_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 
@@ -40,7 +48,7 @@ DESKTOP_GL_CFLAGS := $(shell pkg-config --cflags glfw3 2>/dev/null)
 QOSP_SRC = portable/main.c portable/qa.c portable/haltab.c portable/store.c \
            portable/compile.c \
            $(HAL)/unix/net_raw.c $(HAL)/unix/blk_raw.c $(HAL)/unix/hostlog.c \
-           $(HAL)/unix/tty_raw.c $(HAL)/unix/evdev_raw.c \
+           $(HAL)/unix/tty_raw.c $(HAL)/unix/evdev_raw.c $(HAL)/unix/snd_raw.c \
            $(HAL)/core/buddy.c $(HAL)/core/qaimg.c
 
 # the shell's half of the ABI stamp is DERIVED from the authoritative
@@ -51,8 +59,8 @@ CODEGEN_REV := $(shell grep -m1 '^codegenRev = ' $(FPR)/compiler/Codegen.hs 2>/d
 REV_FLAG := $(if $(CODEGEN_REV),-DQOSP_CODEGEN_REV=$(CODEGEN_REV),)
 
 portable: $(QOSP_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
-	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
-	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp
+	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) $(SND_FLAGS) \
+	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp -lpthread -lm $(SND_LIBS)
 
 portable-run: portable
 	./qosp --yes $(FPR)/app.qa
@@ -66,14 +74,14 @@ portable-run: portable
 QOSP_GL_SRC = $(QOSP_SRC) $(HAL)/unix/gfx.c
 portable-gl: $(QOSP_GL_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
 	gcc $(HOST_LDFLAGS) -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
-	  -DQOSP_GFX -DFPR_DESKTOP_GL \
+	  -DQOSP_GFX -DFPR_DESKTOP_GL $(SND_FLAGS) \
 	  $(DESKTOP_GL_CFLAGS) -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_GL_SRC) -o qosp-gl \
-	  $(DESKTOP_GL_LIBS)
+	  $(DESKTOP_GL_LIBS) $(SND_LIBS)
 
 # ---- QOS Portable, aarch64 cross (verifies the x28 hart discipline
 portable-a64: $(QOSP_SRC) appside/qos_abi.h portable/qa.h $(FPR)/compiler/Codegen.hs
 	aarch64-linux-gnu-gcc -static -O2 -Wall -Wextra -DFPR_POSIX -DQOSP_HOST -DFPR_NHARTS=$(QOSHARTS) -DQOS_ARENA_SIZE="($(ARENA_MB)ul << 20)" $(REV_FLAG) \
-	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp-a64 -lpthread
+	  -I$(HAL)/core -I$(HAL)/unix -Iappside $(QOSP_SRC) -o qosp-a64 -lpthread -lm
 
 # ---- QOS Native: the kernel --------------------------------------------
 RT_CORE = $(HAL)/core/runtime.c $(HAL)/core/actors.c $(HAL)/core/bits.c \

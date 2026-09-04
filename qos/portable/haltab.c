@@ -15,6 +15,7 @@
 #include "hostlog.h"
 #include "net_raw.h"
 #include "blk_raw.h"
+#include "snd_raw.h"
 #ifdef QOSP_GFX
 #include "gfx_raw.h"
 #else
@@ -122,6 +123,10 @@ static qos_hal_t the_table = {
     .blk_pages = qos_blkraw_pages,
     .blk_read = qos_blkraw_read,
     .blk_write = qos_blkraw_write,
+    /* v7: the sound tier (snd_raw.c) -- always present on qosp; the
+     * host itself is silent, honestly and once in the log, without a
+     * device or a dump */
+    .snd_play = qos_snd_play,
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

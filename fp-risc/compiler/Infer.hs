@@ -545,6 +545,7 @@ builtinEnv =
       ("glRender", scheme [0, 1] (TFn (sv 0) (sv 1))),
       ("glSavePpm", mono (TFn tStr tInt)),
       ("inputPoll", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      ("sndPlay", scheme [0] (TFn (sv 0) tInt)),
       -- Pin / GPIO service (fpr_g_ Pin.*)
       ("Pin.read", scheme [0] (TFn (sv 0) tInt)),
       ("Pin.write", scheme [0] (TFn (sv 0) (TFn tInt tUnit))),
