@@ -211,6 +211,12 @@ def build_plugins(prog, plugins, size_mb=8):
     return img
 
 
+def wants_gl(prog):
+    """`#: host gl` (or the _desktop_gl name) = the program draws through
+    the GLES scene walker: run and pack it on qosp-gl."""
+    return Path(prog).stem.endswith("_desktop_gl") or "gl" in prog_directives(FPR / prog).get("host", [])
+
+
 def declared_plugins(a, prog):
     """The program's plugin harness: --plugin flags win, then the
     program's own `#: plugins` line; --no-plugins silences both."""
@@ -258,7 +264,7 @@ def cmd_run(a):
         return run_scan(cmd, cwd=FPR, expect=expect)
 
     # the default: host the .qa on qosp
-    gfx = a.gfx or Path(prog).stem.endswith("_desktop_gl")
+    gfx = a.gfx or wants_gl(prog)
     host = "qosp-gl" if gfx else "qosp"
     build_app(prog, a.harts)
     build_qosp(gfx=gfx)
@@ -309,7 +315,7 @@ def cmd_pack(a):
     name = a.name or (d.get("name") or [Path(prog).stem])[0]
     size_mb = int((d.get("disk-mb") or ["8"])[0])
     build_fpr()
-    gfx = a.gfx or Path(prog).stem.endswith("_desktop_gl")
+    gfx = a.gfx or wants_gl(prog)
     host = "qosp-gl" if gfx else "qosp"
     build_app(prog, a.harts)
     build_qosp(gfx=gfx)

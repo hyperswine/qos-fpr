@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q ghc libghc-megaparsec-dev libghc-network-dev \
             libghc-utf8-string-dev libghc-mtl-dev build-essential python3 \
-            libgl-dev libegl-dev
+            libgl-dev libegl-dev libglfw3-dev
 
       - name: pins are committed versions and the lock is current
         run: ./qos.py lock --check
