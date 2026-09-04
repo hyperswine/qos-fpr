@@ -34,6 +34,9 @@ into a GitHub Release with the same bundles rebuilt from the tag.
     ./qos.py lock --check                 # check-all leg: pins resolvable, lock current
     ./qos.py release 0.2.0 --push         # cut + publish v0.2.0
 
+The exact build tools currently installed on the development Mac are recorded
+in [docs/TOOLCHAIN.md](docs/TOOLCHAIN.md).
+
 ## Layout
 
     fp-risc/            the language project
