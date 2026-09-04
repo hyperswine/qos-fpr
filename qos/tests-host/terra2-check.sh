@@ -15,7 +15,7 @@ cd "$HERE/qos" && make -s portable-gl >/dev/null 2>&1
 python3 tests-host/terra2-keys.py /tmp/terra2.evd \
   enter s right right enter enter space \
   up up right right enter a up up enter p space \
-  up up right right enter a enter p space q >/dev/null
+  up up right right enter a enter left enter right enter p space q >/dev/null
 rm -f /tmp/terra2-*.ppm /tmp/terra2.wav
 FPR_SND_DUMP=/tmp/terra2.wav FPR_EVDEV=/tmp/terra2.evd timeout 240 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-check.log 2>&1 || true
 fail() { echo "terra2-check: FAIL: $1"; tail -20 /tmp/terra2-check.log; exit 1; }
@@ -25,6 +25,9 @@ grep -aq "HQ hit for 2: 13 left" /tmp/terra2-check.log || fail "HQ damage"
 grep -aq "turn 1 side 1" /tmp/terra2-check.log || fail "the enemy turn"
 grep -aq "enemy: .* called to" /tmp/terra2-check.log || fail "the AI's call"
 grep -aq "destroyed" /tmp/terra2-check.log || fail "a death"
+grep -aq "you: MechInf called to forward 4" /tmp/terra2-check.log || fail "the tank's call"
+grep -aq "\[gfx\] mesh tank_hull: 172 triangles" /tmp/terra2-check.log || fail "the hull mesh"
+grep -aq "\[gfx\] mesh tank_turret: 124 triangles" /tmp/terra2-check.log || fail "the turret mesh"
 grep -aq "game over" /tmp/terra2-check.log || fail "clean exit"
 grep -aq "PANIC" /tmp/terra2-check.log && fail "panic"
 N=$(ls /tmp/terra2-*.ppm 2>/dev/null | wc -l)
@@ -60,4 +63,4 @@ assert quiet > 0.3, "never quiet"
 PY
 SND=$(grep -a -m1 "dump closed" /tmp/terra2-check.log | sed 's/.*(\(.*\) s), \(.*\) tones.*/\1 s, \2 tones/')
 FR=$(grep -a "game over" /tmp/terra2-check.log | sed 's/.*\[mvu: \([0-9]*\) frames.*/\1/')
-echo "terra2-check: ALL LEGS PASS ($N snapshots, $FR frames, sound $SND: title, call, lane attack on the HQ, AI turn, a death, clean quit)"
+echo "terra2-check: ALL LEGS PASS ($N snapshots, $FR frames, sound $SND: title, call, lane attack on the HQ, AI turn, a death, the tank, clean quit)"

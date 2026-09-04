@@ -47,7 +47,7 @@ the walker's three meshes in milli units:
 | table, tiles     | a plane; a thin cube per slot, tinted by zone, lit by the cursor (yellow), the selection, a valid target (red) |
 | HQ               | a block and a tower; the enemy's carries an "HQ n" label |
 | infantry (Soft)  | a block body and a sphere head                      |
-| heavy (Hard)     | a hull and a turret                                 |
+| heavy (Hard)     | the CoScad tank (models/tank, docs/MESHES.md): hull + a turret that swings onto the target |
 | artillery        | a carriage and a barrel pointing at the enemy       |
 | support          | a tower with a light roof                           |
 | ambush           | a face-down slab with a "?"                         |

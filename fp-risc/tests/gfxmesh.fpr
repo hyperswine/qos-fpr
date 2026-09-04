@@ -1,0 +1,54 @@
+# gfxmesh.fpr -- a program-carried mesh on the scene walker: the CoScad
+# tank (models/tank/tank.coscad -> OpenSCAD -> STL -> tools/mkmesh.py ->
+# models/tank/tank.fpr) registered through GL.serve's mesh list and drawn
+# as two entities, the hull and the turret, the turret yawed -- the one
+# degree of freedom the walker's yaw already gives.  Snapshots frame 6 to
+# /tmp/gfxmesh-1.ppm and quits.
+#
+#   make qos-app PROG=tests/gfxmesh.fpr
+#   (cd ../qos && make portable-gl && xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa)
+unsafe program.
+
+MV = use "../std/mvu".
+GL = use "../programs/mods/glsvc".
+T = use "../models/tank/tank".
+
+App = MV.App.
+MQuit = MV.MQuit.
+ETick = MV.ETick.
+STick = MV.STick.
+
+Gfx = Type (Scene statics dynamics lights camera
+          | Ent mesh pos yaw scale color).
+
+lights = ((3000, 9000, 6000), (1000, 1000, 1000)) :: Nil.
+camera = ((3200, 3600, 5200), (0, 400, 0), 900).
+
+tank es x z yaw tyaw col =
+  Ent "tank_hull" (x, 0, z) yaw (1000, 1000, 1000) col ::
+  Ent "tank_turret" (x, 750, z) tyaw (1000, 1000, 1000) col :: es.
+
+scene t =
+  es0 = Ent "plane" (0, 0, 0) 0 (12000, 1000, 12000) (150, 170, 150) :: Nil;
+  es1 = tank es0 (0 - 1800) 0 0 0 (250, 450, 950);
+  es2 = tank es1 1800 0 3142 (3142 + 600) (900, 300, 260);
+  es3 = tank es2 0 (0 - 2600) 0 (t * 150) (330, 640, 520);
+  Scene Nil es3 lights camera.
+
+init env = 0.
+update env ev t = case ev of
+    ETick -> tick (t + 1)
+  | e -> (t, Nil).
+tick t | t > 12 = (t, MQuit :: Nil).
+tick t = (t, Nil).
+subs t = STick 40 :: Nil.
+view t = (scene t, case t >= 6 of True -> 1 | False -> 0).
+
+main =
+  me = myself 0;
+  clint = device "clint";
+  mt = reg32 clint 49144;
+  gl = spawn (GL.serve 960 600 "gfxmesh" T.meshes);
+  cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
+  _ = print "gfxmesh: {List.len T.meshes} meshes registered by the service";
+  MV.game me cfg (App init update subs view).

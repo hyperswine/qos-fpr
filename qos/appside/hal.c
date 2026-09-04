@@ -290,6 +290,20 @@ static V h_sndPlay(V tone) {
   return TAG((sw)qos_hal->snd_play(a[0], a[1], a[2], a[3], a[4], a[5]));
 }
 FPR_FN(fpr_g_sndPlay, h_sndPlay, 1);
+/* ---- glMesh name text -> triangle count: register a program-carried mesh */
+static V h_glMesh(V namev, V textv) {
+  need_gfx();
+  if (!qos_hal->gfx_mesh_load) fpr_cpanic("gfx: mesh registry not granted by this host (a pre-v8 qosp)");
+  if (ISINT(namev) || TID(namev) != T_STR) fpr_cpanic("glMesh: name must be a String");
+  if (ISINT(textv) || TID(textv) != T_STR) fpr_cpanic("glMesh: mesh text must be a String");
+  str_t *n = (str_t *)namev, *t = (str_t *)textv;
+  char name[32];
+  uw k = n->len < sizeof name - 1 ? n->len : sizeof name - 1;
+  for (uw i = 0; i < k; i++) name[i] = (char)n->bytes[i];
+  name[k] = 0;
+  return TAG((sw)qos_hal->gfx_mesh_load(name, (const char *)t->bytes, t->len));
+}
+FPR_FN(fpr_g_glMesh, h_glMesh, 2);
 FPR_FN(fpr_g_glInit, h_glInit, 2);
 FPR_FN(fpr_g_glRender, h_glRender, 1);
 FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);

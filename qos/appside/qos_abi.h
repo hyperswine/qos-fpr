@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 7u
+#define QOS_ABI_VERSION 8u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -157,6 +157,14 @@ typedef struct {
    * NULL on a host without it; the app-side shim reports the missing
    * capability the same way gfx does. */
   int (*snd_play)(int64_t wave, int64_t f0, int64_t f1, int64_t ms, int64_t vol, int64_t delay);
+
+  /* ---- v8 additions (appended: earlier offsets unchanged) -----------
+   * registered meshes: the program carries its own geometry (tools/
+   * mkmesh.py from an STL: milli ints, 9 per triangle) and hands it to
+   * the walker once after glInit; the name is then an Ent mesh id like
+   * cube / plane / sphere.  Returns the triangle count, -1 malformed.
+   * NULL without gfx, like the other gfx slots. */
+  int64_t (*gfx_mesh_load)(const char *name, const char *text, uint64_t len);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------
