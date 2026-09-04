@@ -53,9 +53,25 @@ swung onto the target while the unit is the one lunging or firing (an
 integer atan in `atanM`).  `tests/gfxmesh.fpr` draws three tanks with
 yawed turrets and snapshots them; it is a check-all leg.
 
+## The rest of the army: models/
+
+Every unit type is now a CoScad model, split into parts where a second
+colour or a moving piece wants one.  `models/build.sh` regenerates all
+four stages (`COSCAD=... models/build.sh`); the results are checked in.
+
+| model                | parts                                                    | triangles     | in Terra II |
+|----------------------|----------------------------------------------------------|---------------|-------------|
+| `tank/`              | `tank_hull`, `tank_turret` (pivot at the origin)          | 172 + 124     | Hard combat: hull in the side colour, turret a shade lighter, swung onto the target |
+| `infantry/`          | `infantry` (body), `infantry_kit` (helmet, boots, pack, rifle) | 140 + 200 | Soft combat: body in the side colour, kit dark, 1.3x |
+| `truck/`             | `truck` (chassis, bonnet, cab, bed), `truck_kit` (six wheels), `truck_canvas` (the hoop, tailboard) | 176 + 216 + 60 | support: body in the side colour, wheels dark, canvas khaki |
+| `hq/`                | `hq` (slab, command building, silo with cap, two watchtowers), `hq_fence` (nine posts, panel, rails, lamps), `hq_dish` (pivot at the origin) | 270 + 736 + 140 | the HQ: buildings tinted by side, the fence steel, the dish white and turning |
+
+Ten registered meshes plus the three built-in ones: 13 of the table's
+16.  `tests/gfxmesh.fpr` is the showroom, all of them in one frame.
+
 ## Limits and next steps
 
-* The mesh table holds 16 names and 16,384 instances per mesh; a
+* The mesh table holds 16 names (13 used) and 16,384 instances per mesh; a
   registered mesh has no vertex sharing, so triangles cost three vertices
   each -- fine for hundreds, think again for hundreds of thousands.
 * Rotation is yaw only, as for every entity: a model that needs pitch

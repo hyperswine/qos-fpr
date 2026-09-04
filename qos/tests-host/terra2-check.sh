@@ -28,6 +28,9 @@ grep -aq "destroyed" /tmp/terra2-check.log || fail "a death"
 grep -aq "you: MechInf called to forward 4" /tmp/terra2-check.log || fail "the tank's call"
 grep -aq "\[gfx\] mesh tank_hull: 172 triangles" /tmp/terra2-check.log || fail "the hull mesh"
 grep -aq "\[gfx\] mesh tank_turret: 124 triangles" /tmp/terra2-check.log || fail "the turret mesh"
+for m in infantry infantry_kit truck truck_kit truck_canvas hq hq_fence hq_dish; do
+  grep -aq "\[gfx\] mesh $m: [0-9]* triangles" /tmp/terra2-check.log || fail "the $m mesh"
+done
 grep -aq "game over" /tmp/terra2-check.log || fail "clean exit"
 grep -aq "PANIC" /tmp/terra2-check.log && fail "panic"
 N=$(ls /tmp/terra2-*.ppm 2>/dev/null | wc -l)

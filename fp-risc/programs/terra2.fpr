@@ -48,6 +48,10 @@ GL = use "mods/glsvc".
 S2 = use "mods/scene2d".
 Sfx = use "mods/sfx".
 Tank = use "../models/tank/tank".
+Inf = use "../models/infantry/infantry".
+Truck = use "../models/truck/truck".
+Hq = use "../models/hq/hq".
+models = Tank.meshes + Inf.meshes + Truck.meshes + Hq.meshes.
 
 App = MV.App.
 MQuit = MV.MQuit.
@@ -226,6 +230,10 @@ blue = (250, 450, 950).
 red = (900, 300, 260).
 sideCol 0 = blue.
 sideCol s = red.
+hqCol 0 = (420, 500, 700).
+hqCol s = (700, 440, 420).
+dark = (110, 110, 130).
+khaki = (700, 640, 420).
 supCol 0 = (330, 640, 520).
 supCol s = (760, 560, 300).
 
@@ -821,10 +829,13 @@ aimOk m ac z c = targetOk m 0 ac z c.
 hqEnts es m s =
   p = sideOf m s;
   (x, y, z) = hqPos s;
-  col = case m.fx of Nil -> sideCol s | f -> sideCol s;
+  col = hqCol s;
   hl = case m.zone == 3 and isTargetHq m of True -> (1000, 500, 400) | False -> col;
-  es1 = Ent "cube" (x, 600, z) 0 (3600, 1200, 1400) hl ::
-        Ent "cube" (x, 1600, z) 0 (1100, 800, 1000) hl :: es;
+  d = dirOf s;
+  hy = case s == 0 of True -> 0 | False -> 3142;
+  es1 = Ent "hq" (x, y, z) hy (1000, 1000, 1000) hl ::
+        Ent "hq_fence" (x, y, z) hy (1000, 1000, 1000) (620, 660, 720) ::
+        Ent "hq_dish" (x + 1350 * d, 1080, z - 700 * d) (m.ms / 60 % 6284) (1000, 1000, 1000) (950, 950, 950) :: es;
   case s == 1 of
     True -> txtC es1 "HQ {p.hq}" x 3300 (z + 750) 130 white
   | False -> es1.
@@ -899,14 +910,18 @@ atanM dx dz =
 
 # each kind: a few primitives placed relative to the slot, scaled by k/1000
 solids es 1 soft x y z d k col acc ty =
-  Ent "cube" (x, y + 650 * k / 1000, z) 0 (1400 * k / 1000, 1300 * k / 1000, 1400 * k / 1000) col ::
-  Ent "cube" (x, y + 1450 * k / 1000, z) 0 (900 * k / 1000, 300 * k / 1000, 900 * k / 1000) acc :: es.
+  hy = case d < 0 of True -> 0 | False -> 3142;
+  Ent "truck" (x, y, z) hy (k, k, k) col ::
+  Ent "truck_kit" (x, y, z) hy (k, k, k) dark ::
+  Ent "truck_canvas" (x, y, z) hy (k, k, k) khaki :: es.
 solids es 2 soft x y z d k col acc ty =
   Ent "cube" (x, y + 300 * k / 1000, z) 0 (1300 * k / 1000, 550 * k / 1000, 900 * k / 1000) col ::
   Ent "cube" (x, y + 800 * k / 1000, z + d * 500 * k / 1000) 0 (240 * k / 1000, 240 * k / 1000, 1700 * k / 1000) acc :: es.
 solids es kind 1 x y z d k col acc ty =
-  Ent "cube" (x, y + 500 * k / 1000, z) 0 (700 * k / 1000, 900 * k / 1000, 500 * k / 1000) col ::
-  Ent "sphere" (x, y + 1200 * k / 1000, z) 0 (500 * k / 1000, 500 * k / 1000, 500 * k / 1000) acc :: es.
+  hy = case d < 0 of True -> 0 | False -> 3142;
+  sc = k * 13 / 10;
+  Ent "infantry" (x, y, z) hy (sc, sc, sc) col ::
+  Ent "infantry_kit" (x, y, z) hy (sc, sc, sc) dark :: es.
 # heavy: the CoScad tank (models/tank), hull + turret, 1 model unit = 1000
 solids es kind soft x y z d k col acc ty =
   hy = case d < 0 of True -> 0 | False -> 3142;
@@ -983,7 +998,7 @@ main =
   me = myself 0;
   clint = device "clint";
   mt = reg32 clint 49144;
-  gl = spawn (GL.serve 960 600 "terra2" Tank.meshes);
+  gl = spawn (GL.serve 960 600 "terra2" models);
   cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
   MV.game me cfg (App init update subs view).
 
