@@ -262,6 +262,7 @@ safetyCheck preludeNames tops notes = (errs, suggests)
       _ -> []
     msConj e = case e of
       SApp (SApp (SVar "and2") a) b -> msConj a ++ msConj b
+      SBin "and" a b -> msConj a ++ msConj b
       SBin op a b | op `elem` mCmps -> [(a, op, b)]
       _ -> []
     msNeg e = case e of

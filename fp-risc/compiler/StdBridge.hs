@@ -48,7 +48,8 @@ import qualified StdCheck as SC
 
 predItv :: Name -> SExpr -> Maybe SC.Itv
 predItv n e = case e of
-  SBin "and2" a b -> SC.meetItv <$> predItv n a <*> predItv n b
+  SApp (SApp (SVar "and2") a) b -> SC.meetItv <$> predItv n a <*> predItv n b
+  SBin "and" a b -> SC.meetItv <$> predItv n a <*> predItv n b
   SBin op (SVar x) (SInt k) | x == n -> cmpItv op k
   SBin op (SInt k) (SVar x) | x == n -> cmpItv (flipOp op) k
   _ -> Nothing

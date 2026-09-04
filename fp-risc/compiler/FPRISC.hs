@@ -276,13 +276,17 @@ opExpr = dollarChain
           _ <- symbol "->"
           SLam ps <$> expr
       )
-        <|> cmpLayer
+        <|> orLayer
     pipeOp =
       choice
         [ SBin "|>?" <$ try (symbol "|>?"),
           SBin "|>" <$ try (symbol "|>"),
           SBin ">>" <$ try (lexeme (string ">>" <* notFollowedBy (char '=')))
         ]
+
+    orLayer = chainl1' andLayer (SBin "or" <$ keyword "or")
+
+    andLayer = chainl1' cmpLayer (SBin "and" <$ keyword "and")
 
     cmpLayer = chainl1' consLayer cmpOp
     cmpOp =
@@ -331,8 +335,10 @@ opExpr = dollarChain
 
     appLayer = do
       f <- term
-      as <- many term
+      as <- many (notFollowedBy boolOp *> term)
       pure (foldl' SApp f as)
+      where
+        boolOp = keyword "and" <|> keyword "or"
 
 chainl1' :: P a -> P (a -> a -> a) -> P a
 chainl1' p op = p >>= rest
@@ -1433,6 +1439,10 @@ dExpr = \case
     v <- fresh "ok"
     e <- fresh "err"
     dExpr (SCase a [(PCon "Ok" [PVar v], SApp f (SVar v)), (PCon "Err" [PVar e], SApp (SVar "Err") (SVar e))])
+  SBin "and" a b ->
+    dExpr (SCase a [(PCon "True" [], b), (PCon "False" [], SVar "False")])
+  SBin "or" a b ->
+    dExpr (SCase a [(PCon "True" [], SVar "True"), (PCon "False" [], b)])
   SBin "::" a b -> dExpr (SApp (SApp (SVar "Cons") a) b)
   SBin op a b -> do
     a' <- dExpr a

@@ -5,10 +5,14 @@
 # SAFE by construction: the prelude fold scheme carries the recursion,
 # |> carries the value -- no custom recursion, no marker, no parens.
 sumL l = l |> listFold (fn x acc -> x * 10 + acc) 0 .
+doubleSum l = l |> List.map (fn x -> x * 2) |> List.fold (fn x acc -> x + acc) 0 .
 # head-clause pattern guard (the preferred shape over nested case)
 headOr d l | x :: _ <- l = x.
 headOr d l = d.
 verdict b = case b of True -> "OPS AGREE" | False -> "OPS MISMATCH".
+boom b = case b of True -> error "boolean operator failed to short-circuit" | False -> False.
+bounded : (n : Int | n >= 0 and n <= 10) -> Int .
+bounded n = n.
 main =
   a = "fold" + "ability";
   b = a - "ability";
@@ -28,4 +32,8 @@ main =
   _ = print (verdict (ok1 == True));
   _ = print (verdict (ok2 == ok3));
   _ = print (verdict (ok4 == ok5 == ok6 == True));
+  _ = print (verdict (True or False and boom True));
+  _ = print (verdict (doubleSum xs == 20));
+  _ = print (verdict (([True, True, False] |> List.fold (and) True) == False));
+  _ = print (verdict (bounded 5 == 5));
   0 .

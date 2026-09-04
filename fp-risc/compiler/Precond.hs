@@ -83,6 +83,7 @@ validatePre tab =
   where
     okPred e = case e of
       SApp (SApp (SVar c) a) b | c `elem` ["and2", "or2"] -> okPred a && okPred b
+      SBin op a b | op `elem` ["and", "or"] -> okPred a && okPred b
       SBin op a b | op `elem` cmpOps -> okA a && okA b
       _ -> False
     okA = \case
@@ -139,6 +140,7 @@ type Atom = (SExpr, Name, SExpr)
 conjuncts :: SExpr -> [Atom]
 conjuncts e = case e of
   SApp (SApp (SVar "and2") a) b -> conjuncts a ++ conjuncts b
+  SBin "and" a b -> conjuncts a ++ conjuncts b
   SBin op a b | op `elem` cmpOps -> [(a, op, b)]
   _ -> []
 
@@ -214,6 +216,8 @@ entails :: [Atom] -> SExpr -> Bool
 entails facts p = case p of
   SApp (SApp (SVar "and2") a) b -> entails facts a && entails facts b
   SApp (SApp (SVar "or2") a) b -> entails facts a || entails facts b
+  SBin "and" a b -> entails facts a && entails facts b
+  SBin "or" a b -> entails facts a || entails facts b
   SBin op a b | op `elem` cmpOps -> atomEnt (a, op, b)
   _ -> False
   where

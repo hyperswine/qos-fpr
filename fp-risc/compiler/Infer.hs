@@ -955,6 +955,12 @@ inferBin ctx op a b = case op of
     unify "(|>?) source" ta (tcon "Result" [x, err])
     unify "(|>?) fn" tb (TFn x (tcon "Result" [y, err]))
     pure (tcon "Result" [y, err], SBin op a' b')
+  _ | op `elem` ["and", "or"] -> do
+        (ta, a') <- inferE ctx a
+        (tb, b') <- inferE ctx b
+        unify ("(" ++ op ++ ") left") ta tBool
+        unify ("(" ++ op ++ ") right") tb tBool
+        pure (tBool, SBin op a' b')
   _ | op `elem` ["+", "-", "*", "/", "%", "^"] -> do
         (ta, a') <- inferE ctx a
         (tb, b') <- inferE ctx b
