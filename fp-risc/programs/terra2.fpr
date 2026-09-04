@@ -47,6 +47,11 @@ MV = use "../std/mvu".
 GL = use "mods/glsvc".
 S2 = use "mods/scene2d".
 Sfx = use "mods/sfx".
+Tank = use "../models/tank/tank".
+Inf = use "../models/infantry/infantry".
+Truck = use "../models/truck/truck".
+Hq = use "../models/hq/hq".
+models = Tank.meshes + Inf.meshes + Truck.meshes + Hq.meshes.
 
 App = MV.App.
 MQuit = MV.MQuit.
@@ -225,6 +230,10 @@ blue = (250, 450, 950).
 red = (900, 300, 260).
 sideCol 0 = blue.
 sideCol s = red.
+hqCol 0 = (420, 500, 700).
+hqCol s = (700, 440, 420).
+dark = (110, 110, 130).
+khaki = (700, 640, 420).
 supCol 0 = (330, 640, 520).
 supCol s = (760, 560, 300).
 
@@ -820,10 +829,13 @@ aimOk m ac z c = targetOk m 0 ac z c.
 hqEnts es m s =
   p = sideOf m s;
   (x, y, z) = hqPos s;
-  col = case m.fx of Nil -> sideCol s | f -> sideCol s;
+  col = hqCol s;
   hl = case m.zone == 3 and isTargetHq m of True -> (1000, 500, 400) | False -> col;
-  es1 = Ent "cube" (x, 600, z) 0 (3600, 1200, 1400) hl ::
-        Ent "cube" (x, 1600, z) 0 (1100, 800, 1000) hl :: es;
+  d = dirOf s;
+  hy = case s == 0 of True -> 0 | False -> 3142;
+  es1 = Ent "hq" (x, y, z) hy (1000, 1000, 1000) hl ::
+        Ent "hq_fence" (x, y, z) hy (1000, 1000, 1000) (620, 660, 720) ::
+        Ent "hq_dish" (x + 1350 * d, 1080, z - 700 * d) (m.ms / 60 % 6284) (1000, 1000, 1000) (950, 950, 950) :: es;
   case s == 1 of
     True -> txtC es1 "HQ {p.hq}" x 3300 (z + 750) 130 white
   | False -> es1.
@@ -866,27 +878,86 @@ unitEnts es m s z c u =
   es1 = case u.down == 1 of
     True -> Ent "cube" (x, 80, zz) 0 (1700, 120, 2200) (150, 150, 180) ::
             txtC es "?" x 700 (zz + 600) 120 (600, 600, 700)
-  | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u);
+  | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u) (turretYaw m s z c x zz) m.ms (phaseOf s z c);
   case u.down == 1 of
     True -> es1
   | False -> labelEnts es1 u x zz.
 unitCol s u | uKind u == 1 = supCol s.
 unitCol s u = sideCol s.
+accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
 accent s u = (950, 950, 900).
+lighter (r, g, b) = (r + (1000 - r) / 3, g + (1000 - g) / 3, b + (1000 - b) / 3).
+
+# ---- idle motion: waves of the clock, each unit on its own phase ----------
+# tri p t: a triangle wave of period p ms, -1000..1000.  sweep p t: the
+# same span with holds -- 35% at each end, 15% moving between -- the
+# "look here, then there" of a scanning turret or a soldier squaring up.
+# phaseOf: a hash of the slot, so neighbours never move in step.
+tri p t =
+  x = ((t % p) + p) % p * 2000 / p;
+  1000 - Int.abs (x - 1000).
+sweep p t =
+  x = ((t % p) + p) % p * 1000 / p;
+  case x < 350 of
+    True -> 0 - 1000
+  | False -> case x < 500 of
+      True -> (x - 425) * 1000 / 75
+    | False -> case x < 850 of
+        True -> 1000
+      | False -> (925 - x) * 1000 / 75.
+phaseOf s z c = (s * 7 + z * 3 + c * 11) * 397.
+
+# the turret's one degree of freedom: forward at rest (yaw 0 faces -z, the
+# player's front; the enemy's tanks sit at yaw pi), swung onto the target
+# while this unit is the one lunging or firing -- and between actions it
+# scans, two sweeps of different periods summed so it never quite repeats
+turretYaw m s z c x zz =
+  An kind as fz fc tz tc t done = m.anim;
+  base = case s == 0 of True -> 0 | False -> 3142;
+  ph = phaseOf s z c;
+  idle = sweep 4700 (m.ms + ph) * 260 / 1000 + tri 3100 (m.ms + ph * 2) * 90 / 1000;
+  case as == s and fz == z and fc == c and (kind == 1 or kind == 2) of
+    False -> base + idle
+  | True -> aimAt base s (posOf s z c) (tgtPos (1 - s) tz tc s).
+aimAt base s (x, y, z) (tx, ty, tz) =
+  base + dirOf s * atanM (tx - x) (Int.abs (tz - z)).
+# atan(dx/dz) in milli-radians, signed like dx; |r| <= 1 by the polynomial
+# r(pi/4 + 0.273(1 - |r|)), beyond it by pi/2 - atan(dz/dx)
+atanM dx dz | dz == 0 = case dx > 0 of True -> 1571 | False -> (case dx < 0 of True -> 0 - 1571 | False -> 0).
+atanM dx dz | Int.abs dx > dz = case dx > 0 of True -> 1571 - atanM dz (Int.abs dx) | False -> 0 - 1571 + atanM dz (Int.abs dx).
+atanM dx dz =
+  r = Int.abs dx * 1000 / dz;
+  a = r * (785 + 273 * (1000 - r) / 1000) / 1000;
+  case dx < 0 of True -> 0 - a | False -> a.
 
 # each kind: a few primitives placed relative to the slot, scaled by k/1000
-solids es 1 soft x y z d k col acc =
-  Ent "cube" (x, y + 650 * k / 1000, z) 0 (1400 * k / 1000, 1300 * k / 1000, 1400 * k / 1000) col ::
-  Ent "cube" (x, y + 1450 * k / 1000, z) 0 (900 * k / 1000, 300 * k / 1000, 900 * k / 1000) acc :: es.
-solids es 2 soft x y z d k col acc =
+solids es 1 soft x y z d k col acc ty ms ph =
+  hy = case d < 0 of True -> 0 | False -> 3142;
+  bob = (tri 140 (ms + ph) + 1000) * 8 / 2000;
+  Ent "truck" (x, y + bob, z) hy (k, k, k) col ::
+  Ent "truck_kit" (x, y, z) hy (k, k, k) dark ::
+  Ent "truck_canvas" (x, y + bob + (tri 290 (ms + ph) + 1000) * 6 / 2000, z) hy (k, k, k) khaki :: es.
+solids es 2 soft x y z d k col acc ty ms ph =
   Ent "cube" (x, y + 300 * k / 1000, z) 0 (1300 * k / 1000, 550 * k / 1000, 900 * k / 1000) col ::
   Ent "cube" (x, y + 800 * k / 1000, z + d * 500 * k / 1000) 0 (240 * k / 1000, 240 * k / 1000, 1700 * k / 1000) acc :: es.
-solids es kind 1 x y z d k col acc =
-  Ent "cube" (x, y + 500 * k / 1000, z) 0 (700 * k / 1000, 900 * k / 1000, 500 * k / 1000) col ::
-  Ent "sphere" (x, y + 1200 * k / 1000, z) 0 (500 * k / 1000, 500 * k / 1000, 500 * k / 1000) acc :: es.
-solids es kind soft x y z d k col acc =
-  Ent "cube" (x, y + 420 * k / 1000, z) 0 (1500 * k / 1000, 800 * k / 1000, 1100 * k / 1000) col ::
-  Ent "cube" (x, y + 1050 * k / 1000, z - d * 100) 0 (800 * k / 1000, 450 * k / 1000, 800 * k / 1000) acc :: es.
+solids es kind 1 x y z d k col acc ty ms ph =
+  hy = case d < 0 of True -> 0 | False -> 3142;
+  sc = k * 13 / 10;
+  sway = tri 3400 (ms + ph);                      # weight, side to side
+  turn = sweep 6100 (ms + ph * 3);                # squaring up, now and then
+  draw = sweep 5300 (ms + ph * 5);                # the rifle, forward and back
+  bx = x + sway * 40 / 1000;
+  by = hy + sway * 70 / 1000 + turn * 120 / 1000;
+  rz = z + d * (0 - (draw + 1000) * 60 / 2000);   # forward = toward the enemy
+  Ent "infantry" (bx, y, z) by (sc, sc, sc) col ::
+  Ent "infantry_kit" (bx, y, z) by (sc, sc, sc) dark ::
+  Ent "infantry_rifle" (bx, y + (draw + 1000) * 30 / 2000, rz) (by + draw * 160 / 1000) (sc, sc, sc) dark :: es.
+# heavy: the CoScad tank (models/tank), hull + turret, 1 model unit = 1000
+solids es kind soft x y z d k col acc ty ms ph =
+  hy = case d < 0 of True -> 0 | False -> 3142;
+  sc = k * 115 / 100;
+  Ent "tank_hull" (x, y, z) hy (sc, sc, sc) col ::
+  Ent "tank_turret" (x, y + 750 * sc / 1000, z) ty (sc, sc, sc) acc :: es.
 
 labelEnts es u x z | u.dead == 1 = es.
 labelEnts es u x z =
@@ -957,7 +1028,7 @@ main =
   me = myself 0;
   clint = device "clint";
   mt = reg32 clint 49144;
-  gl = spawn (GL.serve 960 600 "terra2");
+  gl = spawn (GL.serve 960 600 "terra2" models);
   cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
   MV.game me cfg (App init update subs view).
 

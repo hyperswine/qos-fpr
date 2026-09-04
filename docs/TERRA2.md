@@ -45,11 +45,11 @@ the walker's three meshes in milli units:
 | thing            | solids                                              |
 |------------------|-----------------------------------------------------|
 | table, tiles     | a plane; a thin cube per slot, tinted by zone, lit by the cursor (yellow), the selection, a valid target (red) |
-| HQ               | a block and a tower; the enemy's carries an "HQ n" label |
-| infantry (Soft)  | a block body and a sphere head                      |
-| heavy (Hard)     | a hull and a turret                                 |
+| HQ               | the CoScad compound (models/hq): command building, silo, two watchtowers, a security fence, a turning dish; the enemy's carries an "HQ n" label |
+| infantry (Soft)  | the CoScad soldier (models/infantry): helmet, pack, a rifle across the chest |
+| heavy (Hard)     | the CoScad tank (models/tank, docs/MESHES.md): hull + a turret that swings onto the target |
 | artillery        | a carriage and a barrel pointing at the enemy       |
-| support          | a tower with a light roof                           |
+| support          | the CoScad truck (models/truck): cab, bonnet, canvas-hooped bed, six wheels |
 | ambush           | a face-down slab with a "?"                         |
 | hand             | standing slabs, the cursor's one lifted, text on the face |
 | text             | scene2d's 5x8 font, one flat cube per lit cell (HUD, message line, labels "atk/hp OW CHG *vet", card faces) |
@@ -70,6 +70,18 @@ whistles, an ambush snarls, overwatch snaps, your turn chimes up, the
 enemy's down, the game opens on an arpeggio and closes on one; victory
 and defeat have their own.  Cues are queued on the model and played by
 the tick, like the transcript, so a replayed game sounds identical.
+
+Idle motion, so a board between actions is alive: every unit runs on
+its own phase (a hash of its slot) over waves of the model's clock -- a
+triangle wave and a "sweep" that holds at each end and moves briskly
+between.  Soldiers shift their weight side to side, square up now and
+then, and draw the rifle forward and back (the rifle is its own part, so
+it rises, comes forward and swings a little in their hands).  Tank
+turrets scan between actions, two sweeps of different periods summed so
+the pattern never quite repeats, and snap onto the target when the unit
+attacks.  Trucks idle with a fast, tiny bob, the canvas a beat behind.
+The HQ dish turns.  All of it is a function of the clock, so a replayed
+game moves the same way.
 
 With it, the cheap extra dimensions: floating damage numbers (white on
 a dark tag, rising and shrinking in front of the target), a camera

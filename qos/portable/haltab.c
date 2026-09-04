@@ -127,6 +127,10 @@ static qos_hal_t the_table = {
      * host itself is silent, honestly and once in the log, without a
      * device or a dump */
     .snd_play = qos_snd_play,
+#ifdef QOSP_GFX
+    /* v8: program-carried meshes (gfx.c gfx_mesh_load) */
+    .gfx_mesh_load = gfx_mesh_load,
+#endif
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

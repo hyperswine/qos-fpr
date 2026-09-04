@@ -628,37 +628,113 @@ void gfx_dims(int *w, int *h) { /* raw export: gfx_raw.h */
 }
 
 /* content-addressed upload: a MeshId is uploaded once, ever */
-static mesh_t *gfx_mesh(const char *name, uw len) {
-  for (int i = 0; i < G.nmeshes; i++)
-    if (strlen(G.meshes[i].name) == len && !memcmp(G.meshes[i].name, name, len))
-      return &G.meshes[i];
-  if (G.nmeshes == MAX_MESHES) fpr_cpanic("gfx: mesh table full");
-  mesh_t *m = &G.meshes[G.nmeshes++];
-  memset(m, 0, sizeof *m);
-  if (len >= sizeof m->name) len = sizeof m->name - 1;
-  memcpy(m->name, name, len);
-
-  static rawmesh_t raw; /* big; static scratch — single-threaded by the service actor */
-  if (!strcmp(m->name, "cube")) mesh_cube(&raw);
-  else if (!strcmp(m->name, "plane")) mesh_plane(&raw);
-  else if (!strcmp(m->name, "sphere")) mesh_sphere(&raw);
-  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere)");
-
+/* upload interleaved [px py pz nx ny nz] + indices as the mesh's buffers */
+static void mesh_upload(mesh_t *m, const float *v, int nv, const uint32_t *ix, int ni) {
   glGenVertexArrays(1, &m->vao);
   glBindVertexArray(m->vao);
   glGenBuffers(1, &m->vbo);
   glBindBuffer(GL_ARRAY_BUFFER, m->vbo);
-  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)raw.nv * sizeof(float)), raw.v, GL_STATIC_DRAW);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)nv * sizeof(float)), v, GL_STATIC_DRAW);
   glEnableVertexAttribArray(0);
   glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)0);
   glEnableVertexAttribArray(1);
   glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(3 * sizeof(float)));
   glGenBuffers(1, &m->ebo);
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m->ebo);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)raw.ni * sizeof(uint32_t)), raw.ix,
-               GL_STATIC_DRAW);
-  m->indexCount = raw.ni;
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)((size_t)ni * sizeof(uint32_t)), ix, GL_STATIC_DRAW);
+  m->indexCount = ni;
   m->stage = malloc(MAX_INST * sizeof(inst_t));
+  m->nstage = 0;
+}
+
+static mesh_t *mesh_slot(const char *name, uw len) {
+  if (G.nmeshes == MAX_MESHES) fpr_cpanic("gfx: mesh table full");
+  mesh_t *m = &G.meshes[G.nmeshes++];
+  memset(m, 0, sizeof *m);
+  if (len >= sizeof m->name) len = sizeof m->name - 1;
+  memcpy(m->name, name, len);
+  return m;
+}
+
+/* the registered tier: a mesh the PROGRAM carries (tools/mkmesh.py from
+ * an STL) as text -- whitespace-separated milli ints, 9 per triangle
+ * (three corners) -- registered once after glInit through glMesh.  The
+ * normal is the triangle's own, so a low-poly model shades as facets.
+ * Re-registering a name replaces its geometry.  Returns the triangle
+ * count, -1 for malformed text. */
+int64_t gfx_mesh_load(const char *name, const char *text, uint64_t len) {
+  gfx_bind_thread();
+  /* count numbers: a number is an optional '-' and a digit run, whatever
+   * separates them (a chunk boundary may carry no space at all) */
+  uint64_t nint = 0;
+  for (uint64_t i = 0; i < len;) {
+    if (text[i] == '-' || (text[i] >= '0' && text[i] <= '9')) {
+      nint++;
+      if (text[i] == '-') i++;
+      while (i < len && text[i] >= '0' && text[i] <= '9') i++;
+    } else
+      i++;
+  }
+  if (nint == 0 || nint % 9) {
+    qos_hostlog("[gfx] mesh %s: malformed text (%llu numbers, not a multiple of 9)", name, (unsigned long long)nint);
+    return -1;
+  }
+  int ntri = (int)(nint / 9);
+  float *v = malloc((size_t)ntri * 3 * 6 * sizeof(float));
+  uint32_t *ix = malloc((size_t)ntri * 3 * sizeof(uint32_t));
+  if (!v || !ix) fpr_cpanic("gfx: mesh alloc");
+  uint64_t i = 0;
+  for (int t = 0; t < ntri; t++) {
+    v3 c[3];
+    for (int k = 0; k < 3; k++) {
+      float w[3];
+      for (int a = 0; a < 3; a++) {
+        while (i < len && !(text[i] == '-' || (text[i] >= '0' && text[i] <= '9'))) i++;
+        int neg = 0; long val = 0;
+        if (text[i] == '-') { neg = 1; i++; }
+        while (i < len && text[i] >= '0' && text[i] <= '9') { val = val * 10 + (text[i] - '0'); i++; }
+        w[a] = (float)(neg ? -val : val) / 1000.0f;
+      }
+      c[k] = (v3){w[0], w[1], w[2]};
+    }
+    v3 e1 = v3sub(c[1], c[0]), e2 = v3sub(c[2], c[0]);
+    v3 n = v3norm(v3cross(e1, e2));
+    for (int k = 0; k < 3; k++) {
+      float *o = &v[(size_t)(t * 3 + k) * 6];
+      o[0] = c[k].x; o[1] = c[k].y; o[2] = c[k].z; o[3] = n.x; o[4] = n.y; o[5] = n.z;
+      ix[t * 3 + k] = (uint32_t)(t * 3 + k);
+    }
+  }
+  uw nlen = strlen(name);
+  mesh_t *m = 0;
+  for (int k = 0; k < G.nmeshes; k++)
+    if (strlen(G.meshes[k].name) == nlen && !memcmp(G.meshes[k].name, name, nlen)) m = &G.meshes[k];
+  if (m) { /* replace: drop the old buffers */
+    glDeleteBuffers(1, &m->vbo); glDeleteBuffers(1, &m->ebo); glDeleteVertexArrays(1, &m->vao);
+    if (m->staticVBO) { glDeleteBuffers(1, &m->staticVBO); m->staticVBO = 0; m->staticCount = 0; G.staticCompiled = 0; }
+    if (m->dynVBO) { glDeleteBuffers(1, &m->dynVBO); m->dynVBO = 0; }
+    free(m->stage);
+  } else
+    m = mesh_slot(name, nlen);
+  mesh_upload(m, v, ntri * 3 * 6, ix, ntri * 3);
+  free(v); free(ix);
+  qos_hostlog("[gfx] mesh %s: %d triangles", m->name, ntri);
+  return ntri;
+}
+
+static mesh_t *gfx_mesh(const char *name, uw len) {
+  for (int i = 0; i < G.nmeshes; i++)
+    if (strlen(G.meshes[i].name) == len && !memcmp(G.meshes[i].name, name, len))
+      return &G.meshes[i];
+  mesh_t *m = mesh_slot(name, len);
+
+  static rawmesh_t raw; /* big; static scratch — single-threaded by the service actor */
+  if (!strcmp(m->name, "cube")) mesh_cube(&raw);
+  else if (!strcmp(m->name, "plane")) mesh_plane(&raw);
+  else if (!strcmp(m->name, "sphere")) mesh_sphere(&raw);
+  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere, or a glMesh-registered name)");
+
+  mesh_upload(m, raw.v, raw.nv, raw.ix, raw.ni);
   if (!m->stage) fpr_cpanic("gfx: instance staging alloc");
   return m;
 }

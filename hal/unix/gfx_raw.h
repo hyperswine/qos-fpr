@@ -23,6 +23,7 @@ void gfx_init(int w, int h); /* create context + renderer (once);
 void gfx_dims(int *w, int *h); /* the FBO size gfx_init settled on */
 int gfx_render_scene(uint64_t scenev, int64_t *draws, int64_t *dyn_bytes);
 int gfx_save_ppm(const char *path); /* 0 ok, 1 io failure */
+int64_t gfx_mesh_load(const char *name, const char *text, uint64_t len); /* triangles, -1 bad */
 int gfx_input_poll(int64_t *kind, int64_t *a, int64_t *c); /* 1 = event */
 
 #endif

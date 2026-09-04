@@ -31,41 +31,55 @@ Render = MV.Render.
 Dims = MV.Dims.
 Poll = MV.Poll.
 
-serve : unsafe Int -> Int -> String -> Int -> a .
-serve w h tag me = loop w h tag 0 0 me.
+# serve w h tag meshes: meshes = (name, text) pairs (tools/mkmesh.py's
+# `meshes`), registered right after glInit -- the context is thread-bound,
+# so the geometry a program carries must be handed over from THIS actor.
+# serveWith is the same service without meshes.
 
-loop : unsafe Int -> Int -> String -> Int -> Int -> Int -> a .
-loop w h tag inited last me =
+serve : unsafe Int -> Int -> String -> List (String, String) -> Int -> a .
+serve w h tag meshes me = loop w h tag meshes 0 0 me.
+serveWith : unsafe Int -> Int -> String -> Int -> a .
+serveWith w h tag me = loop w h tag Nil 0 0 me.
+
+loop : unsafe Int -> Int -> String -> List (String, String) -> Int -> Int -> Int -> a .
+loop w h tag meshes inited last me =
   m = receive me;
   (replyTo, q) = m;
-  r = handle w h tag inited last replyTo q;
+  r = handle w h tag meshes inited last replyTo q;
   _ = drop m;
   (i2, l2) = r;
-  loop w h tag i2 l2 me.
+  loop w h tag meshes i2 l2 me.
 
-handle : unsafe Int -> Int -> String -> Int -> Int -> Int -> Rv -> (Int, Int) .
-handle w h tag inited last replyTo q = case q of
-    Dims u -> dims w h tag inited last replyTo
-  | Render st vs sc fr -> frame w h tag inited last replyTo vs
-  | Poll u -> poll w h inited last replyTo.
+handle : unsafe Int -> Int -> String -> List (String, String) -> Int -> Int -> Int -> Rv -> (Int, Int) .
+handle w h tag meshes inited last replyTo q = case q of
+    Dims u -> dims w h tag meshes inited last replyTo
+  | Render st vs sc fr -> frame w h tag meshes inited last replyTo vs
+  | Poll u -> poll w h meshes inited last replyTo.
 
-ensure w h inited | inited != 0 = inited.
-ensure w h inited = _ = glInit w h; 1.
+ensure w h meshes inited | inited != 0 = inited.
+ensure w h meshes inited =
+  _ = glInit w h;
+  _ = register meshes;
+  1.
+register : unsafe List (String, String) -> Int .
+register ms = case ms of
+    Nil -> 0
+  | (name, text) :: r -> _ = glMesh name text; register r.
 
-dims w h tag inited last replyTo =
-  i = ensure w h inited;
+dims w h tag meshes inited last replyTo =
+  i = ensure w h meshes inited;
   _ = send replyTo (w, h);
   (i, last).
 
-poll w h inited last replyTo =
-  i = ensure w h inited;
+poll w h meshes inited last replyTo =
+  i = ensure w h meshes inited;
   ev = inputPoll 0;
   _ = send replyTo ev;
   _ = drop ev;
   (i, last).
 
-frame w h tag inited last replyTo vs =
-  i = ensure w h inited;
+frame w h tag meshes inited last replyTo vs =
+  i = ensure w h meshes inited;
   (scene, snap) = vs;
   r = glRender scene;
   (draws, bytes) = r;
