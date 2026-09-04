@@ -60,6 +60,24 @@ artillery / ambush shell (a sphere on a parabola, 700 ms), retreat /
 advance slide (360 ms), hit flash (white, 250 ms) with sparks that rise
 and fade, death shrink-and-sink (420 ms), the turn banner.
 
+## Sound and feel
+
+Sound is the second axis (docs/SOUND.md): every cue is a riff of
+integer tones the host synthesizes -- the cursor ticks, a pick chirps, a
+refusal buzzes, a call rises, an attack whooshes, a blow cracks, a
+destroyed unit rumbles, the HQ thuds and the camera shakes, artillery
+whistles, an ambush snarls, overwatch snaps, your turn chimes up, the
+enemy's down, the game opens on an arpeggio and closes on one; victory
+and defeat have their own.  Cues are queued on the model and played by
+the tick, like the transcript, so a replayed game sounds identical.
+
+With it, the cheap extra dimensions: floating damage numbers (white on
+a dark tag, rising and shrinking in front of the target), a camera
+shake on kills and HQ hits (a hash of the clock, so replays shake the
+same way), the cursor's unit bobbing, a title screen (ENTER to begin),
+and a game-over screen (ENTER deals a new game with a new shuffle,
+Q quits after the closing riff).
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
@@ -71,6 +89,7 @@ and fade, death shrink-and-sink (420 ms), the turn banner.
                   C charge  F fire  (artillery)
     1-5           jump to a column      space / E   end the turn
     P screenshot  S auto-screenshot at every animation midpoint   Q quit
+    ENTER on the title screen begins; on the game-over screen, a new game
 
 ## Verified
 
@@ -78,8 +97,9 @@ and fade, death shrink-and-sink (420 ms), the turn banner.
 are present) replays a key file through FPR_EVDEV and asserts the
 transcript the rules print: your call, the lane attack on the HQ (15 ->
 13), the AI's turn and call, a forward unit destroyed by the second
-attack, a clean quit; plus the frames read back mid-lunge: 960x600, not
-blank.  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
+attack, a clean quit; plus the frames read back mid-lunge (960x600, not
+blank) and the sound dump (a WAV as long as the run, 60+ tones in 25+
+distinct bursts over 60% silence).  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
 cube instances a frame, well inside the walker's 16384 per mesh.
 
 ## Not in this cut
