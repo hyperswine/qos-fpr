@@ -40,6 +40,7 @@
 # ============================================================================
 #: host gl
 #: expect game over
+#: music ../models/music/Sunrise_Over_The_Spire.mp3
 
 unsafe program.
 
@@ -279,7 +280,7 @@ initWith s0 s1 =
     anim = noAn, queue = Nil, sel = SNone, zone = 0, cur = 0,
     msg = "arrows, enter, esc; space ends the turn -- press ENTER to begin", keys = Nil,
     snap = 0, auto = 0, banner = "TERRA II", bt = 100000, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil,
-    sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0 }.
+    sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0, music = 0, puffs = Nil }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -591,7 +592,14 @@ attack m s c tz tc =
   ok = canAct u and u.mode == 0 and uKind u != 2 and targetOk m s c tz tc;
   case ok of
     False -> oops m "no valid attack there"
-  | True -> cue (note { m | anim = An 1 s 1 c tz tc 0 0 } "{sideName s}: {cName (uCard u)} attacks {tgtName tz (tc + 1)}") Sfx.attack.
+  | True -> cue (note { m | anim = An 1 s 1 c tz tc 0 0, puffs = smoke m.puffs (muzzle m s c (aimYaw m s c tz tc)) (case uSoft u == 1 of True -> 3 | False -> 6) (case uSoft u == 1 of True -> 0 | False -> 60) }
+                      "{sideName s}: {cName (uCard u)} attacks {tgtName tz (tc + 1)}")
+                (case uSoft u == 1 of True -> Sfx.rifle | False -> Sfx.cannon).
+# muzzle smoke: n puffs around a point, held (negative age) until the shot
+smoke ps pos n delay | n == 0 = ps.
+smoke ps pos n delay =
+  (x, y, z) = pos;
+  smoke ((x + (n * 271) % 300 - 150, y + (n * 97) % 200 - 100, z + (n * 181) % 300 - 150, 0 - delay - n * 25) :: ps) pos (n - 1) delay.
 tgtName 3 c = "the HQ".
 tgtName z c = "{zoneName z} {c}".
 fire m s c tz tc =
@@ -656,7 +664,10 @@ takeKey m = case m.keys of
 
 ageAll m dt =
   { m | me = ageSide m.me dt, en = ageSide m.en dt, bt = Int.max 0 (m.bt - dt), fx = ageFx m.fx dt Nil,
-        nums = ageNums m.nums dt Nil, shake = Int.max 0 (m.shake - dt) }.
+        nums = ageNums m.nums dt Nil, shake = Int.max 0 (m.shake - dt), puffs = agePuffs m.puffs dt Nil }.
+agePuffs Nil dt acc = acc.
+agePuffs ((x, y, z, t) :: r) dt acc | t + dt > 700 = agePuffs r dt acc.
+agePuffs ((x, y, z, t) :: r) dt acc = agePuffs r dt ((x, y, z, t + dt) :: acc).
 ageNums Nil dt acc = acc.
 ageNums ((x, z, s, t) :: r) dt acc | t + dt > 750 = ageNums r dt acc.
 ageNums ((x, z, s, t) :: r) dt acc = ageNums r dt ((x, z, s, t + dt) :: acc).
@@ -669,14 +680,27 @@ ageFx Nil dt acc = acc.
 ageFx ((x, y, z, t) :: r) dt acc | t + dt > 380 = ageFx r dt acc.
 ageFx ((x, y, z, t) :: r) dt acc = ageFx r dt ((x, y, z, t + dt) :: acc).
 
+# the track beside the .qa (`#: music` above: run points FPR_ASSETS at it,
+# pack copies it into the bundle); M toggles it
+musicFile = "Sunrise_Over_The_Spire.mp3".
+musicVol = 450.
+
 # ---- keys: the selection state machine ---------------------------------------------------
+# (one clause group: a definition in the middle of it would split it, and
+# the later half wins)
 # evdev codes: 105 left 106 right 103 up 108 down 28 enter 1 esc 14 bksp
 # 57 space 18 e 16 q 25 p 30 a 24 o 19 r 46 c 33 f 47 v 2..6 columns
 
 key m 16 = (cue { m | qt = 600, msg = "bye" } Sfx.close, Nil).
 key m 25 = ({ m | snap = m.snap + 1 }, Nil).
 key m 31 = ({ m | auto = 1 - m.auto, msg = "auto snapshots {1 - m.auto}" }, Nil).
-key m 28 | m.title == 1 = (cue { m | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "" } Sfx.open, Nil).
+key m 28 | m.title == 1 =
+  _ = sndMusic musicFile musicVol;
+  (cue { m | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "", music = 1 } Sfx.open, Nil).
+key m 50 =
+  on = 1 - m.music;
+  _ = sndMusic musicFile (on * musicVol);
+  ({ m | music = on, msg = (case on == 1 of True -> "music on" | False -> "music off") }, Nil).
 key m 28 | m.over != 0 =
   m2 = initWith (rnd m.seed) (rnd (rnd m.seed));
   (cue { m2 | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "", seed = rnd m.seed, snap = m.snap, auto = m.auto } Sfx.open, Nil).
@@ -771,8 +795,9 @@ scene m =
   es2 = hqEnts (hqEnts es1 m 0) m 1;
   es3 = rowEnts (rowEnts (rowEnts (rowEnts es2 m 0 1 0) m 0 2 0) m 1 1 0) m 1 2 0;
   es4 = handEnts m es3;
-  es5 = shotEnts m es4;
-  es6 = fxEnts m.fx es5;
+  es5 = projEnts m (shotEnts m es4);
+  es5b = puffEnts m.puffs es5;
+  es6 = fxEnts m.fx es5b;
   es7 = numEnts m.nums es6;
   es8 = hud m es7;
   Scene Nil es8 lights (cameraOf m).
@@ -854,9 +879,16 @@ rowEnts es m s z c =
 unitPos m s z c =
   An kind as fz fc tz tc t done = m.anim;
   (x, y, zz) = posOf s z c;
-  case as == s and fz == z and fc == c and (kind == 1 or kind == 3) of
+  case as == s and fz == z and fc == c and kind == 3 of
     True -> lunge kind t (x, y, zz) (tgtPos (1 - s) tz tc s)
-  | False -> (x, y, zz).
+  | False -> case as == s and fz == z and fc == c and kind == 1 of
+      True -> recoil s t (x, y, zz)
+    | False -> (x, y, zz).
+# an attacker fires from where it stands; a tank rocks back 90 milli from
+# the shot at 60 ms and settles by 300
+recoil s t (x, y, zz) =
+  k = case t < 60 of True -> 0 | False -> Int.max 0 (300 - t) * 90 / 240;
+  (x, y, zz - dirOf s * k).
 tgtPos s 3 c me = hqPos s.
 tgtPos s z c me = posOf s z c.
 # kind 1: out to 70% of the way at the midpoint and back; kind 3: all the way
@@ -887,6 +919,26 @@ unitCol s u = sideCol s.
 accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
 accent s u = (950, 950, 900).
 lighter (r, g, b) = (r + (1000 - r) / 3, g + (1000 - g) / 3, b + (1000 - b) / 3).
+
+# ---- integer trig (milli-radians): Bhaskara's sine; atanM is below ------
+sinM x =
+  r = ((x % 6283) + 6283) % 6283;
+  case r > 3142 of
+    True -> 0 - sinM (r - 3142)
+  | False -> 16 * r * (3142 - r) * 1000 / (5 * 3142 * 3142 - 4 * r * (3142 - r)).
+cosM x = sinM (x + 1571).
+# the direction a yaw faces, milli: yaw 0 is -z (the player's front)
+facing yaw = (0 - sinM yaw, 0 - cosM yaw).
+# the yaw a unit at column c on side s turns to hit (tz, tc)
+aimYaw m s c tz tc = aimAt (case s == 0 of True -> 0 | False -> 3142) s (posOf s 1 c) (tgtPos (1 - s) tz tc s).
+# where the shot leaves: the rifle's tip for a soldier, the barrel's for a tank
+muzzle m s c yaw =
+  u = slotOf (sideOf m s) 1 c;
+  (x, y, z) = posOf s 1 c;
+  (fx, fz) = facing yaw;
+  case uSoft u == 1 of
+    True -> (x + fx * 720 / 1000, 860, z + fz * 720 / 1000)
+  | False -> (x + fx * 2200 / 1000, 1090, z + fz * 2200 / 1000).
 
 # ---- idle motion: waves of the clock, each unit on its own phase ----------
 # tri p t: a triangle wave of period p ms, -1000..1000.  sweep p t: the
@@ -977,6 +1029,48 @@ shell es from to t =
   (x, y, z) = lerp from to k;
   Ent "sphere" (x, 700 + 6 * k * (1000 - k) / 1000, z) 0 (420, 420, 420) (1000, 800, 300) :: es.
 
+# kind 1: a soldier fires a burst of tracers from the rifle, a tank one
+# shell from the barrel, with a muzzle flash; both land at the midpoint
+projEnts m es =
+  An kind s fz fc tz tc t done = m.anim;
+  case kind == 1 of
+    False -> es
+  | True -> projOf m es s fc tz tc t.
+projOf m es s c tz tc t =
+  u = slotOf (sideOf m s) 1 c;
+  yaw = aimYaw m s c tz tc;
+  from = muzzle m s c yaw;
+  to = tgtPos (1 - s) tz tc s;
+  case uSoft u == 1 of
+    True -> flash (tracers es from to yaw t 0) from t 90 260
+  | False -> flash (shell2 es from to t) from t 80 420.
+flash es (x, y, z) t upto size | t < upto = Ent "sphere" (x, y, z) 0 (size, size, size) (1000, 950, 600) :: es.
+flash es p t upto size = es.
+# four rounds 55 ms apart, each crossing in 230 ms; elongated along the aim
+tracers es from to yaw t i | i == 4 = es.
+tracers es from to yaw t i =
+  ti = t - i * 55;
+  es2 = case ti > 0 and ti < 230 of
+    True -> tracer es from to yaw (ti * 1000 / 230)
+  | False -> es;
+  tracers es2 from to yaw t (i + 1).
+tracer es from to yaw k =
+  (x, y, z) = lerp from to k;
+  Ent "cube" (x, y - (y - 700) * k / 1000, z) yaw (70, 70, 420) (1000, 900, 300) :: es.
+# the shell leaves at 60 ms and lands at 260, on a flat arc
+shell2 es from to t | t < 60 or t > 260 = es.
+shell2 es from to t =
+  k = (t - 60) * 1000 / 200;
+  (x, y, z) = lerp from to k;
+  Ent "sphere" (x, y + 500 * k * (1000 - k) / 1000000 - (y - 800) * k / 1000, z) 0 (220, 220, 220) (300, 300, 320) :: es.
+# smoke: grey puffs that rise, grow and fade over 700 ms; a puff with a
+# negative age is still in the barrel
+puffEnts Nil es = es.
+puffEnts ((x, y, z, t) :: r) es | t < 0 = puffEnts r es.
+puffEnts ((x, y, z, t) :: r) es =
+  sz = 160 + t * 3 / 5;
+  g = 600 - t * 3 / 5;
+  puffEnts r (Ent "sphere" (x, y + t * 2 / 3, z) 0 (sz, sz, sz) (g, g, g + 30) :: es).
 fxEnts Nil es = es.
 fxEnts ((x, y, z, t) :: r) es =
   fxEnts r (Ent "cube" (x, y + t * 3, z) 0 (160, 160, 160) (1000, 850 - t, 300) :: es).

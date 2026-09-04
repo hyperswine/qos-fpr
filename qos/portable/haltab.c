@@ -131,6 +131,8 @@ static qos_hal_t the_table = {
     /* v8: program-carried meshes (gfx.c gfx_mesh_load) */
     .gfx_mesh_load = gfx_mesh_load,
 #endif
+    /* v9: the music channel */
+    .snd_music = qos_snd_music,
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

@@ -45,14 +45,32 @@ table's `snd_play`, the v7 slot appended to `qos_hal_t`
 (`qos/appside/qos_abi.h`).  `QOS_ABI_VERSION` is 7: an app built after
 this refuses a pre-v7 host at the gate, as every ABI addition does.
 
+## The music channel (v9)
+
+    sndMusic path vol     -> 1 playing, 0 off, -1 not found / not decodable
+
+One MP3, decoded by the host as it plays (hal/unix/minimp3.h, public
+domain, vendored), channels averaged to mono, resampled to 44.1 kHz,
+faded in over a second and looped under the effects at vol/1000.  An
+empty path or vol 0 stops it.  The path resolves as given, then under
+`FPR_ASSETS`, then beside the .qa -- so a bundle carries the track next
+to the program: a `#: music <file>` directive names it, `qos.py run`
+points FPR_ASSETS at its directory and `qos.py pack` copies it into the
+bundle.  `FPR_SND_MUSIC=0` mutes the channel, which is how the scripted
+game's WAV assertions (bursts over silence) still hold; `tests/music.fpr`
+plays three seconds of the track into a dump the check reads back, so the
+decoder is proven on its own.  Terra II starts
+models/music/Sunrise_Over_The_Spire.mp3 with the game and M toggles it.
+
 ## Cues as data: mods/sfx.fpr
 
 A riff is a list of tones; `Sfx.play riff` plays one, `Sfx.playAll`
 a frame's worth.  The module carries the vocabulary a card game needs:
 `cursor`, `pick`, `cancel`, `refuse`, `toggle` (the UI); `call`,
 `attack`, `hit`, `kill`, `hqHit`, `shot`, `charge`, `ambush`,
-`intercept`, `move` (the table); `yourTurn`, `enemyTurn`, `turnOver`
-(the clock); `open`, `close`, `victory`, `defeat` (the frame).  Terra II
+`intercept`, `move` (the table); `rifle` (four cracks), `cannon` (a boom with a deep sine under it),
+`yourTurn`, `enemyTurn`, `turnOver` (the clock); `open`, `close`,
+`victory`, `defeat` (the frame).  Terra II
 queues cues on its model (`cue m Sfx.hit`) and the tick plays them,
 the same way its transcript is printed -- so a replayed game sounds
 the same every run.

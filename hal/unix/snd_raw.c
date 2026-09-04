@@ -18,9 +18,94 @@
 #include <AudioToolbox/AudioToolbox.h>
 #endif
 
+#define MINIMP3_IMPLEMENTATION
+#define MINIMP3_NO_SIMD
+#include "minimp3.h"
+
 #define RATE 44100
 #define CHUNK 512      /* frames per mix: 11.6 ms */
 #define NVOICE 24
+
+/* ---- the music channel: one MP3 file, decoded as it plays, looped ----
+ * Loaded whole (a 3-minute track is ~4 MB), decoded a frame at a time
+ * inside the mixer (minimp3, public domain: ~50 us per 1152-sample
+ * frame), channels averaged to mono, resampled to RATE by linear
+ * interpolation, faded in over a second, under the voices at its own
+ * volume.  Paths resolve as given, then under FPR_ASSETS, then beside
+ * the .qa (qos_snd_set_assets).  FPR_SND_MUSIC=0 mutes it (the scripted
+ * checks assert the effects' bursts over silence). */
+static struct {
+  unsigned char *data; size_t size, pos;
+  mp3dec_t dec;
+  float buf[MINIMP3_MAX_SAMPLES_PER_FRAME]; int nbuf, ibuf;
+  int rate, channels, on;
+  double vol, frac, fade;
+  char name[128];
+} mus;
+static char assets_dir[512];
+
+void qos_snd_set_assets(const char *qa_path) {
+  if (!qa_path) return;
+  const char *slash = strrchr(qa_path, '/');
+  if (!slash) { strcpy(assets_dir, "."); return; }
+  size_t n = (size_t)(slash - qa_path);
+  if (n >= sizeof assets_dir) n = sizeof assets_dir - 1;
+  memcpy(assets_dir, qa_path, n); assets_dir[n] = 0;
+}
+
+static FILE *open_asset(const char *path, char *found, size_t cap) {
+  FILE *f = fopen(path, "rb");
+  if (f) { snprintf(found, cap, "%s", path); return f; }
+  const char *env = getenv("FPR_ASSETS");
+  if (env && *env) {
+    snprintf(found, cap, "%s/%s", env, path);
+    if ((f = fopen(found, "rb"))) return f;
+  }
+  if (assets_dir[0]) {
+    snprintf(found, cap, "%s/%s", assets_dir, path);
+    if ((f = fopen(found, "rb"))) return f;
+  }
+  return 0;
+}
+
+/* refill the decoded buffer; 0 at a decode dead end (then loop) */
+static int music_decode(void) {
+  mp3dec_frame_info_t info;
+  short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME];
+  for (int tries = 0; tries < 8; tries++) {
+    if (mus.pos >= mus.size) { mus.pos = 0; mp3dec_init(&mus.dec); }
+    int n = mp3dec_decode_frame(&mus.dec, mus.data + mus.pos, (int)(mus.size - mus.pos), pcm, &info);
+    mus.pos += (size_t)info.frame_bytes;
+    if (n > 0) {
+      mus.rate = info.hz; mus.channels = info.channels;
+      for (int i = 0; i < n; i++) {
+        float acc = 0;
+        for (int c = 0; c < info.channels; c++) acc += (float)pcm[i * info.channels + c];
+        mus.buf[i] = acc / (32768.0f * (float)info.channels);
+      }
+      mus.nbuf = n; mus.ibuf = 0;
+      return 1;
+    }
+    if (info.frame_bytes == 0) { mus.pos = 0; mp3dec_init(&mus.dec); } /* end: loop */
+  }
+  return 0;
+}
+
+static double music_sample(void) {
+  if (!mus.on || !mus.data) return 0;
+  double step = mus.rate > 0 ? (double)mus.rate / RATE : 1.0;
+  /* advance the source position by step, pulling frames as needed */
+  mus.frac += step;
+  while (mus.frac >= 1.0) {
+    mus.frac -= 1.0;
+    mus.ibuf++;
+    if (mus.ibuf >= mus.nbuf && !music_decode()) return 0;
+  }
+  float a = mus.buf[mus.ibuf];
+  float b = mus.ibuf + 1 < mus.nbuf ? mus.buf[mus.ibuf + 1] : a;
+  if (mus.fade < 1.0) mus.fade += 1.0 / RATE;
+  return (a + (b - a) * mus.frac) * mus.vol * (mus.fade < 1.0 ? mus.fade : 1.0);
+}
 
 typedef struct {
   int active, wave;
@@ -69,6 +154,7 @@ static void mix(int16_t *out, int n) {
       acc += sample(v);
       if (++v->pos >= v->total) v->active = 0;
     }
+    acc += music_sample();
     /* soft clip: tanh keeps a chord from cracking */
     double s = tanh(acc * 0.8) * 32000.0;
     out[i] = (int16_t)s;
@@ -209,4 +295,59 @@ int qos_snd_play(int64_t wave, int64_t f0, int64_t f1, int64_t ms, int64_t vol, 
   }
   pthread_mutex_unlock(&lock);
   return slot;
+}
+
+int qos_snd_music(const char *path, int64_t vol) {
+  pthread_once(&start_once, start);
+  pthread_mutex_lock(&lock);
+  if (!path || !*path || vol <= 0) {
+    mus.on = 0;
+    free(mus.data); mus.data = 0;
+    pthread_mutex_unlock(&lock);
+    qos_hostlog("[snd] music off");
+    return 0;
+  }
+  const char *mute = getenv("FPR_SND_MUSIC");
+  if (mute && !strcmp(mute, "0")) {
+    pthread_mutex_unlock(&lock);
+    qos_hostlog("[snd] music %s: muted by FPR_SND_MUSIC=0", path);
+    return 0;
+  }
+  if (!(mus.data && !strcmp(mus.name, path))) {
+    char found[640];
+    FILE *f = open_asset(path, found, sizeof found);
+    if (!f) {
+      pthread_mutex_unlock(&lock);
+      qos_hostlog("[snd] music %s: not found (tried as given, FPR_ASSETS, beside the .qa)", path);
+      return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char *d = malloc((size_t)(sz > 0 ? sz : 1));
+    if (!d || sz <= 0 || fread(d, 1, (size_t)sz, f) != (size_t)sz) {
+      fclose(f); free(d);
+      pthread_mutex_unlock(&lock);
+      qos_hostlog("[snd] music %s: cannot read", found);
+      return -1;
+    }
+    fclose(f);
+    free(mus.data);
+    mus.data = d; mus.size = (size_t)sz; mus.pos = 0;
+    mp3dec_init(&mus.dec);
+    mus.nbuf = mus.ibuf = 0; mus.frac = 0; mus.fade = 0; mus.rate = 44100; mus.channels = 1;
+    snprintf(mus.name, sizeof mus.name, "%s", path);
+    if (!music_decode()) {
+      free(mus.data); mus.data = 0;
+      pthread_mutex_unlock(&lock);
+      qos_hostlog("[snd] music %s: not an MP3 I can decode", found);
+      return -1;
+    }
+    qos_hostlog("[snd] music %s: %ld bytes, %d Hz %s, looping", found, sz, mus.rate,
+                mus.channels == 2 ? "stereo" : "mono");
+  }
+  mus.vol = (vol > 1000 ? 1000 : (double)vol) / 1000.0;
+  mus.on = 1;
+  pthread_mutex_unlock(&lock);
+  return 1;
 }

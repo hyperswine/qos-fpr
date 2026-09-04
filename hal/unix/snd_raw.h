@@ -26,4 +26,11 @@
 
 int qos_snd_play(int64_t wave, int64_t f0, int64_t f1, int64_t ms, int64_t vol, int64_t delay);
 
+/* the music channel: one MP3, decoded as it plays (minimp3.h, public
+ * domain) and looped, under the voices at vol/1000; an empty path or vol
+ * 0 stops it.  1 playing, 0 off, -1 not found / not decodable.  Paths
+ * resolve as given, under FPR_ASSETS, then beside the .qa. */
+int qos_snd_music(const char *path, int64_t vol);
+void qos_snd_set_assets(const char *qa_path);
+
 #endif
