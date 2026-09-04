@@ -31,7 +31,8 @@ typedef struct {
 
 static voice_t voices[NVOICE];
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static int started, have_dev;
+static pthread_once_t start_once = PTHREAD_ONCE_INIT;
+static int have_dev;
 static FILE *dump;
 static long dump_frames;
 static int64_t played;
@@ -164,7 +165,6 @@ static void *mixer(void *ud) {
 }
 
 static void start(void) {
-  started = 1;
   const char *dp = getenv("FPR_SND_DUMP");
   if (dp && *dp) {
     dump = fopen(dp, "wb");
@@ -186,8 +186,11 @@ static void start(void) {
 }
 
 int qos_snd_play(int64_t wave, int64_t f0, int64_t f1, int64_t ms, int64_t vol, int64_t delay) {
+  /* AudioQueue primes its buffers synchronously in start(); its callback
+   * enters mix() and takes lock, so initialization must happen outside the
+   * voice mutex.  pthread_once also keeps concurrent first calls serialized. */
+  pthread_once(&start_once, start);
   pthread_mutex_lock(&lock);
-  if (!started) start();
   int slot = -1;
   for (int k = 0; k < NVOICE; k++)
     if (!voices[k].active) { slot = k; break; }
