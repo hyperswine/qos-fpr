@@ -102,7 +102,14 @@ It repeatedly asks for an expression, evaluates `+`, `-`, `*`, `/`, unary
 signs, decimals, and parentheses with standard precedence, and keeps parse
 errors in the loop. Enter `quit`, `exit`, a blank line, or EOF to leave.
 
-This is a small arithmetic parser/evaluator written in Sol, not an `eval` of
+The implementation is a railway from tokenization through a two-stack
+evaluator: fallible stages return `Result`, and `|>?` stops at the first error.
+The lexer measures its remaining character span, stack reductions measure the
+remaining operator list, token evaluation measures its remaining token list,
+and the interactive loop has an explicit turn budget. No parser recursion is
+marked `unsafe`.
+
+This is an arithmetic parser/evaluator written in Sol, not an `eval` of
 arbitrary Sol source. `readLineNow` is a realtime escape because a prompt must
 observe each new line as it arrives; the runtime reports that loss of
 whole-script atomicity explicitly.
