@@ -543,6 +543,7 @@ builtinEnv =
       -- GPU tier (runtime/posix/gfx.c: scene-driven render function)
       ("glInit", mono (TFn tInt (TFn tInt tInt))),
       ("glRender", scheme [0, 1] (TFn (sv 0) (sv 1))),
+      ("glRenderUi", scheme [0, 1, 2] (TFn (sv 0) (TFn (sv 1) (TFn tInt (sv 2))))),
       ("glSavePpm", mono (TFn tStr tInt)),
       ("inputPoll", scheme [0, 1] (TFn (sv 0) (sv 1))),
       ("sndPlay", scheme [0] (TFn (sv 0) tInt)),

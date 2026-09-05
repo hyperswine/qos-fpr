@@ -133,6 +133,10 @@ static qos_hal_t the_table = {
 #endif
     /* v9: the music channel */
     .snd_music = qos_snd_music,
+#ifdef QOSP_GFX
+    /* v10: the 2D layer over the scene */
+    .gfx_render_ui = gfx_render_overlay,
+#endif
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

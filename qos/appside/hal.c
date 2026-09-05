@@ -251,6 +251,18 @@ static V h_glRender(V scene) {
   r[1] = TAG((sw)draws); r[2] = TAG((sw)dynBytes);
   return (V)r;
 }
+/* ---- glRenderUi scene ui dist -> (draws, dynBytes): the scene, then the 2D layer */
+static V h_glRenderUi(V scene, V ui, V distv) {
+  need_gfx();
+  if (!qos_hal->gfx_render_ui) fpr_cpanic("gfx: the 2D layer is not granted by this host (a pre-v10 qosp)");
+  if (!ISINT(distv)) fpr_cpanic("glRenderUi: dist must be an Int (milli)");
+  int64_t draws, dynBytes;
+  qos_hal->gfx_render_ui((uint64_t)scene, (uint64_t)ui, (int64_t)UNTAG(distv), &draws, &dynBytes);
+  V *r = (V *)fpr_alloc(24);
+  ((hdr_t *)r)->tid = 4; ((hdr_t *)r)->var = 0;
+  r[1] = TAG((sw)draws); r[2] = TAG((sw)dynBytes);
+  return (V)r;
+}
 static V h_glSavePpm(V pathv) {
   need_gfx();
   if (ISINT(pathv) || TID(pathv) != T_STR) fpr_cpanic("glSavePpm: path must be a String");
@@ -319,5 +331,6 @@ static V h_glMesh(V namev, V textv) {
 FPR_FN(fpr_g_glMesh, h_glMesh, 2);
 FPR_FN(fpr_g_glInit, h_glInit, 2);
 FPR_FN(fpr_g_glRender, h_glRender, 1);
+FPR_FN(fpr_g_glRenderUi, h_glRenderUi, 3);
 FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);
 FPR_FN(fpr_g_inputPoll, h_inputPoll, 1);

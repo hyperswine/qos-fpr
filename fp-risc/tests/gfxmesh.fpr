@@ -61,7 +61,7 @@ update env ev t = case ev of
 tick t | t > 12 = (t, MQuit :: Nil).
 tick t = (t, Nil).
 subs t = STick 40 :: Nil.
-view t = (scene t, case t >= 6 of True -> 1 | False -> 0).
+view t = (scene t, (Nil, 0), case t >= 6 of True -> 1 | False -> 0).
 
 main =
   me = myself 0;
