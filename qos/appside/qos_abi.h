@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 8u
+#define QOS_ABI_VERSION 9u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -165,6 +165,11 @@ typedef struct {
    * cube / plane / sphere.  Returns the triangle count, -1 malformed.
    * NULL without gfx, like the other gfx slots. */
   int64_t (*gfx_mesh_load)(const char *name, const char *text, uint64_t len);
+
+  /* ---- v9 additions (appended: earlier offsets unchanged) -----------
+   * the music channel (snd_raw.h): one MP3 beside the .qa, decoded by
+   * the host as it plays, looped, under the effects at vol/1000. */
+  int (*snd_music)(const char *path, int64_t vol);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

@@ -28,6 +28,7 @@
  *     Memory.qa analogue, the syscall trampoline the System.qa one.
  */
 #include "qos_abi.h"
+#include "snd_raw.h"
 #include "qa.h"
 
 /* ---- the ABI stamp (kills the apps-qa desync class) -----------------
@@ -417,6 +418,7 @@ int main(int argc, char **argv) {
   }
 
   qa_t qa;
+  qos_snd_set_assets(qa_path); /* music and other assets resolve beside the .qa */
   if (qa_load(qa_path, &qa)) return 1;
   load_sha_hex(qa.load, qa.load_len, g_shell_sha, sizeof g_shell_sha);
   TRACE("stage 2: %s (id=%s, loadMode=%s), image %" PRIu64 "B, %d perms\n",

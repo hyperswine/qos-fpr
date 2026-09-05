@@ -290,6 +290,19 @@ static V h_sndPlay(V tone) {
   return TAG((sw)qos_hal->snd_play(a[0], a[1], a[2], a[3], a[4], a[5]));
 }
 FPR_FN(fpr_g_sndPlay, h_sndPlay, 1);
+/* ---- sndMusic path vol -> 1 playing / 0 off / -1 not found */
+static V h_sndMusic(V pathv, V volv) {
+  if (!qos_hal->snd_music) fpr_cpanic("snd: music not granted by this host (a pre-v9 qosp)");
+  if (ISINT(pathv) || TID(pathv) != T_STR) fpr_cpanic("sndMusic: path must be a String");
+  if (!ISINT(volv)) fpr_cpanic("sndMusic: vol must be an Int");
+  str_t *p = (str_t *)pathv;
+  char path[256];
+  uw n = p->len < sizeof path - 1 ? p->len : sizeof path - 1;
+  for (uw i = 0; i < n; i++) path[i] = (char)p->bytes[i];
+  path[n] = 0;
+  return TAG((sw)qos_hal->snd_music(path, (int64_t)UNTAG(volv)));
+}
+FPR_FN(fpr_g_sndMusic, h_sndMusic, 2);
 /* ---- glMesh name text -> triangle count: register a program-carried mesh */
 static V h_glMesh(V namev, V textv) {
   need_gfx();

@@ -54,19 +54,27 @@ the walker's three meshes in milli units:
 | hand             | standing slabs, the cursor's one lifted, text on the face |
 | text             | scene2d's 5x8 font, one flat cube per lit cell (HUD, message line, labels "atk/hp OW CHG *vet", card faces) |
 
-Animations: summon pop (scale + drop over 300 ms), attack lunge (out 70%
-of the way to the target and back, 520 ms, the blow at the midpoint),
-artillery / ambush shell (a sphere on a parabola, 700 ms), retreat /
-advance slide (360 ms), hit flash (white, 250 ms) with sparks that rise
-and fade, death shrink-and-sink (420 ms), the turn banner.
+Animations: summon pop (scale + drop over 300 ms); attacks are
+projectiles now -- a soldier fires a burst of four tracers from the
+rifle's tip (55 ms apart, each crossing in 230 ms, elongated along the
+aim and dropping to the target), a tank turns its turret onto the target
+and fires one shell from the barrel at 60 ms (a flat arc, landing at the
+midpoint) while the hull rocks back 90 milli and settles; both with a
+muzzle flash and grey smoke puffs that rise, grow and fade, and the blow
+at the 260 ms midpoint of the 520 ms attack.  Artillery / ambush shell
+(a sphere on a parabola, 700 ms), retreat / advance slide (360 ms), hit
+flash (white, 250 ms) with sparks that rise and fade, death
+shrink-and-sink (420 ms), the turn banner.  The muzzle points come from
+an integer sine (Bhaskara) over the aim yaw, so the enemy's rounds leave
+its barrels too.
 
 ## Sound and feel
 
 Sound is the second axis (docs/SOUND.md): every cue is a riff of
 integer tones the host synthesizes -- the cursor ticks, a pick chirps, a
 refusal buzzes, a call rises, an attack whooshes, a blow cracks, a
-destroyed unit rumbles, the HQ thuds and the camera shakes, artillery
-whistles, an ambush snarls, overwatch snaps, your turn chimes up, the
+destroyed unit rumbles, rifles crack in bursts and cannons boom, the HQ
+thuds and the camera shakes, artillery whistles, an ambush snarls, overwatch snaps, your turn chimes up, the
 enemy's down, the game opens on an arpeggio and closes on one; victory
 and defeat have their own.  Cues are queued on the model and played by
 the tick, like the transcript, so a replayed game sounds identical.
@@ -101,6 +109,7 @@ Q quits after the closing riff).
                   C charge  F fire  (artillery)
     1-5           jump to a column      space / E   end the turn
     P screenshot  S auto-screenshot at every animation midpoint   Q quit
+    M music on / off (Sunrise Over The Spire starts with the game)
     ENTER on the title screen begins; on the game-over screen, a new game
 
 ## Verified

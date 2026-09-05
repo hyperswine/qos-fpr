@@ -211,6 +211,16 @@ def build_plugins(prog, plugins, size_mb=8):
     return img
 
 
+def asset_env(prog):
+    """`#: music <file>` (relative to the program): the host resolves music
+    beside the .qa or under FPR_ASSETS -- for `run`, point FPR_ASSETS at
+    the file's directory; `pack` copies the file into the bundle instead."""
+    files = prog_directives(FPR / prog).get("music", [])
+    if not files:
+        return {}
+    return {"FPR_ASSETS": str((FPR / prog).parent.joinpath(files[0]).resolve().parent)}
+
+
 def wants_gl(prog):
     """`#: host gl` (or the _desktop_gl name) = the program draws through
     the GLES scene walker: run and pack it on qosp-gl."""
@@ -268,7 +278,7 @@ def cmd_run(a):
     host = "qosp-gl" if gfx else "qosp"
     build_app(prog, a.harts)
     build_qosp(gfx=gfx)
-    env = {}
+    env = asset_env(prog)
     if a.port:
         env["FPR_PORT"] = a.port
     if a.harts:
@@ -324,6 +334,10 @@ def cmd_pack(a):
     qa = out / f"{name}.qa"
     shutil.copy2(FPR / "app.qa", qa)
     pieces = [f"{qa.name} ({qa.stat().st_size // 1024}KB)"]
+    for f in d.get("music", []):
+        src = (FPR / prog).parent / f
+        shutil.copy2(src, out / src.name)
+        pieces.append(f"{src.name} ({src.stat().st_size // 1024}KB, music)")
     disk = None
     plugins = declared_plugins(a, prog)
     if plugins:

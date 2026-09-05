@@ -15,9 +15,13 @@ cd "$HERE/qos" && make -s portable-gl >/dev/null 2>&1
 python3 tests-host/terra2-keys.py /tmp/terra2.evd \
   enter s right right enter enter space \
   up up right right enter a up up enter p space \
-  up up right right enter a enter left enter right enter p space q >/dev/null
+  up up right right enter a enter left enter right enter p space \
+  up up right right right enter a up up enter p space q >/dev/null
 rm -f /tmp/terra2-*.ppm /tmp/terra2.wav
-FPR_SND_DUMP=/tmp/terra2.wav FPR_EVDEV=/tmp/terra2.evd timeout 240 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-check.log 2>&1 || true
+# music muted here: the effects' bursts over silence are what the WAV
+# assertions read; the decoder is proven separately below
+FPR_SND_MUSIC=0 FPR_ASSETS=../fp-risc/models/music FPR_SND_DUMP=/tmp/terra2.wav FPR_EVDEV=/tmp/terra2.evd \
+  timeout 300 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-check.log 2>&1 || true
 fail() { echo "terra2-check: FAIL: $1"; tail -20 /tmp/terra2-check.log; exit 1; }
 grep -aq "you: LightInf called to forward 3" /tmp/terra2-check.log || fail "the call"
 grep -aq "you: LightInf attacks the HQ" /tmp/terra2-check.log || fail "the lane attack"
@@ -26,6 +30,9 @@ grep -aq "turn 1 side 1" /tmp/terra2-check.log || fail "the enemy turn"
 grep -aq "enemy: .* called to" /tmp/terra2-check.log || fail "the AI's call"
 grep -aq "destroyed" /tmp/terra2-check.log || fail "a death"
 grep -aq "you: MechInf called to forward 4" /tmp/terra2-check.log || fail "the tank's call"
+grep -aq "you: MechInf attacks the HQ" /tmp/terra2-check.log || fail "the tank's shot"
+grep -aq "HQ hit for 3: 10 left" /tmp/terra2-check.log || fail "the shell's damage"
+grep -aq "music Sunrise_Over_The_Spire.mp3: muted by FPR_SND_MUSIC=0" /tmp/terra2-check.log || fail "the music call"
 grep -aq "\[gfx\] mesh tank_hull: 172 triangles" /tmp/terra2-check.log || fail "the hull mesh"
 grep -aq "\[gfx\] mesh tank_turret: 124 triangles" /tmp/terra2-check.log || fail "the turret mesh"
 for m in infantry infantry_kit infantry_rifle truck truck_kit truck_canvas hq hq_fence hq_dish; do
@@ -64,6 +71,23 @@ assert secs > 12, "too short"
 assert bursts >= 20, "too few bursts"
 assert quiet > 0.3, "never quiet"
 PY
+# the music channel: three seconds of the track through the decoder,
+# read back as a WAV that is not quiet
+cd "$HERE/fp-risc" && make -s qos-app PROG=tests/music.fpr >/dev/null 2>&1
+cd "$HERE/qos" && rm -f /tmp/music.wav
+FPR_SND_DUMP=/tmp/music.wav FPR_ASSETS=../fp-risc/models/music timeout 30 ./qosp --yes ../fp-risc/app.qa > /tmp/music-check.log 2>&1 || true
+grep -aq "44100 Hz stereo, looping" /tmp/music-check.log || fail "the MP3 decode"
+python3 - /tmp/music.wav <<'PY' || fail "the music mix"
+import sys, struct, math
+b = open(sys.argv[1], 'rb').read(); data = b[44:]; n = len(data) // 2
+fr = struct.unpack('<%dh' % n, data[:n * 2])
+rms = math.sqrt(sum(x * x for x in fr[::7]) / max(1, len(fr[::7])))
+print(f"music: {n / 44100:.1f} s, rms {rms:.0f}")
+assert n > 44100 * 2 and rms > 300
+PY
+# the game's own .qa is what the leg leaves behind
+cd "$HERE/fp-risc" && make -s qos-app PROG=programs/terra2.fpr >/dev/null 2>&1
+cd "$HERE/qos"
 SND=$(grep -a -m1 "dump closed" /tmp/terra2-check.log | sed 's/.*(\(.*\) s), \(.*\) tones.*/\1 s, \2 tones/')
 FR=$(grep -a "game over" /tmp/terra2-check.log | sed 's/.*\[mvu: \([0-9]*\) frames.*/\1/')
-echo "terra2-check: ALL LEGS PASS ($N snapshots, $FR frames, sound $SND: title, call, lane attack on the HQ, AI turn, a death, the tank, clean quit)"
+echo "terra2-check: ALL LEGS PASS ($N snapshots, $FR frames, sound $SND: title, call, tracers on the HQ, AI turn, a death, the tank and its shell, the MP3 decoded, clean quit)"
