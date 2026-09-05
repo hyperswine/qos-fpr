@@ -22,6 +22,9 @@ void gfx_init(int w, int h); /* create context + renderer (once);
                               * w==0||h==0 = AUTO: size to the display */
 void gfx_dims(int *w, int *h); /* the FBO size gfx_init settled on */
 int gfx_render_scene(uint64_t scenev, int64_t *draws, int64_t *dyn_bytes);
+/* the same, then a 2D layer (a List of Ent, scene2d's pixel space at dist
+ * milli) over it: depth cleared, colour kept, then presented */
+int gfx_render_overlay(uint64_t scenev, uint64_t ui, int64_t dist, int64_t *draws, int64_t *dyn_bytes);
 int gfx_save_ppm(const char *path); /* 0 ok, 1 io failure */
 int64_t gfx_mesh_load(const char *name, const char *text, uint64_t len); /* triangles, -1 bad */
 int gfx_input_poll(int64_t *kind, int64_t *a, int64_t *c); /* 1 = event */

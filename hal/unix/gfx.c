@@ -851,7 +851,7 @@ static sw gfx_vec_int_at(V vec, uw i) {
  * (fine across images: qosp shares the app's address space and fpr.h
  * layout), and results leave through out-params; whichever side wraps
  * this builds its V results with ITS OWN allocator. */
-int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out) {
+static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out) {
   V scene = (V)scenev;
   if (!G.inited) fpr_cpanic("glRender: glInit first");
   gfx_bind_thread();
@@ -991,6 +991,10 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
   }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
+  return 0;
+}
+
+static void gfx_present(void) {
 #ifdef FPR_DESKTOP_GL
   {
     int fbw, fbh;
@@ -1008,7 +1012,56 @@ int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out
     drm_scanout_present(&G.drm);
   }
 #endif
-  return 0;
+}
+
+int gfx_render_scene(uint64_t scenev, int64_t *draws_out, int64_t *dyn_bytes_out) {
+  int r = gfx_render_pass(scenev, draws_out, dyn_bytes_out);
+  gfx_present();
+  return r;
+}
+
+/* the 2D layer: a second pass over the same frame -- the depth buffer
+ * cleared (the UI is in front of everything), the colour kept, the
+ * camera the Int form at dist milli on +Z looking at the origin (scene2d's
+ * pixel space: 1 px = 25 milli, the distance IS the visible world height),
+ * the light behind the camera so faces carry their instance colour.  The
+ * list is walked as dynamics; then the frame is presented. */
+int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *draws_out, int64_t *dyn_bytes_out) {
+  int64_t d2 = 0, b2 = 0;
+  int r = gfx_render_pass(scenev, draws_out, dyn_bytes_out);
+  stage_clear();
+  walk_list((V)uiv, walk_entity);
+  for (int i = 0; i < G.nmeshes; i++) {
+    mesh_t *m = &G.meshes[i];
+    if (!m->nstage) continue;
+    if (!m->dynVBO) glGenBuffers(1, &m->dynVBO);
+    glBindBuffer(GL_ARRAY_BUFFER, m->dynVBO);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)m->nstage * sizeof(inst_t)), m->stage, GL_DYNAMIC_DRAW);
+    b2 += (int64_t)((size_t)m->nstage * sizeof(inst_t));
+  }
+  float z = (float)dist / 1000.0f;
+  m4 view = m4lookAt((v3){0, 0, z}, (v3){0, 0, 0}, (v3){0, 1, 0});
+  m4 proj = m4persp(0.927f, (float)G.w / (float)G.h, 0.1f, 100.0f);
+  glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
+  glViewport(0, 0, G.w, G.h);
+  glClear(GL_DEPTH_BUFFER_BIT);
+  glUseProgram(G.prog);
+  glUniformMatrix4fv(G.uView, 1, GL_FALSE, view.m);
+  glUniformMatrix4fv(G.uProj, 1, GL_FALSE, proj.m);
+  glUniform3f(G.uLightPos, 0.0f, 0.0f, z * 40.0f);
+  glUniform3f(G.uLightColor, 1.0f, 1.0f, 1.0f);
+  for (int i = 0; i < G.nmeshes; i++) {
+    mesh_t *m = &G.meshes[i];
+    if (!m->nstage) continue;
+    glBindVertexArray(m->vao);
+    gfx_bind_instances(m->dynVBO);
+    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, m->nstage);
+    d2++;
+  }
+  *draws_out += d2;
+  *dyn_bytes_out += b2;
+  gfx_present();
+  return r;
 }
 
 int gfx_save_ppm(const char *path) {

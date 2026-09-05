@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 9u
+#define QOS_ABI_VERSION 10u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -170,6 +170,12 @@ typedef struct {
    * the music channel (snd_raw.h): one MP3 beside the .qa, decoded by
    * the host as it plays, looped, under the effects at vol/1000. */
   int (*snd_music)(const char *path, int64_t vol);
+
+  /* ---- v10 additions (appended: earlier offsets unchanged) ----------
+   * the 2D layer: render the scene, then a List of Ent in scene2d's
+   * pixel space (the Int camera at dist milli) over it with the depth
+   * cleared -- a UI on top of a 3D board, one present. */
+  int (*gfx_render_ui)(uint64_t scene, uint64_t ui, int64_t dist, int64_t *draws, int64_t *dyn_bytes);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

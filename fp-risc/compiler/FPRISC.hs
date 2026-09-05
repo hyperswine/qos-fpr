@@ -1600,11 +1600,15 @@ compileTop tops = do
   binds <- mapM compileGroup (groupClauses [b | b@TBind {} <- tops])
   pure (M.fromList (conGlobals ++ binds))
   where
-    groupClauses [] = []
-    groupClauses (TBind n ps g b : rest) =
-      let (same, others) = span (\(TBind n' _ _ _) -> n' == n) rest
-       in (n, (ps, g, b) : [(ps', g', b') | TBind _ ps' g' b' <- same]) : groupClauses others
-    groupClauses (_ : rest) = groupClauses rest
+    -- EVERY clause of a name, in source order, wherever it sits: the
+    -- inferencer (Infer.clausesOf) already reads a function that way,
+    -- and a contiguous-run grouping here let a definition dropped
+    -- between two clauses of `key` silently discard the earlier ones
+    -- (M.fromList kept the last run) -- a well-typed program that
+    -- ignored half its keys.  One rule for both passes now.
+    groupClauses bs =
+      [ (n, [(ps, g, b) | TBind n' ps g b <- bs, n' == n])
+      | n <- nub [n | TBind n _ _ _ <- bs] ]
 
 compileGroup :: (Name, [([SPat], [SGuard], SExpr)]) -> D (Name, ([Name], Core))
 compileGroup (n, clauses@((ps0, _, _) : _)) = do

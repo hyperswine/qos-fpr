@@ -66,6 +66,22 @@ SKeys = MV.SKeys.
 Gfx = Type (Scene statics dynamics lights camera
           | Ent mesh pos yaw scale color).
 
+# the 2D layer's view AST (mods/scene2d): boxes and labels laid out like
+# a miniature flexbox, emitted as flat cubes in a 480 x 300 pixel space
+Box = S2.Box.
+Lbl = S2.Lbl.
+Row = S2.Row.
+Col = S2.Col.
+Pad = S2.Pad.
+Gap = S2.Gap.
+W = S2.W.
+H = S2.H.
+Grow = S2.Grow.
+Bg = S2.Bg.
+Fg = S2.Fg.
+Bord = S2.Bord.
+Sc = S2.Sc.
+
 # ---- little prelude ---------------------------------------------------------
 
 nth : (l : List a | measure l) -> Int -> a -> a .
@@ -223,7 +239,7 @@ dirOf 0 = 0 - 1.          # "toward the enemy" along z
 dirOf s = 1.
 
 lights = ((3000, 14000, 9000), (1000, 1000, 1000)) :: Nil.
-camera = ((0, 12500, 14800), (0, 0, 300), 1000).
+camera = ((0, 12500, 16000), (0, 0, 1500), 1000).
 
 white = (1000, 1000, 1000).
 yellow = (1000, 900, 300).
@@ -418,7 +434,7 @@ startTurn m s =
   (p3, m2) = draw (setSide m1 s p2) s p2;
   m3 = cue (note { m2 | turn = s, tno = m2.tno + bi (s == 0),
               banner = (case s == 0 of True -> "YOUR TURN" | False -> "ENEMY TURN"), bt = 900,
-              sel = SNone, zone = 0, cur = 0 } "turn {m2.tno + bi (s == 0)} side {s}: supply {stock2} (rate {r})")
+              sel = SNone } "turn {m2.tno + bi (s == 0)} side {s}: supply {stock2} (rate {r})")
            (case s == 0 of True -> Sfx.yourTurn | False -> Sfx.enemyTurn);
   case s == 1 of
     True -> { m3 | queue = aiPlan m3 + (AEnd 1 :: Nil) }
@@ -708,7 +724,7 @@ key m k | m.title == 1 or m.over != 0 = (m, Nil).
 key m k | m.turn != 0 = ({ m | msg = "enemy turn" }, Nil).
 key m 57 = (cue { m | queue = AEnd 0 :: Nil, sel = SNone, msg = "end of turn" } Sfx.turnOver, Nil).
 key m 18 = key m 57.
-key m 1 = (cue { m | sel = SNone, zone = 0, msg = "" } Sfx.cancel, Nil).
+key m 1 = (cue (cancel m) Sfx.cancel, Nil).
 key m 14 = key m 1.
 key m k | k >= 2 and k <= 6 = (cue (moveCur m (k - 2)) Sfx.cursor, Nil).
 key m 105 = (cue (moveCur m (m.cur - 1)) Sfx.cursor, Nil).
@@ -723,6 +739,13 @@ key m 46 = (unitKey m 46, Nil).
 key m 33 = (unitKey m 33, Nil).
 key m 47 = (unitKey m 47, Nil).
 key m k = (m, Nil).
+
+# esc: back to where the selection started -- the attacker's slot, the
+# card being placed, or just the selection cleared
+cancel m = case m.sel of
+    STarget z c -> { m | sel = SNone, zone = z, cur = c, msg = "" }
+  | SPlace i z -> { m | sel = SNone, zone = 0, cur = i, msg = "" }
+  | s -> { m | sel = SNone, msg = "" }.
 
 curMax m = case m.sel of
     SNone -> (case m.zone == 0 of True -> List.len m.me.hand - 1 | False -> 4)
@@ -751,11 +774,11 @@ placeZone m i z d =
 confirm m = case m.sel of
     SNone -> cue (pick m) Sfx.pick
   | SCard i -> m
-  | SPlace i z -> { m | queue = ACall 0 i z m.cur :: Nil, sel = SNone, zone = 0, cur = 0 }
+  | SPlace i z -> { m | queue = ACall 0 i z m.cur :: Nil, sel = SNone, zone = z }
   | SUnit z c -> unitKey m 30
   | STarget z c -> aim m z c.
 pick m | m.zone == 0 =
-  k = nth m.me.hand m.cur (0 - 1);
+  k = nth m.me.hand (Int.min m.cur (List.len m.me.hand - 1)) (0 - 1);
   case k < 0 of
     True -> oops m "no card there"
   | False -> { m | sel = SPlace m.cur (case cKind (cardOf k) == 1 of True -> 2 | False -> 1),
@@ -783,8 +806,8 @@ unitAct m z c k = oops m "not that, here".
 aim m 1 c =
   u = slotOf m.me 1 c;
   case uKind u == 2 of
-    True -> { m | queue = AFire 0 c m.zone m.cur :: Nil, sel = SNone, zone = 0 }
-  | False -> { m | queue = AAttack 0 1 c m.zone m.cur :: Nil, sel = SNone, zone = 0 }.
+    True -> { m | queue = AFire 0 c m.zone m.cur :: Nil, sel = SNone, zone = 1, cur = c }
+  | False -> { m | queue = AAttack 0 1 c m.zone m.cur :: Nil, sel = SNone, zone = 1, cur = c }.
 aim m z c = { m | sel = SNone }.
 
 # ---- the view: the whole board as a Scene, every frame ------------------------------------
@@ -794,13 +817,12 @@ scene m =
   es1 = tiles m es0;
   es2 = hqEnts (hqEnts es1 m 0) m 1;
   es3 = rowEnts (rowEnts (rowEnts (rowEnts es2 m 0 1 0) m 0 2 0) m 1 1 0) m 1 2 0;
-  es4 = handEnts m es3;
+  es4 = es3;
   es5 = projEnts m (shotEnts m es4);
   es5b = puffEnts m.puffs es5;
   es6 = fxEnts m.fx es5b;
   es7 = numEnts m.nums es6;
-  es8 = hud m es7;
-  Scene Nil es8 lights (cameraOf m).
+  Scene Nil es7 lights (cameraOf m).
 # floating damage numbers: white on a dark tag, in front of the target,
 # rising and shrinking over 750 ms
 numEnts Nil es = es.
@@ -818,7 +840,7 @@ cameraOf m =
   a = m.shake;
   dx = ((m.ms * 7919) % 400 - 200) * a / 300;
   dy = ((m.ms * 104729) % 300 - 150) * a / 300;
-  ((dx, 12500 + dy, 14800), (dx, 0, 300), 1000).
+  ((dx, 12500 + dy, 16000), (dx, 0, 1500), 1000).
 
 # tiles, lit by the cursor / selection / valid targets
 tiles m es = tileRow (tileRow (tileRow (tileRow es m 0 1) m 0 2) m 1 1) m 1 2.
@@ -1075,32 +1097,113 @@ fxEnts Nil es = es.
 fxEnts ((x, y, z, t) :: r) es =
   fxEnts r (Ent "cube" (x, y + t * 3, z) 0 (160, 160, 160) (1000, 850 - t, 300) :: es).
 
-# the hand: standing slabs, the cursor's lifted
-handEnts m es = hgo m es m.me.hand 0.
-hgo m es Nil i = es.
-hgo m es (k :: r) i = hgo m (cardEnts m es (cardOf k) i) r (i + 1).
-cardEnts m es cd i =
-  n = List.len m.me.hand;
-  x = (i * 2 - (n - 1)) * 950;
+# ---- the 2D UI: scene2d over the board -------------------------------------------------
+# A 480 x 300 virtual screen (the 960 x 600 window at an integer 2x, so
+# every glyph cell is exactly 2 x 2 real pixels): a status bar and the
+# message at the top, a unit panel at the right, the banner in the middle,
+# the hand along the bottom as cards facing the viewer -- rebuilt from the
+# model every frame and drawn by the walker's second pass, in front of
+# everything, with the depth cleared.  Every box has a rectangle in this
+# space, which is what a mouse will hit-test against later: no raycasting.
+
+uiW = 480.
+uiH = 300.
+ui m =
+  (ents, slots) = S2.buildW (uiW, uiH) (uiTree m);
+  (ents, S2.camAt uiH).
+
+grow = Box (Grow :: Nil) Nil.
+spacer h = Box (H h :: W 1 :: Nil) Nil.
+label sc col t = Lbl (Sc sc :: Fg col :: Nil) t.
+centred kid = Box (Row :: Nil) (grow :: kid :: grow :: Nil).
+
+uiTree m =
+  Box (Col :: W uiW :: H uiH :: Nil)
+      (topBar m :: msgLine m :: middle m :: handBar m :: Nil).
+
+topBar m =
+  Box (Row :: H 18 :: Pad 3 :: Gap 12 :: Bg (50, 58, 78) :: Nil)
+      (label 1 white "TURN {m.tno}" ::
+       label 1 (700, 800, 1000) "YOU  HQ {m.me.hq}  SUPPLY {m.me.stock}  DECK {List.len m.me.deck}  HAND {List.len m.me.hand}" ::
+       grow ::
+       label 1 (1000, 700, 650) "ENEMY  HQ {m.en.hq}  SUPPLY {m.en.stock}" ::
+       label 1 (case m.env >= 4 of True -> (1000, 600, 300) | False -> white) "ENV {m.env}" :: Nil).
+
+msgLine m =
+  Box (Row :: H 14 :: Pad 2 :: Nil) (grow :: label 1 (950, 950, 700) m.msg :: grow :: Nil).
+
+middle m =
+  Box (Row :: Grow :: Nil)
+      (Box (Col :: Grow :: Nil) (grow :: bannerBox m :: grow :: Nil) :: panel m :: Nil).
+bannerBox m | m.bt > 0 =
+  centred (label (case m.title == 1 of True -> 6 | False -> 4) (1000, 900, 300) m.banner).
+bannerBox m = spacer 1.
+
+# the unit panel: whatever the cursor or the selection is on
+panel m = panelOf m (panelUnit m).
+panelOf m (s, z, c) | s < 0 = spacer 1.
+panelOf m (s, z, c) = panelFor m s z c (slotOf (sideOf m s) z c).
+panelUnit m = case m.sel of
+    SUnit z c -> (0, z, c)
+  | STarget z c -> panelTarget m z c
+  | SPlace i z -> (0 - 1, 0, 0)
+  | s -> case m.zone == 0 of
+      True -> (0 - 1, 0, 0)
+    | False -> case alive (slotOf m.me m.zone m.cur) of True -> (0, m.zone, m.cur) | False -> (0 - 1, 0, 0).
+panelTarget m az ac = case m.zone == 3 of
+    True -> (0, 1, ac)
+  | False -> case alive (slotOf m.en m.zone m.cur) of True -> (1, m.zone, m.cur) | False -> (0, 1, ac).
+panelFor m s z c u =
+  cd = uCard u;
+  who = case s == 0 of True -> "YOURS" | False -> "ENEMY";
+  mode = case u.down == 1 of
+    True -> "face down"
+  | False -> case u.mode == 1 of True -> "OVERWATCH" | False -> (case u.chg == 1 of True -> "CHARGED" | False -> "attack mode");
+  stat = case cKind cd == 1 of
+    True -> "GEN {cGen cd}   HP {u.hp}/{uMax u}"
+  | False -> "ATK {u.atk}   HP {u.hp}/{uMax u}";
+  Box (Col :: W 124 :: Pad 5 :: Gap 4 :: Bg (34, 38, 52) :: Bord (case s == 0 of True -> (450, 600, 950) | False -> (950, 450, 400)) :: Nil)
+      (label 2 white (cName cd) ::
+       label 1 (700, 720, 780) "{who}  {zoneName z} {c + 1}" ::
+       label 1 (1000, 900, 300) stat ::
+       label 1 (800, 800, 800) "{mode}{vetTag u}{readyTag u}" ::
+       label 1 (600, 620, 680) "DRAIN {cDrain cd}  CALL {cCost cd}" ::
+       spacer 4 ::
+       panelHelp m s z u :: Nil).
+helpLines ls = Box (Col :: Gap 2 :: Nil) (ls |> List.map (fn t -> label 1 (550, 650, 850) t)).
+vetTag u | u.vet > 0 = "  VET {u.vet}".
+vetTag u = "".
+readyTag u | u.ready == 1 = "  ready".
+readyTag u = "  spent".
+panelHelp m 0 1 u | uKind u == 2 = helpLines ("C  charge" :: "F  fire" :: "R  retreat" :: "esc  back" :: Nil).
+panelHelp m 0 1 u = helpLines ("A  attack" :: "O  overwatch" :: "R  retreat" :: "esc  back" :: Nil).
+panelHelp m 0 2 u | uKind u != 1 = helpLines ("V  advance" :: "esc  back" :: Nil).
+panelHelp m s z u = spacer 1.
+
+# the hand: cards facing the viewer; the cursor's card lifted and bright
+handBar m =
+  Box (Row :: H 94 :: Pad 5 :: Gap 4 :: Nil) (cards m m.me.hand 0).
+cards m Nil i = Nil.
+cards m (k :: r) i = card m (cardOf k) i :: cards m r (i + 1).
+card m cd i =
   sel = case m.sel of SNone -> m.zone == 0 and m.cur == i | SPlace j z -> j == i | s -> False;
-  y = case sel of True -> 1600 | False -> 1250;
-  col = case sel of True -> (450, 650, 1000) | False -> (case cKind cd == 1 of True -> (300, 520, 470) | False -> (220, 380, 800));
   afford = m.me.stock >= cCost cd;
-  es1 = Ent "cube" (x, y, zHand) 0 (1750, 2300, 60) col :: es;
-  es2 = txt es1 (cName cd) (x - 820) (y + 1020) (zHand + 80) 38 white;
-  es3 = txt es2 "CALL {cCost cd}" (x - 780) (y + 450) (zHand + 80) 45 (case afford of True -> yellow | False -> (900, 400, 400));
-  txtC es3 (statLine cd) x (y - 200) (zHand + 80) 75 white.
+  face = case sel of True -> (70, 100, 160) | False -> (case cKind cd == 1 of True -> (40, 78, 66) | False -> (36, 56, 110));
+  edge = case sel of True -> (1000, 900, 300) | False -> (400, 440, 520);
+  body = Box (Col :: W 62 :: H 76 :: Pad 3 :: Gap 3 :: Bg face :: Bord edge :: Nil)
+             (label 1 white (cName cd) ::
+              label 1 (case afford of True -> (1000, 900, 300) | False -> (950, 420, 380)) "CALL {cCost cd}" ::
+              label 2 white (statLine cd) ::
+              label 1 (620, 660, 720) (kindName cd) :: Nil);
+  case sel of
+    True -> Box (Col :: W 62 :: H 84 :: Nil) (body :: Nil)
+  | False -> Box (Col :: W 62 :: H 84 :: Nil) (spacer 8 :: body :: Nil).
 statLine cd | cKind cd == 1 = "+{cGen cd} {cDef cd}".
 statLine cd = "{cAtk cd}/{cDef cd}".
-
-# HUD: the score line far behind the enemy HQ, the message line over the
-# hand, the banner in the middle of the board
-hud m es =
-  es1 = txtC es "T{m.tno}   YOU  HQ {m.me.hq}  SUP {m.me.stock}  DECK {List.len m.me.deck}    ENEMY  HQ {m.en.hq}  SUP {m.en.stock}    ENV {m.env}" 0 4600 (0 - 10200) 105 white;
-  es2 = txtC es1 m.msg 0 3500 (0 - 10200) 100 (950, 950, 700);
-  case m.bt > 0 of
-    True -> txtC es2 m.banner 0 (case m.title == 1 of True -> 5200 | False -> 4200) 0 (case m.title == 1 of True -> 620 | False -> 420) (1000, 900, 300)
-  | False -> es2.
+kindName cd | cKind cd == 1 = "support".
+kindName cd | cKind cd == 2 = "artillery".
+kindName cd | cSoft cd == 1 = "infantry".
+kindName cd = "armour".
 
 # ---- the elm four ---------------------------------------------------------------------------
 
@@ -1116,7 +1219,7 @@ keyIn m k = ({ m | keys = m.keys + (k :: Nil) }, Nil).
 
 subs m = STick tickMs :: SKeys :: Nil.
 
-view m = (scene m, m.snap).
+view m = (scene m, ui m, m.snap).
 
 main =
   me = myself 0;

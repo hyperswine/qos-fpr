@@ -12,11 +12,13 @@ set -e
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$HERE/fp-risc" && make -s qos-app PROG=programs/terra2.fpr >/dev/null 2>&1
 cd "$HERE/qos" && make -s portable-gl >/dev/null 2>&1
+# the cursor stays where the last action left it (the placed unit, the
+# attacker), so each turn starts from the board, not the hand
 python3 tests-host/terra2-keys.py /tmp/terra2.evd \
   enter s right right enter enter space \
-  up up right right enter a up up enter p space \
-  up up right right enter a enter left enter right enter p space \
-  up up right right right enter a up up enter p space q >/dev/null
+  enter a up up enter p space \
+  enter a enter down down left enter right enter p space \
+  enter a up up enter p space q >/dev/null
 rm -f /tmp/terra2-*.ppm /tmp/terra2.wav
 # music muted here: the effects' bursts over silence are what the WAV
 # assertions read; the decoder is proven separately below

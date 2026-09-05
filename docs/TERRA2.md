@@ -51,8 +51,8 @@ the walker's three meshes in milli units:
 | artillery        | a carriage and a barrel pointing at the enemy       |
 | support          | the CoScad truck (models/truck): cab, bonnet, canvas-hooped bed, six wheels |
 | ambush           | a face-down slab with a "?"                         |
-| hand             | standing slabs, the cursor's one lifted, text on the face |
-| text             | scene2d's 5x8 font, one flat cube per lit cell (HUD, message line, labels "atk/hp OW CHG *vet", card faces) |
+| labels           | scene2d's 5x8 font as flat cubes in the scene: "atk/hp OW CHG *vet" over units, the enemy HQ's "HQ n", damage tags |
+| the UI           | a 2D layer over the board (docs/UI2D.md): status bar, message, unit panel, banner, the hand as cards facing the viewer |
 
 Animations: summon pop (scale + drop over 300 ms); attacks are
 projectiles now -- a soldier fires a burst of four tracers from the
@@ -97,6 +97,10 @@ shake on kills and HQ hits (a hash of the clock, so replays shake the
 same way), the cursor's unit bobbing, a title screen (ENTER to begin),
 and a game-over screen (ENTER deals a new game with a new shuffle,
 Q quits after the closing riff).
+
+The cursor remembers the board: after a call it sits on the new unit,
+after an attack on the attacker, and a new turn leaves it where it was;
+esc returns to where the selection started.
 
 ## Keys
 
