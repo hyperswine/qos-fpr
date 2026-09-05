@@ -7,7 +7,7 @@ values, update files, inspect the host, and coordinate external tools.
 
 Run a script with trailing arguments after its path:
 
-```
+```console
 ./fpr sol sol/scripts/version-compare.sol 2.10 2.9
 ```
 
@@ -62,7 +62,7 @@ programs receive explicit argument vectors through `Proc.spec`.
 job is one railway pipeline: parse into a value, reshape it with pure
 functions, render it back, and let the transaction land the files.
 
-```
+```sol
 J = use "../lib/json".   C = use "../lib/csv".
 JStr = J.JStr.  JObj = J.JObj.                # constructors come in by alias
 
@@ -89,6 +89,24 @@ a JSON object, which is the whole CSV-to-JSON bridge.
 
 `sol/examples/jsoncsv.sol` is the executable spec for both libraries.
 
+## Interactive input
+
+`sol/examples/interactive_script.sol` is a line-oriented calculator built with
+`readLineNow`. Run it from `fp-risc/`:
+
+```console
+./fpr sol sol/examples/interactive_script.sol
+```
+
+It repeatedly asks for an expression, evaluates `+`, `-`, `*`, `/`, unary
+signs, decimals, and parentheses with standard precedence, and keeps parse
+errors in the loop. Enter `quit`, `exit`, a blank line, or EOF to leave.
+
+This is a small arithmetic parser/evaluator written in Sol, not an `eval` of
+arbitrary Sol source. `readLineNow` is a realtime escape because a prompt must
+observe each new line as it arrives; the runtime reports that loss of
+whole-script atomicity explicitly.
+
 ## Boundaries
 
 - Host commands are capabilities of the machine running Sol. Check and report
@@ -101,11 +119,11 @@ a JSON object, which is the whole CSV-to-JSON bridge.
   or `ProcessSpec`: process arguments and deferred journals are not secret
   stores. Secret input needs a dedicated non-serialized runtime capability.
 - Interactive loops and live terminal interfaces are realtime applications,
-  not whole-script transactions. They need an explicit runtime boundary rather
-  than recursive use of immediate host commands.
+  not whole-script transactions. Use `readLineNow` at that explicit boundary;
+  keep state transformation and parsing pure inside the loop.
 
 Run the utility integration checks with:
 
-```
+```console
 sh tools/sol-scripts-check.sh
 ```

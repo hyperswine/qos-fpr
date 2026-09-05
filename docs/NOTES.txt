@@ -45,3 +45,15 @@ Constant variables should use blue instead.
 =================
 
 Get rid of LLVM, use a custom backend that generates native code directly for JIT
+
+=================
+
+Cards overlap the HQ
+Cards could be angled a bit more flat towards the viewer
+Remember last slot that we pressed enter on so it doesnt reset to hand
+Actual 2D UI using Scene2D drawn on top of the Scene3D, no need for raycasting as well later on
+
+=================
+
+Interactive scripts for Sol haven't been tested much yet.
+Can use MVU for Sol Scripts if required. Rather than bolting it on afterwards.
