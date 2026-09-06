@@ -63,6 +63,7 @@
 #ifndef FPR_DESKTOP_GL
 #include "drm_scanout.h"
 #endif
+#include "font_sdf.h" /* the text face: an SDF atlas baked by fp-risc/tools/mkfont.py */
 
 /* ==== small math (vecmath.hpp, column-major, ported verbatim) ======== */
 typedef struct { float x, y, z; } v3;
@@ -173,10 +174,54 @@ static void mesh_sphere(rawmesh_t *m) { /* UV sphere r=0.5, 16x24 */
     }
 }
 
+/* a flat unit disc (r = 0.5, 32 segments): "disc" faces +Z (the 2D layer's
+ * rounded corners, badges, dots), "coin" lies in XZ facing +Y (rings and
+ * pads on a ground plane) */
+static void mesh_disc_at(rawmesh_t *m, int up) {
+  const int seg = 32;
+  m->nv = m->ni = 0;
+  float n[3] = {0, up ? 1.0f : 0, up ? 0 : 1.0f};
+  float c[6] = {0, 0, 0, n[0], n[1], n[2]};
+  memcpy(&m->v[m->nv], c, sizeof c); m->nv += 6;
+  for (int j = 0; j < seg; j++) {
+    float th = (float)j / seg * 6.2831853f;
+    float x = cosf(th) * 0.5f, y = sinf(th) * 0.5f;
+    float out[6] = {x, up ? 0 : y, up ? -y : 0, n[0], n[1], n[2]};
+    memcpy(&m->v[m->nv], out, sizeof out); m->nv += 6;
+  }
+  for (int j = 0; j < seg; j++) {
+    uint32_t tri[3] = {0, (uint32_t)(1 + j), (uint32_t)(1 + (j + 1) % seg)};
+    memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 3;
+  }
+}
+static void mesh_disc(rawmesh_t *m) { mesh_disc_at(m, 0); }
+static void mesh_coin(rawmesh_t *m) { mesh_disc_at(m, 1); }
+/* a quarter disc facing +Z: the +x,+y quadrant of a unit-radius circle
+ * with its centre at the origin.  Rounded rectangles are three rects and
+ * four of these (mirrored by a negative scale), so a translucent shape
+ * never overlaps itself */
+static void mesh_corner(rawmesh_t *m) {
+  const int seg = 8;
+  m->nv = m->ni = 0;
+  float c[6] = {0, 0, 0, 0, 0, 1};
+  memcpy(&m->v[m->nv], c, sizeof c); m->nv += 6;
+  for (int j = 0; j <= seg; j++) {
+    float th = (float)j / seg * 1.5707963f;
+    float out[6] = {cosf(th), sinf(th), 0, 0, 0, 1};
+    memcpy(&m->v[m->nv], out, sizeof out); m->nv += 6;
+  }
+  for (int j = 0; j < seg; j++) {
+    uint32_t tri[3] = {0, (uint32_t)(1 + j), (uint32_t)(2 + j)};
+    memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 3;
+  }
+}
+
 /* ==== renderer state (RenderCache, fixed-capacity C tables) ========== */
 typedef struct { float model[16]; float color[4]; } inst_t; /* rgb + alpha */
 
 #define MAX_MESHES 16
+#define MAX_TEXT 4096 /* glyphs per frame, all text entities together */
+#define TVF 9         /* floats per text vertex: pos3 uv2 rgba */
 #define MAX_INST 16384 /* per mesh per tier: a 5x8 glyph is up to 40
                             * cube instances, and a text-heavy screen
                             * (the CLI, the browser listing) runs to
@@ -200,6 +245,9 @@ static struct {
 #endif
   GLuint prog; GLint uProj, uView, uLightPos, uLightColor, uAmbient, uFog, uFogRange;
   GLuint fbo, fboColor, fboDepth;
+  /* the text pass: one SDF atlas, one streaming quad buffer */
+  GLuint tprog, tvao, tvbo, ttex; GLint tuView, tuProj, tuFog, tuFogRange, tuTex;
+  float *tstage; int ntext;
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
   int staticCompiled;
@@ -368,6 +416,39 @@ static const char *kFS =
     "  vec3 c = vC*uAmbient + d*vC*uLightColor;\n"
     "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
     "  fragColor = vec4(mix(c, uFog, f), vA); }\n";
+
+/* text: streamed quads (pos, uv, colour), unlit, the SDF atlas
+ * thresholded per pixel -- fwidth keeps the edge one pixel soft at
+ * every size, which is the whole reason for a distance field */
+static const char *kTVS =
+#ifdef FPR_DESKTOP_GL
+    "#version 330 core\n"
+#else
+    "#version 310 es\n"
+    "precision highp float;\n"
+#endif
+    "layout(location=0) in vec3 inPos;\n"
+    "layout(location=1) in vec2 inUV;\n"
+    "layout(location=2) in vec4 inCol;\n"
+    "uniform mat4 uView; uniform mat4 uProj;\n"
+    "out vec2 vUV; out vec4 vC; out float vZ;\n"
+    "void main(){ vec4 eye = uView*vec4(inPos,1.0); vZ = -eye.z;\n"
+    "  vUV = inUV; vC = inCol; gl_Position = uProj*eye; }\n";
+static const char *kTFS =
+#ifdef FPR_DESKTOP_GL
+    "#version 330 core\n"
+#else
+    "#version 310 es\n"
+    "precision highp float;\n"
+#endif
+    "in vec2 vUV; in vec4 vC; in float vZ;\n"
+    "uniform sampler2D uTex; uniform vec3 uFog; uniform vec2 uFogRange;\n"
+    "out vec4 fragColor;\n"
+    "void main(){ float s = texture(uTex, vUV).r;\n"
+    "  float w = clamp(fwidth(s) * 0.9, 0.02, 0.25);\n"
+    "  float a = smoothstep(0.5 - w, 0.5 + w, s);\n"
+    "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
+    "  fragColor = vec4(mix(vC.rgb, uFog, f), a * vC.a); }\n";
 
 static GLuint gfx_shader(GLenum type, const char *src) {
   GLuint s = glCreateShader(type);
@@ -607,6 +688,43 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   G.uAmbient = glGetUniformLocation(G.prog, "uAmbient");
   G.uFog = glGetUniformLocation(G.prog, "uFog");
   G.uFogRange = glGetUniformLocation(G.prog, "uFogRange");
+  {
+    GLuint tvs = gfx_shader(GL_VERTEX_SHADER, kTVS), tfs = gfx_shader(GL_FRAGMENT_SHADER, kTFS);
+    G.tprog = glCreateProgram();
+    glAttachShader(G.tprog, tvs); glAttachShader(G.tprog, tfs);
+    glLinkProgram(G.tprog);
+    GLint tok = 0;
+    glGetProgramiv(G.tprog, GL_LINK_STATUS, &tok);
+    if (!tok) fpr_cpanic("gfx: text program link failed");
+    glDeleteShader(tvs); glDeleteShader(tfs);
+    G.tuView = glGetUniformLocation(G.tprog, "uView");
+    G.tuProj = glGetUniformLocation(G.tprog, "uProj");
+    G.tuFog = glGetUniformLocation(G.tprog, "uFog");
+    G.tuFogRange = glGetUniformLocation(G.tprog, "uFogRange");
+    G.tuTex = glGetUniformLocation(G.tprog, "uTex");
+    glGenTextures(1, &G.ttex);
+    glBindTexture(GL_TEXTURE_2D, G.ttex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, FONT_ATLAS_W, FONT_ATLAS_H, 0, GL_RED, GL_UNSIGNED_BYTE, font_atlas);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenVertexArrays(1, &G.tvao);
+    glBindVertexArray(G.tvao);
+    glGenBuffers(1, &G.tvbo);
+    glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(3 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(5 * sizeof(float)));
+    glBindVertexArray(0);
+    G.tstage = malloc((size_t)MAX_TEXT * 6 * TVF * sizeof(float));
+    if (!G.tstage) fpr_cpanic("gfx: text staging alloc");
+    G.ntext = 0;
+  }
 
   /* offscreen target: surfaceless EGL has no default framebuffer */
   G.w = w; G.h = h;
@@ -739,7 +857,10 @@ static mesh_t *gfx_mesh(const char *name, uw len) {
   if (!strcmp(m->name, "cube")) mesh_cube(&raw);
   else if (!strcmp(m->name, "plane")) mesh_plane(&raw);
   else if (!strcmp(m->name, "sphere")) mesh_sphere(&raw);
-  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere, or a glMesh-registered name)");
+  else if (!strcmp(m->name, "disc")) mesh_disc(&raw);
+  else if (!strcmp(m->name, "coin")) mesh_coin(&raw);
+  else if (!strcmp(m->name, "corner")) mesh_corner(&raw);
+  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere disc coin corner, or a glMesh-registered name)");
 
   mesh_upload(m, raw.v, raw.nv, raw.ix, raw.ni);
   if (!m->stage) fpr_cpanic("gfx: instance staging alloc");
@@ -814,6 +935,78 @@ static int draw_dyn(mesh_t *m, const m4 *view, int64_t *bytes) {
   return draws;
 }
 
+/* ---- text ------------------------------------------------------------
+ * A text entity is Ent (mode, "string") pos yaw (em, em, 1) colour: the
+ * mesh slot carries the string, mode 0 stands the text up in its local
+ * XY plane (the 2D layer; a billboard-ish label), mode 1 lays it flat on
+ * the ground (local y -> world -z, so it reads from +Z looking down).
+ * pos is the PEN: the left end of the baseline.  Each glyph is its whole
+ * atlas cell placed at the pen, so the only per-glyph datum is the
+ * advance.  Six vertices per glyph, streamed each frame, drawn after
+ * the meshes: blended, depth-tested, not depth-written. */
+static void stage_text(int mode, const unsigned char *s, uw len, v3 pos, float yaw, v3 sc, v3 col, float alpha) {
+  m4 model = m4mul(m4translate(pos), m4rotY(yaw));
+  if (mode == 1) {
+    m4 flat = m4id();
+    flat.m[5] = 0; flat.m[6] = -1; flat.m[9] = 1; flat.m[10] = 0;
+    model = m4mul(model, flat);
+  }
+  model = m4mul(model, m4scale(sc));
+  const float cell = (float)FONT_CELL / FONT_EM;
+  const float x0 = -(float)FONT_PEN_X / FONT_EM, ytop = (float)FONT_PEN_Y / FONT_EM, ybot = ytop - cell;
+  const float du = (float)FONT_CELL / FONT_ATLAS_W, dv = (float)FONT_CELL / FONT_ATLAS_H;
+  float pen = 0;
+  for (uw i = 0; i < len; i++) {
+    int c = s[i];
+    if (c < 32 || c > 126) c = '?';
+    int gi = c - 32;
+    if (c != ' ') {
+      if (G.ntext == MAX_TEXT) fpr_cpanic("gfx: too much text in one frame");
+      float u0 = (float)(gi % FONT_COLS) * du, v0 = (float)(gi / FONT_COLS) * dv;
+      float lx0 = pen + x0, lx1 = lx0 + cell;
+      float q[4][4] = {{lx0, ytop, u0, v0}, {lx1, ytop, u0 + du, v0}, {lx1, ybot, u0 + du, v0 + dv}, {lx0, ybot, u0, v0 + dv}};
+      static const int order[6] = {0, 2, 1, 0, 3, 2};
+      float *o = G.tstage + (size_t)G.ntext * 6 * TVF;
+      for (int k = 0; k < 6; k++) {
+        const float *v = q[order[k]];
+        const float *m = model.m;
+        o[0] = m[0] * v[0] + m[4] * v[1] + m[12];
+        o[1] = m[1] * v[0] + m[5] * v[1] + m[13];
+        o[2] = m[2] * v[0] + m[6] * v[1] + m[14];
+        o[3] = v[2]; o[4] = v[3];
+        o[5] = col.x; o[6] = col.y; o[7] = col.z; o[8] = alpha;
+        o += TVF;
+      }
+      G.ntext++;
+    }
+    pen += font_adv[gi];
+  }
+}
+static int draw_text(const m4 *view, const m4 *proj, v3 fog, float fogNear, float fogFar, int64_t *bytes) {
+  if (!G.ntext) return 0;
+  size_t nbytes = (size_t)G.ntext * 6 * TVF * sizeof(float);
+  glUseProgram(G.tprog);
+  glUniformMatrix4fv(G.tuView, 1, GL_FALSE, view->m);
+  glUniformMatrix4fv(G.tuProj, 1, GL_FALSE, proj->m);
+  glUniform3f(G.tuFog, fog.x, fog.y, fog.z);
+  glUniform2f(G.tuFogRange, fogNear, fogFar);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, G.ttex);
+  glUniform1i(G.tuTex, 0);
+  glBindVertexArray(G.tvao);
+  glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nbytes, G.tstage, GL_DYNAMIC_DRAW);
+  *bytes += (int64_t)nbytes;
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDepthMask(GL_FALSE);
+  glDrawArrays(GL_TRIANGLES, 0, G.ntext * 6);
+  glDepthMask(GL_TRUE);
+  glDisable(GL_BLEND);
+  glBindVertexArray(0);
+  return 1;
+}
+
 /* ==== the FPRISC scene walker ======================================== */
 /* value layout (fpr.h/runtime.c): Int = (n<<1)|1; objects = hdr{tid,var}
  * + V fields at +8.  T_LIST var 0/1 = Nil/Cons(head,tail); tuples tid 4
@@ -856,7 +1049,17 @@ static float walk_color(V v, v3 *col) {
 static void walk_entity(V v) {
   V *f = nfields(v, "gfx: expected entity (Ent mesh pos yaw scale color)");
   V ms = f[0];
-  if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String");
+  if (!ISINT(ms) && TID(ms) == 4) { /* (mode, "text"): a text entity */
+    V *tf = (V *)((char *)ms + 8);
+    if (!ISINT(tf[0]) || ISINT(tf[1]) || TID(tf[1]) != T_STR)
+      fpr_cpanic("gfx: text entity must be Ent (modeInt, String) pos yaw scale color");
+    str_t *ts = (str_t *)tf[1];
+    v3 tcol;
+    float ta = walk_color(f[4], &tcol);
+    stage_text((int)UNTAG(tf[0]), (const unsigned char *)ts->bytes, ts->len, walk_v3(f[1]), fmilli(f[2]), walk_v3(f[3]), tcol, ta);
+    return;
+  }
+  if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String or (mode, text)");
   str_t *s = (str_t *)ms;
   mesh_t *m = gfx_mesh((const char *)s->bytes, s->len);
   if (m->nstage == MAX_INST) fpr_cpanic("gfx: too many instances of one mesh");
@@ -882,6 +1085,7 @@ static void walk_list(V v, void (*each)(V)) {
 }
 static void stage_clear(void) {
   for (int i = 0; i < G.nmeshes; i++) G.meshes[i].nstage = 0;
+  G.ntext = 0;
 }
 
 /* ---- packed-dynamics vector reader ----------------------------------
@@ -1061,6 +1265,7 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
   }
   { int64_t b = 0;
     for (int i = 0; i < G.nmeshes; i++) draws += draw_dyn(&G.meshes[i], &view, &b);
+    draws += draw_text(&view, &proj, sky, fogNear, fogFar, &b);
     dynBytes += (sw)b; }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
@@ -1119,6 +1324,7 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   glUniform3f(G.uFog, 0.0f, 0.0f, 0.0f);
   glUniform2f(G.uFogRange, 1000.0f, 2000.0f);
   for (int i = 0; i < G.nmeshes; i++) d2 += draw_dyn(&G.meshes[i], &view, &b2);
+  d2 += draw_text(&view, &proj, (v3){0, 0, 0}, 1000.0f, 2000.0f, &b2);
   *draws_out += d2;
   *dyn_bytes_out += b2;
   gfx_present();

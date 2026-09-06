@@ -16,9 +16,10 @@
 # builds the whole board as a Scene every frame: the table, tiles, HQs,
 # units as simple solids (infantry = block + head, heavy = hull + turret,
 # artillery = carriage + barrel, support = tower, ambush = a face-down
-# slab), hand cards as standing slabs with 5x8 glyph text, a HUD and a
-# message line as glyph text too.  The camera is Hearthstone's: behind
-# and above your hand, looking down the board.
+# slab), unit labels as the walker's text entities standing over them;
+# the hand, the status bar, the unit panel and the banner are a 2D layer
+# (mods/scene2d) drawn over the board in a second pass.  The camera is
+# Hearthstone's: behind and above your hand, looking down the board.
 #
 # TIME.  A 40 ms STick drives everything that moves.  Player and AI both
 # ENQUEUE actions; the tick pops one at a time, plays its animation
@@ -47,6 +48,7 @@ unsafe program.
 MV = use "../std/mvu".
 GL = use "mods/glsvc".
 S2 = use "mods/scene2d".
+Fm = use "mods/fontm".
 Sfx = use "mods/sfx".
 Tank = use "../models/tank/tank".
 Inf = use "../models/infantry/infantry".
@@ -67,7 +69,8 @@ Gfx = Type (Scene statics dynamics lights camera
           | Ent mesh pos yaw scale color).
 
 # the 2D layer's view AST (mods/scene2d): boxes and labels laid out like
-# a miniature flexbox, emitted as flat cubes in a 480 x 300 pixel space
+# a miniature flexbox, emitted as flat cubes, discs and text entities in
+# a 960 x 600 pixel space (one virtual px per window px)
 Box = S2.Box.
 Lbl = S2.Lbl.
 Row = S2.Row.
@@ -81,6 +84,12 @@ Bg = S2.Bg.
 Fg = S2.Fg.
 Bord = S2.Bord.
 Sc = S2.Sc.
+Fs = S2.Fs.
+Round = S2.Round.
+Shadow = S2.Shadow.
+Bga = S2.Bga.
+Center = S2.Center.
+Mid = S2.Mid.
 
 # ---- little prelude ---------------------------------------------------------
 
@@ -282,28 +291,31 @@ inkDim = (600, 630, 700).
 paper = (34, 40, 56).
 paperLit = (62, 74, 108).
 edge = (330, 370, 440).
+# the 2D layer's surfaces: glass (translucent, over the board), chips, bands
+glass = (12, 16, 26, 800).
+glassLit = (34, 44, 66, 860).
+chip = (48, 58, 84).
+blueDark = (30, 54, 104).
+redDark = (104, 36, 42).
+bandInf = (58, 96, 156).
+bandArm = (92, 88, 120).
+bandArt = (150, 84, 58).
+bandSup = (40, 118, 96).
 supCol 0 = (330, 640, 520).
 supCol s = (760, 560, 300).
 
-# ---- glyph text -------------------------------------------------------------------
-# 5x8 cells (scene2d's font) as flat cubes standing upright facing +z; (x, y)
-# is the top-left of the first glyph, cell the cell size.
+# ---- text in the scene -------------------------------------------------------------
+# The walker's text entity: Ent (0, s) pen 0 (em, em, 1) col stands the
+# string upright facing +z with the pen at the left end of the baseline.
+# (x, y) is the top-left of the line box, cell an em/9 size unit kept from
+# the glyph days so the callers' numbers still read.
 
-txt es s x y z cell col = tgo es s 1 (strlen s) x y z cell col.
-tgo es s i n x y z cell col | i > n = es.
-tgo es s i n x y z cell col =
-  es2 = glyph es (S2.font (charAt s i)) 0 x y z cell col;
-  tgo es2 s (i + 1) n (x + 6 * cell) y z cell col.
-glyph es 0 b x y z cell col = es.
-glyph es bits b x y z cell col | b == 40 = es.
-glyph es bits b x y z cell col =
-  es2 = cellAt es (band bits 1) (b % 5) (b / 5) x y z cell col;
-  glyph es2 (bits / 2) (b + 1) x y z cell col.
-cellAt es 0 c r x y z cell col = es.
-cellAt es 1 c r x y z cell col =
-  Ent "cube" (x + c * cell + cell / 2, y - r * cell - cell / 2, z) 0 (cell - cell / 8, cell - cell / 8, 40) col :: es.
+txt es s x y z cell col =
+  em = cell * 9;
+  Ent (0, s) (x, y - Fm.ascent * em / 1000, z) 0 (em, em, 1000) col :: es.
 # centered on x
-txtC es s x y z cell col = txt es s (x - strlen s * 3 * cell) y z cell col.
+txtC es s x y z cell col = txt es s (x - textW s (cell * 9) / 2) y z cell col.
+textW s em = Fm.width s * em / 1000.
 
 # ---- the model --------------------------------------------------------------------
 # sel: SNone | SCard i | SPlace i z | SUnit z c | STarget z c (the attacker)
@@ -914,9 +926,9 @@ numEnts ((x, z, s, t) :: r) es =
   cell = 190 - k / 8;
   y = 2100 + k * 22 / 10;
   zz = z + 1500;
-  w = strlen s * 6 * cell + cell;
+  w = textW s (cell * 9) + 3 * cell;
   a = 1000 - easeIn k;
-  es1 = Ent "cube" (x, y - 4 * cell, zz - 60) 0 (w, 9 * cell, 60) (60, 30, 30, a * 85 / 100) :: es;
+  es1 = Ent "cube" (x, y - 43 * cell / 10, zz - 60) 0 (w, 8 * cell, 60) (60, 30, 30, a * 85 / 100) :: es;
   numEnts r (txtC es1 s x (y + cell / 2) zz cell (1000, 980, 900, a)).
 # the camera, knocked about while shake > 0 (a hash of the clock, not a
 # random stream: a replayed game shakes the same way)
@@ -1021,7 +1033,7 @@ hqEnts es m s =
         Ent "hq_fence" (x, y, z) hy (1000, 1000, 1000) (620, 660, 720) ::
         Ent "hq_dish" (x + 1350 * d, 1080, z - 700 * d) (m.ms / 60 % 6284) (1000, 1000, 1000) (950, 950, 950) :: es;
   case s == 1 of
-    True -> txtC es1 "HQ {p.hq}" x 3300 (z + 750) 130 white
+    True -> txtC es1 "HQ {p.hq}" x 3400 (z + 750) 95 white
   | False -> es1.
 isTargetHq m = case m.sel of STarget az ac -> True | s -> False.
 
@@ -1069,7 +1081,7 @@ unitEnts es m s z c u =
   d = dirOf s;
   es1 = case u.down == 1 of
     True -> Ent "cube" (x, 80, zz) 0 (1700, 120, 2200) (150, 150, 180) ::
-            txtC es "?" x 700 (zz + 600) 120 (600, 600, 700)
+            txtC es "?" x 700 (zz + 600) 90 (600, 600, 700)
   | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u) (turretYaw m s z c x zz) m.ms (phaseOf s z c);
   es2 = Ent "sphere" (x, 60, zz) 0 (1500 * k / 1000, 30, 1500 * k / 1000) shadow :: es1;
   hot = s == 0 and (isCursor m z c or isSelected m z c);
@@ -1192,7 +1204,7 @@ labelEnts es u x z hot =
   tag = case u.mode == 1 of True -> " OW" | False -> (case u.chg == 1 of True -> " CHG" | False -> "");
   vet = case u.vet > 0 of True -> " *{u.vet}" | False -> "";
   col = case hot of True -> white | False -> (case u.ready == 1 of True -> yellow | False -> (800, 800, 800));
-  txtC es "{s}{tag}{vet}" x 2750 (z - 300) (case hot of True -> 105 | False -> 95) col.
+  txtC es "{s}{tag}{vet}" x 2750 (z - 300) (case hot of True -> 80 | False -> 70) col.
 
 # an artillery or ambush shell in flight (kind 2), or the summon's card (kind 5)
 shotEnts m es =
@@ -1277,43 +1289,59 @@ fxEnts ((x, y, z, t) :: r) es =
 # everything, with the depth cleared.  Every box has a rectangle in this
 # space, which is what a mouse will hit-test against later: no raycasting.
 
-uiW = 480.
-uiH = 300.
+uiW = 960.
+uiH = 600.
 ui m =
   (ents, slots) = S2.buildW (uiW, uiH) (uiTree m);
   (ents, S2.camAt uiH).
 
 grow = Box (Grow :: Nil) Nil.
 spacer h = Box (H h :: W 1 :: Nil) Nil.
-label sc col t = Lbl (Sc sc :: Fg col :: Nil) t.
-centred kid = Box (Row :: Nil) (grow :: kid :: grow :: Nil).
+hspace w = Box (W w :: H 1 :: Nil) Nil.
+# text in the proportional face at em px
+t em col s = Lbl (Fs em :: Fg col :: Nil) s.
+centred kid = Box (Row :: Center :: Nil) (kid :: Nil).
+# a rounded chip with a word in it
+tag bg fg s = Box (Row :: Pad 5 :: Round 9 :: Bg bg :: Mid :: Nil) (t 12 fg s :: Nil).
+# a small caption over a figure
+stat cap col v =
+  Box (Row :: Gap 5 :: Mid :: Nil) (t 10 inkDim cap :: t 15 col v :: Nil).
+# a key cap and what it does
+keyLine k what =
+  Box (Row :: Gap 7 :: Mid :: Nil)
+      (Box (Row :: W 26 :: Pad 3 :: Round 5 :: Bg chip :: Center :: Mid :: Nil) (t 11 ink k :: Nil) ::
+       t 12 inkDim what :: Nil).
 
 uiTree m | m.title == 1 = titleTree m.
 uiTree m =
   Box (Col :: W uiW :: H uiH :: Nil)
       (topBar m :: msgLine m :: middle m :: handBar m :: Nil).
-# the title: a framed logo over the drifting board, the prompt blinking
+# the title: a glass card over the drifting board, the prompt blinking
 titleTree m =
   blink = case tri 1200 m.ms > 0 of True -> ink | False -> inkDim;
-  logo = Box (Col :: Pad 12 :: Gap 6 :: Bg paper :: Bord yellow :: Nil)
-             (centred (label 7 yellow "TERRA II") ::
-              centred (label 1 inkDim "a positional card game  --  Republic VI against the Southern Empire") ::
-              spacer 6 ::
-              centred (label 2 blink "press ENTER") ::
-              spacer 2 ::
-              centred (label 1 inkDim "arrows  enter  esc     space ends the turn     M music     Q quit") :: Nil);
+  logo = Box (Col :: Pad 30 :: Gap 10 :: Round 18 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+             (centred (t 64 yellow "TERRA II") ::
+              centred (t 14 inkDim "a positional card game  |  Republic VI against the Southern Empire") ::
+              spacer 10 ::
+              centred (t 20 blink "press ENTER") ::
+              spacer 4 ::
+              centred (t 12 inkDim "arrows  enter  esc     space ends the turn     M music     Q quit") :: Nil);
   Box (Col :: W uiW :: H uiH :: Nil)
-      (grow :: centred logo :: grow :: centred (label 1 inkDim "FP-RISC on QOS Portable") :: spacer 6 :: Nil).
+      (grow :: centred logo :: grow :: centred (t 12 inkDim "FP-RISC on QOS Portable") :: spacer 14 :: Nil).
 
 topBar m =
-  Box (Row :: H 18 :: Pad 3 :: Gap 12 :: Bg paper :: Nil)
-      (label 1 ink "TURN {m.tno}" ::
-       label 1 blueLight "YOU  HQ {m.me.hq}  SUPPLY" ::
-       label 1 (supplyCol m) "{supplyShown m}" ::
-       label 1 blueLight "DECK {List.len m.me.deck}  HAND {List.len m.me.hand}" ::
+  Box (Row :: H 46 :: Pad 8 :: Gap 14 :: Mid :: Bga glass :: Nil)
+      (tag yellow paper "TURN {m.tno}" ::
+       tag blueDark blueLight "YOU" ::
+       stat "HQ" ink "{m.me.hq}" ::
+       stat "SUPPLY" (supplyCol m) "{supplyShown m}" ::
+       stat "DECK" ink "{List.len m.me.deck}" ::
+       stat "HAND" ink "{List.len m.me.hand}" ::
        grow ::
-       label 1 redLight "ENEMY  HQ {m.en.hq}  SUPPLY {m.en.stock}" ::
-       label 1 (case m.env >= 4 of True -> yellow | False -> ink) "ENV {m.env}" :: Nil).
+       stat "HQ" ink "{m.en.hq}" ::
+       stat "SUPPLY" ink "{m.en.stock}" ::
+       tag redDark redLight "ENEMY" ::
+       tag (case m.env >= 4 of True -> yellow | False -> chip) (case m.env >= 4 of True -> paper | False -> ink) "ENV {m.env}" :: Nil).
 
 # the supply figure: counts up or down one a tick, amber while it moves
 supplyShown m =
@@ -1321,23 +1349,23 @@ supplyShown m =
   sv.
 supplyCol m =
   (sv, st) = m.supV;
-  case st < 400 of True -> yellow | False -> blueLight.
+  case st < 400 of True -> yellow | False -> ink.
 msgLine m =
-  Box (Row :: H 14 :: Pad 2 :: Nil) (grow :: label 1 (960, 930, 720) m.msg :: grow :: Nil).
+  Box (Row :: H 30 :: Pad 4 :: Center :: Mid :: Nil) (t 14 (960, 930, 720) m.msg :: Nil).
 
 middle m =
-  Box (Row :: Grow :: Nil)
+  Box (Row :: Grow :: Pad 10 :: Nil)
       (Box (Col :: Grow :: Nil) (grow :: bannerBox m :: grow :: Nil) :: panel m :: Nil).
 bannerBox m | m.bt > 0 =
   age = case m.title == 1 of True -> 1000 | False -> clampK ((900 - m.bt) * 1000 / 260);
-  sc = case m.title == 1 of True -> 6 | False -> 1 + backOut age * 3 / 1000;
-  centred (label sc yellow m.banner).
+  em = case m.title == 1 of True -> 44 | False -> 16 + backOut age * 28 / 1000;
+  centred (Box (Row :: Pad 14 :: Round 14 :: Bga glass :: Nil) (t em yellow m.banner :: Nil)).
 bannerBox m = spacer 1.
 
 # the unit panel: whatever the cursor or the selection is on
 panel m = panelOf m (panelUnit m).
 panelOf m (s, z, c) | s < 0 = spacer 1.
-panelOf m (s, z, c) = panelFor m s z c (slotOf (sideOf m s) z c).
+panelOf m (s, z, c) = Box (Col :: Nil) (panelFor m s z c (slotOf (sideOf m s) z c) :: grow :: Nil).
 panelUnit m = case m.sel of
     SUnit z c -> (0, z, c)
   | STarget z c -> panelTarget m z c
@@ -1354,32 +1382,45 @@ panelFor m s z c u =
   mode = case u.down == 1 of
     True -> "face down"
   | False -> case u.mode == 1 of True -> "OVERWATCH" | False -> (case u.chg == 1 of True -> "CHARGED" | False -> "attack mode");
-  stat = case cKind cd == 1 of
-    True -> "GEN {cGen cd}   HP {u.hp}/{uMax u}"
-  | False -> "ATK {u.atk}   HP {u.hp}/{uMax u}";
   k = easeOut (clampK (m.hovT * 1000 / 220));
-  Box (Col :: W 124 :: Pad 5 :: Gap 4 :: Bg (mixC paper paperLit (1000 - k)) :: Bord (case s == 0 of True -> blueLight | False -> redLight) :: Nil)
-      (label 2 ink (cName cd) ::
-       label 1 inkDim "{who}  {zoneName z} {c + 1}" ::
-       label 1 yellow stat ::
-       label 1 (800, 800, 800) "{mode}{vetTag u}{readyTag u}" ::
-       label 1 inkDim "DRAIN {cDrain cd}  CALL {cCost cd}" ::
-       spacer 4 ::
-       panelHelp m s z u :: Nil).
-helpLines ls = Box (Col :: Gap 2 :: Nil) (ls |> List.map (fn t -> label 1 edge t)).
+  rim = case s == 0 of True -> blueLight | False -> redLight;
+  Box (Col :: W 250 :: Pad 6 :: Gap 8 :: Round 12 :: Shadow :: Bga (mixA glass glassLit (1000 - k)) :: Bord rim :: Nil)
+      (Box (Row :: Pad 8 :: Gap 8 :: Round 8 :: Bg (bandOf cd) :: Mid :: Nil)
+           (t 17 white (cName cd) :: grow :: t 11 (mixC white (bandOf cd) 300) who :: Nil) ::
+       Box (Col :: Pad 4 :: Gap 8 :: Nil)
+           (t 12 inkDim "{zoneName z} {c + 1}   {mode}{vetTag u}{readyTag u}" ::
+            Box (Row :: Gap 8 :: Nil) (statChips cd u) ::
+            t 11 inkDim "drain {cDrain cd}   call {cCost cd}" ::
+            panelHelp m s z u :: Nil) :: Nil).
+statChips cd u | cKind cd == 1 = chipOf "GEN" "+{cGen cd}" :: chipOf "HP" "{u.hp}/{uMax u}" :: Nil.
+statChips cd u = chipOf "ATK" "{u.atk}" :: chipOf "HP" "{u.hp}/{uMax u}" :: Nil.
+chipOf cap v =
+  Box (Col :: Grow :: Pad 6 :: Round 8 :: Bg chip :: Center :: Mid :: Nil)
+      (t 10 inkDim cap :: t 20 ink v :: Nil).
+helpLines ls = Box (Col :: Gap 5 :: Nil) ls.
 mixC (r1, g1, b1) (r2, g2, b2) k = (r1 + (r2 - r1) * k / 1000, g1 + (g2 - g1) * k / 1000, b1 + (b2 - b1) * k / 1000).
-vetTag u | u.vet > 0 = "  VET {u.vet}".
+mixA (r1, g1, b1, a1) (r2, g2, b2, a2) k = (r1 + (r2 - r1) * k / 1000, g1 + (g2 - g1) * k / 1000, b1 + (b2 - b1) * k / 1000, a1 + (a2 - a1) * k / 1000).
+vetTag u | u.vet > 0 = "   vet {u.vet}".
 vetTag u = "".
-readyTag u | u.ready == 1 = "  ready".
-readyTag u = "  spent".
-panelHelp m 0 1 u | uKind u == 2 = helpLines ("C  charge" :: "F  fire" :: "R  retreat" :: "esc  back" :: Nil).
-panelHelp m 0 1 u = helpLines ("A  attack" :: "O  overwatch" :: "R  retreat" :: "esc  back" :: Nil).
-panelHelp m 0 2 u | uKind u != 1 = helpLines ("V  advance" :: "esc  back" :: Nil).
+readyTag u | u.ready == 1 = "   ready".
+readyTag u = "   spent".
+panelHelp m 0 1 u | uKind u == 2 = helpLines (keyLine "C" "charge" :: keyLine "F" "fire" :: keyLine "R" "retreat" :: keyLine "esc" "back" :: Nil).
+panelHelp m 0 1 u = helpLines (keyLine "A" "attack" :: keyLine "O" "overwatch" :: keyLine "R" "retreat" :: keyLine "esc" "back" :: Nil).
+panelHelp m 0 2 u | uKind u != 1 = helpLines (keyLine "V" "advance" :: keyLine "esc" "back" :: Nil).
 panelHelp m s z u = spacer 1.
 
-# the hand: cards facing the viewer; the cursor's card lifted and bright
+# a card's header band by kind
+bandOf cd | cKind cd == 1 = bandSup.
+bandOf cd | cKind cd == 2 = bandArt.
+bandOf cd | cSoft cd == 1 = bandInf.
+bandOf cd = bandArm.
+
+# the hand: cards facing the viewer, centred; the cursor's card lifted,
+# lit and rimmed amber
+cardW = 124.
+cardH = 150.
 handBar m =
-  Box (Row :: H 94 :: Pad 5 :: Gap 4 :: Nil) (cards m m.me.hand 0).
+  Box (Row :: H 184 :: Pad 10 :: Gap 10 :: Center :: Nil) (cards m m.me.hand 0).
 # the departing card's ghost shrinks in place over 200 ms so the hand
 # closes the gap; the last card, just dealt, grows in over 200 ms
 cards m Nil i = ghost m i Nil.
@@ -1387,35 +1428,38 @@ cards m (k :: r) i = ghost m i (card m (cardOf k) i (dealtW m i) :: cards m r (i
 ghost m i rest =
   (gi, gt) = m.gone;
   case gi == i and gt < 200 of
-    True -> Box (Col :: W (Int.max 1 (62 - easeOut (gt * 1000 / 200) * 62 / 1000)) :: H 84 :: Nil)
-                (spacer 8 :: Box (Col :: Grow :: Bg paper :: Bord edge :: Nil) Nil :: Nil) :: rest
+    True -> stub (Int.max 1 (cardW - easeOut (gt * 1000 / 200) * cardW / 1000)) :: rest
   | False -> rest.
-dealtW m i | i == List.len m.me.hand - 1 and m.dealt < 200 = Int.max 1 (easeOut (m.dealt * 1000 / 200) * 62 / 1000).
-dealtW m i = 62.
-card m cd i w | w < 62 =
-  Box (Col :: W w :: H 84 :: Nil) (spacer 8 :: Box (Col :: Grow :: Bg paper :: Bord edge :: Nil) Nil :: Nil).
+dealtW m i | i == List.len m.me.hand - 1 and m.dealt < 200 = Int.max 1 (easeOut (m.dealt * 1000 / 200) * cardW / 1000).
+dealtW m i = cardW.
+stub w =
+  Box (Col :: W w :: H (cardH + 14) :: Nil)
+      (spacer 14 :: Box (Col :: Grow :: Round 10 :: Bg paper :: Bord edge :: Nil) Nil :: Nil).
+card m cd i w | w < cardW = stub w.
 card m cd i w =
   sel = case m.sel of SNone -> m.zone == 0 and m.cur == i | SPlace j z -> j == i | s -> False;
   afford = m.me.stock >= cCost cd;
   k = case sel of True -> easeOut (clampK (m.hovT * 1000 / 140)) | False -> 0;
-  base = case cKind cd == 1 of True -> (36, 66, 58) | False -> paper;
-  face = mixC base paperLit k;
+  face = mixC paper paperLit k;
   rim = case sel of True -> mixC edge yellow k | False -> edge;
-  body = Box (Col :: W 62 :: H 76 :: Pad 3 :: Gap 3 :: Bg face :: Bord rim :: Nil)
-             (label 1 ink (cName cd) ::
-              label 1 (case afford of True -> yellow | False -> danger) "CALL {cCost cd}" ::
-              label 2 ink (statLine cd) ::
-              label 1 inkDim (kindName cd) :: Nil);
-  lift = 8 - k * 8 / 1000;
-  case lift == 0 of
-    True -> Box (Col :: W 62 :: H 84 :: Nil) (body :: Nil)
-  | False -> Box (Col :: W 62 :: H 84 :: Nil) (spacer lift :: body :: Nil).
-statLine cd | cKind cd == 1 = "+{cGen cd} {cDef cd}".
-statLine cd = "{cAtk cd}/{cDef cd}".
-kindName cd | cKind cd == 1 = "support".
-kindName cd | cKind cd == 2 = "artillery".
-kindName cd | cSoft cd == 1 = "infantry".
-kindName cd = "armour".
+  body = Box (Col :: W cardW :: H cardH :: Pad 5 :: Gap 6 :: Round 10 :: Shadow :: Bg face :: Bord rim :: Nil)
+             (Box (Row :: H 32 :: Pad 6 :: Round 7 :: Bg (bandOf cd) :: Mid :: Gap 4 :: Nil)
+                  (t 13 white (cName cd) :: grow :: costBadge afford (cCost cd) :: Nil) ::
+              Box (Row :: Grow :: Round 7 :: Bg (mixC face paper 500) :: Center :: Mid :: Nil)
+                  (t 11 (mixC inkDim (bandOf cd) 400) (kindName cd) :: Nil) ::
+              Box (Row :: H 44 :: Pad 2 :: Gap 6 :: Mid :: Nil) (bigStats cd) :: Nil);
+  lift = 14 - k * 14 / 1000;
+  Box (Col :: W cardW :: H (cardH + 14) :: Nil) (spacer lift :: body :: Nil).
+costBadge afford cost =
+  Box (Row :: W 22 :: H 22 :: Round 11 :: Bg (case afford of True -> yellow | False -> danger) :: Center :: Mid :: Nil)
+      (t 12 paper "{cost}" :: Nil).
+bigStats cd | cKind cd == 1 = figure "+{cGen cd}" "GEN" yellow :: grow :: figure "{cDef cd}" "DEF" ink :: Nil.
+bigStats cd = figure "{cAtk cd}" "ATK" ink :: grow :: figure "{cDef cd}" "DEF" ink :: Nil.
+figure v cap col = Box (Col :: Center :: Mid :: Nil) (t 22 col v :: t 9 inkDim cap :: Nil).
+kindName cd | cKind cd == 1 = "SUPPORT".
+kindName cd | cKind cd == 2 = "ARTILLERY".
+kindName cd | cSoft cd == 1 = "INFANTRY".
+kindName cd = "ARMOUR".
 
 # ---- the elm four ---------------------------------------------------------------------------
 

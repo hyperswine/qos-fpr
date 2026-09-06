@@ -153,6 +153,26 @@ drifting board -- the name, a line about the two factions, a blinking
 prompt, the keys -- with the bar and the hand hidden until the game
 begins.
 
+## The art pass
+
+The look was cells and slabs; a modern surface wants type and rounded
+glass.  The walker gained a real face -- DejaVu Sans Bold as a signed-
+distance-field atlas and a text pass (docs/UI2D.md) -- and scene2d the
+treatments to go with it (`Fs`, `Round`, `Shadow`, `Bga`, `Center`,
+`Mid`).  The layer now runs at 960 x 600, one virtual px per window px,
+and everything on it was redrawn: a glass status bar with chips (TURN,
+YOU, ENEMY, ENV) and captioned figures; the message in the face; the
+banner in a glass pill that grows in with the back-out ease; the unit
+panel as a rounded glass card with a header band in the unit's kind
+colour, stat chips for ATK/GEN and HP, and the keys that apply as key
+caps; the hand as 124 x 150 rounded, shadowed cards -- a kind band with
+the name and an amber cost badge (red when you cannot afford it), the
+kind in small caps, big ATK/DEF figures -- the cursor's card lifted, lit
+and rimmed amber, the ghost and the dealt card keeping their tweens.
+The title is a glass card with the name at 64 px.  On the board the unit
+labels, the HQ figure, the ambush "?" and the damage tags are text
+entities standing over their units instead of glyph cells.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone

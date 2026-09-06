@@ -79,6 +79,19 @@ mesh (there is no sorting across meshes, which is fine for smoke, tags
 and veils and would show on two large overlapping translucent bodies of
 different meshes).  Statics are always opaque.
 
+## Flat meshes and text
+
+Three built-in flat meshes joined `cube`, `plane` and `sphere`: `disc`
+(a unit circle in XY facing +Z), `corner` (its +x,+y quarter, mirrored
+into the other quadrants by a negative scale) and `coin` (the circle in
+XZ facing +Y).  The 2D layer builds rounded boxes and badges from the
+first two; the third is for rings and pads on a ground plane.
+
+Text is an entity too -- `Ent (mode, "string") pen 0 (em, em, 1) colour`
+-- drawn by a separate pass from a distance-field atlas compiled into
+the host (docs/UI2D.md, "The second face").  Mode 0 stands the string
+upright (Terra II's unit labels and damage tags), mode 1 lays it flat.
+
 ## Limits and next steps
 
 * The mesh table holds 16 names (14 used) and 16,384 instances per mesh; a
