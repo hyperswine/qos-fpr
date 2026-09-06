@@ -313,7 +313,7 @@ txtC es s x y z cell col = txt es s (x - strlen s * 3 * cell) y z cell col.
 Sel = Type (SNone | SCard i | SPlace i z | SUnit z c | STarget z c).
 # actions, queued and played one at a time
 Act = Type (ACall s i z c | AAttack s z c tz tc | AOver s c | ARetreat s c
-          | AAdvance s c | ACharge s c | AFire s c tz tc | AEnd s | AStart s).
+          | AAdvance s c | ACharge s c | AFire s c tz tc | AEnd s | AStart s | ABeat).
 # the animation in flight: kind 0 none, 1 lunge, 2 shot, 3 slide, 4 pause
 An = Type (An kind s fz fc tz tc t done).
 noAn = An 0 0 0 0 0 0 0 0.
@@ -328,7 +328,7 @@ initWith s0 s1 =
     msg = "arrows, enter, esc; space ends the turn -- press ENTER to begin", keys = Nil,
     snap = 0, auto = 0, banner = "TERRA II", bt = 100000, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil,
     sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0, music = 0, puffs = Nil,
-    ring = (0, 2400), hov = (0, 0), hovT = 1000 }.
+    ring = (0, 2400), hov = (0, 0), hovT = 1000, marks = Nil, supV = (0, 0), vt = 0 }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -378,8 +378,9 @@ slay m s z c =
   p = sideOf m s;
   u = slotOf p z c;
   m2 = setSide m s (setSlot p z c { u | dead = 1, dt = 0, hp = 0 });
+  (mx, my, mz) = posOf s z c;
   cue (note { m2 | env = Int.min 10 (m2.env + (case uSoft u == 1 of True -> 1 | False -> 2)),
-                   fx = sparks m2.fx (posOf s z c) 6, shake = 160 } "{cName (uCard u)} destroyed") Sfx.kill.
+                   fx = sparks m2.fx (posOf s z c) 6, shake = 160, marks = (mx, mz, 0) :: m2.marks } "{cName (uCard u)} destroyed") Sfx.kill.
 damageHq m s dmg =
   p = sideOf m s;
   hq2 = p.hq - dmg;
@@ -533,7 +534,9 @@ aiPlan m =
   p = m.en;
   (calls, p2) = aiCalls m p 0 Nil 3;
   acts = aiActs m p2 0 Nil;
-  calls + acts.
+  beats (calls + acts).
+beats Nil = Nil.
+beats (a :: r) = a :: ABeat :: beats r.
 aiCalls m p i acc n | n == 0 = (rev acc Nil, p).
 aiCalls m p i acc n =
   k = bestCard p.hand p.stock 0 (0 - 1) (0 - 1);
@@ -604,7 +607,8 @@ richest (u :: r) i best bg = richest r (i + 1) best bg.
 # ---- the queue: starting an action = validating it and choosing its animation ------------
 
 startAct m a = case a of
-    AStart s -> pause (startTurn m s) 900
+    ABeat -> pause m 260
+  | AStart s -> pause (startTurn m s) 900
   | AEnd s -> pause (endTurn m s) 500
   | ACall s i z c -> flyCard (callCard m s i z c) m s i z c
   | AOver s c -> pause (overwatch m s c) 250
@@ -704,7 +708,7 @@ tick m =
     True -> (advance m1 tickMs, Nil)
   | False -> idle m1;
   _ = say (rev m2.log Nil);
-  _ = Sfx.playAll (rev m2.sfx Nil);
+  _ = Sfx.playAllVar m2.ms (rev m2.sfx Nil);
   (m2, cs).
 # the transcript goes straight to stdout: the host's log echo is
 # rate-limited (rings are not), and a scripted game must be readable
@@ -720,6 +724,7 @@ takeKey m = case m.keys of
 ageAll m dt =
   m1 = chase m dt;
   { m1 | me = ageSide m.me dt, en = ageSide m.en dt, bt = Int.max 0 (m.bt - dt), fx = ageFx m.fx dt Nil,
+         marks = ageMarks m.marks dt Nil, vt = (case m.turn == 1 of True -> Int.min 400 (m.vt + dt) | False -> Int.max 0 (m.vt - dt)),
         nums = ageNums m.nums dt Nil, shake = Int.max 0 (m.shake - dt), puffs = agePuffs m.puffs dt Nil }.
 agePuffs Nil dt acc = acc.
 agePuffs ((x, y, z, t) :: r) dt acc | t + dt > 700 = agePuffs r dt acc.
@@ -732,12 +737,18 @@ chase m dt =
   ring2 = (x + (tx - x) * 35 / 100, z + (tz - z) * 35 / 100);
   hov2 = (m.zone, m.cur);
   same = hov2 == m.hov;
-  { m | ring = ring2, hov = hov2, hovT = (case same of True -> Int.min 2000 (m.hovT + dt) | False -> 0) }.
+  (sv, st) = m.supV;
+  sv2 = case sv < m.me.stock of True -> sv + 1 | False -> (case sv > m.me.stock of True -> sv - 1 | False -> sv);
+  { m | ring = ring2, hov = hov2, hovT = (case same of True -> Int.min 2000 (m.hovT + dt) | False -> 0),
+        supV = (sv2, case sv2 == m.me.stock of True -> Int.min 1000 (st + dt) | False -> 0) }.
 ringTarget m = case m.sel of
     STarget az ac -> (case m.zone == 3 of
         True -> (0, zOf 1 3 + 700)
       | False -> (colX m.cur, zOf 1 m.zone))
   | s -> (case m.zone == 0 of True -> m.ring | False -> (colX m.cur, zOf 0 m.zone)).
+ageMarks Nil dt acc = acc.
+ageMarks ((x, z, t) :: r) dt acc | t + dt > 20000 = ageMarks r dt acc.
+ageMarks ((x, z, t) :: r) dt acc = ageMarks r dt ((x, z, t + dt) :: acc).
 ageNums Nil dt acc = acc.
 ageNums ((x, z, s, t) :: r) dt acc | t + dt > 750 = ageNums r dt acc.
 ageNums ((x, z, s, t) :: r) dt acc = ageNums r dt ((x, z, s, t + dt) :: acc).
@@ -867,7 +878,7 @@ aim m z c = { m | sel = SNone }.
 # ---- the view: the whole board as a Scene, every frame ------------------------------------
 
 scene m =
-  es0 = backdrop Nil;
+  es0 = markEnts m.marks (backdrop Nil);
   es1 = cursorRing m (tiles m es0);
   es2 = hqEnts (hqEnts es1 m 0) m 1;
   es3 = rowEnts (rowEnts (rowEnts (rowEnts es2 m 0 1 0) m 0 2 0) m 1 1 0) m 1 2 0;
@@ -876,7 +887,19 @@ scene m =
   es5b = puffEnts m.puffs es5;
   es6 = fxEnts m.fx es5b;
   es7 = numEnts m.nums es6;
-  Scene Nil es7 lights (cameraOf m).
+  es8 = veil m es7;
+  Scene Nil es8 lights (cameraOf m).
+# where a unit fell: a dark ellipse that fades over twenty seconds
+markEnts Nil es = es.
+markEnts ((x, z, t) :: r) es =
+  a = 520 - t * 520 / 20000;
+  markEnts r (Ent "sphere" (x, 64, z) 0 (1900, 24, 1500) (40, 35, 35, a) :: es).
+# the enemy's turn under a veil: a translucent dark sheet over the board,
+# fading in and out over 400 ms, so their moves read as theirs
+veil m es | m.turn == 0 and m.vt == 0 = es.
+veil m es =
+  a = 330 * m.vt / 400;
+  Ent "cube" (0, 5200, 0) 0 (40000, 10, 40000) (20, 20, 40, a) :: es.
 # floating damage numbers: white on a dark tag, in front of the target,
 # rising and shrinking over 750 ms
 numEnts Nil es = es.
@@ -886,10 +909,14 @@ numEnts ((x, z, s, t) :: r) es =
   y = 2100 + k * 22 / 10;
   zz = z + 1500;
   w = strlen s * 6 * cell + cell;
-  es1 = Ent "cube" (x, y - 4 * cell, zz - 60) 0 (w, 9 * cell, 60) (60, 30, 30) :: es;
-  numEnts r (txtC es1 s x (y + cell / 2) zz cell (1000, 980, 900)).
+  a = 1000 - easeIn k;
+  es1 = Ent "cube" (x, y - 4 * cell, zz - 60) 0 (w, 9 * cell, 60) (60, 30, 30, a * 85 / 100) :: es;
+  numEnts r (txtC es1 s x (y + cell / 2) zz cell (1000, 980, 900, a)).
 # the camera, knocked about while shake > 0 (a hash of the clock, not a
 # random stream: a replayed game shakes the same way)
+cameraOf m | m.title == 1 =
+  a = m.ms / 3;
+  ((sinM a * 5500 / 1000, 9000 + sinM (a / 2) * 1500 / 1000, 15000 + cosM a * 2500 / 1000), (0, 0, 0 - 600), 1000).
 cameraOf m | m.shake == 0 = camera.
 cameraOf m =
   a = m.shake;
@@ -1011,7 +1038,7 @@ unitEnts es m s z c u =
   k = case u.dead == 1 of True -> Int.max 50 (1000 - easeIn (u.dt * 1000 / 420)) | False -> 150 + backOut (Int.min 1000 (u.born * 1000 / 340)) * 850 / 1000;
   bob = case s == 0 and (isCursor m z c or isSelected m z c) of True -> 120 - Int.abs ((m.ms % 800) - 400) * 3 / 10 | False -> 0;
   lift = (case u.born < 340 of True -> (1000 - easeOut (u.born * 1000 / 340)) * 12 / 10 | False -> 0) + bob;
-  col = case u.flash > 0 of True -> white | False -> unitCol s u;
+  col = case u.flash > 0 of True -> fade white 1000 | False -> (case u.dead == 1 of True -> fade (unitCol s u) (1000 - easeIn (clampK (u.dt * 1000 / 420))) | False -> fade (unitCol s u) 1000);
   d = dirOf s;
   es1 = case u.down == 1 of
     True -> Ent "cube" (x, 80, zz) 0 (1700, 120, 2200) (150, 150, 180) ::
@@ -1026,6 +1053,7 @@ unitCol s u = sideCol s.
 accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
 accent s u = (950, 950, 900).
 lighter (r, g, b) = (r + (1000 - r) / 3, g + (1000 - g) / 3, b + (1000 - b) / 3).
+fade (r, g, b) a = (r, g, b, a).
 
 # ---- easing (milli): the difference between a thing moving and a thing
 # ARRIVING.  k in 0..1000 -> 0..1000.
@@ -1202,13 +1230,14 @@ shell2 es from to t =
 puffEnts Nil es = es.
 puffEnts ((x, y, z, t) :: r) es | t < 0 = puffEnts r es.
 puffEnts ((x, y, z, t) :: r) es =
-  sz = 160 + t * 3 / 5;
-  g = 600 - t * 3 / 5;
-  puffEnts r (Ent "sphere" (x, y + t * 2 / 3, z) 0 (sz, sz, sz) (g, g, g + 30) :: es).
+  k = easeOut (clampK (t * 1000 / 700));
+  sz = 160 + k * 7 / 10;
+  a = 800 - k * 8 / 10;
+  puffEnts r (Ent "sphere" (x, y + k * 6 / 10, z) 0 (sz, sz, sz) (520, 520, 550, a) :: es).
 fxEnts Nil es = es.
 fxEnts ((x, y, z, t) :: r) es =
   k = easeOut (clampK (t * 1000 / 380));
-  fxEnts r (Ent "cube" (x, y + k * 11 / 10, z) 0 (160 - k / 8, 160 - k / 8, 160 - k / 8) (1000, 850 - k * 38 / 100, 300) :: es).
+  fxEnts r (Ent "cube" (x, y + k * 11 / 10, z) 0 (160 - k / 8, 160 - k / 8, 160 - k / 8) (1000, 850 - k * 38 / 100, 300, 1000 - k * 7 / 10) :: es).
 
 # ---- the 2D UI: scene2d over the board -------------------------------------------------
 # A 480 x 300 virtual screen (the 960 x 600 window at an integer 2x, so
@@ -1237,11 +1266,20 @@ uiTree m =
 topBar m =
   Box (Row :: H 18 :: Pad 3 :: Gap 12 :: Bg paper :: Nil)
       (label 1 ink "TURN {m.tno}" ::
-       label 1 blueLight "YOU  HQ {m.me.hq}  SUPPLY {m.me.stock}  DECK {List.len m.me.deck}  HAND {List.len m.me.hand}" ::
+       label 1 blueLight "YOU  HQ {m.me.hq}  SUPPLY" ::
+       label 1 (supplyCol m) "{supplyShown m}" ::
+       label 1 blueLight "DECK {List.len m.me.deck}  HAND {List.len m.me.hand}" ::
        grow ::
        label 1 redLight "ENEMY  HQ {m.en.hq}  SUPPLY {m.en.stock}" ::
        label 1 (case m.env >= 4 of True -> yellow | False -> ink) "ENV {m.env}" :: Nil).
 
+# the supply figure: counts up or down one a tick, amber while it moves
+supplyShown m =
+  (sv, st) = m.supV;
+  sv.
+supplyCol m =
+  (sv, st) = m.supV;
+  case st < 400 of True -> yellow | False -> blueLight.
 msgLine m =
   Box (Row :: H 14 :: Pad 2 :: Nil) (grow :: label 1 (960, 930, 720) m.msg :: grow :: Nil).
 

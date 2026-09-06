@@ -69,6 +69,16 @@ four stages (`COSCAD=... models/build.sh`); the results are checked in.
 Eleven registered meshes plus the three built-in ones: 14 of the table's
 16.  `tests/gfxmesh.fpr` is the showroom, all of them in one frame.
 
+## Colour and alpha
+
+An entity's colour is `(r, g, b)` in milli, or `(r, g, b, a)`: alpha
+below 1000 makes the instance translucent.  Each mesh draws its opaque
+instances first, then its translucent ones blended over the frame,
+depth-tested but not depth-written and sorted far to near within the
+mesh (there is no sorting across meshes, which is fine for smoke, tags
+and veils and would show on two large overlapping translucent bodies of
+different meshes).  Statics are always opaque.
+
 ## Limits and next steps
 
 * The mesh table holds 16 names (14 used) and 16,384 instances per mesh; a

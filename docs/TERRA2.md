@@ -125,6 +125,21 @@ settles into the horizon; a backdrop wall and a ground rim carry the
 gradient.  Every unit stands on a flat shadow ellipse; tiles carry a
 light edge strip so the board reads as a board.
 
+## Polish, batch two
+
+Things fade now: the walker's instance colour carries an alpha
+((r, g, b, a) beside the plain triple), and each mesh draws its opaque
+instances first, then the translucent ones blended, depth-tested but
+not depth-written, sorted far to near -- so smoke thins out, sparks and
+damage tags dissolve, a destroyed unit fades as it shrinks, and the
+scorch mark it leaves fades over twenty seconds.  The enemy's turn plays
+under a veil, a translucent sheet over the board fading in and out over
+400 ms, with a 260 ms beat between its actions so they read as decisions
+rather than a burst.  The supply figure in the bar counts up and down one
+a tick and stays amber while it moves.  Repeated cues vary in pitch by a
+few percent from the clock, so four rifle cracks are four cracks.  On the
+title screen the camera drifts slowly over the board until ENTER.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
