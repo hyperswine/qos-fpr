@@ -942,8 +942,6 @@ accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
 accent s u = (950, 950, 900).
 lighter (r, g, b) = (r + (1000 - r) / 3, g + (1000 - g) / 3, b + (1000 - b) / 3).
 
-# INTEGER
-
 # ---- integer trig (milli-radians): Bhaskara's sine; atanM is below ------
 sinM x =
   r = ((x % 6283) + 6283) % 6283;
