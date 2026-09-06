@@ -328,7 +328,8 @@ initWith s0 s1 =
     msg = "arrows, enter, esc; space ends the turn -- press ENTER to begin", keys = Nil,
     snap = 0, auto = 0, banner = "TERRA II", bt = 100000, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil,
     sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0, music = 0, puffs = Nil,
-    ring = (0, 2400), hov = (0, 0), hovT = 1000, marks = Nil, supV = (0, 0), vt = 0 }.
+    ring = (0, 2400), hov = (0, 0), hovT = 1000, marks = Nil, supV = (0, 0), vt = 0,
+    gone = (0 - 1, 1000), dealt = 1000 }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -385,7 +386,10 @@ damageHq m s dmg =
   p = sideOf m s;
   hq2 = p.hq - dmg;
   m2 = setSide m s { p | hq = hq2 };
-  m3 = cue (number (note { m2 | fx = sparks m2.fx (hqPos s) 8, shake = 320 } "HQ hit for {dmg}: {hq2} left") (hqPos s) "-{dmg}") Sfx.hqHit;
+  (hx, hy, hz) = hqPos s;
+  m3 = cue (number (note { m2 | fx = sparks m2.fx (hqPos s) 8, shake = 320,
+                               marks = (hx + (p.hq * 1237) % 2400 - 1200, hz - dirOf s * ((p.hq * 811) % 900 + 300), 0) :: m2.marks }
+                        "HQ hit for {dmg}: {hq2} left") (hqPos s) "-{dmg}") Sfx.hqHit;
   case hq2 <= 0 of
     True -> cue (note { m3 | over = 1 + (1 - s), banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil,
                              msg = "press ENTER for a new game, Q to quit" }
@@ -474,7 +478,7 @@ startTurn m s =
   | False -> m3.
 draw m s p = case p.deck of
     Nil -> (p, damageHq { m | msg = "deck out: HQ takes 2" } s 2)
-  | k :: r -> drawn m s { p | deck = r, hand = p.hand + (k :: Nil) }.
+  | k :: r -> drawn (case s == 0 of True -> { m | dealt = 0 } | False -> m) s { p | deck = r, hand = p.hand + (k :: Nil) }.
 drawn m s p = (p, setSide m s p).
 
 endTurn m s =
@@ -516,7 +520,7 @@ callCard m s i z c =
   | True -> called m s p i z c cd (mkU cd down) cost.
 called m s p i z c cd u cost =
   p2 = setSlot { p | stock = p.stock - cost, hand = delAt p.hand i } z c { u | born = 0 - 380 };
-  m2 = setSide m s p2;
+  m2 = case s == 0 of True -> setSide { m | gone = (i, 0) } s p2 | False -> setSide m s p2;
   cue (note m2 "{sideName s}: {cName cd} called to {zoneName z} {c + 1}") Sfx.call.
 sideName 0 = "you".
 sideName s = "enemy".
@@ -725,6 +729,7 @@ ageAll m dt =
   m1 = chase m dt;
   { m1 | me = ageSide m.me dt, en = ageSide m.en dt, bt = Int.max 0 (m.bt - dt), fx = ageFx m.fx dt Nil,
          marks = ageMarks m.marks dt Nil, vt = (case m.turn == 1 of True -> Int.min 400 (m.vt + dt) | False -> Int.max 0 (m.vt - dt)),
+         gone = ageGone m.gone dt, dealt = Int.min 1000 (m.dealt + dt),
         nums = ageNums m.nums dt Nil, shake = Int.max 0 (m.shake - dt), puffs = agePuffs m.puffs dt Nil }.
 agePuffs Nil dt acc = acc.
 agePuffs ((x, y, z, t) :: r) dt acc | t + dt > 700 = agePuffs r dt acc.
@@ -746,6 +751,7 @@ ringTarget m = case m.sel of
         True -> (0, zOf 1 3 + 700)
       | False -> (colX m.cur, zOf 1 m.zone))
   | s -> (case m.zone == 0 of True -> m.ring | False -> (colX m.cur, zOf 0 m.zone)).
+ageGone (i, t) dt = (i, Int.min 1000 (t + dt)).
 ageMarks Nil dt acc = acc.
 ageMarks ((x, z, t) :: r) dt acc | t + dt > 20000 = ageMarks r dt acc.
 ageMarks ((x, z, t) :: r) dt acc = ageMarks r dt ((x, z, t + dt) :: acc).
@@ -916,7 +922,7 @@ numEnts ((x, z, s, t) :: r) es =
 # random stream: a replayed game shakes the same way)
 cameraOf m | m.title == 1 =
   a = m.ms / 3;
-  ((sinM a * 5500 / 1000, 9000 + sinM (a / 2) * 1500 / 1000, 15000 + cosM a * 2500 / 1000), (0, 0, 0 - 600), 1000).
+  ((sinM a * 6000 / 1000, 12500 + sinM (a / 2) * 1500 / 1000, 17500 + cosM a * 2500 / 1000), (0, 0, 0 - 1200), 1000).
 cameraOf m | m.shake == 0 = camera.
 cameraOf m =
   a = m.shake;
@@ -935,7 +941,28 @@ backdrop es =
 # the cursor: a ring of four strips that GLIDES between slots (the model
 # keeps its position chasing the target) and breathes
 cursorRing m es | m.zone == 0 or m.title == 1 or m.over != 0 = es.
-cursorRing m es =
+cursorRing m es = targetRings m (cursorRingAt m es).
+# while aiming, every slot the attacker can hit wears a breathing red ring
+targetRings m es = case m.sel of
+    STarget az ac -> hqRing m ac (ringsGo m ac 1 0 (ringsGo m ac 2 0 es))
+  | s -> es.
+ringsGo m ac z c es | c > 4 = es.
+ringsGo m ac z c es =
+  (x, y, zz) = posOf 1 z c;
+  es2 = case aimOk m ac z c and not (m.zone == z and m.cur == c) of
+    True -> ring es x zz 2000 2400 (breathe m danger (600, 300, 280)) 84
+  | False -> es;
+  ringsGo m ac z (c + 1) es2.
+hqRing m ac es | aimOk m ac 3 0 and m.zone != 3 =
+  (x, y, z) = hqPos 1;
+  ring es x z 4400 2600 (breathe m danger (600, 300, 280)) 84.
+hqRing m ac es = es.
+ring es x z w d col h =
+  Ent "cube" (x, h, z - d / 2) 0 (w + 40, 60, 50) col ::
+  Ent "cube" (x, h, z + d / 2) 0 (w + 40, 60, 50) col ::
+  Ent "cube" (x - w / 2, h, z) 0 (50, 60, d) col ::
+  Ent "cube" (x + w / 2, h, z) 0 (50, 60, d) col :: es.
+cursorRingAt m es =
   (x, z) = m.ring;
   side = case m.sel of STarget az ac -> 1 | s -> 0;
   pulse = 700 + (tri 900 m.ms + 1000) * 3 / 20;
@@ -987,7 +1014,7 @@ hqEnts es m s =
   p = sideOf m s;
   (x, y, z) = hqPos s;
   col = hqCol s;
-  hl = case m.zone == 3 and isTargetHq m of True -> (1000, 500, 400) | False -> col;
+  hl = case s == 1 and m.zone == 3 and isTargetHq m of True -> breathe m (1000, 520, 420) col | False -> col;
   d = dirOf s;
   hy = case s == 0 of True -> 0 | False -> 3142;
   es1 = Ent "hq" (x, y, z) hy (1000, 1000, 1000) hl ::
@@ -1045,9 +1072,10 @@ unitEnts es m s z c u =
             txtC es "?" x 700 (zz + 600) 120 (600, 600, 700)
   | False -> solids es (uKind u) (uSoft u) x (y + lift) zz d k col (accent s u) (turretYaw m s z c x zz) m.ms (phaseOf s z c);
   es2 = Ent "sphere" (x, 60, zz) 0 (1500 * k / 1000, 30, 1500 * k / 1000) shadow :: es1;
+  hot = s == 0 and (isCursor m z c or isSelected m z c);
   case u.down == 1 of
     True -> es2
-  | False -> labelEnts es2 u x zz.
+  | False -> labelEnts es2 u x zz hot.
 unitCol s u | uKind u == 1 = supCol s.
 unitCol s u = sideCol s.
 accent s u | uSoft u == 0 and uKind u == 0 = lighter (sideCol s).
@@ -1158,12 +1186,13 @@ solids es kind soft x y z d k col acc ty ms ph =
   Ent "tank_hull" (x, y, z) hy (sc, sc, sc) col ::
   Ent "tank_turret" (x, y + 750 * sc / 1000, z) ty (sc, sc, sc) acc :: es.
 
-labelEnts es u x z | u.dead == 1 = es.
-labelEnts es u x z =
+labelEnts es u x z hot | u.dead == 1 = es.
+labelEnts es u x z hot =
   s = case uKind u == 1 of True -> "+{cGen (uCard u)} {u.hp}" | False -> "{u.atk}/{u.hp}";
   tag = case u.mode == 1 of True -> " OW" | False -> (case u.chg == 1 of True -> " CHG" | False -> "");
   vet = case u.vet > 0 of True -> " *{u.vet}" | False -> "";
-  txtC es "{s}{tag}{vet}" x 2750 (z - 300) 95 (case u.ready == 1 of True -> yellow | False -> (800, 800, 800)).
+  col = case hot of True -> white | False -> (case u.ready == 1 of True -> yellow | False -> (800, 800, 800));
+  txtC es "{s}{tag}{vet}" x 2750 (z - 300) (case hot of True -> 105 | False -> 95) col.
 
 # an artillery or ambush shell in flight (kind 2), or the summon's card (kind 5)
 shotEnts m es =
@@ -1259,9 +1288,22 @@ spacer h = Box (H h :: W 1 :: Nil) Nil.
 label sc col t = Lbl (Sc sc :: Fg col :: Nil) t.
 centred kid = Box (Row :: Nil) (grow :: kid :: grow :: Nil).
 
+uiTree m | m.title == 1 = titleTree m.
 uiTree m =
   Box (Col :: W uiW :: H uiH :: Nil)
       (topBar m :: msgLine m :: middle m :: handBar m :: Nil).
+# the title: a framed logo over the drifting board, the prompt blinking
+titleTree m =
+  blink = case tri 1200 m.ms > 0 of True -> ink | False -> inkDim;
+  logo = Box (Col :: Pad 12 :: Gap 6 :: Bg paper :: Bord yellow :: Nil)
+             (centred (label 7 yellow "TERRA II") ::
+              centred (label 1 inkDim "a positional card game  --  Republic VI against the Southern Empire") ::
+              spacer 6 ::
+              centred (label 2 blink "press ENTER") ::
+              spacer 2 ::
+              centred (label 1 inkDim "arrows  enter  esc     space ends the turn     M music     Q quit") :: Nil);
+  Box (Col :: W uiW :: H uiH :: Nil)
+      (grow :: centred logo :: grow :: centred (label 1 inkDim "FP-RISC on QOS Portable") :: spacer 6 :: Nil).
 
 topBar m =
   Box (Row :: H 18 :: Pad 3 :: Gap 12 :: Bg paper :: Nil)
@@ -1338,9 +1380,21 @@ panelHelp m s z u = spacer 1.
 # the hand: cards facing the viewer; the cursor's card lifted and bright
 handBar m =
   Box (Row :: H 94 :: Pad 5 :: Gap 4 :: Nil) (cards m m.me.hand 0).
-cards m Nil i = Nil.
-cards m (k :: r) i = card m (cardOf k) i :: cards m r (i + 1).
-card m cd i =
+# the departing card's ghost shrinks in place over 200 ms so the hand
+# closes the gap; the last card, just dealt, grows in over 200 ms
+cards m Nil i = ghost m i Nil.
+cards m (k :: r) i = ghost m i (card m (cardOf k) i (dealtW m i) :: cards m r (i + 1)).
+ghost m i rest =
+  (gi, gt) = m.gone;
+  case gi == i and gt < 200 of
+    True -> Box (Col :: W (Int.max 1 (62 - easeOut (gt * 1000 / 200) * 62 / 1000)) :: H 84 :: Nil)
+                (spacer 8 :: Box (Col :: Grow :: Bg paper :: Bord edge :: Nil) Nil :: Nil) :: rest
+  | False -> rest.
+dealtW m i | i == List.len m.me.hand - 1 and m.dealt < 200 = Int.max 1 (easeOut (m.dealt * 1000 / 200) * 62 / 1000).
+dealtW m i = 62.
+card m cd i w | w < 62 =
+  Box (Col :: W w :: H 84 :: Nil) (spacer 8 :: Box (Col :: Grow :: Bg paper :: Bord edge :: Nil) Nil :: Nil).
+card m cd i w =
   sel = case m.sel of SNone -> m.zone == 0 and m.cur == i | SPlace j z -> j == i | s -> False;
   afford = m.me.stock >= cCost cd;
   k = case sel of True -> easeOut (clampK (m.hovT * 1000 / 140)) | False -> 0;

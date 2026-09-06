@@ -140,6 +140,19 @@ a tick and stays amber while it moves.  Repeated cues vary in pitch by a
 few percent from the clock, so four rifle cracks are four cracks.  On the
 title screen the camera drifts slowly over the board until ENTER.
 
+## Polish, batch three
+
+Aiming shows its options: every slot the attacker can hit wears a
+breathing red ring, the HQ a wider one and a pulse on the compound
+itself, the amber cursor ring on the one being aimed at.  The hand
+closes the gap a played card leaves (its ghost shrinks in place over 200
+ms) and opens one for a dealt card (it grows in).  A struck HQ collects
+craters in front of its compound.  The hovered unit's label brightens and
+grows a step.  The title is a framed logo in the 2D layer over the
+drifting board -- the name, a line about the two factions, a blinking
+prompt, the keys -- with the bar and the hand hidden until the game
+begins.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
