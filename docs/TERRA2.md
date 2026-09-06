@@ -102,6 +102,29 @@ The cursor remembers the board: after a call it sits on the new unit,
 after an attack on the attacker, and a new turn leaves it where it was;
 esc returns to where the selection started.
 
+## Polish, batch one
+
+Motion arrives instead of stopping: an integer easing set (`easeOut`,
+`easeIn`, `easeInOut`, a `backOut` that overshoots and settles) runs the
+summon pop, the death shrink, the slides, the recoil, the damage tags
+and sparks, the banner's scale-in, the card lift and the panel's
+brighten-in.  Visual state chases the model: the cursor is a ring of
+four amber strips that glides a third of the way to its slot every tick
+and breathes; a hover clock (`hovT`) times the lifted card and the panel.
+A summon is a card slab flying from the hand's edge (the enemy's from
+beyond its HQ) to the slot on a small arc, shrinking and turning, the
+unit popping up as it lands.
+
+The look is one palette declared at the top of the program: a dusk sky
+and ground, two desaturated factions with a light of each, amber as the
+single accent, a danger red, and the 2D layer's ink and paper.  The
+walker's lights list takes a second entry, the sky -- (fog and clear
+colour, ambient tint) -- and the shader now mixes a cool ambient with
+the warm sun and fogs by distance toward the sky, so the far compound
+settles into the horizon; a backdrop wall and a ground rim carry the
+gradient.  Every unit stands on a flat shadow ellipse; tiles carry a
+light edge strip so the board reads as a board.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone

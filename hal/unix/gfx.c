@@ -198,7 +198,7 @@ static struct {
 #else
   EGLDisplay dpy; EGLContext ctx;
 #endif
-  GLuint prog; GLint uProj, uView, uLightPos, uLightColor;
+  GLuint prog; GLint uProj, uView, uLightPos, uLightColor, uAmbient, uFog, uFogRange;
   GLuint fbo, fboColor, fboDepth;
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
@@ -345,11 +345,12 @@ static const char *kVS =
     "layout(location=5) in vec4 iM3;\n"
     "layout(location=6) in vec3 iColor;\n"
     "uniform mat4 uView; uniform mat4 uProj;\n"
-    "out vec3 vN; out vec3 vW; out vec3 vC;\n"
+    "out vec3 vN; out vec3 vW; out vec3 vC; out float vZ;\n"
     "void main(){ mat4 model = mat4(iM0,iM1,iM2,iM3);\n"
     "  vec4 world = model*vec4(inPos,1.0); vW = world.xyz;\n"
     "  vN = mat3(model)*inNormal; vC = iColor;\n"
-    "  gl_Position = uProj*uView*world; }\n";
+    "  vec4 eye = uView*world; vZ = -eye.z;\n"
+    "  gl_Position = uProj*eye; }\n";
 static const char *kFS =
 #ifdef FPR_DESKTOP_GL
   "#version 330 core\n"
@@ -357,13 +358,16 @@ static const char *kFS =
     "#version 310 es\n"
     "precision highp float;\n"
 #endif
-    "in vec3 vN; in vec3 vW; in vec3 vC;\n"
+    "in vec3 vN; in vec3 vW; in vec3 vC; in float vZ;\n"
     "uniform vec3 uLightPos; uniform vec3 uLightColor;\n"
+    "uniform vec3 uAmbient; uniform vec3 uFog; uniform vec2 uFogRange;\n"
     "out vec4 fragColor;\n"
     "void main(){ vec3 n = normalize(vN);\n"
     "  vec3 l = normalize(uLightPos - vW);\n"
     "  float d = max(dot(n,l), 0.0);\n"
-    "  fragColor = vec4(0.15*vC + d*vC*uLightColor, 1.0); }\n";
+    "  vec3 c = vC*uAmbient + d*vC*uLightColor;\n"
+    "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
+    "  fragColor = vec4(mix(c, uFog, f), 1.0); }\n";
 
 static GLuint gfx_shader(GLenum type, const char *src) {
   GLuint s = glCreateShader(type);
@@ -600,6 +604,9 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   G.uView = glGetUniformLocation(G.prog, "uView");
   G.uLightPos = glGetUniformLocation(G.prog, "uLightPos");
   G.uLightColor = glGetUniformLocation(G.prog, "uLightColor");
+  G.uAmbient = glGetUniformLocation(G.prog, "uAmbient");
+  G.uFog = glGetUniformLocation(G.prog, "uFog");
+  G.uFogRange = glGetUniformLocation(G.prog, "uFogRange");
 
   /* offscreen target: surfaceless EGL has no default framebuffer */
   G.w = w; G.h = h;
@@ -956,23 +963,38 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
     proj = m4persp(fmilli(cam[2]), (float)G.w / (float)G.h, 0.1f, 100.0f);
   }
   v3 lp = {5, 5, 5}, lc = {1, 1, 1};
+  v3 sky = {0.06f, 0.07f, 0.09f}, amb = {0.15f, 0.15f, 0.15f};
+  float fogNear = 1000.0f, fogFar = 2000.0f; /* no sky entry: fog off */
   V lv = f[2];
   if (!ISINT(lv) && TID(lv) == T_LIST && ((hdr_t *)lv)->var == 1) {
     V *lf = (V *)((char *)lv + 8);
     V *l0 = fields(lf[0], 4, "gfx: light must be (pos, color)");
     lp = walk_v3(l0[0]); lc = walk_v3(l0[1]);
+    /* a second entry is the sky: (clearAndFogColor, ambientColor); with
+     * it, distance fog settles the far edge of the world into the sky
+     * between 30 and 78 units from the eye */
+    V rest = lf[1];
+    if (!ISINT(rest) && TID(rest) == T_LIST && ((hdr_t *)rest)->var == 1) {
+      V *rf = (V *)((char *)rest + 8);
+      V *l1 = fields(rf[0], 4, "gfx: sky must be (fogColor, ambient)");
+      sky = walk_v3(l1[0]); amb = walk_v3(l1[1]);
+      fogNear = 30.0f; fogFar = 78.0f;
+    }
   }
 
   glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
   glViewport(0, 0, G.w, G.h);
   glEnable(GL_DEPTH_TEST);
-  glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
+  glClearColor(sky.x, sky.y, sky.z, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glUseProgram(G.prog);
   glUniformMatrix4fv(G.uView, 1, GL_FALSE, view.m);
   glUniformMatrix4fv(G.uProj, 1, GL_FALSE, proj.m);
   glUniform3f(G.uLightPos, lp.x, lp.y, lp.z);
   glUniform3f(G.uLightColor, lc.x, lc.y, lc.z);
+  glUniform3f(G.uAmbient, amb.x, amb.y, amb.z);
+  glUniform3f(G.uFog, sky.x, sky.y, sky.z);
+  glUniform2f(G.uFogRange, fogNear, fogFar);
 
   for (int i = 0; i < G.nmeshes; i++) {
     mesh_t *m = &G.meshes[i];
@@ -1049,7 +1071,10 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   glUniformMatrix4fv(G.uView, 1, GL_FALSE, view.m);
   glUniformMatrix4fv(G.uProj, 1, GL_FALSE, proj.m);
   glUniform3f(G.uLightPos, 0.0f, 0.0f, z * 40.0f);
-  glUniform3f(G.uLightColor, 1.0f, 1.0f, 1.0f);
+  glUniform3f(G.uLightColor, 0.85f, 0.85f, 0.85f);
+  glUniform3f(G.uAmbient, 0.15f, 0.15f, 0.15f);
+  glUniform3f(G.uFog, 0.0f, 0.0f, 0.0f);
+  glUniform2f(G.uFogRange, 1000.0f, 2000.0f);
   for (int i = 0; i < G.nmeshes; i++) {
     mesh_t *m = &G.meshes[i];
     if (!m->nstage) continue;
