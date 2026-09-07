@@ -230,6 +230,17 @@ and a line on what its kind does; arrows browse, up and down swap
 faction.  The same card component the hand uses, so the screen doubles
 as a check that every card in the table renders.
 
+## Staying inside the box
+
+The 2D layer's text and cards used to run past their containers.  The
+walker now carries a clip rect per instance (docs/UI2D.md, `Clip`), so
+the hand is a centred carousel: cards beyond the edge are cut, the
+strip follows the cursor's card when the cursor moves, and the wheel
+scrolls it in place while the cursor is in the hand.  The Stats
+screen's list of games scrolls under the wheel the same way.  Text
+that would overflow -- the message line, the panel's status line, card
+names -- is capped and cut with "..".
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
@@ -242,6 +253,7 @@ as a check that every card in the table renders.
     1-5           jump to a column      space / E   end the turn
     P screenshot  S auto-screenshot at every animation midpoint   Q quit
     M music on / off (Sunrise Over The Spire starts with the game)
+    wheel         scrolls the hand (cursor in the hand) or the Stats list
     esc with nothing selected: pause (Resume / Restart / Cards / Stats / Keys / Quit)
     K keys, S stats, C cards: from the title, the pause menu and game over
     ENTER on the title screen begins (or continues the saved game; N deals

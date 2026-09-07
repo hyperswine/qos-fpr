@@ -90,7 +90,9 @@ and badges from the first four; the last is for rings and pads on a
 ground plane.  Flat meshes are single-sided: a translucent one blends
 once, which a translucent cube (front and back face) does not.
 
-Text is an entity too -- `Ent (mode, "string") pen 0 (em, em, 1) colour`
+`Ent "clip" pos 0 (w, h, 1) colour` is not a mesh but a state change:
+every instance and glyph after it in the list is cut to that rect (x,
+y in world), until a zero-sized clip lifts it.  Text is an entity too -- `Ent (mode, "string") pen 0 (em, em, 1) colour`
 -- drawn by a separate pass from a distance-field atlas compiled into
 the host (docs/UI2D.md, "The second face").  Mode 0 stands the string
 upright (Terra II's unit labels and damage tags), mode 1 lays it flat.

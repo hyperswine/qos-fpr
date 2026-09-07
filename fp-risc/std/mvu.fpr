@@ -41,7 +41,7 @@
 #
 # -- and events are DATA, not ints:
 #
-#   Ev  = ETick | EKey k | EMsg m a | EResize w h
+#   Ev  = ETick | EKey k | EMsg m a | EResize w h | EWheel dy dx  (the wheel, notches x10)
 #   Sub = STick ms | SKeys | SPort p
 #
 # Subscriptions are elm's: update hears ONLY what subs(model) asks for.
@@ -95,7 +95,7 @@
 # ============================================================================
 
 MC   = Type (MQuit | MLog s).
-Ev   = Type (ETick | EKey k | EMsg m a | EResize w h).
+Ev   = Type (ETick | EKey k | EMsg m a | EResize w h | EWheel dy dx).
 Sub  = Type (STick ms | SKeys | SPort p).
 App  = Type (App ini upd sbs vw).
 MApp = Type (MApp ini upd sk vw vl dn sbs).
@@ -228,7 +228,9 @@ drainEv me inp n acc kind a b = case kind == 0 of
         True -> drain me inp (n - 1) (EKey (ascii2code a) :: acc)
       | False -> case kind == 5 of
           True -> drain me inp (n - 1) (EResize a b :: acc)
-        | False -> drain me inp (n - 1) acc.
+        | False -> case kind == 6 of
+            True -> drain me inp (n - 1) (EWheel a b :: acc)
+          | False -> drain me inp (n - 1) acc.
 drainKey : unsafe Int -> Int -> Int -> List Ev -> Int -> Int -> List Ev .
 drainKey me inp n acc a b = case b == 1 of
     True -> drain me inp (n - 1) (EKey a :: acc)
