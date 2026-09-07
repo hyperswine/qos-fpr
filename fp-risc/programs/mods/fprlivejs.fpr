@@ -82,7 +82,8 @@ src u = "/* fprlive.js -- the FPRLive client.
   function argOf(el) \{
     if (el.hasAttribute('data-lit')) return el.getAttribute('data-lit');
     var a = el.getAttribute('data-arg');
-    return a ? (locals[a] ?? '') : '';
+    if (!a) return '';
+    return a.split(',').map(function (n) \{ return locals[n] ?? ''; }).join('|');
   }
 
   function wire() \{
