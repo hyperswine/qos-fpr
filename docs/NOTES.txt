@@ -57,3 +57,33 @@ Actual 2D UI using Scene2D drawn on top of the Scene3D, no need for raycasting a
 
 Interactive scripts for Sol haven't been tested much yet.
 Can use MVU for Sol Scripts if required. Rather than bolting it on afterwards.
+
+=================
+
+Memory Subsystem.
+
+Buddy allocator for managing memory in power-of-two blocks as the global allocator at the very bottom.
+Slab allocator for managing small objects efficiently on top of the buddy allocator, on a per actor basis.
+Each actor is an ACB (Actor Control Block) that manages its own memory using the slab allocator.
+The code in the ACB - the .program stuff should implicitly use the actor's slab allocator for memory management in a soft runtime
+So each actor basically has its own soft runtime with an Rc and Slab allocation mechanism basically integrated into its .program code
+rather than an external or explicit thing
+
+This basically means, when we call something like `x = Cons y z` this needs an Rc and slab allocation for the new cons cell.
+But this happens implicitly, and basically just links in the C backend allocator function almost like a vDSO but no virtual memory, just a direct ABI memory call to *alloc and *dealloc and *rc and *unrc.
+it can be seen like x_mem = (*vdso.alloc sizeof(Cons)); x_rc = (*vdso.rc x_mem); *x_mem = (Cons){y, z}; x = x_mem; x.
+The entire lifecycle of the Rc and memory is inserted into the .program, no extra "runtime" or "kernel" required
+
+=================
+
+Disk Subsystem.
+
+As described in DISK.txt
+
+The data is a recursive chunk based system.
+Each chunk has a header and body, with a hash
+"Files" are just a higher level concept managed by things like System.qa and Files.qa and typically map a URL to an ID
+By folding all the chunks with that ID, you can get the file's data
+
+Almost everything else is built ontop of this
+Any "driver code" is basically just a file managed within this recursive chunk system that can be loaded into memory as executable code for some service actor
