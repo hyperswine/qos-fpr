@@ -134,25 +134,41 @@ orphaned slabs so cross-actor references never dangle. v2:
 ## Phase 5 — delete the locks (each behind its owner)
 
 fpr_lock now backs off exponentially (done); the end-state deletes
-each site by giving the structure one owner:
+each site by giving the structure one owner.  **Stage 1 of Memory.qa
+LANDED** (docs/MEMORY.md, the allocator contract): one memory actor
+owns the buddy, every actor-context block is a request to it, the
+qosp app owns its arena (ABI v12; the host's buddy, grow callback and
+grow mutex are deleted), the grant pool / stack freelist / acb leak
+retire on every image with a buddy, and message slabs pack.
 
 | lock                      | site                    | owner in v2                         |
 |---------------------------|-------------------------|-------------------------------------|
-| buddy_lock                | hal/core/buddy.c        | Memory.qa mailbox (grants are rare) |
-| fpr_freelist_t mu ×4      | fpr.h (phase 1)         | one discipline now; each instance   |
-| (stacks/bkts/chb/grants)  |                         | retires behind Memory.qa with buddy |
-| acb_lock                  | hal/core/actors.c       | Memory.qa (acb carving is a grant)  |
+| buddy_lock                | hal/core/buddy.c        | the memory actor serialises the     |
+|                           |                         | CONTENDED case (LIVE); the lock is  |
+|                           |                         | the uncontended inline path's guard |
+|                           |                         | and the direct callers' (boot, the  |
+|                           |                         | reaper, IRQ delivery)               |
+| fpr_freelist_t mu ×2      | fpr.h (phase 1)         | bucket arrays and channel-block     |
+| (bkts/chb)                |                         | extras remain; stacks and grants    |
+|                           |                         | retired behind the memory actor     |
+| acb_lock                  | hal/core/actors.c       | the bump carve stays (acbs are      |
+|                           |                         | permanent); its refill is a request |
+|                           |                         | taken outside the lock              |
 | chb_lock (epoch limbo)    | hal/core/actors.c       | owner-hart epochs + messages        |
-| arc_lock                  | hal/core/runtime.c      | retires with phase 4                |
+| arc_lock                  | hal/core/runtime.c      | retires with phase 4 (the rehash    |
+|                           |                         | block is taken outside it already)  |
 | ledger/reap               | hal/core/actors.c       | owner-hart only + messages          |
-| grow_mu / store_mu        | qos/portable/main.c     | the storage/growth trampoline actor |
+| grow_mu                   | qos/portable/main.c     | DELETED (v12: the app owns the      |
+|                           |                         | arena)                              |
+| store_mu                  | qos/portable/main.c     | the storage trampoline actor        |
 | gfx statics cache         | hal/unix/gfx.c          | the render service actor (already   |
 |                           |                         | single-caller in practice)          |
 
 Rules that hold from today onward: an actor that must wait yields
 (receive / safepoint), never spins; any remaining CAS loop backs off
-exponentially (fpr_backoff); no new fpr_lock site lands without a row
-in this table naming the owner that will delete it.
+exponentially (fpr_backoff); no spinlock is held across a memory
+request (take first, lock, re-check); no new fpr_lock site lands
+without a row in this table naming the owner that will delete it.
 
 ## Phase 6 — masked filter (branch-light conditionals)
 

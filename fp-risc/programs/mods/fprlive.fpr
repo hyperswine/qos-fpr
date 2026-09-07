@@ -48,6 +48,7 @@ MV = use "../../std/mvu".
 G  = use "genview".
 LJ = use "fprlivejs".
 Core = use "coreutil".
+AC = use "../../std/actor".
 
 STick = MV.STick.
 MQuit = MV.MQuit.
@@ -363,8 +364,8 @@ serve cfg app =
   regLoop me (Rs cfg app m0 Nil 0 0).
 
 spawnAcc reg port cfg app tickMs = case Sys.harts Unit > 1 of
-    True -> spawnOn 1 (acceptor reg port cfg app tickMs)
-  | False -> spawn (acceptor reg port cfg app tickMs).
+    True -> AC.spawnWithOn 1 (AC.Dynamic 64) (acceptor reg port cfg app tickMs)
+  | False -> AC.spawnWith (AC.Dynamic 64) (acceptor reg port cfg app tickMs).
 
 regLoop : unsafe Int -> Rs -> String .
 regLoop me st =
@@ -481,7 +482,7 @@ actorFor : unsafe Int -> Int -> _ -> App -> List (Int, Int) -> Int -> Int -> (In
 actorFor reg port cfg app map cid k = afGo reg port cfg app map cid k map.
 afGo : unsafe Int -> Int -> _ -> App -> List (Int, Int) -> Int -> Int -> List (Int, Int) -> (Int, List (Int, Int)) .
 afGo reg port cfg app Nil cid k map =
-  a = spawnOn (hartFor k) (conn reg port cfg app cid);
+  a = AC.spawnWithOn (hartFor k) (AC.Dynamic 64) (conn reg port cfg app cid);
   (a, (cid, a) :: map).
 afGo reg port cfg app ((i, a) :: r) cid k map | i == cid = (a, map).
 afGo reg port cfg app (e :: r) cid k map = afGo reg port cfg app r cid k map.

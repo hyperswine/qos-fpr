@@ -336,8 +336,9 @@ scrOver = 3.
 scrKeys = 4.
 scrStats = 5.
 scrCards = 6.
+scrTerm = 7.
 
-frozen m = m.screen == scrPause or m.screen == scrKeys or m.screen == scrStats or m.screen == scrCards.
+frozen m = m.screen == scrPause or m.screen == scrKeys or m.screen == scrStats or m.screen == scrCards or m.screen == scrTerm.
 show m scr = { m | back = m.screen, screen = scr }.
 goBack m = { m | screen = m.back }.
 
@@ -349,7 +350,7 @@ keymap =
   (2, "A", "attack") :: (2, "O", "overwatch") :: (2, "R", "retreat") ::
   (2, "V", "advance") :: (2, "C", "charge (artillery)") :: (2, "F", "fire (artillery)") ::
   (3, "space", "end the turn") :: (3, "M", "music on / off") :: (3, "K", "keys") ::
-  (3, "S", "stats") :: (3, "C", "cards") :: (3, "P", "screenshot") :: (3, "Q", "quit") :: Nil.
+  (3, "S", "stats") :: (3, "C", "cards") :: (3, "T", "terminal") :: (3, "P / F1", "screenshot") :: (3, "Q", "quit") :: Nil.
 
 # ---- the profile ------------------------------------------------------------------
 # One append-only record on the disk (std/fs over the QLOG log at
@@ -526,7 +527,7 @@ initWith s0 s1 =
     gone = (0 - 1, 1000), dealt = 1000,
     screen = scrTitle, back = scrTitle, menu = 0, confirm = 0, ccur = (0, 0),
     prof = profEmpty, fsOn = 0, recs = Nil, called = 0, lostU = 0, kills = 0, dmg = 0,
-    cont = 0, dirty = 0, hs = 0, ss = 0 }.
+    cont = 0, dirty = 0, hs = 0, ss = 0, tin = "", tout = Nil }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -985,8 +986,12 @@ musicVol = 450.
 # evdev codes: 105 left 106 right 103 up 108 down 28 enter 1 esc 14 bksp
 # 57 space 18 e 16 q 25 p 30 a 24 o 19 r 46 c 33 f 47 v 2..6 columns
 
+# the terminal takes every key while it is open; T opens it anywhere
+key m k | m.screen == scrTerm = termKey m k.
+key m 20 = (cue (show { m | tin = "" } scrTerm) Sfx.pick, Nil).
 key m 16 = (cue { m | qt = 600, msg = "bye" } Sfx.close, Nil).
 key m 25 = ({ m | snap = m.snap + 1 }, Nil).
+key m 59 = ({ m | snap = m.snap + 1 }, Nil).
 key m 50 =
   on = 1 - m.music;
   _ = sndMusic musicFile (on * volNow { m | music = on });
@@ -1091,6 +1096,166 @@ facIds 0 = range 0 14.
 facIds f = range 20 35.
 range a b | a > b = Nil.
 range a b = a :: range (a + 1) b.
+
+# ---- the terminal: the model as a data console ----------------------------------------------
+# Typed from the evdev codes (so a replayed key file types too; the
+# live window's char events are ignored, one source of truth): letters,
+# digits, space . - = , /.  Enter runs the line, backspace edits, esc
+# closes.  Every line and its answer also go to the transcript.
+
+termKey m 1 = (cue (goBack m) Sfx.cancel, Nil).
+termKey m 59 = ({ m | snap = m.snap + 1 }, Nil).
+termKey m 28 = (runTerm m, Nil).
+termKey m 14 = ({ m | tin = dropLast m.tin }, Nil).
+termKey m k =
+  ch = keyChar k;
+  case strlen ch == 0 or strlen m.tin >= 60 of
+    True -> (m, Nil)
+  | False -> ({ m | tin = m.tin + ch }, Nil).
+dropLast s | strlen s == 0 = s.
+dropLast s = substr s 1 (strlen s - 1).
+keyChar k | k >= 2 and k <= 10 = chr (k + 47).
+keyChar 11 = "0".
+keyChar 57 = " ".
+keyChar 12 = "-".
+keyChar 52 = ".".
+keyChar 13 = "=".
+keyChar 51 = ",".
+keyChar 53 = "/".
+keyChar k = letterOf k "qwertyuiop" 16 (letterOf k "asdfghjkl" 30 (letterOf k "zxcvbnm" 44 "")).
+letterOf k row base dflt | k >= base and k < base + strlen row = chr (charAt row (k - base + 1)).
+letterOf k row base dflt = dflt.
+
+runTerm m =
+  line = m.tin;
+  (m2, out) = termRun m (twords line);
+  shown = ("> " + line) :: out;
+  { m2 | tin = "", tout = takeN (rev out Nil + (("> " + line) :: m.tout)) 14,
+         log = rev (shown |> List.map (fn s -> "term: " + s)) Nil + m2.log }.
+twords s = twGo s 1 (strlen s) Nil.
+twGo s i n acc | i > n = rev acc Nil.
+twGo s i n acc =
+  (w, j) = Core.wordAt s i n;
+  case strlen w == 0 of True -> twGo s j n acc | False -> twGo s j n (w :: acc).
+eq a b = Core.strEq a b.
+tnum s = Core.parseDigits s.
+
+# commands -> (model, output lines)
+termRun m Nil = (m, termHelp).
+termRun m (w :: r) | eq w "help" = (m, termHelp).
+termRun m (w :: r) | eq w "ls" = (m, "me.hq me.stock en.hq en.stock env tno turn seed music auto hs ss cur zone" ::
+                                     "me.hand en.hand me.deck en.deck prof.played prof.won prof.lost" ::
+                                     "me.fwd.N en.rear.N (a unit; .hp .atk .ready .mode .down .chg .vet to set)" :: Nil).
+termRun m (w :: p :: r) | eq w "get" = (m, ("{p} = " + getP m (parts p)) :: Nil).
+termRun m (w :: p :: v :: r) | eq w "set" = setP m (parts p) (tnum v).
+termRun m (w :: side :: r) | eq w "hand" = (m, handText m (sideNo side) :: Nil).
+termRun m (w :: r) | eq w "board" = (m, rowText m 0 1 :: rowText m 0 2 :: rowText m 1 1 :: rowText m 1 2 :: Nil).
+termRun m (w :: side :: id :: r) | eq w "deal" = dealCmd m (sideNo side) (tnum id).
+termRun m (w :: side :: z :: c :: id :: r) | eq w "place" = placeCmd m (sideNo side) (tnum z) (tnum c) (tnum id).
+termRun m (w :: side :: z :: c :: r) | eq w "clear" = clearCmd m (sideNo side) (tnum z) (tnum c).
+termRun m (w :: side :: n :: r) | eq w "hit" = (damageHq m (sideNo side) (tnum n), "HQ of {side} hit for {tnum n}" :: Nil).
+termRun m (w :: r) = (m, "unknown: {w} (help)" :: Nil).
+termHelp =
+  "get PATH        set PATH N       ls (the paths)" ::
+  "hand me|en      board            deal me|en CARD" ::
+  "place me|en ZONE COL CARD        clear me|en ZONE COL" ::
+  "hit me|en N (the rules' HQ damage: victory and defeat apply)" :: Nil.
+sideNo s | eq s "en" = 1.
+sideNo s = 0.
+parts s = ptGo s 1 1 (strlen s) Nil.
+ptGo s st i n acc | i > n = rev (substr s st (i - st) :: acc) Nil.
+ptGo s st i n acc | charAt s i == 46 = ptGo s (i + 1) (i + 1) n (substr s st (i - st) :: acc).
+ptGo s st i n acc = ptGo s st (i + 1) n acc.
+
+# paths, read
+getP m (a :: Nil) | eq a "env" = "{m.env}".
+getP m (a :: Nil) | eq a "tno" = "{m.tno}".
+getP m (a :: Nil) | eq a "turn" = "{m.turn}".
+getP m (a :: Nil) | eq a "seed" = "{m.seed}".
+getP m (a :: Nil) | eq a "music" = "{m.music}".
+getP m (a :: Nil) | eq a "auto" = "{m.auto}".
+getP m (a :: Nil) | eq a "hs" = "{m.hs}".
+getP m (a :: Nil) | eq a "ss" = "{m.ss}".
+getP m (a :: Nil) | eq a "cur" = "{m.cur}".
+getP m (a :: Nil) | eq a "zone" = "{m.zone}".
+getP m (a :: Nil) | eq a "screen" = "{m.back}".
+getP m (a :: b :: Nil) | eq a "prof" and eq b "played" = "{m.prof.played}".
+getP m (a :: b :: Nil) | eq a "prof" and eq b "won" = "{m.prof.won}".
+getP m (a :: b :: Nil) | eq a "prof" and eq b "lost" = "{m.prof.lost}".
+getP m (a :: b :: Nil) | (eq a "me" or eq a "en") and eq b "hq" = p = sideOf m (sideNo a); "{p.hq}".
+getP m (a :: b :: Nil) | (eq a "me" or eq a "en") and eq b "stock" = p = sideOf m (sideNo a); "{p.stock}".
+getP m (a :: b :: Nil) | (eq a "me" or eq a "en") and eq b "hand" = handText m (sideNo a).
+getP m (a :: b :: Nil) | (eq a "me" or eq a "en") and eq b "deck" = p = sideOf m (sideNo a); "{List.len p.deck} cards".
+getP m (a :: b :: c :: Nil) | (eq a "me" or eq a "en") and (eq b "fwd" or eq b "rear") = unitText (slotOf (sideOf m (sideNo a)) (zoneNo b) (tnum c - 1)).
+getP m (a :: b :: c :: f :: Nil) | (eq a "me" or eq a "en") and (eq b "fwd" or eq b "rear") = "{unitField (slotOf (sideOf m (sideNo a)) (zoneNo b) (tnum c - 1)) f}".
+getP m p = "? (ls lists the paths)".
+zoneNo b | eq b "fwd" = 1.
+zoneNo b = 2.
+
+# paths, written (Ints)
+setP m (a :: Nil) v | eq a "env" = ({ m | env = Int.max 0 (Int.min 10 v) }, "env = {Int.max 0 (Int.min 10 v)}" :: Nil).
+setP m (a :: Nil) v | eq a "tno" = ({ m | tno = v }, "tno = {v}" :: Nil).
+setP m (a :: Nil) v | eq a "seed" = ({ m | seed = v }, "seed = {v}" :: Nil).
+setP m (a :: Nil) v | eq a "music" = ({ m | music = v }, "music = {v}" :: Nil).
+setP m (a :: Nil) v | eq a "auto" = ({ m | auto = v }, "auto = {v}" :: Nil).
+setP m (a :: Nil) v | eq a "hs" = ({ m | hs = v }, "hs = {v}" :: Nil).
+setP m (a :: Nil) v | eq a "ss" = ({ m | ss = v }, "ss = {v}" :: Nil).
+setP m (a :: b :: Nil) v | (eq a "me" or eq a "en") and eq b "hq" =
+  p = sideOf m (sideNo a);
+  (setSide m (sideNo a) { p | hq = v }, "{a}.hq = {v}" :: Nil).
+setP m (a :: b :: Nil) v | (eq a "me" or eq a "en") and eq b "stock" =
+  p = sideOf m (sideNo a);
+  (setSide m (sideNo a) { p | stock = v }, "{a}.stock = {v}" :: Nil).
+setP m (a :: b :: c :: f :: Nil) v | (eq a "me" or eq a "en") and (eq b "fwd" or eq b "rear") =
+  s = sideNo a;
+  z = zoneNo b;
+  col = tnum c - 1;
+  p = sideOf m s;
+  u = slotOf p z col;
+  case alive u of
+    False -> (m, "no unit at {a}.{b}.{c}" :: Nil)
+  | True -> (setSide m s (setSlot p z col (setUnitField u f v)), "{a}.{b}.{c}.{f} = {v}" :: Nil).
+setP m p v = (m, "cannot set that (ls lists the paths)" :: Nil).
+unitField u f | eq f "hp" = u.hp.
+unitField u f | eq f "atk" = u.atk.
+unitField u f | eq f "ready" = u.ready.
+unitField u f | eq f "mode" = u.mode.
+unitField u f | eq f "down" = u.down.
+unitField u f | eq f "chg" = u.chg.
+unitField u f | eq f "vet" = u.vet.
+unitField u f = 0 - 1.
+setUnitField u f v | eq f "hp" = { u | hp = v }.
+setUnitField u f v | eq f "atk" = { u | atk = v }.
+setUnitField u f v | eq f "ready" = { u | ready = v }.
+setUnitField u f v | eq f "mode" = { u | mode = v }.
+setUnitField u f v | eq f "down" = { u | down = v }.
+setUnitField u f v | eq f "chg" = { u | chg = v }.
+setUnitField u f v | eq f "vet" = { u | vet = v }.
+setUnitField u f v = u.
+unitText u | alive u = "{cName (uCard u)} {u.atk}/{u.hp} ready {u.ready} mode {u.mode} down {u.down} chg {u.chg} vet {u.vet}".
+unitText u = "empty".
+handText m s =
+  p = sideOf m s;
+  Core.joinWith " " (p.hand |> List.map (fn k -> "{k}:{cName (cardOf k)}")).
+rowText m s z =
+  p = sideOf m s;
+  who = case s == 0 of True -> "me" | False -> "en";
+  who + "." + (case z == 1 of True -> "fwd" | False -> "rear") + ": " +
+  Core.joinWith "  " (rowOf p z |> List.map (fn u -> case alive u of True -> "{cName (uCard u)} {u.atk}/{u.hp}" | False -> "-")).
+dealCmd m s id | strlen (cName (cardOf id)) == 1 = (m, "no card {id}" :: Nil).
+dealCmd m s id =
+  p = sideOf m s;
+  (setSide m s { p | hand = p.hand + (id :: Nil) }, "dealt {cName (cardOf id)} to {sideName s}" :: Nil).
+placeCmd m s z c id | z < 1 or z > 2 or c < 1 or c > 5 = (m, "place me|en ZONE(1 fwd, 2 rear) COL(1-5) CARD" :: Nil).
+placeCmd m s z c id | strlen (cName (cardOf id)) == 1 = (m, "no card {id}" :: Nil).
+placeCmd m s z c id =
+  p = sideOf m s;
+  u = mkU (cardOf id) 0;
+  (setSide m s (setSlot p z (c - 1) { u | born = 1000, ready = 1 }), "placed {cName (cardOf id)} at {sideName s} {zoneName z} {c}" :: Nil).
+clearCmd m s z c | z < 1 or z > 2 or c < 1 or c > 5 = (m, "clear me|en ZONE COL" :: Nil).
+clearCmd m s z c =
+  p = sideOf m s;
+  (setSide m s (setSlot p z (c - 1) noU), "cleared {sideName s} {zoneName z} {c}" :: Nil).
 
 # esc: back to where the selection started -- the attacker's slot, the
 # card being placed, or just the selection cleared
@@ -1585,6 +1750,7 @@ keyLineW w k what =
       (Box (Row :: W w :: Pad 3 :: Round 5 :: Bg chip :: Center :: Mid :: Nil) (t 11 ink k :: Nil) ::
        t 12 inkDim what :: Nil).
 
+uiTree m | m.screen == scrTerm = termTree m.
 uiTree m | m.screen == scrCards = cardsTree m.
 uiTree m | m.screen == scrKeys = keysTree m.
 uiTree m | m.screen == scrStats = statsTree m.
@@ -1663,6 +1829,15 @@ kindText cd | cKind cd == 1 = "a rear unit: earns supply every turn".
 kindText cd | cKind cd == 2 = "charges, then fires past cover".
 kindText cd | cSoft cd == 1 = "soft: the ENV track bites it".
 kindText cd = "hard: shrugs off ENV, drains supply".
+
+# the terminal: the transcript of the session so far, the line being typed
+termTree m =
+  caret = case tri 500 m.ms > 0 of True -> "_" | False -> " ";
+  card = Box (Col :: W 760 :: Pad 20 :: Gap 10 :: Round 16 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+             (Box (Row :: Mid :: Nil) (t 26 yellow "TERMINAL" :: grow :: t 12 inkDim "the model, live -- help lists the commands, esc closes" :: Nil) ::
+              Box (Col :: Gap 3 :: H 300 :: Clip :: Nil) (rev m.tout Nil |> List.map (fn l -> tE 13 ink 720 l)) ::
+              Box (Row :: Pad 8 :: Round 8 :: Bg chip :: Nil) (tE 15 white 720 ("> " + m.tin + caret) :: Nil) :: Nil);
+  Box (Col :: W uiW :: H uiH :: Center :: Mid :: Nil) (card :: Nil).
 
 # the Keys screen: the key table in three columns
 keysTree m =

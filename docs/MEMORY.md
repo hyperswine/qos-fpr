@@ -65,30 +65,112 @@ replaces, file:line. Everything else is live.
 
 ## The allocator contract
 
-* **Buddy (Memory.qa's mechanism).** One global power-of-two buddy
-  hands out grants — process slots, growth, and the backing for the
-  fixed-block needs (stacks, acbs, channel blocks). It implements all
-  three ops: `buddy_alloc`, `buddy_realloc` (in place whenever the
-  block is the low half and its buddy is free — the natural substrate
-  for realloc-by-doubling), `buddy_free`.
-* **The one freelist discipline.** Every recycled-block pool in the
-  runtime is the same structure — `fpr_freelist_t`: a locked LIFO of
-  free blocks, each node carrying its capacity, taken first-fit
-  (fpr.h; stacks, bucket arrays, channel-block extras, and the
-  variable-size grant pool are its four instances). What stays at a
-  call site is POLICY: where a miss fills from, telemetry, and any
-  deferred-reuse discipline layered on top (the chblk epoch limbo).
-* **Per-actor pool.** An actor's grant becomes a bump slab chain plus
+* **Buddy, owned by the memory actor (Memory.qa, stage 1 -- LIVE).**
+  The image that runs `buddy_init` -- a machine boot, or the qosp app
+  over the arena the host hands it whole (ABI v12: nothing past the
+  loaded image belongs to the host any more) -- spawns ONE actor that
+  owns the buddy, second in hart 0's queue after actor 0.  Every block
+  the runtime needs from actor context is a message to it: pool
+  slabs, message slabs, stacks, the acb and channel-block carves, a
+  ring that doubles, the ARC table's next size.  A request is an
+  Int (`bytes<<1|1` to take, `ptr>>1` to give -- buddy pointers are
+  8-aligned, the low bit tells them apart), so the request path
+  allocates nothing; the answer to a take is a store into the
+  requester's acb plus a wake, never a mailbox message, so a full
+  mailbox cannot lose it and the requester's open borrows are not
+  drained by a receive.  Frees are one-way.  The actor is the
+  SERIALISATION POINT, not the path every block takes: a requester
+  that finds the buddy lock free serves itself on the spot
+  (`buddy_alloc_try`; `Sys.memInfo` counts these as inline) and only
+  one that finds it held queues on the actor -- a round trip through
+  one actor on one hart costs more than the allocation and stalls
+  whenever that hart is inside a long C section (the register copying
+  a big model), which showed up as every other actor's allocations
+  serialising behind it.  The actor is admitted ahead of the backlog
+  (`prio`) so a queued request never waits on a reservoir draw.
+  Contexts with no actor to park (boot, the hart loop's reaper, IRQ
+  delivery) and the memory actor itself call the buddy directly.  No
+  spinlock is ever held across a queued request: the sites that used
+  to allocate under one (ring growth under the receiver's producer
+  lock, the ARC rehash under `arc_lock`, the acb bump refill) take the
+  block first, lock, and re-check.  The buddy implements all three
+  ops: `buddy_alloc`, `buddy_realloc` (in place whenever the block is
+  the low half and its buddy is free -- the natural substrate for
+  realloc-by-doubling), `buddy_free`.
+* **A dead actor's blocks go home.**  The reaper frees the stack and
+  the escape-free slabs straight back to the memory actor; the
+  process-mode recyclers that existed because a loader never took
+  grants back (the grant pool, the stack freelist and its self-topping,
+  the acb bump arena's leak) are gone from every image that owns a
+  buddy.  What remains recycled: the bucket-array freelist (type-
+  stable, tiny) and the channel-block epoch limbo (a stale send may
+  still be reading a dead actor's rings -- docs/SCHEDULER.txt).  A
+  loaded process WITHOUT a buddy (the legacy nested-scheduler launch
+  on virt) keeps the grant path and its recyclers; that is the last
+  `fpr_grow_memory` user.
+* **Message slabs are packed.**  `send` deep-copies into the SENDER'S
+  message slab (64 KiB, the buddy's floor) until it is full, then
+  starts another; a message too big for a fresh one gets a slab of its
+  own.  A slab's lifetime is two counts under `arc_lock`: `escaped`
+  (promoted roots still live) and `holds` -- the sender while it is
+  still packing, plus one per DROP of a root in the slab, held until
+  that dropper's next receive (its borrow window: the compiler's
+  `drop m` lands right after the destructure while the arm still
+  reads the children; `fpr_drop_park`).  Every drop takes a hold, not
+  only the last escapee's -- with many messages in one slab, an
+  earlier dropper's window is still open when the last root goes,
+  and the first cut freed the slab under it (POS v1 died on a string
+  that was no longer one).  The slab goes home when both counts are
+  zero.  Three thousand forty-byte tuples in flight cost a few slabs,
+  not 750 MiB, and a stream of sends costs one block per 64 KiB, not
+  per send.  tests/msgpack.fpr is the contract: four producers, a
+  hub that verifies after its autodrop and relays by sendLinear, a
+  sink that verifies again, churners dying underneath.
+* **Per-actor pool.** An actor's blocks become a bump slab chain plus
   two recycling tiers, both exact-fit: the size-class buckets below
-  the 8 KiB ceiling and the bigfree LIFO above it. Death returns the
-  chain wholesale — an actor's memory lifetime IS the actor's
-  lifetime. Long-lived actors `Sys.poolReset` at loop boundaries.
+  the 8 KiB ceiling and the bigfree LIFO above it.  Death returns the
+  chain wholesale -- an actor's memory lifetime IS the actor's
+  lifetime.  Long-lived actors `Sys.poolReset` at loop boundaries.
   `fpr_realloc` is the pool's third op: copy-based, with the freed
   predecessor recycling exactly, so a doubling ladder reuses its own
   history. **[pending: in-place growth for bulk storage arrives when
-  columns sit on Memory.qa's buddy, where buddy_realloc provides it]**
-* Nothing else. A recycler that is not an `fpr_freelist_t` instance,
-  a pool tier, or buddy itself is debt.
+  columns sit on the buddy directly, where buddy_realloc provides it]**
+* **The ledger.**  `Sys.memInfo 0` is `[arena KiB, free KiB,
+  queued requests, waits, direct, frees, denied, inline]`;
+  `Sys.growLog` still attributes every block to its site (slab, msg,
+  stack, ...).
+  tests/memory.fpr is the contract: two hundred workers come and go
+  and the free space is back within the permanent residue (acbs,
+  channel blocks, the ARC table), with the requests served by the
+  actor and none denied -- on qosp and on the bare-metal kernel.
+* Nothing else. A recycler that is not one of the two named above, a
+  pool tier, or buddy itself is debt.
+
+## App images: many processes, one runtime (Memory.qa stage 2)
+
+With the memory actor owning the arena, a second app image is just
+more actors on the same plane: `LD.launch me ld "appa"` (std/
+loader.fpr) reads `apps/appa.qa` off the disk, attaches it through the
+same host gate every module passes (the shell-stamp check), finds its
+`app` export and spawns it under a FRESH pid with `Sys.spawnApp` --
+the shell's actors stay pid 0, the app's root gets the next pid and
+everything it spawns inherits it (`myPid`, `Sys.actInfo`).  The app's
+first message is its launcher's handle; its table is popped straight
+back out of the module registry (the registry is the module chain
+that hot-swaps gate against; an app is a process, not a binding), and
+its code stays in its window.  Nothing is recorded: apps are runtime
+state, a reboot starts none of them -- the next step, when it is
+wanted, is a `sys/apps` record the loader replays like `sys/live`.
+tests/apps.fpr is the contract: two images from one disk, distinct
+pids, a helper inheriting its app's pid, both reporting back, and the
+free space back where it was once they exit.
+
+What stage 2 does NOT do yet: an app is linked at one of the eight
+fixed 4 MiB plugin sub-slots (no relocation), so eight images is the
+ceiling and each must be built for a distinct slot; a launched app
+shares the shell's capability set (per-pid caps are the next gate);
+and isolation is cooperative -- the pid is an accounting label on the
+one plane, not an address space.
 
 ## Vectors: contiguous, branch-light
 
@@ -107,7 +189,11 @@ frame-boundary event, not a per-element decision. **[pending]**
 
 ## Concurrency: nothing blocks, nothing spins hot
 
-* An actor that must wait YIELDS (receive, fuel safepoint) — it never
+* An actor that must wait YIELDS (receive, fuel safepoint, and now
+  `Sys.sleepUs`: a parked sleep with a deadline on its hart's sleeper
+  list, woken by the hart loop — it used to nanosleep the hart
+  THREAD on qosp, so every actor sharing that hart waited out the
+  sleep; a sleeper is not a deadlock to the detector) — it never
   holds a core.
 * Any CAS retry loop backs off EXPONENTIALLY (capped) before trying
   again — contention degrades bandwidth, never livelocks a hart.

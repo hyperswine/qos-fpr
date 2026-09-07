@@ -65,12 +65,21 @@ solBuiltins =
       ("read", scheme [0, 1] (TFn (sv 0) (sv 1))),
       ("write", scheme [0, 1] (TFn (sv 0) (TFn (sv 1) tUnit))),
       -- the actor shim (VM.hs): same schemes as the AOT tier's table
-      ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
-      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
-      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("send", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
+      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
+      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
       ("receive", scheme [0] (TFn tInt (sv 0))),
       ("receiveFrom", scheme [0] (TFn tInt (TFn tInt (sv 0)))),
       ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
+      -- the mailbox policy (spawnCap) and placement are accepted and
+      -- ignored here: the shim's actors are Haskell threads with
+      -- unbounded queues (docs/MAILBOX.md)
+      ("spawnCap", scheme [0] (TFn tInt (TFn tInt (TFn (TFn tInt (sv 0)) tInt)))),
+      ("spawnCapOn", scheme [0] (TFn tInt (TFn tInt (TFn tInt (TFn (TFn tInt (sv 0)) tInt))))),
+      ("spawnOn", scheme [0] (TFn tInt (TFn (TFn tInt (sv 0)) tInt))),
+      ("Sys.spawnApp", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
+      ("timeNow", scheme [0] (TFn (sv 0) tInt)),
+      ("Sys.memInfo", mono (TFn tInt (tList tInt))),
       ("myself", mono (TFn tInt tInt)),
       ("yield", scheme [0] (TFn tInt (sv 0))),
       ("kill", mono (TFn tInt tUnit)),

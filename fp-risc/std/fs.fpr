@@ -22,10 +22,11 @@
 
 QL = use "../programs/mods/qlog".
 SVC = use "../programs/mods/svc".
+AC = use "actor".
 
 # spawn the service on a device the caller opened; the returned actor
 # handle IS the filesystem from here on
-serve dev = spawn (QL.actor dev).
+serve dev = AC.spawnWith (AC.Dynamic 64) (QL.actor dev).
 
 rpc : unsafe Int -> Int -> Int -> String -> String -> Result String String .
 rpc me fs tag url pay =

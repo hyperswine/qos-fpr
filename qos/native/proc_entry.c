@@ -79,7 +79,8 @@ static V proc_root(V self) {
   res->tid = T_RESULT;
   res->var = 0; /* Ok */
   *(V *)((char *)res + 8) = r;
-  fpr_send_as((uw)self, g_reply, (V)res);
+  for (int t = 0; !fpr_sent(fpr_send_as((uw)self, g_reply, (V)res)); t++)
+    if (t > 1000) fpr_cpanic("process: the reply mailbox refused the result");
   if (g_on_exit) g_on_exit();
   return (V)&fpr_unit;
 }
@@ -162,6 +163,7 @@ V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_b
     sl->next = 0;
     sl->owner = &h->pool;
     sl->escaped = 0;
+    sl->holds = 0;
     sl->hp = (char *)(sl + 1);
     sl->end = (char *)heap_base + heap_size;
     h->pool.cur = sl;

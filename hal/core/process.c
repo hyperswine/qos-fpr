@@ -65,6 +65,15 @@ FPR_FN(fpr_g_Sys_x2ebindApp, g_sys_bind_app, 1);
  * The old scheme here — a Tup2 header carrying 4 slots — was exactly
  * the silent-corruption ABI the compiler now rejects at compile time;
  * this was its last C-side survivor. */
+/* the storage actor's mailbox is Dynamic; a refusal here means the
+ * machine is out of memory, and a syscall cannot proceed without it */
+static void send_or_die(uw key, V to, V msg) {
+  for (int t = 0; t < 1000; t++) {
+    if (fpr_sent(fpr_send_as(key, to, msg))) return;
+    __asm__ volatile("" ::: "memory");
+  }
+  fpr_cpanic("syscall: the storage actor's mailbox refused the request");
+}
 static V mkrpc(V a, V b, V c, V d) {
   if (!g_rpc_tid) fpr_cpanic("store call before bindStore prototype");
   hdr_t *t = (hdr_t *)fpr_alloc(8 + 4 * sizeof(uw));
@@ -115,12 +124,12 @@ sw qos_store_call(uw tag, const char *pay, uw plen, char *out, uw outcap) {
      * the hart; no mailbox spin, no hart-1 assumption) */
     void *me = fpr_hart()->current;
     V msg = mkrpc((V)me, TAG((sw)tag), urlv, payv);
-    fpr_send_as((uw)me, g_store_actor, msg);
+    send_or_die((uw)me, g_store_actor, msg);
     r = fpr_receive_res_c((V)me);
   } else {
     V mb = (V)fpr_syscall_mailbox();
     V msg = mkrpc(mb, TAG((sw)tag), urlv, payv);
-    fpr_send_as((uw)mb, g_store_actor, msg);
+    send_or_die((uw)mb, g_store_actor, msg);
     r = fpr_syscall_wait_result();
   }
   /* r = Ok s | Err s (builtin Result, variant 0/1), field at +8 */

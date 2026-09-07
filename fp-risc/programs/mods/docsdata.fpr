@@ -52,7 +52,7 @@ still DONATE its ready work to the steal FIFO under load, which
 updates the owner hart. Pin services that own devices; let compute
 migrate.
 
-**send : actor -> msg -> Unit** — enqueue on the per-sender SPSC
+**send : actor -> msg -> Result Unit String** — Ok when queued, Err "mailbox full" / "dead actor" otherwise (docs/MAILBOX.md); enqueue on the per-sender SPSC
 channel; promotes the message into shared ARC.
 ```
 u = send boss (n + 1);
@@ -281,7 +281,9 @@ scene, same bytes.
 
 **Sys.init / Sys.harts / Sys.caps / Sys.arenaFree / Sys.loadImageAt /
 Sys.bindApp / Sys.bindStore / Sys.storeReq** — System.qa's C
-surface. **Apps.list / Apps.read** — the built-in .qa catalogue.
+surface. **Sys.memInfo** — the memory actor's ledger (arena, free,
+requests, waits, direct, frees, denied, blocks). **Sys.spawnApp** —
+spawn under a fresh pid (the loader's `launch`). **Apps.list / Apps.read** — the built-in .qa catalogue.
 **Mod.resolve / Mod.has / Mod.fn** — hash-addressed module lookup at
 runtime.
 ```

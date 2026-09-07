@@ -185,21 +185,38 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
 
   fpr_hart_t *h = &fpr_harts[0];
   h->id = 0;
-  /* the loader's grant IS this process's first slab -- same pool
-   * machinery as a machine boot, different lower allocator (grants
-   * instead of buddy; fpr_alloc's process branch), verbatim the
-   * proc_entry.c shape */
+  /* ---- the arena is OURS (ABI v12) ---------------------------------
+   * The host mapped it and loaded us at its start; everything past the
+   * image is handed over raw, and this image's buddy runs over it --
+   * the same lower allocator a machine boot has, behind the same
+   * memory actor (docs/MEMORY.md).  The plugin window is a fixed
+   * address range inside the span: reserved here so no block ever
+   * lands where a runtime-loaded library will.  Hart 0's first slab is
+   * then an ordinary block, taken directly (no actor exists yet). */
+  {
+    uw minb = 64u * 1024; /* buddy's BUDDY_MIN_BLOCK: the seed alignment */
+    uw lo = ((uw)boot->arena_base + (minb - 1)) & ~(minb - 1);
+    uw hi = (uw)boot->arena_base + boot->arena_size;
+    if (!boot->arena_size || hi <= lo + 4 * minb) return -1;
+    buddy_init((void *)lo, hi - lo);
+    if (QOS_PLUG_BASE >= lo && QOS_PLUG_BASE + QOS_PLUG_SIZE <= hi &&
+        !buddy_reserve_range((void *)QOS_PLUG_BASE, QOS_PLUG_SIZE))
+      return -1;
+    fpr_mem_own = 1;
+  }
   {
     static void *boot_bkts[FPR_NBUCKETS]; /* hart 0 lives forever */
     fpr_pool_init(&h->pool, boot_bkts);
   }
   {
-    fpr_slab_t *sl = (fpr_slab_t *)boot->heap_base;
+    fpr_slab_t *sl = (fpr_slab_t *)fpr_mem_take_direct(256u * 1024);
+    if (!sl) return -1;
     sl->next = 0;
     sl->owner = &h->pool;
     sl->escaped = 0;
+    sl->holds = 0;
     sl->hp = (char *)(sl + 1);
-    sl->end = (char *)boot->heap_base + boot->heap_size;
+    sl->end = (char *)sl + buddy_block_usable_size(sl);
     h->pool.cur = sl;
   }
   h->current = 0;
@@ -224,8 +241,8 @@ int64_t qos_app_entry(const qos_boot_t *boot, char *result_out,
    * "sys/panic\n<msg>" record -- the restart loop stops eating its own
    * evidence (Disk.qa shows the record on the next boot). */
   fpr_panic_persist = qos_panic_persist;
-  fpr_grow_memory = (fpr_grant_t (*)(uw))boot->grow; /* layout-identical */
-  fpr_is_process = 1;
+  fpr_grow_memory = 0; /* v12: no host grants -- the arena is ours */
+  fpr_is_process = 1;  /* still a hosted process: the exit returns to the host */
   fpr_process_done = 0;
 
   /* ---- multi-hart (ABI v2): resolve, init, start ------------------

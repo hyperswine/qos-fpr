@@ -107,6 +107,7 @@ void fpr_rt_init(void) {
 #endif
     uw base = ((uw)_heap_start + (minb - 1)) & ~(uw)(minb - 1);
     buddy_init((void *)base, (uw)_heap_end - base);
+    fpr_mem_own = 1; /* this image runs the buddy: the memory actor follows */
   }
   fpr_set_tp(&fpr_harts[0]);
   fpr_rvv_enable();
@@ -237,7 +238,12 @@ const char *fpr_growsite_name(uw site) {
 extern uw fpr_current_id(void);
 
 fpr_grant_t fpr_grow_counted(uw want, uw site) {
-  fpr_grant_t g = fpr_grow_memory ? fpr_grow_memory(want) : (fpr_grant_t){0, 0};
+  fpr_grant_t g = {0, 0};
+  if (fpr_mem_own) { /* the memory actor's buddy (fpr.h) */
+    g.ptr = fpr_mem_take(want);
+    if (g.ptr) g.size = buddy_block_usable_size(g.ptr);
+  } else if (fpr_grow_memory)
+    g = fpr_grow_memory(want); /* a loaded process: the loader's grant */
   if (g.ptr) {
     __atomic_add_fetch(&fpr_grow_count, 1, __ATOMIC_RELAXED);
     __atomic_add_fetch(&fpr_grow_bytes, g.size, __ATOMIC_RELAXED);
@@ -277,19 +283,28 @@ static fpr_slab_t *grant_take(uw total) {
 }
 
 static void grant_put(fpr_slab_t *sl); /* fwd: defined just below */
-/* the actual release of an ownerless (message) slab: recycler in
- * process mode, buddy on a machine boot.  Split out so actors.c's
- * deferred-drop list can call it at drain time. */
+/* a slab goes home: to the memory actor on an image that owns the
+ * buddy, to the grant recycler in a loaded process (the loader never
+ * takes grants back), else straight to buddy.  Safe from any context
+ * and under any lock: the memory actor's path never waits. */
+static void slab_home(fpr_slab_t *sl) {
+  if (fpr_mem_own) fpr_mem_give(sl);
+  else if (fpr_is_process) grant_put(sl);
+  else buddy_free(sl);
+}
+/* the actual release of an ownerless (message) slab.  Split out so
+ * actors.c's deferred-drop list can call it at drain time. */
 void fpr_slab_release(fpr_slab_t *sl) {
   if (fpr_sched) { fpr_sched->slab_release(sl); return; }
-  if (fpr_is_process) grant_put(sl);
-  else buddy_free(sl);
+  slab_home(sl);
 }
 
 /* a fresh pool slab from THIS image's lower allocator -- the shared
- * plane's growth path for routed process pools (fpr.h fpr_sched_t) */
+ * plane's growth path for routed process pools (fpr.h fpr_sched_t);
+ * the caller is the process's actor, so the request parks it like
+ * any other */
 fpr_slab_t *fpr_slab_new(uw want) {
-  fpr_slab_t *sl = (fpr_slab_t *)buddy_alloc(want);
+  fpr_slab_t *sl = (fpr_slab_t *)(fpr_mem_own ? fpr_mem_take(want) : buddy_alloc(want));
   if (!sl) return 0;
   sl->end = (char *)sl + buddy_block_usable_size(sl);
   return sl;
@@ -314,14 +329,19 @@ static fpr_freelist_t bkt_fl;
 void **fpr_bkt_take(void) {
   bktblk_t *k = (bktblk_t *)fpr_fl_take(&bkt_fl, sizeof(bktblk_t));
   if (!k) {
-    if (fpr_is_process && fpr_grow_memory) {
 #ifdef FPR_GROWTRACE
-      fpr_growlog("bkt", sizeof(bktblk_t));
+    fpr_growlog("bkt", sizeof(bktblk_t));
 #endif
-      fpr_grant_t g = fpr_grow_counted(sizeof(bktblk_t), 3); /* buckets */
-      k = (g.ptr && g.size >= sizeof(bktblk_t)) ? (bktblk_t *)g.ptr : 0;
-    } else
-      k = (bktblk_t *)buddy_alloc(sizeof(bktblk_t));
+    /* a 4 KiB array from a 64 KiB-floor allocator: carve the whole
+     * block and seed the recycler with the rest (a block per array
+     * left 6 MiB behind a hundred dead workers) */
+    fpr_grant_t g = fpr_grow_counted(sizeof(bktblk_t), 3); /* buckets */
+    if (g.ptr && g.size >= sizeof(bktblk_t)) {
+      k = (bktblk_t *)g.ptr;
+      for (char *q = (char *)g.ptr + sizeof(bktblk_t); q + sizeof(bktblk_t) <= (char *)g.ptr + g.size;
+           q += sizeof(bktblk_t))
+        fpr_fl_put(&bkt_fl, q, sizeof(bktblk_t));
+    }
   }
   if (!k) return 0;
   for (int i = 0; i < FPR_NBUCKETS; i++) k->b[i] = 0;
@@ -380,22 +400,28 @@ V fpr_alloc(V raw_bytes) {
   }
   fpr_slab_t *sl = pool->cur;
   if (!sl || sl->hp + total > sl->end) {
-    /* a loaded process grows through its loader's grant, exactly as
-     * before -- its "slab" is whatever System.qa's buddy handed over */
-    if (fpr_is_process && fpr_grow_memory) {
-      /* recycled grant first; only a miss grows the arena */
-      sl = grant_take(total);
-      if (!sl) {
-        uw want = total + sizeof(fpr_slab_t);
-        if (want < SLAB_SZ) want = SLAB_SZ;
-        /* SELF-TOPPING, same reasoning as the stack pool: a miss here
-         * is the spawn-vs-reap epilogue race finding the grant
-         * recycler empty (a dying worker's slab returns microseconds
-         * after the next worker's first alloc shops for it).  Take a
-         * spare so recycler depth converges to real concurrency and
-         * each level is a one-time cost, not a permanent 256KB/N-frames
-         * drip. */
-        if (want == SLAB_SZ) {
+    uw want = total + sizeof(fpr_slab_t);
+    if (want < SLAB_SZ) want = SLAB_SZ;
+    if (fpr_sched) {
+      /* shared plane: pools grow from the KERNEL's buddy, so every
+       * value this process builds lives in the one heap span and the
+       * kernel reaps its acbs like any other */
+      sl = fpr_sched->slab_new(want);
+      if (!sl) fpr_cpanic("heap exhausted (shared buddy has no free block)");
+    } else {
+      sl = 0;
+      if (!fpr_mem_own && fpr_is_process && fpr_grow_memory) {
+        /* a loaded process without a buddy grows through its loader's
+         * grant: recycled grant first; only a miss grows the arena */
+        sl = grant_take(total);
+        /* SELF-TOPPING on a miss, same reasoning as the stack pool: a
+         * miss here is the spawn-vs-reap epilogue race finding the
+         * grant recycler empty (a dying worker's slab returns
+         * microseconds after the next worker's first alloc shops for
+         * it).  Take a spare so recycler depth converges to real
+         * concurrency and each level is a one-time cost, not a
+         * permanent 256KB/N-frames drip. */
+        if (!sl && want == SLAB_SZ) {
           fpr_grant_t sp = fpr_grow_counted(SLAB_SZ, 2); /* slab-spare */
           if (sp.ptr) {
             fpr_slab_t *ss = (fpr_slab_t *)sp.ptr;
@@ -403,6 +429,9 @@ V fpr_alloc(V raw_bytes) {
             grant_put(ss);
           }
         }
+      }
+      if (!sl) {
+        /* the memory actor's buddy (or the loader's grant): one block */
         fpr_grant_t g = fpr_grow_counted(want, 1); /* slab */
 #ifdef FPR_GROWTRACE
         { /* which actor, and is the recycler empty? */
@@ -417,36 +446,23 @@ V fpr_alloc(V raw_bytes) {
 #endif
         if (!g.ptr || g.size < total + sizeof(fpr_slab_t)) {
           /* the post-mortem journal should carry the numbers: how much
-           * the arena had grown and what was being asked when it died */
+           * had been taken and what was being asked when it died */
           praw("[mem] exhausted: want ");
           pdec(want);
           praw(" after ");
           pdec(fpr_grow_count);
-          praw(" grows / ");
+          praw(" blocks / ");
           pdec(fpr_grow_bytes >> 20);
-          praw(" MiB granted\n");
-          fpr_cpanic("heap exhausted (process arena growth denied)");
+          praw(" MiB taken\n");
+          fpr_cpanic("heap exhausted (no block for a slab)");
         }
         sl = (fpr_slab_t *)g.ptr;
         sl->end = (char *)g.ptr + g.size;
       }
-    } else if (fpr_sched) {
-      /* shared plane: pools grow from the KERNEL's buddy, so every
-       * value this process builds lives in the one heap span and the
-       * kernel reaps its acbs like any other */
-      uw want = total + sizeof(fpr_slab_t);
-      if (want < SLAB_SZ) want = SLAB_SZ;
-      sl = fpr_sched->slab_new(want);
-      if (!sl) fpr_cpanic("heap exhausted (shared buddy has no free block)");
-    } else {
-      uw want = total + sizeof(fpr_slab_t);
-      if (want < SLAB_SZ) want = SLAB_SZ;
-      sl = (fpr_slab_t *)buddy_alloc(want);
-      if (!sl) fpr_cpanic("heap exhausted (buddy has no free block)");
-      sl->end = (char *)sl + buddy_block_usable_size(sl);
     }
     sl->owner = pool;
     sl->escaped = 0;
+    sl->holds = 0;
     sl->hp = (char *)(sl + 1);
     sl->next = pool->cur;
     pool->cur = sl;
@@ -732,39 +748,92 @@ static V dc_dup(V v, dctx_t *c) {
   }
 }
 
-/* copy v into one fresh ownerless slab; returns the new root (or v
- * itself when there is nothing to copy: ints, statics, bare handles) */
-V fpr_msg_copy(V v) {
-  uw need = dc_size(v);
-  if (!need) return dc_dup(v, 0); /* ints, statics, bare actor handles */
+/* ---- message slabs: PACKED --------------------------------------------
+ * A message used to get a slab of its own -- 256 KiB from the buddy for
+ * a forty-byte tuple, three thousand in flight was 750 MiB, and with
+ * the memory actor every send was a round trip.  Now each actor packs
+ * its outgoing messages into ONE ownerless slab (MSG_SLAB_SZ, the
+ * buddy's floor) until it is full, then starts another; a message too
+ * big for a fresh one gets a slab of its own, as before.
+ *
+ * Lifetime is the two counts on the slab, both under arc_lock:
+ * `escaped` (promoted roots still live, exactly as before) and
+ * `holds` -- the sender's own hold while it is still packing into the
+ * slab, plus one per DROPPER whose borrow window is open (fpr_drop_park:
+ * a dropped root's children may be read until that actor's next
+ * receive, so its hold lasts until then).  The slab goes home when both
+ * are zero.  With one dropper per slab the old "park the slab on the
+ * dropper" was the same rule; with many droppers it would have freed
+ * the slab under a slower dropper's window, which is why the holds
+ * exist. */
+#ifndef FPR_MSG_SLAB_SZ
+#define FPR_MSG_SLAB_SZ ((uw)64 * 1024)
+#endif
+#define MSG_SLAB_SZ FPR_MSG_SLAB_SZ
+static fpr_slab_t *msg_slab_new(uw need) {
   fpr_slab_t *sl = 0;
-  if (fpr_is_process && fpr_grow_memory) {
-    sl = grant_take(need);
-    if (!sl) {
-      uw want = need + sizeof(fpr_slab_t);
-      if (want < SLAB_SZ) want = SLAB_SZ;
-      fpr_grant_t g = fpr_grow_counted(want, 6); /* msg */
-      if (!g.ptr || g.size < need + sizeof(fpr_slab_t))
-        fpr_cpanic("send: message slab growth denied");
-      sl = (fpr_slab_t *)g.ptr;
-      sl->end = (char *)g.ptr + g.size;
-    }
-  } else {
-    uw want = need + sizeof(fpr_slab_t);
-    if (want < SLAB_SZ) want = SLAB_SZ;
-    sl = (fpr_slab_t *)buddy_alloc(want);
-    if (!sl) fpr_cpanic("send: message slab exhausted");
-    sl->end = (char *)sl + buddy_block_usable_size(sl);
+  uw want = need + sizeof(fpr_slab_t);
+  if (want < MSG_SLAB_SZ) want = MSG_SLAB_SZ;
+  if (!fpr_mem_own && fpr_is_process && fpr_grow_memory) sl = grant_take(need);
+  if (!sl) {
+    fpr_grant_t g = fpr_grow_counted(want, 6); /* msg */
+    if (!g.ptr || g.size < need + sizeof(fpr_slab_t))
+      fpr_cpanic("send: no block for the message slab");
+    sl = (fpr_slab_t *)g.ptr;
+    sl->end = (char *)g.ptr + g.size;
   }
   sl->owner = 0; /* ownerless from birth: freed wholesale on last drop */
   sl->escaped = 0;
+  sl->holds = 0;
   sl->hp = (char *)(sl + 1);
   sl->next = 0;
+  return sl;
+}
+/* holds--; the slab goes home once nothing keeps it (arc_lock) */
+static void slab_unhold_locked(fpr_slab_t *sl) {
+  if (--sl->holds == 0 && sl->escaped == 0 && !sl->owner) fpr_slab_release(sl);
+}
+void fpr_slab_unhold(fpr_slab_t *sl, int locked) {
+  if (!locked) fpr_lock(&arc_lock);
+  slab_unhold_locked(sl);
+  if (!locked) fpr_unlock(&arc_lock);
+}
+void fpr_slabs_unhold(fpr_slab_t **sls, uw n) {
+  fpr_lock(&arc_lock);
+  for (uw i = 0; i < n; i++) slab_unhold_locked(sls[i]);
+  fpr_unlock(&arc_lock);
+}
+static V msg_copy_in(V v, int fresh) {
+  uw need = dc_size(v);
+  if (!need) return dc_dup(v, 0); /* ints, statics, bare actor handles */
+  fpr_hart_t *h = fpr_hart();
+  fpr_slab_t **slot = (!fresh && h && h->current) ? fpr_acb_msg_slot(h->current) : 0;
+  fpr_slab_t *sl = slot ? *slot : 0;
+  if (sl && sl->hp + need > sl->end) { /* full: the sender's hold ends */
+    *slot = 0;
+    fpr_slab_unhold(sl, 0);
+    sl = 0;
+  }
+  if (!sl) {
+    sl = msg_slab_new(need);
+    if (slot && need + sizeof(fpr_slab_t) <= MSG_SLAB_SZ) {
+      sl->holds = 1; /* the sender keeps packing into it */
+      *slot = sl;
+    }
+  }
   dctx_t c = {sl->hp, sl};
   V r = dc_dup(v, &c);
   sl->hp = c.hp;
   return r;
 }
+/* copy v into the sender's message slab; returns the new root (or v
+ * itself when there is nothing to copy: ints, statics, bare handles) */
+#ifndef FPR_MSG_PACK
+#define FPR_MSG_PACK 1 /* 0: a slab per message (the bisecting switch) */
+#endif
+V fpr_msg_copy(V v) { return msg_copy_in(v, !FPR_MSG_PACK); }
+/* ... into a slab of its own: Sys.arena's transfer copy, freed by hand */
+V fpr_msg_copy_fresh(V v) { return msg_copy_in(v, 1); }
 
 /* keep: retain a received value past its message's drop -- a deep copy
  * into the CALLER'S OWN pool (fpr_alloc), vectors included (v2: a
@@ -916,17 +985,14 @@ static V g_arena(V f) {
     fpr_cpanic("Sys.arena: Vector results cannot escape an arena "
                "(their storage IS the arena) -- return scalars/trees, "
                "or build pool-owned vectors outside");
-  V t = fpr_msg_copy(r); /* self-contained; survives the teardown */
+  V t = fpr_msg_copy_fresh(r); /* its own slab: survives the teardown, freed below */
   /* teardown, poolReset-style, under arc_lock (owner/escaped race) */
   fpr_lock(&arc_lock);
   fpr_slab_t *sl = ap.cur;
   while (sl) {
     fpr_slab_t *nx = sl->next;
-    if (sl->escaped == 0) {
-      if (fpr_is_process) grant_put(sl);
-      else buddy_free(sl);
-    } else
-      sl->owner = 0; /* something was sent from inside: orphan it */
+    if (sl->escaped == 0) slab_home(sl);
+    else sl->owner = 0; /* something was sent from inside: orphan it */
     sl = nx;
   }
   fpr_unlock(&arc_lock);
@@ -936,10 +1002,9 @@ static V g_arena(V f) {
   if (ISINT(t) || !fpr_in_heap(t)) return t;
   fpr_slab_t *ts = slab_of(t);
   V out = kp_dup(t);
-  if (ts && !ts->owner && ts->escaped == 0) {
+  if (ts && !ts->owner && ts->escaped == 0 && ts->holds == 0) {
     fpr_lock(&arc_lock);
-    if (fpr_is_process) grant_put(ts);
-    else buddy_free(ts);
+    slab_home(ts);
     fpr_unlock(&arc_lock);
   }
   return out;
@@ -967,10 +1032,21 @@ void fpr_pool_reclaim(struct fpr_acb *a) {
  * equality wants). In the real compiler the RC-insertion pass emits
  * these drops; here the demo program does it by hand to show the
  * protocol working. */
-#define ARC_CAP 1024
+/* THE TABLE GROWS.  It starts as a static 1024-slot array and rehashes
+ * into a buddy block of twice the size whenever live + tombstone slots
+ * pass 70% -- so a long-running hub with ten thousand shared values in
+ * flight costs a bigger table, not a panic (the old fixed table died
+ * at 1024).  Growth happens under arc_lock on the insert path, before
+ * the probe, so a probe never runs on a table it could overrun; the
+ * panic below is unreachable and kept as the last word if allocation
+ * itself fails.  arc_hwm is the most live entries ever held. */
+#define ARC_CAP0 1024
 #define ARC_TOMB ((V)1)
-static struct { V ptr; uw cnt; } arct[ARC_CAP];
-static uw arc_live;
+typedef struct { V ptr; uw cnt; } arcent_t;
+static arcent_t arct0[ARC_CAP0];
+static arcent_t *arct = arct0;
+static uw arc_cap = ARC_CAP0;
+static uw arc_live, arc_used, arc_hwm, arc_grows; /* used = live + tombstones */
 
 /* probe for v; on miss, the returned slot is the best insertion point
  * (first tombstone seen, else the empty that ended the probe) --
@@ -978,19 +1054,83 @@ static uw arc_live;
  * with tombstones and kills it (found the hard way: a 100k-hop token
  * ring paniced "ARC table full" at ~1k cycles). */
 static uw arc_probe(V v, int *found) {
-  uw i = ((v >> 4) * (uw)2654435761UL) & (ARC_CAP - 1);
-  uw first_tomb = ARC_CAP;
-  for (uw n = 0; n < ARC_CAP; n++) {
+  uw i = ((v >> 4) * (uw)2654435761UL) & (arc_cap - 1);
+  uw first_tomb = arc_cap;
+  for (uw n = 0; n < arc_cap; n++) {
     V p = arct[i].ptr;
     if (p == v) { *found = 1; return i; }
-    if (p == 0) { *found = 0; return first_tomb != ARC_CAP ? first_tomb : i; }
-    if (p == ARC_TOMB && first_tomb == ARC_CAP) first_tomb = i;
-    i = (i + 1) & (ARC_CAP - 1);
+    if (p == 0) { *found = 0; return first_tomb != arc_cap ? first_tomb : i; }
+    if (p == ARC_TOMB && first_tomb == arc_cap) first_tomb = i;
+    i = (i + 1) & (arc_cap - 1);
   }
   *found = 0;
-  if (first_tomb != ARC_CAP) return first_tomb;
+  if (first_tomb != arc_cap) return first_tomb;
   fpr_cpanic("ARC table full");
 }
+/* a block for the table: the counted gateway (the memory actor, or a
+ * loader grant); `direct` for the never-waiting path under arc_lock */
+static void *arc_block(uw bytes, int direct) {
+  if (fpr_mem_own && direct) return fpr_mem_take_direct(bytes);
+  fpr_grant_t g = fpr_grow_counted(bytes, 5); /* site 5: the ARC table */
+  return (g.ptr && g.size >= bytes) ? g.ptr : 0;
+}
+/* the next table, taken BEFORE arc_lock by whoever is about to insert
+ * (a memory-actor request parks the caller; no spinlock is held across
+ * a wait) and installed by arc_grow under the lock.  A spare that
+ * turns out unneeded (a racer grew first) goes back. */
+static arcent_t *arc_spare;
+static uw arc_spare_cap;
+static void arc_reserve(void) {
+  uw cap = __atomic_load_n(&arc_cap, __ATOMIC_RELAXED);
+  if ((__atomic_load_n(&arc_used, __ATOMIC_RELAXED) + 1) * 10 <= cap * 7) return;
+  if (__atomic_load_n(&arc_spare, __ATOMIC_ACQUIRE)) return;
+  uw ncap = cap * 2;
+  arcent_t *nt = (arcent_t *)arc_block(ncap * sizeof(arcent_t), 0);
+  if (!nt) return; /* the direct fallback under the lock has the last word */
+  fpr_lock(&arc_lock);
+  if (!arc_spare && arc_cap == cap) { arc_spare = nt; arc_spare_cap = ncap; nt = 0; }
+  fpr_unlock(&arc_lock);
+  if (nt) { if (fpr_mem_own) fpr_mem_give(nt); }
+}
+/* under arc_lock: double the table and reinsert the live entries
+ * (tombstones are left behind, which is what makes the rehash also the
+ * table's compaction) */
+static void arc_grow(void) {
+  uw ncap = arc_cap * 2;
+  arcent_t *nt = 0;
+  if (arc_spare && arc_spare_cap == ncap) { nt = arc_spare; arc_spare = 0; }
+  if (!nt) nt = (arcent_t *)arc_block(ncap * sizeof(arcent_t), 1);
+  if (!nt) return; /* out of memory: the probe's panic stays the last word */
+  __builtin_memset(nt, 0, ncap * sizeof(arcent_t));
+  arcent_t *ot = arct;
+  uw ocap = arc_cap;
+  arct = nt;
+  arc_cap = ncap;
+  arc_used = 0;
+  for (uw k = 0; k < ocap; k++) {
+    if (ot[k].ptr && ot[k].ptr != ARC_TOMB) {
+      int f;
+      uw j = arc_probe(ot[k].ptr, &f);
+      arct[j] = ot[k];
+      arc_used++;
+    }
+  }
+  if (ot != arct0) { if (fpr_mem_own) fpr_mem_give(ot); else if (!fpr_is_process) buddy_free(ot); }
+  arc_grows++;
+}
+/* an insert is coming: make room first (the 70% rule) and account for it */
+static uw arc_slot_for(V v, int *found) {
+  if ((arc_used + 1) * 10 > arc_cap * 7) arc_grow();
+  uw i = arc_probe(v, found);
+  if (!*found) {
+    if (arct[i].ptr == 0) arc_used++; /* a tombstone reused keeps the count */
+    if (arc_live + 1 > arc_hwm) arc_hwm = arc_live + 1;
+  }
+  return i;
+}
+uw fpr_arc_cap(void) { return arc_cap; }
+uw fpr_arc_hwm(void) { return arc_hwm; }
+uw fpr_arc_grows_count(void) { return arc_grows; }
 
 /* one lock for the whole table: promotion happens on SEND, which is
  * rare next to computation -- contention is negligible and the SPSC
@@ -1000,12 +1140,19 @@ static uw arc_probe(V v, int *found) {
 
 static fpr_slab_t *slab_of(V v) { return *(fpr_slab_t **)((char *)v - 8); }
 
+/* an actor handle is the acb itself: immortal, no allocation preheader,
+ * shared raw -- a bare handle as a message (spawn's result passed on)
+ * must not be counted, or the slab lookup reads the word before it */
+static int arc_by_value(V v) {
+  return !fpr_in_heap(v) || TID(v) == T_ACTOR;
+}
 void fpr_arc_incref(V v) {
   if (fpr_sched) { fpr_sched->arc_incref(v); return; }
-  if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
+  if (arc_by_value(v)) return; /* ints, immortal statics, handles: by value */
+  arc_reserve(); /* the next table, if one is due, before the lock */
   fpr_lock(&arc_lock);
   int found;
-  uw i = arc_probe(v, &found);
+  uw i = arc_slot_for(v, &found);
   if (!found) {
     arct[i].ptr = v;
     arct[i].cnt = 0;
@@ -1020,7 +1167,7 @@ void fpr_arc_incref(V v) {
 
 void fpr_arc_decref(V v) {
   if (fpr_sched) { fpr_sched->arc_decref(v); return; }
-  if (!fpr_in_heap(v)) return;
+  if (arc_by_value(v)) return;
   fpr_lock(&arc_lock);
   int found;
   uw i = arc_probe(v, &found);
@@ -1031,14 +1178,17 @@ void fpr_arc_decref(V v) {
     arc_live--;
     fpr_slab_t *sl = slab_of(v);
     if (sl) {
-      if (!sl->owner) dc_release(v); /* message slab: release its vecs */
       sl->escaped--;
-      if (!sl->owner && sl->escaped == 0) {
-        /* last escapee of an orphaned slab: the whole slab goes home
-         * -- DEFERRED to the dropping actor's next receive, so the
-         * compiler may insert `drop m` right after the destructure
-         * while the arm still reads m's children (borrows are dead by
-         * the next receive: the copy-on-retain law). */
+      if (!sl->owner) {
+        /* an ownerless slab (a message slab, or a dead actor's
+         * orphaned one): release the root's vecs and take THIS
+         * DROPPER's hold on the slab -- every drop, not only the last
+         * escapee's, because the slab is shared by many messages now
+         * and each dropper's borrow window (the compiler's `drop m`
+         * right after the destructure, the arm still reading the
+         * children) must keep the slab until its own next receive.
+         * The slab goes home once escaped and holds are both zero. */
+        dc_release(v);
         fpr_drop_park(sl);
       } else {
         fpr_free(v); /* under arc_lock: owner read is death-race-free */
@@ -1055,14 +1205,9 @@ void fpr_arc_teardown_pool(fpr_pool_t *pool) {
   fpr_slab_t *sl = pool->cur;
   while (sl) {
     fpr_slab_t *nx = sl->next;
-    if (sl->escaped == 0) {
-      /* machine boot: back to buddy.  Process: onto the grant
-       * recycler -- the loader keeps the memory either way, the
-       * process reuses it (see grant_take above). */
-      if (fpr_is_process) grant_put(sl);
-      else buddy_free(sl);
-    } else
-      sl->owner = 0; /* orphan: freed at last drop above */
+    if (sl->escaped == 0) slab_home(sl); /* home: the memory actor, or the
+                                          * grant recycler (see grant_take) */
+    else sl->owner = 0; /* orphan: freed at last drop above */
     sl = nx;
   }
   pool->cur = 0;
@@ -1095,11 +1240,8 @@ static V g_poolReset(V u) {
   fpr_slab_t *sl = pool->cur;
   while (sl) {
     fpr_slab_t *nx = sl->next;
-    if (sl->escaped == 0) {
-      if (fpr_is_process) grant_put(sl);
-      else buddy_free(sl);
-    } else
-      sl->owner = 0;
+    if (sl->escaped == 0) slab_home(sl);
+    else sl->owner = 0;
     sl = nx;
   }
   pool->cur = 0;
@@ -1127,10 +1269,11 @@ uw fpr_arc_live_count(void) { return arc_live; }
  * underneath without changing this contract. */
 void fpr_arc_promote_share(V v) {
   if (fpr_sched) { fpr_sched->arc_incref(v); return; }
-  if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
+  if (arc_by_value(v)) return; /* ints, immortal statics, handles: by value */
+  arc_reserve(); /* the next table, if one is due, before the lock */
   fpr_lock(&arc_lock);
   int found;
-  uw i = arc_probe(v, &found);
+  uw i = arc_slot_for(v, &found);
   if (!found) {
     arct[i].ptr = v;
     arct[i].cnt = 1; /* the sender's standing share */
@@ -1163,18 +1306,11 @@ int fpr_arc_movable_root(V v) {
   return found;
 }
 
-/* ---- Sys.sleepUs: waitTick without pegging a core --------------------
- * The HAL hook actually sleeps where the host can (qosp: nanosleep);
- * the weak default returns 0, which makes the builtin a no-op and the
- * caller's re-check loop a spin -- bare metal keeps today's behavior
- * until a WFI-based strong definition lands. */
+/* ---- Sys.sleepUs lives in actors.c now: a PARKED sleep.  This hook is
+ * its fallback where there is no actor to park (a hart-loop context)
+ * or no clock: the host sleeps the thread (qosp's syscall 6); the weak
+ * default returns 0, a no-op. */
 __attribute__((weak)) int fpr_hal_sleep_us(uw us) { (void)us; return 0; }
-static V g_sleepUs(V usv) {
-  sw us = UNTAG(usv);
-  if (us > 0) fpr_hal_sleep_us((uw)us);
-  return (V)&fpr_unit;
-}
-FPR_FN(fpr_g_Sys_x2esleepUs, g_sleepUs, 1);
 
 uw fpr_arc_live(void) { return arc_live; }
 
@@ -1690,6 +1826,40 @@ static V g_memstats(V u) {
   return (V)t;
 }
 FPR_FN(fpr_g_Sys_x2ememStats, g_memstats, 1);
+
+/* Sys.memInfo () -> [arenaKiB, freeKiB, requests, waits, direct,
+ * frees, denied, inline]: the memory actor's ledger (fpr.h).  arena
+ * and free are the buddy's own numbers (0 without a buddy: a loaded
+ * process on grants); requests/waits count takes queued on the actor
+ * and how often one had to park; direct counts the takes that
+ * bypassed it with no actor to park (boot, the reaper, the actor
+ * itself); inline counts the takes served on the spot because the
+ * buddy was uncontended. */
+static V g_meminfo(V u) {
+  (void)u;
+  /* build the cells FIRST: the list itself may be the caller's first
+   * allocation, and the numbers should include the slab that costs */
+  hdr_t *nil = (hdr_t *)fpr_alloc(8);
+  nil->tid = T_LIST;
+  nil->var = 0;
+  V list = (V)nil;
+  V *cells[8];
+  for (int i = 7; i >= 0; i--) {
+    V *cell = (V *)fpr_alloc(24);
+    ((hdr_t *)cell)->tid = T_LIST;
+    ((hdr_t *)cell)->var = 1;
+    cell[2] = list;
+    list = (V)cell;
+    cells[i] = cell;
+  }
+  uw vals[8] = {fpr_mem_own ? buddy_arena_size() >> 10 : 0,
+                fpr_mem_own ? buddy_free_bytes() >> 10 : 0,
+                fpr_mem_reqs, fpr_mem_waits, fpr_mem_direct, fpr_mem_frees,
+                fpr_mem_denied, fpr_mem_inline};
+  for (int i = 0; i < 8; i++) cells[i][1] = TAG((sw)vals[i]);
+  return list;
+}
+FPR_FN(fpr_g_Sys_x2ememInfo, g_meminfo, 1);
 
 /* Sys.growLog () -> newest-first list of formatted grow events (fresh
  * copies in the caller's pool). The ring
