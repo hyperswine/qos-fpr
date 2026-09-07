@@ -194,6 +194,37 @@ static void mesh_disc_at(rawmesh_t *m, int up) {
     memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 3;
   }
 }
+/* a unit square in XY facing +Z: the 2D layer's fill.  Single-sided, so
+ * a translucent one blends ONCE (a thin cube blends its back face too,
+ * which is what made glass over a field come out three times darker
+ * than its alpha says) */
+static void mesh_quad(rawmesh_t *m) {
+  static const float V[] = {-0.5f,-0.5f,0, 0,0,1,  0.5f,-0.5f,0, 0,0,1,
+                            0.5f,0.5f,0, 0,0,1,  -0.5f,0.5f,0, 0,0,1};
+  static const uint32_t I[] = {0, 1, 2, 0, 2, 3};
+  memcpy(m->v, V, sizeof V); m->nv = 24;
+  memcpy(m->ix, I, sizeof I); m->ni = 6;
+}
+/* a quarter ANNULUS facing +Z (radii 0.92 and 1, the +x,+y quadrant):
+ * the corner of a rounded one-px border at radius r is one of these at
+ * scale r, so a border can ring a translucent fill without lying under
+ * it */
+static void mesh_arc(rawmesh_t *m) {
+  const int seg = 8;
+  const float in = 0.92f;
+  m->nv = m->ni = 0;
+  for (int j = 0; j <= seg; j++) {
+    float th = (float)j / seg * 1.5707963f, c = cosf(th), sn = sinf(th);
+    float a[6] = {c * in, sn * in, 0, 0, 0, 1}, b[6] = {c, sn, 0, 0, 0, 1};
+    memcpy(&m->v[m->nv], a, sizeof a); m->nv += 6;
+    memcpy(&m->v[m->nv], b, sizeof b); m->nv += 6;
+  }
+  for (int j = 0; j < seg; j++) {
+    uint32_t i0 = (uint32_t)(j * 2), o0 = i0 + 1, i1 = i0 + 2, o1 = i0 + 3;
+    uint32_t tri[6] = {i0, o0, o1, i0, o1, i1};
+    memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 6;
+  }
+}
 static void mesh_disc(rawmesh_t *m) { mesh_disc_at(m, 0); }
 static void mesh_coin(rawmesh_t *m) { mesh_disc_at(m, 1); }
 /* a quarter disc facing +Z: the +x,+y quadrant of a unit-radius circle
@@ -218,8 +249,9 @@ static void mesh_corner(rawmesh_t *m) {
 
 /* ==== renderer state (RenderCache, fixed-capacity C tables) ========== */
 typedef struct { float model[16]; float color[4]; } inst_t; /* rgb + alpha */
+typedef struct titem titem_t;
 
-#define MAX_MESHES 16
+#define MAX_MESHES 32
 #define MAX_TEXT 4096 /* glyphs per frame, all text entities together */
 #define TVF 9         /* floats per text vertex: pos3 uv2 rgba */
 #define MAX_INST 16384 /* per mesh per tier: a 5x8 glyph is up to 40
@@ -232,8 +264,8 @@ typedef struct {
   GLsizei indexCount;
   GLuint staticVBO; GLsizei staticCount;
   GLuint dynVBO;
-  /* per-frame staging (walker output) */
-  inst_t *stage; int nstage;
+  /* per-frame staging (walker output); the first nopaque are opaque */
+  inst_t *stage; int nstage, nopaque;
 } mesh_t;
 
 static struct {
@@ -248,6 +280,8 @@ static struct {
   /* the text pass: one SDF atlas, one streaming quad buffer */
   GLuint tprog, tvao, tvbo, ttex; GLint tuView, tuProj, tuFog, tuFogRange, tuTex;
   float *tstage; int ntext;
+  /* the translucent pass: every mesh's tail and the text, sorted together */
+  titem_t *titems; int titemCap; inst_t *tinst; float *tsorted; GLuint tinstVBO;
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
   int staticCompiled;
@@ -860,7 +894,9 @@ static mesh_t *gfx_mesh(const char *name, uw len) {
   else if (!strcmp(m->name, "disc")) mesh_disc(&raw);
   else if (!strcmp(m->name, "coin")) mesh_coin(&raw);
   else if (!strcmp(m->name, "corner")) mesh_corner(&raw);
-  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere disc coin corner, or a glMesh-registered name)");
+  else if (!strcmp(m->name, "quad")) mesh_quad(&raw);
+  else if (!strcmp(m->name, "arc")) mesh_arc(&raw);
+  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere quad disc coin corner arc, or a glMesh-registered name)");
 
   mesh_upload(m, raw.v, raw.nv, raw.ix, raw.ni);
   if (!m->stage) fpr_cpanic("gfx: instance staging alloc");
@@ -886,20 +922,17 @@ static void gfx_bind_instances_at(GLuint vbo, int first) {
 }
 static void gfx_bind_instances(GLuint vbo) { gfx_bind_instances_at(vbo, 0); }
 
-/* the dynamics of one mesh, drawn: the opaque instances first, then the
- * translucent ones (alpha < 1) blended, depth-tested but not depth-
- * written, sorted far to near by view depth.  The stage is partitioned
- * in place and uploaded here, once the view is known. */
+/* the dynamics of one mesh: partitioned in place (opaque first), uploaded,
+ * and the OPAQUE part drawn.  The translucent tail (alpha < 1) is left
+ * for draw_translucent, which sorts every mesh's tail and the text
+ * together, far to near, so a veil over a chip and a label behind smoke
+ * both come out right whatever mesh they use. */
 static float *g_sort_view;
 static float view_z(const inst_t *it) {
   const float *v = g_sort_view;
   return v[2] * it->model[12] + v[6] * it->model[13] + v[10] * it->model[14] + v[14];
 }
-static int cmp_view_far_first(const void *a, const void *b) {
-  float za = view_z(a), zb = view_z(b); /* more negative = farther */
-  return za < zb ? -1 : za > zb ? 1 : 0;
-}
-static int draw_dyn(mesh_t *m, const m4 *view, int64_t *bytes) {
+static int draw_opaque_dyn(mesh_t *m, int64_t *bytes) {
   if (!m->nstage) return 0;
   int n = m->nstage, nopq = 0;
   for (int i = 0; i < n; i++)
@@ -907,31 +940,109 @@ static int draw_dyn(mesh_t *m, const m4 *view, int64_t *bytes) {
       if (i != nopq) { inst_t t = m->stage[i]; m->stage[i] = m->stage[nopq]; m->stage[nopq] = t; }
       nopq++;
     }
-  if (n - nopq > 1) {
-    g_sort_view = (float *)view->m;
-    qsort(m->stage + nopq, (size_t)(n - nopq), sizeof(inst_t), cmp_view_far_first);
-  }
+  m->nopaque = nopq;
+  if (!nopq) return 0;
   if (!m->dynVBO) glGenBuffers(1, &m->dynVBO);
   glBindBuffer(GL_ARRAY_BUFFER, m->dynVBO);
-  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(inst_t)), m->stage, GL_DYNAMIC_DRAW);
-  *bytes += (int64_t)((size_t)n * sizeof(inst_t));
-  int draws = 0;
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)nopq * sizeof(inst_t)), m->stage, GL_DYNAMIC_DRAW);
+  *bytes += (int64_t)((size_t)nopq * sizeof(inst_t));
   glBindVertexArray(m->vao);
-  if (nopq) {
-    gfx_bind_instances_at(m->dynVBO, 0);
-    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, nopq);
-    draws++;
+  gfx_bind_instances_at(m->dynVBO, 0);
+  glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, nopq);
+  return 1;
+}
+
+/* one translucent item: a mesh instance (mesh >= 0) or a text glyph */
+struct titem { float z; int mesh, idx; };
+static int cmp_titem_far_first(const void *a, const void *b) {
+  float za = ((const titem_t *)a)->z, zb = ((const titem_t *)b)->z;
+  return za < zb ? -1 : za > zb ? 1 : 0;
+}
+static float text_view_z(int g) {
+  const float *v = g_sort_view, *o = G.tstage + (size_t)g * 6 * TVF;
+  return v[2] * o[0] + v[6] * o[1] + v[10] * o[2] + v[14];
+}
+static void text_set_uniforms(const m4 *view, const m4 *proj, v3 fog, float fogNear, float fogFar) {
+  glUseProgram(G.tprog);
+  glUniformMatrix4fv(G.tuView, 1, GL_FALSE, view->m);
+  glUniformMatrix4fv(G.tuProj, 1, GL_FALSE, proj->m);
+  glUniform3f(G.tuFog, fog.x, fog.y, fog.z);
+  glUniform2f(G.tuFogRange, fogNear, fogFar);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, G.ttex);
+  glUniform1i(G.tuTex, 0);
+}
+static int draw_translucent(const m4 *view, const m4 *proj, v3 fog, float fogNear, float fogFar, int64_t *bytes) {
+  int total = G.ntext;
+  for (int i = 0; i < G.nmeshes; i++) total += G.meshes[i].nstage - G.meshes[i].nopaque;
+  if (!total) return 0;
+  if (total > G.titemCap) {
+    G.titemCap = total + 1024;
+    G.titems = realloc(G.titems, (size_t)G.titemCap * sizeof(titem_t));
+    G.tinst = realloc(G.tinst, (size_t)G.titemCap * sizeof(inst_t));
+    G.tsorted = realloc(G.tsorted, (size_t)G.titemCap * 6 * TVF * sizeof(float));
+    if (!G.titems || !G.tinst || !G.tsorted) fpr_cpanic("gfx: translucent staging alloc");
   }
-  if (n > nopq) {
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glDepthMask(GL_FALSE);
-    gfx_bind_instances_at(m->dynVBO, nopq);
-    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, n - nopq);
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
-    draws++;
+  g_sort_view = (float *)view->m;
+  int n = 0;
+  for (int i = 0; i < G.nmeshes; i++) {
+    mesh_t *m = &G.meshes[i];
+    for (int k = m->nopaque; k < m->nstage; k++) {
+      G.titems[n].z = view_z(&m->stage[k]); G.titems[n].mesh = i; G.titems[n].idx = k; n++;
+    }
   }
+  for (int g = 0; g < G.ntext; g++) {
+    G.titems[n].z = text_view_z(g); G.titems[n].mesh = -1; G.titems[n].idx = g; n++;
+  }
+  qsort(G.titems, (size_t)n, sizeof(titem_t), cmp_titem_far_first);
+  /* lay the sorted instances and glyphs out contiguously, so a run is a
+   * range in one buffer */
+  int ni = 0, ng = 0;
+  for (int i = 0; i < n; i++) {
+    titem_t *t = &G.titems[i];
+    if (t->mesh >= 0) G.tinst[ni++] = G.meshes[t->mesh].stage[t->idx];
+    else { memcpy(G.tsorted + (size_t)ng * 6 * TVF, G.tstage + (size_t)t->idx * 6 * TVF, 6 * TVF * sizeof(float)); ng++; }
+  }
+  if (!G.tinstVBO) glGenBuffers(1, &G.tinstVBO);
+  if (ni) {
+    glBindBuffer(GL_ARRAY_BUFFER, G.tinstVBO);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)ni * sizeof(inst_t)), G.tinst, GL_DYNAMIC_DRAW);
+    *bytes += (int64_t)((size_t)ni * sizeof(inst_t));
+  }
+  if (ng) {
+    glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)ng * 6 * TVF * sizeof(float)), G.tsorted, GL_DYNAMIC_DRAW);
+    *bytes += (int64_t)((size_t)ng * 6 * TVF * sizeof(float));
+    text_set_uniforms(view, proj, fog, fogNear, fogFar);
+  }
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDepthMask(GL_FALSE);
+  int draws = 0, ii = 0, gi = 0;
+  for (int i = 0; i < n;) {
+    int mesh = G.titems[i].mesh, j = i;
+    while (j < n && G.titems[j].mesh == mesh) j++;
+    int count = j - i;
+    if (mesh >= 0) {
+      mesh_t *m = &G.meshes[mesh];
+      glUseProgram(G.prog);
+      glBindVertexArray(m->vao);
+      gfx_bind_instances_at(G.tinstVBO, ii);
+      glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, count);
+      ii += count;
+    } else {
+      glUseProgram(G.tprog);
+      glBindVertexArray(G.tvao);
+      glDrawArrays(GL_TRIANGLES, gi * 6, count * 6);
+      gi += count;
+    }
+    draws++;
+    i = j;
+  }
+  glDepthMask(GL_TRUE);
+  glDisable(GL_BLEND);
+  glBindVertexArray(0);
+  glUseProgram(G.prog);
   return draws;
 }
 
@@ -982,31 +1093,6 @@ static void stage_text(int mode, const unsigned char *s, uw len, v3 pos, float y
     pen += font_adv[gi];
   }
 }
-static int draw_text(const m4 *view, const m4 *proj, v3 fog, float fogNear, float fogFar, int64_t *bytes) {
-  if (!G.ntext) return 0;
-  size_t nbytes = (size_t)G.ntext * 6 * TVF * sizeof(float);
-  glUseProgram(G.tprog);
-  glUniformMatrix4fv(G.tuView, 1, GL_FALSE, view->m);
-  glUniformMatrix4fv(G.tuProj, 1, GL_FALSE, proj->m);
-  glUniform3f(G.tuFog, fog.x, fog.y, fog.z);
-  glUniform2f(G.tuFogRange, fogNear, fogFar);
-  glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, G.ttex);
-  glUniform1i(G.tuTex, 0);
-  glBindVertexArray(G.tvao);
-  glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
-  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nbytes, G.tstage, GL_DYNAMIC_DRAW);
-  *bytes += (int64_t)nbytes;
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  glDepthMask(GL_FALSE);
-  glDrawArrays(GL_TRIANGLES, 0, G.ntext * 6);
-  glDepthMask(GL_TRUE);
-  glDisable(GL_BLEND);
-  glBindVertexArray(0);
-  return 1;
-}
-
 /* ==== the FPRISC scene walker ======================================== */
 /* value layout (fpr.h/runtime.c): Int = (n<<1)|1; objects = hdr{tid,var}
  * + V fields at +8.  T_LIST var 0/1 = Nil/Cons(head,tail); tuples tid 4
@@ -1264,8 +1350,8 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
     draws++;
   }
   { int64_t b = 0;
-    for (int i = 0; i < G.nmeshes; i++) draws += draw_dyn(&G.meshes[i], &view, &b);
-    draws += draw_text(&view, &proj, sky, fogNear, fogFar, &b);
+    for (int i = 0; i < G.nmeshes; i++) draws += draw_opaque_dyn(&G.meshes[i], &b);
+    draws += draw_translucent(&view, &proj, sky, fogNear, fogFar, &b);
     dynBytes += (sw)b; }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
@@ -1323,8 +1409,8 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   glUniform3f(G.uAmbient, 0.15f, 0.15f, 0.15f);
   glUniform3f(G.uFog, 0.0f, 0.0f, 0.0f);
   glUniform2f(G.uFogRange, 1000.0f, 2000.0f);
-  for (int i = 0; i < G.nmeshes; i++) d2 += draw_dyn(&G.meshes[i], &view, &b2);
-  d2 += draw_text(&view, &proj, (v3){0, 0, 0}, 1000.0f, 2000.0f, &b2);
+  for (int i = 0; i < G.nmeshes; i++) d2 += draw_opaque_dyn(&G.meshes[i], &b2);
+  d2 += draw_translucent(&view, &proj, (v3){0, 0, 0}, 1000.0f, 2000.0f, &b2);
   *draws_out += d2;
   *dyn_bytes_out += b2;
   gfx_present();

@@ -19,12 +19,15 @@ python3 tests-host/terra2-keys.py /tmp/terra2.evd \
   enter a up up p enter p space \
   enter a enter down down left enter right enter p space \
   enter a up up enter p space q >/dev/null
-rm -f /tmp/terra2-*.ppm /tmp/terra2.wav
+rm -f /tmp/terra2-*.ppm /tmp/terra2.wav /tmp/terra2.disk
 # music muted here: the effects' bursts over silence are what the WAV
 # assertions read; the decoder is proven separately below
-FPR_SND_MUSIC=0 FPR_ASSETS=../fp-risc/models/music FPR_SND_DUMP=/tmp/terra2.wav FPR_EVDEV=/tmp/terra2.evd \
+# a fresh disk: the profile log is what the second run reads back
+FPR_DISK=/tmp/terra2.disk FPR_SND_MUSIC=0 FPR_ASSETS=../fp-risc/models/music FPR_SND_DUMP=/tmp/terra2.wav FPR_EVDEV=/tmp/terra2.evd \
   timeout 300 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-check.log 2>&1 || true
 fail() { echo "terra2-check: FAIL: $1"; tail -20 /tmp/terra2-check.log; exit 1; }
+grep -aq "profile: 0 games (0 won, 0 lost, 0 abandoned)" /tmp/terra2-check.log || fail "the empty profile"
+grep -aq "game saved: turn 5" /tmp/terra2-check.log || fail "the board saved at the turn's start"
 grep -aq "you: LightInf called to forward 3" /tmp/terra2-check.log || fail "the call"
 grep -aq "you: LightInf attacks the HQ" /tmp/terra2-check.log || fail "the lane attack"
 grep -aq "HQ hit for 2: 13 left" /tmp/terra2-check.log || fail "HQ damage"
@@ -53,6 +56,23 @@ lit=sum(1 for i in range(0,len(d),3*97) if d[i]>40 or d[i+1]>40 or d[i+2]>40)
 sys.exit(0 if lit*97*3 > len(d)*0.02 else 1)
 PY
 done
+# the lifecycle, on the same disk: the first run's start record reads
+# back as one abandoned game and its board as a game to continue; the
+# Keys, Stats and Cards screens from the title, Continue, pause with esc,
+# Restart through its confirm, Stats from the menu, quit
+for f in /tmp/terra2-*.ppm; do mv "$f" "${f/terra2-/terra2-game-}"; done
+python3 tests-host/terra2-keys.py /tmp/terra2-life.evd \
+  k p esc s p esc c p right right down p esc enter esc p down enter p enter esc down down down enter p esc q >/dev/null
+FPR_DISK=/tmp/terra2.disk FPR_SND_MUSIC=0 FPR_ASSETS=../fp-risc/models/music FPR_EVDEV=/tmp/terra2-life.evd \
+  timeout 120 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-life.log 2>&1 || true
+grep -aq "profile: 1 games (0 won, 0 lost, 1 abandoned)" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "the profile read back"; }
+grep -aq "a game is waiting: turn 5" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "the saved game read back"; }
+grep -aq "welcome back: turn 5" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "continue"; }
+grep -aq "\[terra2\] paused" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "pause"; }
+grep -aq "\[terra2\] restart: a new game" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "restart"; }
+grep -aq "game over" /tmp/terra2-life.log || { cp /tmp/terra2-life.log /tmp/terra2-check.log; fail "clean exit after the menu"; }
+NL=$(ls /tmp/terra2-[0-9]*.ppm 2>/dev/null | wc -l)
+[ "$NL" -ge 6 ] || fail "expected >= 6 lifecycle snapshots, got $NL"
 # the sound: the mix is as long as the run and carries distinct bursts
 # (cursor ticks, the opening riff, calls, blows, turn chimes, the close)
 [ -s /tmp/terra2.wav ] || fail "no sound dump"
@@ -92,4 +112,4 @@ cd "$HERE/fp-risc" && make -s qos-app PROG=programs/terra2.fpr >/dev/null 2>&1
 cd "$HERE/qos"
 SND=$(grep -a -m1 "dump closed" /tmp/terra2-check.log | sed 's/.*(\(.*\) s), \(.*\) tones.*/\1 s, \2 tones/')
 FR=$(grep -a "game over" /tmp/terra2-check.log | sed 's/.*\[mvu: \([0-9]*\) frames.*/\1/')
-echo "terra2-check: ALL LEGS PASS ($N snapshots, $FR frames, sound $SND: title, call, tracers on the HQ, AI turn, a death, the tank and its shell, the MP3 decoded, clean quit)"
+echo "terra2-check: ALL LEGS PASS ($N + $NL snapshots, $FR frames, sound $SND: title, call, tracers on the HQ, AI turn, a death, the tank and its shell, the MP3 decoded, clean quit; keys, stats, cards, continue, pause, restart, the profile read back)"

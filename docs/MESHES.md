@@ -72,20 +72,23 @@ Eleven registered meshes plus the three built-in ones: 14 of the table's
 ## Colour and alpha
 
 An entity's colour is `(r, g, b)` in milli, or `(r, g, b, a)`: alpha
-below 1000 makes the instance translucent.  Each mesh draws its opaque
-instances first, then its translucent ones blended over the frame,
-depth-tested but not depth-written and sorted far to near within the
-mesh (there is no sorting across meshes, which is fine for smoke, tags
-and veils and would show on two large overlapping translucent bodies of
-different meshes).  Statics are always opaque.
+below 1000 makes the instance translucent.  Every mesh draws its opaque
+instances first; then all translucent instances of all meshes, and the
+text glyphs, are sorted far to near TOGETHER and drawn blended over the
+frame in runs, depth-tested but not depth-written -- so a veil over a
+badge or a label behind smoke comes out right whatever mesh each uses.
+Statics are always opaque.
 
 ## Flat meshes and text
 
-Three built-in flat meshes joined `cube`, `plane` and `sphere`: `disc`
-(a unit circle in XY facing +Z), `corner` (its +x,+y quarter, mirrored
-into the other quadrants by a negative scale) and `coin` (the circle in
-XZ facing +Y).  The 2D layer builds rounded boxes and badges from the
-first two; the third is for rings and pads on a ground plane.
+Five built-in flat meshes joined `cube`, `plane` and `sphere`: `quad`
+(a unit square in XY facing +Z), `disc` (a unit circle there), `corner`
+(its +x,+y quarter, mirrored into the other quadrants by a negative
+scale), `arc` (a quarter ring, radii 0.92 and 1) and `coin` (the circle
+in XZ facing +Y).  The 2D layer builds its fills, rounded boxes, rings
+and badges from the first four; the last is for rings and pads on a
+ground plane.  Flat meshes are single-sided: a translucent one blends
+once, which a translucent cube (front and back face) does not.
 
 Text is an entity too -- `Ent (mode, "string") pen 0 (em, em, 1) colour`
 -- drawn by a separate pass from a distance-field atlas compiled into
@@ -94,7 +97,7 @@ upright (Terra II's unit labels and damage tags), mode 1 lays it flat.
 
 ## Limits and next steps
 
-* The mesh table holds 16 names (14 used) and 16,384 instances per mesh; a
+* The mesh table holds 32 names (19 used) and 16,384 instances per mesh; a
   registered mesh has no vertex sharing, so triangles cost three vertices
   each -- fine for hundreds, think again for hundreds of thousands.
 * Rotation is yaw only, as for every entity: a model that needs pitch

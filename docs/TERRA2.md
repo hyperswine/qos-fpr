@@ -173,6 +173,63 @@ The title is a glass card with the name at 64 px.  On the board the unit
 labels, the HQ figure, the ambush "?" and the damage tags are text
 entities standing over their units instead of glyph cells.
 
+## The lifecycle
+
+A packaged game has screens, and the model now says which one is up:
+title, playing, paused, game over, keys, stats (`screen`).  Paused,
+Keys and Stats freeze the tick -- animations, the AI and the supply
+ticker stop, only keys are taken -- and the music ducks to half while
+paused.  Esc with nothing selected pauses: a glass menu over the veiled
+board with Resume, Restart, Stats, Keys and Quit, arrows and enter.
+Restart asks first ("Abandon this game and deal a new one?") so a stray
+key cannot wipe a game; the new deal keeps the profile, the settings
+and the snapshot counter.  K and S open the Keys and Stats screens from
+the title, the menu and game over, and esc, enter, K or S return to
+where you came from.  The Keys screen is a table (`keymap`) that is also
+the source of the unit panel's key caps, so the two cannot drift.
+
+## The profile
+
+The disk keeps a profile: one append-only record at `terra2/profile`
+on the QLOG log through `std/fs` (the same service POS uses), a line per
+event -- `start <seed>` when a game is dealt and `end <seed> win|loss
+<rounds> <hqMe> <hqEn> <called> <lost> <destroyed> <damage>` when an HQ
+falls.  Boot replays the log and folds it into totals; every line the
+game writes is folded into the model's copy first, so the Stats screen
+never lags the disk, and update flushes the pending lines after each
+step (the rules never touch the service).  A start with no end is a
+game abandoned.  Stats shows played / won / lost / abandoned and the
+win rate, the best win in rounds, the average length, units called and
+lost, and the recent games one line each.  The GL host opens
+`qosp.disk` beside it (or `FPR_DISK`), so `./qos.py run` and a packed
+bundle keep the profile between runs without any flag; with no disk the
+game says so on the Stats screen and plays on.  Boot also asks the
+storage service to compact (live records copied forward, the log
+truncated -- idempotent), so a long-played disk does not fill with
+superseded saves.
+
+## Continue
+
+The board is saved too: at `terra2/game`, whenever a turn of yours
+begins (the state after income, nothing in flight -- `dirty` is set by
+the turn start and the save goes out with the next flush that finds the
+board idle) and cleared when an HQ falls.  Only what the rules need
+goes out: both sides (HQ, supply, deck, hand, the two rows as eleven
+numbers a unit), turn, ENV, the counters; never the animation, cursor
+or queue.  Boot reads it back under the title -- the saved board is
+what the camera drifts over -- and the prompt becomes "ENTER continue
+turn N / N new game".  Continue picks up at that turn with no start
+record; N deals fresh.
+
+## Cards
+
+C from the title, the pause menu or game over opens the Cards screen:
+both factions as small cards eight to a row (name, cost badge, kind,
+figures), the cursor's card in a detail line below with its full stats
+and a line on what its kind does; arrows browse, up and down swap
+faction.  The same card component the hand uses, so the screen doubles
+as a check that every card in the table renders.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
@@ -185,7 +242,10 @@ entities standing over their units instead of glyph cells.
     1-5           jump to a column      space / E   end the turn
     P screenshot  S auto-screenshot at every animation midpoint   Q quit
     M music on / off (Sunrise Over The Spire starts with the game)
-    ENTER on the title screen begins; on the game-over screen, a new game
+    esc with nothing selected: pause (Resume / Restart / Cards / Stats / Keys / Quit)
+    K keys, S stats, C cards: from the title, the pause menu and game over
+    ENTER on the title screen begins (or continues the saved game; N deals
+    fresh); on the game-over screen, a new game
 
 ## Verified
 
@@ -195,7 +255,11 @@ transcript the rules print: your call, the lane attack on the HQ (15 ->
 13), the AI's turn and call, a forward unit destroyed by the second
 attack, a clean quit; plus the frames read back mid-lunge (960x600, not
 blank) and the sound dump (a WAV as long as the run, 60+ tones in 25+
-distinct bursts over 60% silence).  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
+distinct bursts over 60% silence).  A second run on the same fresh disk
+walks the lifecycle -- the Keys, Stats and Cards screens, Continue into
+the board the first run saved at its fourth turn, pause, Restart through
+its confirm, Stats from the menu, quit -- and reads the first run's
+start record back as one abandoned game.  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
 cube instances a frame, well inside the walker's 16384 per mesh.
 
 ## Not in this cut

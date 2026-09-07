@@ -12,7 +12,7 @@ import struct, sys
 
 CODES = {"esc": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "bksp": 14, "q": 16, "e": 18,
          "r": 19, "o": 24, "s": 31, "p": 25, "enter": 28, "a": 30, "f": 33, "c": 46, "v": 47,
-         "space": 57, "up": 103, "left": 105, "right": 106, "down": 108}
+         "space": 57, "up": 103, "left": 105, "right": 106, "down": 108, "k": 37, "m": 50, "n": 49}
 
 def main():
     out, names = sys.argv[1], sys.argv[2:]
