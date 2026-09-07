@@ -1,6 +1,7 @@
 # gl2d.fpr -- scene2d's box treatments on the walker: rounded corners,
 # shadows, translucent fills, borders as rings, proportional text and a
-# menu laid over a layer (buildAt).  Snapshots frame 6 to /tmp/gl2d-1.ppm
+# menu laid over a layer (buildAt), a clipped and scrolled row of chips,
+# a label cut with "..".  Snapshots frame 6 to /tmp/gl2d-1.ppm
 # and quits; the check reads pixels back (a glass card over a grey field
 # must be one even tint, corners included).
 #
@@ -37,6 +38,9 @@ Shadow = S2.Shadow.
 Bga = S2.Bga.
 Center = S2.Center.
 Mid = S2.Mid.
+Clip = S2.Clip.
+Scroll = S2.Scroll.
+Ellip = S2.Ellip.
 
 lights = ((3000, 9000, 6000), (1000, 1000, 1000)) :: Nil.
 camera = ((0, 5200, 7800), (0, 0, 0), 950).
@@ -61,7 +65,13 @@ tree =
        Box (Row :: Gap 12 :: Mid :: Nil)
            (Box (Row :: W 22 :: H 22 :: Round 11 :: Bg yellow :: Center :: Mid :: Nil) (t 12 (34, 40, 56) "3" :: Nil) ::
             t 14 ink "a badge, a chip" ::
-            Box (Row :: Pad 5 :: Round 9 :: Bg (48, 58, 84) :: Mid :: Nil) (t 12 ink "CHIP" :: Nil) :: Nil) :: Nil).
+            Box (Row :: Pad 5 :: Round 9 :: Bg (48, 58, 84) :: Mid :: Nil) (t 12 ink "CHIP" :: Nil) :: Nil) ::
+       Box (Row :: Gap 20 :: Nil)
+           (Box (Row :: W 300 :: H 60 :: Pad 8 :: Gap 10 :: Clip :: Scroll 40 0 :: Bg (34, 40, 56) :: Nil)
+                (chip "one" :: chip "two" :: chip "three" :: chip "four" :: chip "five" :: chip "six" :: Nil) ::
+            Box (Col :: W 160 :: Pad 8 :: Bg (34, 40, 56) :: Nil)
+                (Lbl (Fs 16 :: Fg ink :: Ellip 140 :: Nil) "a rather long label that must be cut" :: Nil) :: Nil) :: Nil).
+chip s = Box (Row :: W 90 :: H 44 :: Round 8 :: Bg yellow :: Center :: Mid :: Nil) (t 14 (34, 40, 56) s :: Nil).
 # a menu over it all
 menu =
   Box (Col :: W 960 :: H 600 :: Center :: Mid :: Bga (0, 0, 0, 520) :: Nil)

@@ -248,12 +248,13 @@ static void mesh_corner(rawmesh_t *m) {
 }
 
 /* ==== renderer state (RenderCache, fixed-capacity C tables) ========== */
-typedef struct { float model[16]; float color[4]; } inst_t; /* rgb + alpha */
+typedef struct { float model[16]; float color[4]; float clip[4]; } inst_t; /* rgb + alpha; clip x0 y0 x1 y1 (world) */
 typedef struct titem titem_t;
 
 #define MAX_MESHES 32
 #define MAX_TEXT 4096 /* glyphs per frame, all text entities together */
-#define TVF 9         /* floats per text vertex: pos3 uv2 rgba */
+#define TVF 13        /* floats per text vertex: pos3 uv2 rgba clip4 */
+#define CLIP_FAR 1.0e9f
 #define MAX_INST 16384 /* per mesh per tier: a 5x8 glyph is up to 40
                             * cube instances, and a text-heavy screen
                             * (the CLI, the browser listing) runs to
@@ -282,6 +283,9 @@ static struct {
   float *tstage; int ntext;
   /* the translucent pass: every mesh's tail and the text, sorted together */
   titem_t *titems; int titemCap; inst_t *tinst; float *tsorted; GLuint tinstVBO;
+  /* the clip rect in force while walking a list (world x0 y0 x1 y1);
+   * Ent "clip" pos 0 (w, h, 1) c sets it, a zero-width one clears it */
+  float clip[4];
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
   int staticCompiled;
@@ -385,6 +389,13 @@ static void gfx_cursor_cb(GLFWwindow *window, double x, double y) {
   gfx_cursor_x = x; gfx_cursor_y = y; gfx_have_cursor = 1;
 }
 
+/* the wheel: kind 6, a = vertical notches x10 (a trackpad's fractions
+ * survive), c = horizontal */
+static void gfx_scroll_cb(GLFWwindow *window, double xoff, double yoff) {
+  (void)window;
+  gfx_event_push(6, (int64_t)lround(yoff * 10.0), (int64_t)lround(xoff * 10.0));
+}
+
 static void gfx_mouse_cb(GLFWwindow *window, int button, int action, int mods) {
   (void)window; (void)mods;
   if (button >= 0 && button < 31) {
@@ -426,10 +437,11 @@ static const char *kVS =
     "layout(location=4) in vec4 iM2;\n"
     "layout(location=5) in vec4 iM3;\n"
     "layout(location=6) in vec4 iColor;\n"
+    "layout(location=7) in vec4 iClip;\n"
     "uniform mat4 uView; uniform mat4 uProj;\n"
-    "out vec3 vN; out vec3 vW; out vec3 vC; out float vZ; out float vA;\n"
+    "out vec3 vN; out vec3 vW; out vec3 vC; out float vZ; out float vA; out vec4 vClip;\n"
     "void main(){ mat4 model = mat4(iM0,iM1,iM2,iM3);\n"
-    "  vec4 world = model*vec4(inPos,1.0); vW = world.xyz;\n"
+    "  vec4 world = model*vec4(inPos,1.0); vW = world.xyz; vClip = iClip;\n"
     "  vN = mat3(model)*inNormal; vC = iColor.rgb; vA = iColor.a;\n"
     "  vec4 eye = uView*world; vZ = -eye.z;\n"
     "  gl_Position = uProj*eye; }\n";
@@ -440,11 +452,12 @@ static const char *kFS =
     "#version 310 es\n"
     "precision highp float;\n"
 #endif
-    "in vec3 vN; in vec3 vW; in vec3 vC; in float vZ; in float vA;\n"
+    "in vec3 vN; in vec3 vW; in vec3 vC; in float vZ; in float vA; in vec4 vClip;\n"
     "uniform vec3 uLightPos; uniform vec3 uLightColor;\n"
     "uniform vec3 uAmbient; uniform vec3 uFog; uniform vec2 uFogRange;\n"
     "out vec4 fragColor;\n"
-    "void main(){ vec3 n = normalize(vN);\n"
+    "void main(){ if (vW.x < vClip.x || vW.x > vClip.z || vW.y < vClip.y || vW.y > vClip.w) discard;\n"
+    "  vec3 n = normalize(vN);\n"
     "  vec3 l = normalize(uLightPos - vW);\n"
     "  float d = max(dot(n,l), 0.0);\n"
     "  vec3 c = vC*uAmbient + d*vC*uLightColor;\n"
@@ -464,9 +477,10 @@ static const char *kTVS =
     "layout(location=0) in vec3 inPos;\n"
     "layout(location=1) in vec2 inUV;\n"
     "layout(location=2) in vec4 inCol;\n"
+    "layout(location=3) in vec4 inClip;\n"
     "uniform mat4 uView; uniform mat4 uProj;\n"
-    "out vec2 vUV; out vec4 vC; out float vZ;\n"
-    "void main(){ vec4 eye = uView*vec4(inPos,1.0); vZ = -eye.z;\n"
+    "out vec2 vUV; out vec4 vC; out float vZ; out vec3 vW; out vec4 vClip;\n"
+    "void main(){ vec4 eye = uView*vec4(inPos,1.0); vZ = -eye.z; vW = inPos; vClip = inClip;\n"
     "  vUV = inUV; vC = inCol; gl_Position = uProj*eye; }\n";
 static const char *kTFS =
 #ifdef FPR_DESKTOP_GL
@@ -475,10 +489,11 @@ static const char *kTFS =
     "#version 310 es\n"
     "precision highp float;\n"
 #endif
-    "in vec2 vUV; in vec4 vC; in float vZ;\n"
+    "in vec2 vUV; in vec4 vC; in float vZ; in vec3 vW; in vec4 vClip;\n"
     "uniform sampler2D uTex; uniform vec3 uFog; uniform vec2 uFogRange;\n"
     "out vec4 fragColor;\n"
-    "void main(){ float s = texture(uTex, vUV).r;\n"
+    "void main(){ if (vW.x < vClip.x || vW.x > vClip.z || vW.y < vClip.y || vW.y > vClip.w) discard;\n"
+    "  float s = texture(uTex, vUV).r;\n"
     "  float w = clamp(fwidth(s) * 0.9, 0.02, 0.25);\n"
     "  float a = smoothstep(0.5 - w, 0.5 + w, s);\n"
     "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
@@ -657,6 +672,7 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   glfwSetCharCallback(G.window, gfx_char_cb);
   glfwSetCursorPosCallback(G.window, gfx_cursor_cb);
   glfwSetMouseButtonCallback(G.window, gfx_mouse_cb);
+  glfwSetScrollCallback(G.window, gfx_scroll_cb);
   glfwSwapInterval(1);
   G.boundTid = pthread_self(); G.haveTid = 1;
   qos_hostlog("[desktopgl] GLFW  OpenGL %s  %s",
@@ -754,6 +770,8 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(3 * sizeof(float)));
     glEnableVertexAttribArray(2);
     glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(5 * sizeof(float)));
+    glEnableVertexAttribArray(3);
+    glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(9 * sizeof(float)));
     glBindVertexArray(0);
     G.tstage = malloc((size_t)MAX_TEXT * 6 * TVF * sizeof(float));
     if (!G.tstage) fpr_cpanic("gfx: text staging alloc");
@@ -919,6 +937,10 @@ static void gfx_bind_instances_at(GLuint vbo, int first) {
   glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, sizeof(inst_t),
                         (void *)(base + offsetof(inst_t, color)));
   glVertexAttribDivisor(6, 1);
+  glEnableVertexAttribArray(7);
+  glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, sizeof(inst_t),
+                        (void *)(base + offsetof(inst_t, clip)));
+  glVertexAttribDivisor(7, 1);
 }
 static void gfx_bind_instances(GLuint vbo) { gfx_bind_instances_at(vbo, 0); }
 
@@ -1055,6 +1077,9 @@ static int draw_translucent(const m4 *view, const m4 *proj, v3 fog, float fogNea
  * atlas cell placed at the pen, so the only per-glyph datum is the
  * advance.  Six vertices per glyph, streamed each frame, drawn after
  * the meshes: blended, depth-tested, not depth-written. */
+static void clip_reset(void) {
+  G.clip[0] = -CLIP_FAR; G.clip[1] = -CLIP_FAR; G.clip[2] = CLIP_FAR; G.clip[3] = CLIP_FAR;
+}
 static void stage_text(int mode, const unsigned char *s, uw len, v3 pos, float yaw, v3 sc, v3 col, float alpha) {
   m4 model = m4mul(m4translate(pos), m4rotY(yaw));
   if (mode == 1) {
@@ -1086,6 +1111,7 @@ static void stage_text(int mode, const unsigned char *s, uw len, v3 pos, float y
         o[2] = m[2] * v[0] + m[6] * v[1] + m[14];
         o[3] = v[2]; o[4] = v[3];
         o[5] = col.x; o[6] = col.y; o[7] = col.z; o[8] = alpha;
+        o[9] = G.clip[0]; o[10] = G.clip[1]; o[11] = G.clip[2]; o[12] = G.clip[3];
         o += TVF;
       }
       G.ntext++;
@@ -1147,6 +1173,15 @@ static void walk_entity(V v) {
   }
   if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String or (mode, text)");
   str_t *s = (str_t *)ms;
+  if (s->len == 4 && !memcmp(s->bytes, "clip", 4)) { /* a state change, not a mesh */
+    v3 cp = walk_v3(f[1]), cs = walk_v3(f[3]);
+    if (cs.x <= 0 || cs.y <= 0) clip_reset();
+    else {
+      G.clip[0] = cp.x - cs.x * 0.5f; G.clip[1] = cp.y - cs.y * 0.5f;
+      G.clip[2] = cp.x + cs.x * 0.5f; G.clip[3] = cp.y + cs.y * 0.5f;
+    }
+    return;
+  }
   mesh_t *m = gfx_mesh((const char *)s->bytes, s->len);
   if (m->nstage == MAX_INST) fpr_cpanic("gfx: too many instances of one mesh");
   inst_t *it = &m->stage[m->nstage++];
@@ -1158,6 +1193,7 @@ static void walk_entity(V v) {
   m4 model = m4mul(m4translate(pos), m4mul(m4rotY(yaw), m4scale(sc)));
   memcpy(it->model, model.m, sizeof it->model);
   it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z; it->color[3] = alpha;
+  memcpy(it->clip, G.clip, sizeof it->clip);
 }
 static void walk_list(V v, void (*each)(V)) {
   for (;;) {
@@ -1236,6 +1272,7 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
   }
   if (!G.staticCompiled) {
     stage_clear();
+    clip_reset();
     walk_list(f[0], walk_entity);
     for (int i = 0; i < G.nmeshes; i++) {
       mesh_t *m = &G.meshes[i];
@@ -1283,10 +1320,12 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
                            m4mul(m4rotY((float)w[3] / 1000.0f), m4scale(sc)));
           memcpy(it->model, model.m, sizeof it->model);
           it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z; it->color[3] = 1.0f;
+          it->clip[0] = -CLIP_FAR; it->clip[1] = -CLIP_FAR; it->clip[2] = CLIP_FAR; it->clip[3] = CLIP_FAR;
         }
         packed = 1;
       }
     }
+    clip_reset();
     if (!packed) walk_list(f[1], walk_entity);
   }
   /* Camera: an INT is the 2D case -- the eye distance in milli, looking
@@ -1394,6 +1433,7 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   int64_t d2 = 0, b2 = 0;
   int r = gfx_render_pass(scenev, draws_out, dyn_bytes_out);
   stage_clear();
+  clip_reset();
   walk_list((V)uiv, walk_entity);
   float z = (float)dist / 1000.0f;
   m4 view = m4lookAt((v3){0, 0, z}, (v3){0, 0, 0}, (v3){0, 1, 0});

@@ -54,7 +54,8 @@
 
 At = Type (Row | Col | Pad p | Gap g | W w | H h | Grow
          | Bg c | Fg c | Bord c | Sc s
-         | Fs e | Round r | Shadow | Bga c4 | Center | Mid).
+         | Fs e | Round r | Shadow | Bga c4 | Center | Mid
+         | Clip | Scroll sx sy | Ellip w).
 Sn = Type (Box attrs kids | Lbl attrs text | Slot attrs idx cap).
 
 # entity + scene shapes (the walker's positional contract; gfxdemo.fpr)
@@ -127,6 +128,21 @@ mids Nil = False.
 mids (Mid :: r) = True.
 mids (a :: r) = mids r.
 
+# a Clip box cuts its children at its own rect (the walker's clip
+# entity); Scroll offsets them; Ellip caps a label's width, the text cut
+# with ".." to fit
+clips Nil = False.
+clips (Clip :: r) = True.
+clips (a :: r) = clips r.
+
+scrollOf Nil = (0, 0).
+scrollOf (Scroll sx sy :: r) = (sx, sy).
+scrollOf (a :: r) = scrollOf r.
+
+ellipOf Nil = 0.
+ellipOf (Ellip w :: r) = w.
+ellipOf (a :: r) = ellipOf r.
+
 # translucent fill: (has, (r, g, b, a))
 bgaOf Nil = (False, (0, 0, 0, 0)).
 bgaOf (Bga c :: r) = (True, c).
@@ -147,9 +163,32 @@ propH e = (Fm.line * e) / 1000.
 propCap cap e = (cap * 620 * e) / 1000.
 textSize a n t =
   e = fsOf a;
-  case e > 0 of
+  (w, h) = case e > 0 of
     True -> (propW t e, propH e)
-  | False -> (textW n (scOf a), textH (scOf a)).
+  | False -> (textW n (scOf a), textH (scOf a));
+  cap = ellipOf a;
+  case cap > 0 and w > cap of True -> (cap, h) | False -> (w, h).
+
+# the text that fits a capped label: the longest prefix plus ".."
+fitText a t =
+  cap = ellipOf a;
+  e = fsOf a;
+  case cap == 0 of
+    True -> t
+  | False -> (case e > 0 of
+      True -> fitP t e cap
+    | False -> fitB t (scOf a) cap).
+fitP t e cap | propW t e <= cap = t.
+fitP t e cap = fpGo t 1 (strlen t) (cap * 1000 / e - Fm.width "..") 0.
+fpGo t i n lim acc | i > n = t + "..".
+fpGo t i n lim acc =
+  a = acc + Fm.adv (charAt t i);
+  case a > lim of True -> substr t 1 (i - 1) + ".." | False -> fpGo t (i + 1) n lim a.
+fitB t sc cap =
+  most = (cap + sc) / (6 * sc);
+  case strlen t <= most of
+    True -> t
+  | False -> substr t 1 (imax 0 (most - 2)) + "..".
 
 # override natural size with W/H when given
 sized a (nw, nh) =
@@ -222,8 +261,9 @@ node c n x y d =
   c3 = boxBg c2 a x y w h (d + 2);
   body c3 n x y w h d.
 
-body c (Lbl a t) x y w h d =
+body c (Lbl a t0) x y w h d =
   e = fsOf a;
+  t = fitText a t0;
   case e > 0 of
     True -> addEnt c (textEnt (vpOf c) t x y e (fgCol a) (d + 3))
   | False -> emitText c t x y (scOf a) (fgCol a) (d + 3).
@@ -234,7 +274,17 @@ body c (Box a kids) x y w h d =
   cross = case isRow a of True -> h - 2 * p | False -> w - 2 * p;
   lead = case centers a of True -> leadSlack (isRow a) a kids w h p | False -> 0;
   (lx, ly) = case isRow a of True -> (lead, 0) | False -> (0, lead);
-  kidsGo c (isRow a, mids a) kids (x + p + lx) (y + p + ly) (gapOf a, slack, cross) (d + 3).
+  (sx, sy) = scrollOf a;
+  c1 = case clips a of True -> addEnt c (clipEnt (vpOf c) x y w h) | False -> c;
+  c2 = kidsGo c1 (isRow a, mids a) kids (x + p + lx - sx) (y + p + ly - sy) (gapOf a, slack, cross) (d + 3);
+  case clips a of True -> addEnt c2 clipOff | False -> c2.
+
+# the walker's clip entity: everything after it in the list is cut to
+# the rect until the zero-sized one lifts it
+clipEnt vp x y w h =
+  (vw, vh) = vp;
+  Ent "clip" (idiv2 ((2 * x + w - vw) * pxm), idiv2 ((vh - 2 * y - h) * pxm), 0) 0 (w * pxm, h * pxm, 1) (0, 0, 0, 0).
+clipOff = Ent "clip" (0, 0, 0) 0 (0, 0, 0) (0, 0, 0, 0).
 
 # half the leftover along the axis, when nothing grows into it
 leadSlack row a kids w h p =

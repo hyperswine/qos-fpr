@@ -68,6 +68,26 @@ fill; text and children above), still 5 milli each.  A second tree can
 be laid over the first from a deeper start (`S2.buildAt vp tree d0`):
 Terra II's pause menu is one, over a veil, over the game's own layer.
 
+Three more attrs keep a layer inside its box:
+
+    Clip          the box cuts its children at its own rect -- the
+                  walker's clip entity, Ent "clip" pos 0 (w, h, 1) c,
+                  sets a rect that every instance and glyph after it in
+                  the list carries (a per-instance attribute, so
+                  batching and the sorted translucent pass are
+                  untouched; the fragment shader discards outside it);
+                  a zero-sized clip lifts it
+    Scroll sx sy  children offset by (-sx, -sy) px: with Clip, a
+                  carousel or a list that scrolls in place
+    Ellip w       a label capped at w px, its text cut with ".." to fit
+
+The wheel arrives as an MVU event, `EWheel dy dx` (tenths of a notch,
+up positive), from GLFW's scroll callback; the app decides what is
+under the cursor and moves its Scroll offset.  Terra II's hand is a
+clipped, centred carousel that follows the cursor's card and the
+wheel; its Stats list scrolls the same way; the message line, the
+panel's status line and the card names are capped with "..".
+
 For that to come out right the walker's translucent pass is one sorted
 stream: after every mesh's opaque instances, all translucent instances
 of all meshes AND the text glyphs are sorted far to near together and

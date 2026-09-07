@@ -66,7 +66,7 @@ echo "== the 2D layer's box treatments: glass, rings, corners, a menu over a lay
 import sys
 def px(path, x, y):
     b = open(path, 'rb').read(); d = b.split(b'\\n', 3)[3]; i = (y * 960 + x) * 3; return tuple(d[i:i + 3])
-a = px('/tmp/gl2d-1.ppm', 48, 48); b = px('/tmp/gl2d-1.ppm', 140, 110); g = px('/tmp/gl2d-1.ppm', 20, 20)
+a = px('/tmp/gl2d-1.ppm', 48, 48); b = px('/tmp/gl2d-1.ppm', 140, 110); g = px('/tmp/gl2d-1.ppm', 20, 20); cl = px('/tmp/gl2d-1.ppm', 20, 254); ci = px('/tmp/gl2d-1.ppm', 60, 254); assert cl == g, ('the clip: a chip scrolled past the box edge must not paint', cl); assert ci[0] > 200 and ci[2] < 120, ('the clip: the chip inside the box paints', ci)
 assert a == b, ('corner and interior differ', a, b)            # one even tint, corners included
 assert max(g) > 100 and max(b) < 60, ('glass not translucent over grey', g, b)
 m = px('/tmp/gl2d-2.ppm', 20, 20)

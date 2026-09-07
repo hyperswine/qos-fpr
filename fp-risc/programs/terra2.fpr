@@ -92,6 +92,10 @@ Shadow = S2.Shadow.
 Bga = S2.Bga.
 Center = S2.Center.
 Mid = S2.Mid.
+Clip = S2.Clip.
+Scroll = S2.Scroll.
+Ellip = S2.Ellip.
+EWheel = MV.EWheel.
 
 # ---- little prelude ---------------------------------------------------------
 
@@ -522,7 +526,7 @@ initWith s0 s1 =
     gone = (0 - 1, 1000), dealt = 1000,
     screen = scrTitle, back = scrTitle, menu = 0, confirm = 0, ccur = (0, 0),
     prof = profEmpty, fsOn = 0, recs = Nil, called = 0, lostU = 0, kills = 0, dmg = 0,
-    cont = 0, dirty = 0 }.
+    cont = 0, dirty = 0, hs = 0, ss = 0 }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -946,8 +950,9 @@ chase m dt =
   same = hov2 == m.hov;
   (sv, st) = m.supV;
   sv2 = case sv < m.me.stock of True -> sv + 1 | False -> (case sv > m.me.stock of True -> sv - 1 | False -> sv);
-  { m | ring = ring2, hov = hov2, hovT = (case same of True -> Int.min 2000 (m.hovT + dt) | False -> 0),
-        supV = (sv2, case sv2 == m.me.stock of True -> Int.min 1000 (st + dt) | False -> 0) }.
+  m2 = { m | ring = ring2, hov = hov2, hovT = (case same of True -> Int.min 2000 (m.hovT + dt) | False -> 0),
+             supV = (sv2, case sv2 == m.me.stock of True -> Int.min 1000 (st + dt) | False -> 0) };
+  case same of True -> { m2 | hs = clampTo m2.hs (hsMax m2) } | False -> followCard m2.
 ringTarget m = case m.sel of
     STarget az ac -> (case m.zone == 3 of
         True -> (0, zOf 1 3 + 700)
@@ -1565,6 +1570,8 @@ spacer h = Box (H h :: W 1 :: Nil) Nil.
 hspace w = Box (W w :: H 1 :: Nil) Nil.
 # text in the proportional face at em px
 t em col s = Lbl (Fs em :: Fg col :: Nil) s.
+# text capped at w px, cut with ".." when longer
+tE em col w s = Lbl (Fs em :: Fg col :: Ellip w :: Nil) s.
 centred kid = Box (Row :: Center :: Nil) (kid :: Nil).
 # a rounded chip with a word in it
 tag bg fg s = Box (Row :: Pad 5 :: Round 9 :: Bg bg :: Mid :: Nil) (t 12 fg s :: Nil).
@@ -1642,14 +1649,14 @@ mini cd sel =
   rim = case sel of True -> yellow | False -> edge;
   Box (Col :: W 104 :: H 80 :: Pad 4 :: Gap 3 :: Round 8 :: Bg face :: Bord rim :: Nil)
       (Box (Row :: H 26 :: Pad 4 :: Round 6 :: Bg (bandOf cd) :: Mid :: Gap 3 :: Nil)
-           (t 11 white (cName cd) :: grow :: costBadge True (cCost cd) :: Nil) ::
+           (tE 11 white 62 (cName cd) :: grow :: costBadge True (cCost cd) :: Nil) ::
        Box (Row :: Grow :: Center :: Mid :: Nil) (t 9 inkDim (kindName cd) :: Nil) ::
        Box (Row :: Mid :: Pad 2 :: Nil) (miniStats cd) :: Nil).
 miniStats cd | cKind cd == 1 = t 14 yellow "+{cGen cd}" :: grow :: t 14 ink "{cDef cd}" :: Nil.
 miniStats cd = t 14 ink "{cAtk cd}" :: grow :: t 14 ink "{cDef cd}" :: Nil.
 detailOf cd =
   t 15 white (cName cd) :: t 12 inkDim (kindName cd) :: t 12 ink "cost {cCost cd}" ::
-  statsText cd :: t 12 ink "drain {cDrain cd}" :: t 12 inkDim (kindText cd) :: Nil.
+  statsText cd :: t 12 ink "drain {cDrain cd}" :: tE 12 inkDim 330 (kindText cd) :: Nil.
 statsText cd | cKind cd == 1 = t 12 ink "GEN +{cGen cd}   DEF {cDef cd}".
 statsText cd = t 12 ink "ATK {cAtk cd}   DEF {cDef cd}".
 kindText cd | cKind cd == 1 = "a rear unit: earns supply every turn".
@@ -1687,20 +1694,21 @@ statsTree m =
                   (chipOf "BEST WIN" (bestStr p.best) :: chipOf "AVG ROUNDS" "{avg}" ::
                    chipOf "UNITS CALLED" "{p.calls}" :: chipOf "UNITS LOST" "{p.losses}" :: Nil) ::
               t 11 inkDim "RECENT GAMES   Republic VI against the Southern Empire" ::
-              recentBox p.recent ::
+              recentBox m p.recent ::
               centred (t 12 inkDim "esc  back") :: Nil);
   Box (Col :: W uiW :: H uiH :: Center :: Mid :: Nil) (card :: Nil).
 bestStr 0 = "-".
 bestStr b = "{b} rounds".
-recentBox Nil = t 13 inkDim "no game finished yet -- play one through".
-recentBox rs = Box (Col :: Gap 4 :: Nil) (recentRows rs 0).
+recentBox m Nil = t 13 inkDim "no game finished yet -- play one through".
+# the list scrolls in place under the wheel; 30 px a row
+recentBox m rs = Box (Col :: Gap 4 :: H 236 :: Clip :: Scroll 0 m.ss :: Nil) (recentRows rs 0).
 recentRows Nil i = Nil.
-recentRows r i | i == 7 = Nil.
+recentRows r i | i == 50 = Nil.
 recentRows (g :: r) i =
   (won, rounds, hqMe, hqEn, cl, lo, ki, dm) = g;
   res = case won == 1 of True -> "WIN" | False -> "LOSS";
   col = case won == 1 of True -> yellow | False -> danger;
-  Box (Row :: Gap 16 :: Mid :: Pad 5 :: Round 6 :: Bg chip :: Nil)
+  Box (Row :: Gap 16 :: Mid :: Pad 5 :: H 26 :: Round 6 :: Bg chip :: Nil)
       (Box (Row :: W 48 :: Nil) (t 13 col res :: Nil) ::
        Box (Row :: W 90 :: Nil) (t 13 ink "{rounds} rounds" :: Nil) ::
        Box (Row :: W 90 :: Nil) (t 12 inkDim "HQ {hqMe} : {hqEn}" :: Nil) ::
@@ -1728,7 +1736,7 @@ supplyCol m =
   (sv, st) = m.supV;
   case st < 400 of True -> yellow | False -> ink.
 msgLine m =
-  Box (Row :: H 30 :: Pad 4 :: Center :: Mid :: Nil) (t 14 (960, 930, 720) m.msg :: Nil).
+  Box (Row :: H 30 :: Pad 4 :: Center :: Mid :: Nil) (tE 14 (960, 930, 720) 760 m.msg :: Nil).
 
 middle m =
   Box (Row :: Grow :: Pad 10 :: Nil)
@@ -1763,9 +1771,9 @@ panelFor m s z c u =
   rim = case s == 0 of True -> blueLight | False -> redLight;
   Box (Col :: W 250 :: Pad 6 :: Gap 8 :: Round 12 :: Shadow :: Bga (mixA glass glassLit (1000 - k)) :: Bord rim :: Nil)
       (Box (Row :: Pad 8 :: Gap 8 :: Round 8 :: Bg (bandOf cd) :: Mid :: Nil)
-           (t 17 white (cName cd) :: grow :: t 11 (mixC white (bandOf cd) 300) who :: Nil) ::
+           (tE 17 white 150 (cName cd) :: grow :: t 11 (mixC white (bandOf cd) 300) who :: Nil) ::
        Box (Col :: Pad 4 :: Gap 8 :: Nil)
-           (t 12 inkDim "{zoneName z} {c + 1}   {mode}{vetTag u}{readyTag u}" ::
+           (tE 12 inkDim 226 "{zoneName z} {c + 1}   {mode}{vetTag u}{readyTag u}" ::
             Box (Row :: Gap 8 :: Nil) (statChips cd u) ::
             t 11 inkDim "drain {cDrain cd}   call {cCost cd}" ::
             panelHelp m s z u :: Nil) :: Nil).
@@ -1797,7 +1805,7 @@ bandOf cd = bandArm.
 cardW = 124.
 cardH = 150.
 handBar m =
-  Box (Row :: H 184 :: Pad 10 :: Gap 10 :: Center :: Nil) (cards m m.me.hand 0).
+  Box (Row :: H 184 :: Pad 10 :: Gap 10 :: Center :: Clip :: Scroll m.hs 0 :: Nil) (cards m m.me.hand 0).
 # the departing card's ghost shrinks in place over 200 ms so the hand
 # closes the gap; the last card, just dealt, grows in over 200 ms
 cards m Nil i = ghost m i Nil.
@@ -1821,7 +1829,7 @@ card m cd i w =
   rim = case sel of True -> mixC edge yellow k | False -> edge;
   body = Box (Col :: W cardW :: H cardH :: Pad 5 :: Gap 6 :: Round 10 :: Shadow :: Bg face :: Bord rim :: Nil)
              (Box (Row :: H 32 :: Pad 6 :: Round 7 :: Bg (bandOf cd) :: Mid :: Gap 4 :: Nil)
-                  (t 13 white (cName cd) :: grow :: costBadge afford (cCost cd) :: Nil) ::
+                  (tE 13 white 76 (cName cd) :: grow :: costBadge afford (cCost cd) :: Nil) ::
               Box (Row :: Grow :: Round 7 :: Bg (mixC face paper 500) :: Center :: Mid :: Nil)
                   (t 11 (mixC inkDim (bandOf cd) 400) (kindName cd) :: Nil) ::
               Box (Row :: H 44 :: Pad 2 :: Gap 6 :: Mid :: Nil) (bigStats cd) :: Nil);
@@ -1850,7 +1858,29 @@ update env ev m =
 step ev m = case ev of
     ETick -> tick m
   | EKey k -> keyIn m k
+  | EWheel dy dx -> (wheel m dy, Nil)
   | e -> (m, Nil).
+
+# ---- the wheel: whatever is under the cursor scrolls in place ---------------------------
+# (dy in tenths of a notch, up positive): the hand while the cursor is
+# in it, the Stats screen's list of games
+wheel m dy | m.screen == scrStats = { m | ss = clampTo (m.ss - dy * 4) (ssMax m) }.
+wheel m dy | m.screen == scrPlay and m.zone == 0 = { m | hs = clampTo (m.hs - dy * 6) (hsMax m) }.
+wheel m dy = m.
+clampTo v hi = Int.max 0 (Int.min hi v).
+handInner = uiW - 20.
+hsMax m =
+  n = List.len m.me.hand;
+  Int.max 0 (n * cardW + (n - 1) * 10 - handInner).
+ssMax m = Int.max 0 (Int.min 50 (List.len m.prof.recent) * 30 - 236).
+# the cursor's card stays in view when the cursor moves; otherwise the
+# hand is where the wheel left it
+followCard m | m.zone != 0 = m.
+followCard m =
+  cx = m.cur * (cardW + 10);
+  hs1 = case cx < m.hs of True -> cx | False -> m.hs;
+  hs2 = case cx + cardW > hs1 + handInner of True -> cx + cardW - handInner | False -> hs1;
+  { m | hs = clampTo hs2 (hsMax m) }.
 # buffered; a live window also sends kind-1 chars (negative codes): ignored
 keyIn m k | k < 0 = (m, Nil).
 keyIn m k = ({ m | keys = m.keys + (k :: Nil) }, Nil).
