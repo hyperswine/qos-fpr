@@ -15,6 +15,14 @@
 #                and the same live set reassembles, hot-swaps included,
 #                with no compiler and no operator anywhere
 #   LList u      the live chain, newest last ("a b c")
+#   LLaunch id   read apps/<id>.qa, attach it through the same host
+#                gate, and RUN it: its `app me` export is spawned under
+#                a fresh pid (Sys.spawnApp), handed the launcher's
+#                handle as its first message, and its table is popped
+#                straight back out of the registry -- the registry is
+#                the module chain; an app is a process, not a binding.
+#                Answers Ok <actor>.  Apps are runtime state: nothing
+#                is recorded, so a reboot starts none of them.
 #
 # The gates make refusal the loader's ONLY failure mode: a version that
 # does not match this shell image (plugsyms bakes absolute addresses --
@@ -37,7 +45,7 @@
 FS = use "fs".
 AC = use "actor".
 
-LMsg = Type (LLoad id | LList u | LReplay u).
+LMsg = Type (LLoad id | LList u | LReplay u | LLaunch id).
 
 serve fs = AC.spawnWith (AC.Dynamic 64) (loader fs).
 
@@ -51,6 +59,10 @@ replay me ld = _ = send ld (me, LReplay 0); receiveFrom me ld.
 
 list : unsafe Int -> Int -> String .
 list me ld = _ = send ld (me, LList 0); receiveFrom me ld.
+
+# run an app image from the disk under its own pid: Ok <its root actor>
+launch : unsafe Int -> Int -> String -> Result Int String .
+launch me ld id = _ = send ld (me, LLaunch id); receiveFrom me ld.
 
 # newest attached export wins; a miss is loud (the loader gated every load)
 bind : String -> _ .
@@ -77,7 +89,37 @@ lServe : unsafe Int -> Int -> List String -> Int -> LMsg -> a .
 lServe fs me chain from q = case q of
     LLoad id -> lLoad fs me chain from id 1
   | LList u -> send from (lRender chain "") >> lLoop fs me chain
-  | LReplay u -> lReplay fs me chain from.
+  | LReplay u -> lReplay fs me chain from
+  | LLaunch id -> lLaunch fs me chain from id.
+
+# one launch: record -> the host gate -> its `app` export -> a fresh pid
+lLaunch : unsafe Int -> Int -> List String -> Int -> String -> a .
+lLaunch fs me chain from id =
+  r = FS.readLatest me fs "apps/{id}.qa";
+  case r of
+    Err e -> send from (Err "launch {id}: {e}") >> lLoop fs me chain
+  | Ok qa -> lLaunch2 fs me chain from id r qa.
+lLaunch2 : unsafe Int -> Int -> List String -> Int -> String -> _ -> String -> a .
+lLaunch2 fs me chain from id r qa =
+  ar = Sys.attachQa qa;
+  _ = drop r;                        # the image is in its window now
+  case ar of
+    Err e -> send from (Err "launch {id}: {e}") >> lLoop fs me chain
+  | Ok n -> lStart fs me chain from id.
+lStart : unsafe Int -> Int -> List String -> Int -> String -> a .
+lStart fs me chain from id =
+  (ok, f) = Mod.findAt (Mod.plugs 0 - 1) "app";
+  _ = Mod.detachLast Unit;           # the registry is the module chain; the
+                                     # app's code stays in its window
+  case ok == 1 of
+    True -> lRun fs me chain from id f
+  | False -> send from (Err "launch {id}: no `app` export") >> lLoop fs me chain.
+lRun : unsafe Int -> Int -> List String -> Int -> String -> _ -> a .
+lRun fs me chain from id f =
+  h = Sys.spawnApp f;
+  _ = AC.sendOrDie h from;           # its first message: who launched it
+  _ = send from (Ok h);
+  lLoop fs me chain.
 
 # one load: record -> gates -> attach -> the new chain -> sys/live
 lLoad : unsafe Int -> Int -> List String -> Int -> String -> Int -> a .

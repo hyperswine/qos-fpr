@@ -14,7 +14,8 @@
  *     actually be mapped where the app was linked?), build the HAL
  *     table as in-memory C ABI functions (haltab.c).  TRACE output
  *     when asked, off by default, exactly the design's TRACE=TRUE.
- *   Stage 2, Loader -- buddy allocator over the arena; read the .qa,
+ *   Stage 2, Loader -- read the .qa (the app owns the arena past its
+ *     image, abi v12: no host allocator over it),
  *     parse the manifest, run the permission gate (required perms are
  *     compulsory: any denial refuses the launch, docs/QA-FORMAT.md);
  *     reserve the image slot; elfload the QOS-x86_64 ELF into it;
@@ -53,7 +54,8 @@ static int abi_gate(qa_t *); /* defined with perm_gate below */
 #include <sys/ucontext.h>
 #include <pthread.h>
 
-/* runtime/core, compiled hosted into qosp (buddy.c + elfload.c only) */
+/* runtime/core, compiled hosted into qosp (qaimg.c only: the host
+ * keeps no allocator over the arena since abi v12) */
 #include "fpr.h"
 
 const qos_hal_t *qosp_hal_table(void);
@@ -73,9 +75,6 @@ __attribute__((noreturn)) void fpr_cpanic(const char *msg) {
 #define TRACE(...) \
   do { if (g_trace) qos_hostlog("qosp: " __VA_ARGS__); } while (0)
 
-/* the growth callback wired into the boot record: buddy grants from
- * the arena past the slot -- the Memory.qa analogue, one caller so no
- * linearization needed (the design's single-core bootstrap rule) */
 /* ---- runtime plugin loader (syscall tag 4, qos_abi.h) ---------------
  * Load a plugin .qa into the reserved plugin window from the BYTES the
  * app hands over -- the app read them off qosp.disk (mods/qlog over
@@ -194,31 +193,9 @@ int64_t qosp_load_plugin_bytes(const char *bytes, uint64_t len, char *err,
   return (int64_t)(uintptr_t)ld.entry;
 }
 
-static pthread_mutex_t grow_mu = PTHREAD_MUTEX_INITIALIZER;
-static qos_grant_t grow_cb(uint64_t want) {
-  /* v2: every app hart thread grows through here -- buddy is the
-   * host's single-threaded allocator, so this callback is the
-   * linearization point (the Memory.qa mailbox, as a mutex) */
-  pthread_mutex_lock(&grow_mu);
-  void *p = buddy_alloc(want);
-  qos_grant_t g = {p, p ? buddy_block_usable_size(p) : 0};
-  pthread_mutex_unlock(&grow_mu);
-  /* host-side print: safe (libc in the host, no app-scheduler paths).
-   * The elapsed stamp turns a soak log into a rate/phase timeline.
-   * DELIBERATELY bare stderr, never qos_hostlog: this is an
-   * allocation site -- the ring sink takes the app's log/console
-   * locks and byte-loops the UART (the instrumentation-poison law */
-  if (g_trace) {
-    static struct timespec t0;
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    if (!t0.tv_sec) t0 = t;
-    fprintf(stderr, "qosp: [%6ld ms] grow(%" PRIu64 ") -> %p (+%" PRIu64 ")\n",
-            (t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000,
-            want, p, g.size);
-  }
-  return g;
-}
+/* v12: no grow callback.  The app owns the arena past its image and
+ * runs its own buddy behind its memory actor (docs/MEMORY.md); the
+ * host's buddy, the grow mutex, and the grow trace went with it. */
 
 /* ---- multi-hart (ABI v2) --------------------------------------------
  * The TLS borrow block: one per hart THREAD, host __thread -- the app
@@ -404,18 +381,8 @@ int main(int argc, char **argv) {
         hal->version);
 
   /* ---- Stage 2: Loader --------------------------------------------- */
-  TRACE("stage 2 (loader): buddy over the arena\n");
-  buddy_init(arena, QOS_ARENA_SIZE);
-  if (!buddy_reserve_range(arena, QOS_SLOT_SIZE)) {
-    qos_hostlog("qosp: slot reservation failed (arena misconfigured)");
-    return 1;
-  }
-  /* the PLUGIN slot: reserved unconditionally so heap grants can never
-   * land where a runtime-loaded library will (qos_abi.h) */
-  if (!buddy_reserve_range((void *)QOS_PLUG_BASE, QOS_PLUG_SIZE)) {
-    qos_hostlog("qosp: plugin slot reservation failed");
-    return 1;
-  }
+  TRACE("stage 2 (loader): the image into the slot; the rest of the "
+        "arena is the app's (abi v12)\n");
 
   qa_t qa;
   qos_snd_set_assets(qa_path); /* music and other assets resolve beside the .qa */
@@ -438,11 +405,11 @@ int main(int argc, char **argv) {
     qos_hostlog("qosp: image load failed: %s", ld.err);
     return 1;
   }
-	uint64_t heap_base = ((uint64_t)ld.image_end + 15) & ~15ull;
-  uint64_t heap_size = (QOS_SLOT_BASE + QOS_SLOT_SIZE) - heap_base;
-  TRACE("stage 2: image [%#lx..%p), entry %p, heap %#" PRIx64 " (+%" PRIu64
-        " KiB)\n",
-        QOS_SLOT_BASE, ld.image_end, ld.entry, heap_base, heap_size >> 10);
+	uint64_t arena_base = ((uint64_t)ld.image_end + 15) & ~15ull;
+  uint64_t arena_size = (QOS_ARENA_BASE + QOS_ARENA_SIZE) - arena_base;
+  TRACE("stage 2: image [%#lx..%p), entry %p, the app's arena %#" PRIx64
+        " (+%" PRIu64 " MiB)\n",
+        QOS_SLOT_BASE, ld.image_end, ld.entry, arena_base, arena_size >> 20);
 
 	/* Publish the code: the arena is a single rw anonymous mapping, but on
    * macOS arm64 a page can never be writable and executable at once, so
@@ -501,13 +468,15 @@ int main(int argc, char **argv) {
   qos_boot_t boot = {
       .abi_version = QOS_ABI_VERSION,
       .hal = hal,
-      .heap_base = (void *)heap_base,
-      .heap_size = heap_size,
-      .grow = grow_cb,
+      .heap_base = 0, /* v12: the app carves its own first slab */
+      .heap_size = 0,
+      .grow = 0,      /* v12: retired -- the arena is the app's */
       .caps = (const unsigned char *)caps,
       .caps_len = caps_len,
       .syscall_fn = qosp_store_call,
       .tls_off = qosp_tls_off(),
+      .arena_base = (void *)arena_base,
+      .arena_size = arena_size,
   };
   qosp_hal_set_smp(resolve_nharts(), start_hart_cb);
   /* the guaranteed first /logs/host line: which host, which app, how

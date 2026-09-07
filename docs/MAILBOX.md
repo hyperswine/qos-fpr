@@ -21,9 +21,11 @@ the channel block is reused, and the reuse path frees the chain.  n
 rounds up to a power of two between 8 and a million.  The rule of
 thumb: services -- anything many actors send to -- spawn Dynamic; use
 Static only where you are sure the queue cannot need to grow and want
-the bound.  The runtime's own hubs (actor 0, MVU's render worker, the
-storage and loader services, FPRLive's acceptor and connection actors)
-are Dynamic.
+the bound.  The runtime's own hubs (actor 0 -- its shared ring included, which
+the first cut had left Static: a fan-in of more than seven senders
+lands there --, MVU's render worker, the storage and loader services,
+FPRLive's acceptor and connection actors, and the memory actor whose
+mailbox is the whole runtime's allocation queue) are Dynamic.
 
 Under the hood a channel carries a pointer to the ring in force (its
 capacity, slots and, for the shared ring, sender tags, in one block).

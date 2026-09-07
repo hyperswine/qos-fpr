@@ -29,7 +29,8 @@ TOkI = TM.TOkI.
 after : Int -> Int -> Unit .
 after svc ms =
   me = myself 0;
-  send svc (me, TAfter ms).
+  _ = send svc (me, TAfter ms);   # a full service ring drops the tick: the
+  Unit.                           # caller's sleep loop re-checks anyway
 
 # blocking sleep: schedule the fire, then wait for it
 sleep : Int -> Int -> Unit .

@@ -163,6 +163,7 @@ V fpr_process_entry(void *heap_base, uw heap_size, fpr_grant_t (*grow)(uw want_b
     sl->next = 0;
     sl->owner = &h->pool;
     sl->escaped = 0;
+    sl->holds = 0;
     sl->hp = (char *)(sl + 1);
     sl->end = (char *)heap_base + heap_size;
     h->pool.cur = sl;

@@ -32,3 +32,24 @@ same actor falls back to sleeper children over Sys.sleepUs.  Single-
 hart machines keep the hart-0 deadlock detector's 30 ms pacing: a
 sooner timer deadline overrides its mtimecmp arm, a later one rides the
 next detector sample.
+
+Sys.sleepUs is a PARKED sleep (actors.c a_sleep_us): the sleeper goes
+on its hart's sleeper list with an mtime deadline and blocks; every
+hart-loop pass wakes the sleepers whose time has come (slp_drain), the
+idle path arms the CLINT for the nearest deadline (slp_wfi_arm; qosp's
+wfi is a 200 us poll, so that is the granularity there), and the
+deadlock detector does not count sleepers.  It used to nanosleep the
+HART THREAD on qosp: every actor sharing that hart -- the memory actor
+of docs/MEMORY.md included, and with it every allocation in the system
+-- waited out the sleep.  A message still wakes a sleeper early; it
+re-parks until its deadline.
+
+One admission rule the memory actor forced into the open: an actor
+that is IN THE RUN QUEUE (admitted, not yet popped; acb in_rq) is never
+added to the backlog again.  A waker's ship can land late -- it flipped
+the actor READY, the actor noticed on its own, ran on, parked again,
+was re-woken and admitted before the first push arrived -- and the old
+in_bl guard alone let that stale push queue it a second time: two run
+queue entries, the second pointing at itself, and the hart spun in deq
+forever.  The memory actor, woken thousands of times a second and
+admitted ahead of the backlog (acb prio), hit it within seconds.

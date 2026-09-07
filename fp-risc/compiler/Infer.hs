@@ -574,6 +574,8 @@ builtinEnv =
       ("Sys.logSeq", scheme [0] (TFn tInt tInt)),
       ("Sys.logSnap", scheme [0] (TFn tInt (sv 0))),
       ("Sys.memStats", scheme [0] (TFn tInt (sv 0))),
+      ("Sys.memInfo", mono (TFn tInt (tList tInt))),
+      ("Sys.spawnApp", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
       ("Sys.stkStats", scheme [0] (TFn tInt (sv 0))),
       ("Sys.growLog", scheme [0] (TFn tInt (sv 0))),
       ("Sys.poolReset", scheme [0] (TFn tInt (sv 0))),

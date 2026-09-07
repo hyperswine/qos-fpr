@@ -142,15 +142,37 @@ typedef struct fpr_acb {
                            * process's actors carry its pid -- the ONLY
                            * kernel/process distinction that remains */
   struct fpr_acb *all_nx; /* the all-actors ledger (monitor's walk) */
-  fpr_slab_t *drop_pending; /* dropped-message slabs awaiting the next
-                             * receive (fpr_drop_park in fpr.h): the
-                             * borrow window the compiler's autodrop
-                             * leans on ends there, so that's where
-                             * the batch is released */
+  /* the borrow window (fpr_drop_park): a message slab whose root this
+   * actor dropped stays HELD until its next receive -- the compiler's
+   * autodrop drops right after the destructure while the arm still
+   * reads the children.  Slabs are shared by many messages now (send
+   * packs), so a dropper records a hold per slab instead of chaining
+   * the slab itself; DP_N outstanding is plenty (one window holds the
+   * messages of one activation), and an overflow retires the oldest. */
+#define DP_N 16
+  fpr_slab_t *dp[DP_N];
+  uw dp_n;
+  fpr_slab_t *msg_slab; /* the slab this actor's sends pack into (runtime.c) */
   fpr_pool_t pool; /* this actor's slabs + recycle buckets (slab refactor) */
   fpr_lock_t shlock; /* producers' lock on the shared ring */
   uw wait_kind, wait_arg; /* while BLOCKED: 1 any, 2 from(arg = sender acb), 3 res */
   uint8_t tr[16]; uw tr_i; /* scheduler transition trace (site codes; the deadlock dump reads it) */
+  struct fpr_acb *slp_next; /* the hart's sleeper list (Sys.sleepUs) */
+  uint64_t wake_at;         /* its deadline, mtime ticks */
+  uw prio; /* 1: admitted ahead of the backlog (the memory actor: every
+            * other actor's allocation waits on it, so it never queues
+            * behind them -- backlog_add / select_backlog) */
+  volatile uw mem_reply; /* the memory actor's answer to this actor's
+                          * pending request (fpr_mem_take): MEM_PENDING
+                          * while it waits, then the block (0 = denied) */
+  uw in_rq; /* owner-only: admitted to the run queue, not yet popped.  A
+             * STALE SHIP -- a waker flipped us READY, we noticed and
+             * ran on, then parked again and were re-woken and admitted
+             * before the first waker's push landed -- must not add us
+             * to the backlog a second time: the next admission would
+             * queue us twice and the run queue would loop on itself
+             * (found with the memory actor, woken thousands of times
+             * a second and admitted ahead of everyone). */
   uw in_bl; /* owner-only: on this hart's backlog list right now.  A second
              * enqueue of a listed actor -- a waker's ship racing the
              * receiver's own early un-block, then a yield -- used to
@@ -168,23 +190,33 @@ static int p_from(acb_t *a, uw sid);      /* fwd: the deadlock dump and block_un
 static int p_res(acb_t *a, uw unused);
 static uint32_t ch_count(chan_t *c);
 
-/* ---- deferred message-slab release (see fpr.h) ---------------------- */
+/* ---- deferred message-slab release (see fpr.h) ----------------------
+ * Called under arc_lock when the last promoted root in an ownerless
+ * slab is dropped: the dropper takes a HOLD on the slab until its next
+ * receive (its borrow window); a context with no actor has no window,
+ * and the slab goes home now unless someone else holds it. */
 void fpr_drop_park(fpr_slab_t *sl) {
-  acb_t *a = fpr_hart()->current;
-  if (!a) { fpr_slab_release(sl); return; } /* hart-loop context: no borrower */
-  sl->next = a->drop_pending;
-  a->drop_pending = sl;
+  fpr_hart_t *h = fpr_hart();
+  acb_t *a = h ? h->current : 0;
+  if (!a) { /* hart-loop context: no borrower; home if nothing keeps it */
+    if (sl->holds == 0 && sl->escaped == 0) fpr_slab_release(sl);
+    return;
+  }
+  if (a->dp_n == DP_N) { /* overflow: the oldest window is retired now */
+    fpr_slab_unhold(a->dp[0], 1);
+    for (uw i = 1; i < DP_N; i++) a->dp[i - 1] = a->dp[i];
+    a->dp_n--;
+  }
+  a->dp[a->dp_n++] = sl;
+  sl->holds++;
 }
 static void drop_drain(acb_t *a) {
-  fpr_slab_t *sl = a->drop_pending;
-  if (!sl) return;
-  a->drop_pending = 0;
-  while (sl) {
-    fpr_slab_t *nx = sl->next;
-    fpr_slab_release(sl);
-    sl = nx;
-  }
+  if (!a->dp_n) return;
+  uw n = a->dp_n;
+  a->dp_n = 0;
+  fpr_slabs_unhold(a->dp, n);
 }
+fpr_slab_t **fpr_acb_msg_slot(struct fpr_acb *a) { return &a->msg_slab; }
 void fpr_drop_drain_current(void) {
   acb_t *a = fpr_hart()->current;
   if (a) drop_drain(a);
@@ -192,26 +224,36 @@ void fpr_drop_drain_current(void) {
 
 fpr_pool_t *fpr_acb_pool(struct fpr_acb *a) { return &a->pool; }
 
-/* big raw blocks (stacks, acbs): buddy on a machine boot; inside a
- * loaded process, a grant from the loader (the process has no buddy).
- * Process-mode blocks are reclaimed wholesale at process exit. */
-static void *big_block(uw n) {
-  if (!fpr_is_process) return buddy_alloc(n);
+/* big raw blocks (stacks, acbs, rings): the memory actor's buddy on an
+ * image that owns one (fpr_mem_own -- a machine boot, the qosp app);
+ * inside a loaded process without a buddy, a grant from the loader.
+ * `direct` asks for the never-waiting path (a spinlock is held). */
+static void *big_block_d(uw n, int direct) {
+  if (fpr_mem_own) return direct ? fpr_mem_take_direct(n) : fpr_mem_take(n);
   fpr_grant_t g = fpr_grow_counted(n, 4); /* big-block: stacks/acbs */
   return (g.ptr && g.size >= n) ? g.ptr : 0;
 }
+static void *big_block(uw n) { return big_block_d(n, 0); }
+/* the usable size of a block big_block handed out */
+static uw big_block_size(void *p, uw want) {
+  return fpr_mem_own ? buddy_block_usable_size(p) : want;
+}
 
-/* ---- process-mode spawn-side recycling ------------------------------
- * Grants are never returned to the loader, so without recycling every
- * spawn leaks a full stack grant and a mostly-empty acb grant --
- * frame-per-actor designs (pshell) burn the whole arena in seconds.
+/* ---- spawn-side blocks ---------------------------------------------
+ * With a memory actor, a dead actor's stack simply goes home (a one-
+ * way free from the reaper) and the next spawn asks for a fresh one;
+ * the recycling that process mode needed -- grants are never returned
+ * to a loader, so without it every spawn leaked a stack grant and a
+ * mostly-empty acb grant (pshell burned an arena in seconds) -- stays
+ * only for that legacy mode (fpr_mem_own == 0):
  *
  *   stacks: all STACK_SZ, so dead stacks go on a free list and the
- *           next spawn pops one (mirrors runtime.c's slab recycler);
+ *           next spawn pops one;
  *   acbs:   PERMANENT by contract (the acb IS the actor value that
  *           send-to-dead reads), so they cannot be recycled -- but a
- *           bump arena carves many acbs from one grant instead of
- *           wasting a 64 KiB minimum grant on each 8 KiB acb. */
+ *           bump arena carves many acbs from one block instead of
+ *           wasting a 64 KiB minimum block on each 250 B acb.  That
+ *           carve stays in both modes. */
 static fpr_freelist_t stack_fl; /* the one freelist discipline (fpr.h) */
 static fpr_lock_t acb_lock;     /* the acb bump arena below */
 static char *acb_hp, *acb_end;
@@ -222,7 +264,7 @@ uw fpr_stk_pushes, fpr_stk_misses, fpr_spawns, fpr_chb_carves;
 static void stack_recycle(void *p);
 static V spawn_on_pid(uw hart, V f, uw pin, uw pid);
 static void *stack_block(void) {
-  if (!fpr_is_process) return buddy_alloc(STACK_SZ);
+  if (fpr_mem_own) return fpr_mem_take(STACK_SZ);
   void *p = fpr_fl_take(&stack_fl, STACK_SZ);
   if (p) return p;
   __atomic_add_fetch(&fpr_stk_misses, 1, __ATOMIC_RELAXED);
@@ -237,46 +279,43 @@ static void *stack_block(void) {
   return big_block(STACK_SZ);
 }
 
+/* a dead actor's stack: home to the memory actor, or the recycler */
 static void stack_recycle(void *p) {
+  if (fpr_mem_own) { fpr_mem_give(p); return; }
   fpr_fl_put(&stack_fl, p, STACK_SZ);
   __atomic_add_fetch(&fpr_stk_pushes, 1, __ATOMIC_RELAXED);
 }
 
 static acb_t *acb_block(void) {
-  /* BOTH modes bump-carve: acbs are permanent by contract, and the
-   * lower allocators have a 64 KiB floor (buddy's BUDDY_MIN_BLOCK, the
-   * loader's grant rounding) -- one block per 250 B acb exhausted the
-   * posix heap in ~1000 spawns on a Pi 4.  Carving packs ~250 acbs
-   * into each floor-sized block. */
   uw sz = (sizeof(acb_t) + 15) & ~(uw)15;
-  fpr_lock(&acb_lock);
-  if (acb_hp + sz > acb_end) {
-    uw want = 16 * sz;
-    char *p;
-    uw got;
-    if (fpr_is_process && fpr_grow_memory) {
-      /* no growlog here: this runs under acb_lock, and the trace
-       * print is a uart SYSCALL under qosp -- printing inside an
-       * allocator lock stalls the world and poisons the very numbers
-       * the trace exists to collect (a lesson measured the hard way) */
-      fpr_grant_t g = fpr_grow_counted(want, 5); /* stack pool */
-      p = (char *)g.ptr;
-      got = g.size;
-    } else {
-      p = (char *)buddy_alloc(want);
-      got = p ? buddy_block_usable_size(p) : 0;
-    }
-    if (!p || got < sz) {
+  for (;;) {
+    fpr_lock(&acb_lock);
+    if (acb_hp + sz <= acb_end) {
+      acb_t *a = (acb_t *)acb_hp;
+      acb_hp += sz;
       fpr_unlock(&acb_lock);
-      return 0;
+      return a;
     }
-    acb_hp = p;
-    acb_end = p + got;
+    fpr_unlock(&acb_lock);
+    /* refill OUTSIDE the lock: the block may come from the memory
+     * actor (a wait), and no spinlock is ever held across a wait.
+     * No growlog here either: the trace print is a uart SYSCALL under
+     * qosp, and printing inside an allocator stalls the world. */
+    uw want = 16 * sz;
+    char *p = (char *)big_block(want);
+    if (!p) return 0;
+    uw got = big_block_size(p, want);
+    if (got < sz) return 0;
+    fpr_lock(&acb_lock);
+    if (acb_hp + sz > acb_end) { /* still empty: install ours */
+      acb_hp = p;
+      acb_end = p + got;
+      fpr_unlock(&acb_lock);
+    } else { /* a racer refilled first: give ours back, carve from theirs */
+      fpr_unlock(&acb_lock);
+      if (fpr_mem_own) fpr_mem_give(p);
+    }
   }
-  acb_t *a = (acb_t *)acb_hp;
-  acb_hp += sz;
-  fpr_unlock(&acb_lock);
-  return a;
 }
 
 /* ---- out-of-line channel blocks: type-stable, epoch-deferred --------
@@ -326,7 +365,7 @@ static void chan_init(chan_t *c, uw *shfrom, int fresh) {
   ringv_t *rv = fresh ? 0 : c->rv;
   while (rv && rv != &c->rv0) {
     ringv_t *o = rv->old;
-    if (!fpr_is_process) buddy_free(rv);
+    if (fpr_mem_own) fpr_mem_give(rv); /* a loader grant is kept until exit */
     rv = o;
   }
   c->sender = 0;
@@ -340,9 +379,9 @@ static void chan_init(chan_t *c, uw *shfrom, int fresh) {
 }
 /* a ring of cap slots (plus tags when the channel is the shared one),
  * in one block; 0 when there is no memory */
-static ringv_t *ring_block(uint32_t cap, int tagged, ringv_t *old) {
+static ringv_t *ring_block_d(uint32_t cap, int tagged, ringv_t *old, int direct) {
   uw bytes = sizeof(ringv_t) + (uw)cap * sizeof(V) + (tagged ? (uw)cap * sizeof(uw) : 0);
-  ringv_t *nv = (ringv_t *)big_block(bytes);
+  ringv_t *nv = (ringv_t *)big_block_d(bytes, direct);
   if (!nv) return 0;
   nv->cap = cap;
   nv->pad = 0;
@@ -350,6 +389,9 @@ static ringv_t *ring_block(uint32_t cap, int tagged, ringv_t *old) {
   nv->from = tagged ? (uw *)(nv->slots + cap) : 0;
   nv->old = old;
   return nv;
+}
+static ringv_t *ring_block(uint32_t cap, int tagged, ringv_t *old) {
+  return ring_block_d(cap, tagged, old, 0);
 }
 static chan_t *chb_take(void) {
   chblk_t *b = 0;
@@ -376,7 +418,7 @@ static chan_t *chb_take(void) {
     fpr_chb_carves++;
     char *p = (char *)big_block(want);
     if (!p) return 0;
-    uw got = fpr_is_process ? want : buddy_block_usable_size(p);
+    uw got = big_block_size(p, want);
     if (got < sz) got = sz;
     b = (chblk_t *)p;
     for (char *q = p + sz; q + sz <= p + got; q += sz)
@@ -403,10 +445,10 @@ static void chb_limbo_put(chan_t *ch) {
  * cannot escape -- straight back to buddy.  Idempotent via stack=0. */
 static void reap(acb_t *a) {
   if (!a->stack) return;
-  drop_drain(a); /* dropped-message slabs the dead actor never received after */
+  drop_drain(a); /* the holds of windows the dead actor never closed */
+  if (a->msg_slab) { fpr_slab_unhold(a->msg_slab, 0); a->msg_slab = 0; } /* its packing slab */
   fpr_pool_reclaim(a);
-  if (fpr_is_process) stack_recycle(a->stack);
-  else buddy_free(a->stack);
+  stack_recycle(a->stack); /* home to the memory actor (or the recycler) */
   a->stack = 0;
   if (a->ch) {
     chb_limbo_put(a->ch); /* deferred: see the epoch essay above */
@@ -447,6 +489,7 @@ static void ledger_push(acb_t *a) {
                                         __ATOMIC_ACQUIRE));
 }
 static volatile uw g_blocked;      /* actors currently parked */
+static volatile uw g_sleepers;     /* of which: parked with a deadline */
 static volatile uw g_activity;     /* bumped on every ship/spawn */
 
 /* ---- cross-hart wake rings: xr[src][dst], strictly SPSC -------------- */
@@ -574,11 +617,13 @@ static acb_t *steal(fpr_hart_t *h) {
 }
 
 static void backlog_add(fpr_hart_t *h, acb_t *a) {
-  if (a->in_bl) { TR(a, 13); return; } /* already listed: one entry is the invariant */
+  if (a->in_bl || a->in_rq) { TR(a, 13); return; } /* already listed: one entry is the invariant */
   a->in_bl = 1;
   TR(a, 4);
   a->bl_next = 0;
-  a->ready_at = g_adm; /* stamped in admission time */
+  a->ready_at = a->prio ? 0 : g_adm; /* stamped in admission time; a
+                                      * priority actor is the oldest by
+                                      * construction, so aging picks it */
   if (!a->weight) a->weight = 1;
   if (h->bl_tail) h->bl_tail->bl_next = a;
   else h->bl_head = a;
@@ -620,7 +665,7 @@ static acb_t *select_backlog(fpr_hart_t *h) {
       a = nx;
       continue;
     }
-    if (g_adm - a->ready_at > g_tau) {
+    if (a->prio || g_adm - a->ready_at > g_tau) {
       if (!aged || a->ready_at < aged->ready_at) { aged = a; aged_prev = prev; }
     }
     total += a->weight;
@@ -649,7 +694,25 @@ static void refill(fpr_hart_t *h) {
     uw adm = __atomic_add_fetch(&g_adm, 1, __ATOMIC_RELAXED);
     uw wait = adm - a->ready_at;
     if (wait > g_max_wait) g_max_wait = wait;
+    /* the run queue holds an actor once: a second entry is a self-loop
+     * that spins the hart forever -- name it instead */
+    for (acb_t *q = h->rq_head; q; q = q->next)
+      if (q == a) {
+        char buf[128], *bp = buf, *e = buf + sizeof buf - 1;
+        dl_put(&bp, e, "run queue holds actor "); dl_num(&bp, e, a->id);
+        dl_put(&bp, e, " twice (var "); dl_num(&bp, e, a->var);
+        dl_put(&bp, e, " in_bl "); dl_num(&bp, e, a->in_bl);
+        dl_put(&bp, e, " prio "); dl_num(&bp, e, a->prio);
+        dl_put(&bp, e, " hart "); dl_num(&bp, e, a->hart);
+        dl_put(&bp, e, " on "); dl_num(&bp, e, h->id);
+        dl_put(&bp, e, " current "); dl_num(&bp, e, h->current ? h->current->id : 0);
+        dl_put(&bp, e, ")");
+        *bp = 0;
+        dl_out(buf, (uw)(bp - buf));
+        fpr_cpanic("actors: run queue double entry");
+      }
     a->next = 0;
+    a->in_rq = 1;
     if (h->rq_tail) h->rq_tail->next = a;
     else h->rq_head = a;
     h->rq_tail = a;
@@ -666,6 +729,7 @@ static acb_t *deq(fpr_hart_t *h) {
     h->rq_head = a->next;
     if (!h->rq_head) h->rq_tail = 0;
     h->rq_len--;
+    a->in_rq = 0;
     uint32_t st = __atomic_load_n(&a->var, __ATOMIC_ACQUIRE);
     /* skip stale entries: DEAD forever; BLOCKED re-ships on real wake */
     if (st == ST_DEAD) reap(a); /* slab refactor: reclaim off its stack */
@@ -779,6 +843,9 @@ static void tmr_drain(fpr_hart_t *h) {
                                           * 0's detector re-arms its own) */
   fpr_send_as((uw)&tmr_src_key, (V)tmr_act, TAG((sw)(dl & 0x3FFFFFFFFFFFFFFFull)));
 }
+
+static void slp_drain(fpr_hart_t *h);   /* the parked sleep, below block_unless */
+static void slp_wfi_arm(fpr_hart_t *h);
 
 static void drain(fpr_hart_t *h) {
   for (uw s = 0; s < FPR_NHARTS; s++) {
@@ -938,6 +1005,7 @@ static void hart_loop(fpr_hart_t *h) {
     hart_loops[h->id]++;
     irq_drain(h);
     tmr_drain(h);
+    slp_drain(h);
     drain(h);
     hart_phase[h->id] = 1;
     acb_t *n = deq(h);
@@ -949,6 +1017,7 @@ static void hart_loop(fpr_hart_t *h) {
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
       irq_drain(h); /* MEIP/MTIP wakes ride the same doorbell protocol */
       tmr_drain(h);
+      slp_drain(h);
       drain(h);
       n = deq(h);
     }
@@ -987,7 +1056,8 @@ static void hart_loop(fpr_hart_t *h) {
       int all_idle = 1;
       for (uw i = 0; i < fpr_live_harts; i++)
         if (!fpr_harts[i].idle) all_idle = 0;
-      if (all_idle && blk > 0 && act == last_act) {
+      uw slp = __atomic_load_n(&g_sleepers, __ATOMIC_RELAXED);
+      if (all_idle && blk > slp && act == last_act) { /* a sleeper is not a deadlock */
         uint64_t now = hal_mtime();
         if (stable == 0) {
           quiet_since = now;
@@ -1004,6 +1074,7 @@ static void hart_loop(fpr_hart_t *h) {
       hal_timer_arm(0, DETECT_TICKS); /* re-arm clears MTIP until then */
     }
     tmr_wfi_arm(h); /* a sooner timer deadline overrides on the irq hart */
+    slp_wfi_arm(h); /* the nearest sleeper, sooner still */
     hart_phase[h->id] = 4;
     hart_wfi_at[h->id] = hal_mtime();
     hal_wfi(); /* sleeps unless msip/mtip is already pending again */
@@ -1134,6 +1205,72 @@ static void block_unless(acb_t *a, pred_t pred, uw arg) {
   a->wait_kind = 0;
 }
 
+/* ---- Sys.sleepUs: a PARKED sleep ------------------------------------
+ * The sleeper leaves its hart: parked with a deadline on the hart's
+ * own list (only this hart touches it), woken by the hart loop once
+ * mtime passes -- qosp's wfi polls every 200 us, bare metal arms the
+ * CLINT timer for the nearest deadline (slp_wfi_arm).  It used to
+ * nanosleep the HART THREAD on qosp, so every actor sharing that hart
+ * -- the memory actor included, and with it every allocation in the
+ * system -- waited out the sleep.  A message wakes a sleeper early
+ * like any parked actor; it re-parks until its deadline. */
+static int p_sleep(acb_t *a, uw unused) {
+  (void)unused;
+  return hal_mtime() >= a->wake_at;
+}
+static V a_sleep_us(V usv) {
+  if (!ISINT(usv)) fpr_cpanic("Sys.sleepUs: microseconds must be an Int");
+  sw us = UNTAG(usv);
+  if (us <= 0) return (V)&fpr_unit;
+  fpr_hart_t *h = fpr_hart();
+  acb_t *a = h ? h->current : 0;
+  uint64_t now = hal_mtime();
+#ifndef FPR_PARKED_SLEEP
+#define FPR_PARKED_SLEEP 1 /* 0: the hart-blocking host sleep (the bisecting switch) */
+#endif
+  if (!a || fpr_sched || !now || !FPR_PARKED_SLEEP) { /* no actor to park, or no clock: the host sleep */
+    fpr_hal_sleep_us((uw)us);
+    return (V)&fpr_unit;
+  }
+  a->wake_at = now + (uint64_t)us * 10; /* mtime runs at 10 MHz everywhere we run */
+  a->slp_next = h->slp_head;
+  h->slp_head = a;
+  __atomic_fetch_add(&g_sleepers, 1, __ATOMIC_RELAXED);
+  while (!p_sleep(a, 0)) block_unless(a, p_sleep, 0);
+  return (V)&fpr_unit;
+}
+FPR_FN(fpr_g_Sys_x2esleepUs, a_sleep_us, 1);
+/* wake the sleepers whose time has come (hart loop, every pass) */
+static void slp_drain(fpr_hart_t *h) {
+  if (!h->slp_head) return;
+  uint64_t now = hal_mtime();
+  acb_t **pp = &h->slp_head;
+  int fired = 0;
+  while (*pp) {
+    acb_t *a = *pp;
+    uint32_t st = __atomic_load_n(&a->var, __ATOMIC_ACQUIRE);
+    if (now >= a->wake_at || st == ST_DEAD) {
+      *pp = a->slp_next;
+      __atomic_fetch_sub(&g_sleepers, 1, __ATOMIC_RELAXED);
+      if (st != ST_DEAD) wake(a);
+      fired = 1;
+    } else
+      pp = &a->slp_next;
+  }
+  if (fired && h->id != 0) hal_timer_park(h->id); /* MTIP would pend forever (see tmr_drain) */
+}
+/* before wfi: the nearest sleeper deadline arms the hart's timer (bare
+ * metal; a no-op on qosp, whose wfi is a 200 us poll) */
+static void slp_wfi_arm(fpr_hart_t *h) {
+  if (!h->slp_head) return;
+  uint64_t now = hal_mtime(), best = 0;
+  for (acb_t *a = h->slp_head; a; a = a->slp_next)
+    if (!best || a->wake_at < best) best = a->wake_at;
+  uint64_t delta = best > now ? best - now : 1;
+  if (h->id == 0 && delta > DETECT_TICKS) return; /* the detector's own arm is sooner */
+  hal_timer_arm(h->id, delta);
+}
+
 /* channel emptiness/content tests (consumer side: acquire on rt) */
 static uint32_t ch_count(chan_t *c) {
   return __atomic_load_n(&c->rt, __ATOMIC_ACQUIRE) - c->rh;
@@ -1213,8 +1350,14 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   if (!main_acb.ch) fpr_cpanic("boot: no memory for actor 0's channels");
   main_acb.scan = 0;
   __builtin_memset(&main_acb.shlock, 0, sizeof main_acb.shlock);
+  main_acb.prio = 0;
+  main_acb.in_rq = 0;
   main_acb.mbdyn = 1; /* actor 0 hosts services: its rings grow */
   main_acb.mbcap = RING_CAP;
+  for (int i = 0; i < MAXSND; i++) main_acb.ch[i].dyn = 1; /* the shared
+                                 * ring too: chan_for only stamps the
+                                 * dedicated slots, and a fan-in of
+                                 * more than 7 senders lands there */
   main_acb.entry = 0; /* trampoline runs fpr_fn_main + fpr_exit */
   main_acb.id = 0;
   main_acb.hart = 0;
@@ -1226,12 +1369,14 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   if (!stk) fpr_cpanic("boot: no block for actor 0's stack");
   static void *main_bkts[FPR_NBUCKETS]; /* actor 0 lives forever */
   fpr_pool_init(&main_acb.pool, main_bkts);
-  main_acb.drop_pending = 0;
+  main_acb.dp_n = 0;
+  main_acb.msg_slab = 0;
   main_acb.stack = stk;
   for (int i = 0; i < 16; i++) main_acb.ctx[i] = 0;
   fpr_ctx_fabricate(main_acb.ctx, (void (*)(void))trampoline,
                     ((uw)stk + STACK_SZ) & ~(uw)15, &fpr_harts[0]);
   enq(&fpr_harts[0], &main_acb);
+  fpr_mem_spawn(); /* the memory actor, second in hart 0's queue */
 }
 
 void fpr_hart_main(int id) { /* boot stack becomes the hart loop */
@@ -1263,7 +1408,8 @@ static V spawn_on_pid_cap(uw hart, V f, uw pin, uw pid, uint32_t cap, uint32_t d
   char *stk = (char *)stack_block();
   if (!a || !stk) fpr_cpanic("spawn: buddy has no free block");
   fpr_pool_init(&a->pool, fpr_bkt_take()); /* zeroed; teardown returns it */
-  a->drop_pending = 0;
+  a->dp_n = 0;
+  a->msg_slab = 0;
   if (!a->pool.buckets) fpr_cpanic("spawn: no memory for a bucket array");
   f = fpr_msg_copy(f); /* the entry closure crosses like any message:
                         * deep-copied, so captures never dangle into
@@ -1275,6 +1421,8 @@ static V spawn_on_pid_cap(uw hart, V f, uw pin, uw pid, uint32_t cap, uint32_t d
   if (!a->ch) fpr_cpanic("spawn: no memory for a channel block");
   a->mbdyn = dyn;
   a->mbcap = cap;
+  a->prio = 0;
+  a->in_rq = 0;
   for (int i = 0; i < MAXSND; i++) {
     a->ch[i].dyn = dyn;
     if (cap > RING_CAP) { /* a bigger first ring than the inline one */
@@ -1343,6 +1491,19 @@ static V a_spawn_at(V hv, V f) {
   return spawn_on((uw)UNTAG(hv), f, 1); /* explicit placement pins */
 }
 
+/* Sys.spawnApp f -> actor: run `f me` under a FRESH pid -- the app-
+ * image launch (std/loader.fpr `launch`): the shell's actors stay pid
+ * 0, the app's root gets the next pid and everything it spawns
+ * inherits it, so Sys.actInfo / myPid tell the images apart.  Not
+ * routed: an image on the shared plane is itself a process already. */
+static uw next_pid; /* 0 = the boot image; apps count up from 1 */
+static V a_spawn_app(V f) {
+  if (fpr_sched) fpr_cpanic("Sys.spawnApp: only the plane's own image launches apps");
+  uw pid = __atomic_add_fetch(&next_pid, 1, __ATOMIC_RELAXED);
+  return spawn_on_pid(fpr_hart()->id, f, 0, pid);
+}
+FPR_FN(fpr_g_Sys_x2espawnApp, a_spawn_app, 1);
+
 /* myPid u -> Int: the ACB's owning process (0 = the boot image) */
 static V a_mypid(V u) {
   (void)u;
@@ -1371,51 +1532,57 @@ static const struct { hdr_t h; V f; } ok_unit_s = {{T_RESULT, 0}, (V)&fpr_unit};
 static V send_err(const char *why) { fpr_send_full++; return fpr_mkresult(1, why); }
 int fpr_sent(V r) { return !ISINT(r) && TID(r) == T_RESULT && ((hdr_t *)r)->var == 0; }
 
-/* grow c's ring by doubling, under a->shlock: the new block, [rh, rt)
- * copied by logical index, the pointer published (before any rt that
- * lands in it).  0 = no memory, or the ceiling. */
-static ringv_t *ring_grow(acb_t *a, chan_t *c) {
+static acb_t *mem_act; /* the memory actor (below); 0 before it exists */
+
+/* install nv as c's ring, under a->shlock: [rh, rt) copied by logical
+ * index, the pointer published (before any rt that lands in it). */
+static void ring_install(chan_t *c, ringv_t *nv) {
   ringv_t *ov = c->rv;
-  if (ov->cap >= RING_MAX) return 0;
-  ringv_t *nv = ring_block(ov->cap * 2, ov->from != 0, ov);
-  if (!nv) return 0;
   uint32_t rh = __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE), rt = c->rt;
   for (uint32_t k = rh; k != rt; k++) {
     SLOT(nv, k) = SLOT(ov, k);
     if (nv->from) TAGAT(nv, k) = TAGAT(ov, k);
   }
+  nv->old = ov;
   __atomic_store_n(&c->rv, nv, __ATOMIC_RELEASE);
   fpr_ring_grows++;
-  return nv;
 }
-/* place m (already copied and pinned) on channel c of a: 1 queued, 0 full */
+/* place m (already copied and pinned) on channel c of a: 1 queued, 0
+ * full.  A Dynamic ring that is full doubles -- and the new block is
+ * taken OUTSIDE a->shlock (it may come from the memory actor, which is
+ * a wait; a spinlock is never held across one), then installed under
+ * the lock after a re-check: on the shared ring another producer may
+ * have grown it meanwhile, and ours goes back.  The memory actor's own
+ * rings grow through the direct path: a request to it cannot be what
+ * makes room for that request. */
 static int ring_push(acb_t *a, chan_t *c, uw key, V m) {
-  if (c->sender == SHARED_KEY) { /* many producers: the lock orders them */
-    fpr_lock(&a->shlock);
+  int shared = c->sender == SHARED_KEY; /* many producers: the lock orders them */
+  for (;;) {
+    if (shared) fpr_lock(&a->shlock);
+    ringv_t *rv = c->rv; /* dedicated: single producer, private rt */
     uint32_t rt = c->rt;
-    ringv_t *rv = c->rv;
-    if (rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == rv->cap) {
-      rv = c->dyn ? ring_grow(a, c) : 0;
-      if (!rv) { fpr_unlock(&a->shlock); return 0; }
+    if (rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) < rv->cap) {
+      if (shared) TAGAT(rv, rt) = key;
+      SLOT(rv, rt) = m;
+      __atomic_store_n(&c->rt, rt + 1, __ATOMIC_RELEASE); /* publish */
+      if (shared) fpr_unlock(&a->shlock);
+      return 1;
     }
-    TAGAT(rv, rt) = key;
-    SLOT(rv, rt) = m;
-    __atomic_store_n(&c->rt, rt + 1, __ATOMIC_RELEASE); /* publish */
+    uint32_t ncap = rv->cap * 2;
+    int can = c->dyn && rv->cap < RING_MAX;
+    if (shared) fpr_unlock(&a->shlock);
+    if (!can) return 0;
+    ringv_t *nv = ring_block_d(ncap, shared, 0, a == mem_act);
+    if (!nv) return 0;
+    fpr_lock(&a->shlock); /* take_at's shifting and the copy exclude each other */
+    if (c->rv->cap >= ncap) { /* a racer grew it first */
+      fpr_unlock(&a->shlock);
+      if (fpr_mem_own) fpr_mem_give(nv);
+      continue;
+    }
+    ring_install(c, nv);
     fpr_unlock(&a->shlock);
-    return 1;
   }
-  /* single producer: our rt is private; check the consumer's rh */
-  ringv_t *rv = c->rv;
-  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == rv->cap) {
-    if (!c->dyn) return 0;
-    fpr_lock(&a->shlock);
-    rv = ring_grow(a, c);
-    fpr_unlock(&a->shlock);
-    if (!rv) return 0;
-  }
-  SLOT(rv, c->rt) = m;
-  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE); /* publish */
-  return 1;
 }
 V fpr_send_as(uw sender_key, V av, V m) {
   if (fpr_sched) return fpr_sched->send_as(sender_key, av, m);
@@ -1774,6 +1941,127 @@ static V g_actInfo(V iv) {
 }
 FPR_FN(fpr_g_Sys_x2eactLive, g_actLive, 1);
 FPR_FN(fpr_g_Sys_x2eactInfo, g_actInfo, 1);
+
+/* ---- the MEMORY ACTOR (fpr.h; docs/MEMORY.md) -----------------------
+ * One actor owns the buddy.  A request is an Int -- (bytes << 1) | 1
+ * to take, ptr >> 1 to give (buddy pointers are 8-aligned, so the
+ * low bit distinguishes) -- so the request path allocates nothing.
+ * The answer to a take is a plain store into the requester's
+ * mem_reply plus a wake: no mailbox on the reply path, so a full
+ * mailbox can never lose an answer, and no receive on the requester's
+ * side, so the borrows of the message it may be holding stay intact
+ * (a_receive's drop_drain would release them).  Frees are one-way.
+ *
+ * The requester's channel key is its acb; contexts with no actor (the
+ * hart loop's reaper, IRQ delivery, boot) free through one pinned key
+ * per hart -- a hart loop only ever runs on its own hart, so each key
+ * keeps the single-producer discipline of a dedicated channel -- and
+ * take directly.  The memory actor itself, and any request that could
+ * not be queued, go to the buddy directly as well; those direct calls
+ * are the reason buddy_lock still exists. */
+#define MEM_PENDING ((uw)-1)
+#define MEM_CAP 1024 /* its rings start here and grow (Dynamic) */
+int fpr_mem_own;
+uw fpr_mem_reqs, fpr_mem_waits, fpr_mem_direct, fpr_mem_frees, fpr_mem_denied, fpr_mem_inline;
+static acb_t mem_hart_key[FPR_NHARTS]; /* var pinned READY: never "dead" */
+
+void *fpr_mem_take_direct(uw bytes) {
+  __atomic_add_fetch(&fpr_mem_direct, 1, __ATOMIC_RELAXED);
+  return buddy_alloc(bytes);
+}
+static int p_mem(acb_t *a, uw unused) {
+  (void)unused;
+  return __atomic_load_n(&a->mem_reply, __ATOMIC_ACQUIRE) != MEM_PENDING;
+}
+/* queue an Int request on the memory actor as `key`: 1 queued */
+static int mem_post(uw key, V m) {
+  chan_t *c = chan_for(mem_act, key, 1);
+  if (!ring_push(mem_act, c, key, m)) return 0;
+  __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
+  wake(mem_act);
+  return 1;
+}
+void *fpr_mem_take(uw bytes) {
+  fpr_hart_t *h = fpr_hart();
+  acb_t *a = h ? h->current : 0;
+  if (!mem_act || !a || a == mem_act) return fpr_mem_take_direct(bytes);
+  { /* uncontended: served on the spot (buddy.c's essay); a miss with
+     * the lock free is a real shortage, still queued behind the frees
+     * ahead of it in case one of them makes room */
+    int busy;
+    void *p = buddy_alloc_try(bytes, &busy);
+    if (p) { __atomic_add_fetch(&fpr_mem_inline, 1, __ATOMIC_RELAXED); return p; }
+  }
+  __atomic_store_n(&a->mem_reply, MEM_PENDING, __ATOMIC_RELEASE);
+  if (!mem_post((uw)a, TAG((sw)((bytes << 1) | 1)))) return fpr_mem_take_direct(bytes);
+  __atomic_add_fetch(&fpr_mem_reqs, 1, __ATOMIC_RELAXED);
+  while (!p_mem(a, 0)) {
+    __atomic_add_fetch(&fpr_mem_waits, 1, __ATOMIC_RELAXED);
+    block_unless(a, p_mem, 0);
+  }
+  return (void *)__atomic_load_n(&a->mem_reply, __ATOMIC_ACQUIRE);
+}
+void fpr_mem_give(void *p) {
+  if (!p) return;
+  __atomic_add_fetch(&fpr_mem_frees, 1, __ATOMIC_RELAXED);
+  fpr_hart_t *h = fpr_hart();
+  acb_t *a = h ? h->current : 0;
+  if (!mem_act || a == mem_act) { buddy_free(p); return; }
+  if (buddy_free_try(p)) return; /* uncontended: done on the spot */
+  uw key = a ? (uw)a : (uw)&mem_hart_key[h ? h->id : 0];
+  if (!mem_post(key, TAG((sw)((uw)p >> 1)))) buddy_free(p); /* could not queue */
+}
+/* the body: the next request from any channel, with its sender */
+static V mem_next(acb_t *a, uw *from) {
+  for (;;) {
+    for (int n = 0; n < MAXSND; n++) {
+      chan_t *c = &a->ch[(a->scan + n) % MAXSND];
+      if (c->sender && ch_count(c)) {
+        a->scan = (a->scan + n + 1) % MAXSND;
+        if (c->sender == SHARED_KEY) {
+          ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE);
+          *from = TAGAT(rv, c->rh);
+        } else
+          *from = c->sender;
+        return take_at(a, c, c->rh);
+      }
+    }
+    block_unless(a, p_any, 0);
+  }
+}
+static V mem_body(V me) {
+  acb_t *a = (acb_t *)me;
+  for (;;) {
+    uw from;
+    V m = mem_next(a, &from);
+    if (ISINT(m) == 0) continue; /* not a request: ignored */
+    uw x = (uw)UNTAG(m);
+    if (x & 1) {
+      void *p = buddy_alloc(x >> 1);
+      if (!p) fpr_mem_denied++;
+      acb_t *r = (acb_t *)from;
+      __atomic_store_n(&r->mem_reply, (uw)p, __ATOMIC_RELEASE);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      wake(r);
+    } else
+      buddy_free((void *)(x << 1));
+  }
+  return (V)&fpr_unit; /* not reached: the owner never exits */
+}
+FPR_FN(mem_entry, mem_body, 1);
+void fpr_mem_spawn(void) {
+  if (!fpr_mem_own || fpr_sched || mem_act) return;
+  for (uw i = 0; i < FPR_NHARTS; i++) {
+    mem_hart_key[i].tid = T_ACTOR;
+    mem_hart_key[i].var = ST_READY;
+  }
+  /* pinned to hart 0 (the boot hart is always live), pid 0, Dynamic
+   * rings: its mailbox is the whole runtime's allocation queue */
+  mem_act = (acb_t *)spawn_on_pid_cap(0, (V)&mem_entry, 1, 0, MEM_CAP, 1);
+  mem_act->prio = 1; /* ahead of the backlog: nobody's allocation waits
+                      * on a reservoir draw (read at selection time; the
+                      * spawn above only queued it on this hart) */
+}
 
 /* ---- the exported plane (fpr.h fpr_sched_t) ------------------------- */
 static V sched_spawn(V f) { return spawn_on(fpr_hart()->id, f, 0); }

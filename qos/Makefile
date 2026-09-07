@@ -49,7 +49,7 @@ QOSP_SRC = portable/main.c portable/qa.c portable/haltab.c portable/store.c \
            portable/compile.c \
            $(HAL)/unix/net_raw.c $(HAL)/unix/blk_raw.c $(HAL)/unix/hostlog.c \
            $(HAL)/unix/tty_raw.c $(HAL)/unix/evdev_raw.c $(HAL)/unix/snd_raw.c \
-           $(HAL)/core/buddy.c $(HAL)/core/qaimg.c
+           $(HAL)/core/qaimg.c
 
 # the shell's half of the ABI stamp is DERIVED from the authoritative
 # source (Codegen.hs codegenRev), not hardcoded -- the first stamped

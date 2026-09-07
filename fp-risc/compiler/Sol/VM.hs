@@ -32,6 +32,7 @@ import Control.Monad (forM, forM_, when)
 import Data.List (minimumBy)
 import Data.Ord (comparing)
 import GHC.Clock (getMonotonicTime)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import System.Environment (lookupEnv)
 import System.IO.Unsafe (unsafePerformIO)
 import Sol.HandJIT
@@ -369,8 +370,9 @@ builtinArities =
   M.union schemeArities $
     M.fromList
       [ ("myself", 1), ("spawn", 1), ("send", 2), ("sendLinear", 2), ("sendArc", 2), ("receive", 1), ("receiveFrom", 2),
+        ("spawnCap", 3), ("spawnCapOn", 4), ("spawnOn", 2), ("Sys.spawnApp", 1), ("timeNow", 1),
         ("kill", 1), ("yield", 1), ("drop", 1), ("keep", 1), ("device", 1), ("reg32", 2),
-        ("Sys.poolReset", 1), ("Sys.sleepUs", 1), ("Sys.logAt", 2), ("Sys.memStats", 1),
+        ("Sys.poolReset", 1), ("Sys.sleepUs", 1), ("Sys.logAt", 2), ("Sys.memStats", 1), ("Sys.memInfo", 1),
         ("use", 1), ("run", 2), ("View.serve", 5),
         ("Vec.new", 1), ("Vec.range", 2), ("Vec.mmul", 5), ("Vec.push", 2), ("Vec.len", 1), ("Vec.get", 2),
         ("Vec.set", 3), ("Vec.map", 2), ("Vec.filter", 2), ("Vec.fold", 3),
@@ -523,8 +525,9 @@ actorNames :: S.Set Name
 actorNames =
   S.fromList
     [ "myself", "spawn", "send", "sendLinear", "sendArc", "receive", "receiveFrom", "kill", "yield",
+      "spawnCap", "spawnCapOn", "spawnOn", "Sys.spawnApp", "timeNow",
       "drop", "keep", "device", "reg32",
-      "Sys.poolReset", "Sys.sleepUs", "Sys.logAt", "Sys.memStats"
+      "Sys.poolReset", "Sys.sleepUs", "Sys.logAt", "Sys.memStats", "Sys.memInfo"
     ]
 
 actorCall :: VMEnv -> Name -> [Value] -> IO Value
@@ -555,11 +558,20 @@ actorCall env "spawn" [f] = do
     writeIORef (abTid b) (Just tid)
     putMVar start ()
   pure (VInt (fromIntegral i))
+-- the mailbox policy / placement / pid variants: this shim's queues are
+-- unbounded Haskell channels and its actors are threads, so every one
+-- of them is a plain spawn (docs/MAILBOX.md, docs/MEMORY.md)
+actorCall env "spawnCap" [_, _, f] = actorCall env "spawn" [f]
+actorCall env "spawnCapOn" [_, _, _, f] = actorCall env "spawn" [f]
+actorCall env "spawnOn" [_, f] = actorCall env "spawn" [f]
+actorCall env "Sys.spawnApp" [f] = actorCall env "spawn" [f]
+actorCall _ "timeNow" [_] = VInt . round <$> getPOSIXTime
+actorCall _ "Sys.memInfo" [_] = pure (foldr (\x acc -> VData listT 1 [VInt x, acc]) (VData listT 0 []) (replicate 8 0))
 actorCall env "send" [VInt to, m] = do
   let actors = vmActors env
   from <- actorSelf actors
   actorEnqueue actors (fromIntegral to) from m
-  pure vUnit
+  pure (VData 3 0 [vUnit]) -- Ok Unit: an unbounded queue never refuses
 -- sendLinear: MOVE semantics.  In this profile values are immutable
 -- Haskell terms, so the move IS a send -- the verb exists for grammar
 -- parity with the AOT tiers, where it transfers the message slab

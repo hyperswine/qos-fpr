@@ -281,7 +281,9 @@ scene, same bytes.
 
 **Sys.init / Sys.harts / Sys.caps / Sys.arenaFree / Sys.loadImageAt /
 Sys.bindApp / Sys.bindStore / Sys.storeReq** — System.qa's C
-surface. **Apps.list / Apps.read** — the built-in .qa catalogue.
+surface. **Sys.memInfo** — the memory actor's ledger (arena, free,
+requests, waits, direct, frees, denied, blocks). **Sys.spawnApp** —
+spawn under a fresh pid (the loader's `launch`). **Apps.list / Apps.read** — the built-in .qa catalogue.
 **Mod.resolve / Mod.has / Mod.fn** — hash-addressed module lookup at
 runtime.
 ```

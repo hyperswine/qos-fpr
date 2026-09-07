@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 11u
+#define QOS_ABI_VERSION 12u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -28,7 +28,9 @@
  * build-process-app.sh there is no +wordsize header bias to extract
  * from a symbol table: the link address is a CONSTANT, and an app.qa
  * built today loads under any qosp built tomorrow.  Everything after
- * the slot is the buddy arena that growth grants come from. */
+ * the image is the APP'S OWN arena (v12): the host hands it over in
+ * the boot record and the app runs the buddy -- behind its memory
+ * actor (docs/MEMORY.md) -- itself; the host allocates nothing there. */
 #define QOS_ARENA_BASE 0x400000000ul /* 16 GiB (bumped for macOS arm64 mmap compatibility) */
 #ifndef QOS_ARENA_SIZE
 #define QOS_ARENA_SIZE (256ul << 20) /* the host build sets ARENA_MB (qos/Makefile) */
@@ -184,9 +186,10 @@ typedef struct {
   int64_t (*clock_now)(void);
 } qos_hal_t;
 
-/* ---- the memory-growth grant ---------------------------------------
- * Layout-identical to fpr_grant_t (fpr.h) on both sides -- kept as its
- * own named type here so the header stands alone for the host build. */
+/* ---- the memory-growth grant (RETIRED in v12) ----------------------
+ * Layout-identical to fpr_grant_t (fpr.h) on both sides; the boot
+ * record keeps the slot for layout stability, but a v12 host sets it
+ * NULL: the app owns its arena and never asks the host for memory. */
 typedef struct {
   void *ptr; /* NULL = denied */
   uint64_t size;
@@ -202,9 +205,10 @@ typedef struct {
 typedef struct {
   uint64_t abi_version;
   const qos_hal_t *hal;
-  void *heap_base; /* the app's first slab: slot space past the image */
+  void *heap_base; /* v1..v11: the app's first slab (slot space past the
+                    * image).  v12: unused (0) -- see arena_base below */
   uint64_t heap_size;
-  qos_grant_t (*grow)(uint64_t want_bytes); /* buddy grants from the host */
+  qos_grant_t (*grow)(uint64_t want_bytes); /* v12: NULL (retired) */
   const unsigned char *caps;
   uint64_t caps_len;
   /* the storage syscall channel, tag-compatible with System.qa's
@@ -226,6 +230,18 @@ typedef struct {
    * it there before anything else runs), and fpr.h's FPR_QOSAPP
    * accessors give the C-side runtime the same view. */
   uint64_t tls_off;
+  /* ---- v12 additions (appended: earlier offsets unchanged) ----------
+   * THE APP OWNS ITS ARENA.  [arena_base, arena_base + arena_size) is
+   * every byte of the mapped arena past the loaded image -- the slot
+   * tail, the plugin window, and the rest -- and the app runs its own
+   * buddy over it (reserving the plugin window itself, since it knows
+   * QOS_PLUG_BASE), behind its memory actor.  The host keeps no
+   * allocator over the arena: plugin loads write into the fixed window
+   * (syscall tag 4), nothing else.  The first slab, every growth, and
+   * every free happen inside the app; the host's grow callback and its
+   * mutex are gone with them. */
+  void *arena_base;
+  uint64_t arena_size;
 } qos_boot_t;
 
 /* ---- the entry ------------------------------------------------------

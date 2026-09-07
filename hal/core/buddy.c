@@ -20,6 +20,8 @@
  */
 #include "fpr.h"
 
+static void buddy_free_locked(void *p); /* the coalescing free, under buddy_lock */
+
 #ifndef BUDDY_MIN_BLOCK
 #ifdef FPR_BUDDY_MIN
 #define BUDDY_MIN_BLOCK ((uw)FPR_BUDDY_MIN)
@@ -169,9 +171,13 @@ void buddy_release_range(void *addr, uw bytes) {
 
 void buddy_free(void *p) {
   if (!p) return;
+  fpr_lock(&buddy_lock);
+  buddy_free_locked(p);
+  fpr_unlock(&buddy_lock);
+}
+static void buddy_free_locked(void *p) { /* under buddy_lock */
   char *hdr = (char *)p - sizeof(uw);
   int order = (int)*(uw *)hdr;
-  fpr_lock(&buddy_lock);
   uw off = offset_of(hdr);
   while (order < max_order) {
     uw buddy_off = off ^ block_size(order);
@@ -193,7 +199,6 @@ void buddy_free(void *p) {
   free_node_t *merged = (free_node_t *)(arena_base + off);
   merged->next = free_lists[order];
   free_lists[order] = merged;
-  fpr_unlock(&buddy_lock);
 }
 
 /* grow or shrink a buddy block, IN PLACE whenever the structure
@@ -267,6 +272,44 @@ uw buddy_block_usable_size(void *p) {
   char *hdr = (char *)p - sizeof(uw);
   int order = (int)*(uw *)hdr;
   return block_size(order) - sizeof(uw);
+}
+
+/* ---- the uncontended fast path (the memory actor's inline service) --
+ * A requester that finds the lock FREE serves itself on the spot; one
+ * that finds it held queues on the memory actor instead (fpr.h,
+ * fpr_mem_take).  A round trip through one actor on one hart costs
+ * more than the allocation itself -- and stalls whenever that hart is
+ * inside a long C section (a big deep copy) -- so the actor is the
+ * serialisation point for CONTENTION, not the path every block takes.
+ * *busy = 1 means "the lock was held: nothing was tried". */
+static int buddy_trylock(void) {
+  uw exp = 0;
+  return __atomic_compare_exchange_n(&buddy_lock.v, &exp, 1, 0, __ATOMIC_ACQUIRE,
+                                     __ATOMIC_RELAXED);
+}
+void *buddy_alloc_try(uw bytes, int *busy) {
+  int want = order_of(bytes);
+  *busy = 0;
+  if (want > max_order) return 0;
+  if (!buddy_trylock()) { *busy = 1; return 0; }
+  int order = want;
+  while (order <= max_order && !free_lists[order]) order++;
+  if (order > max_order) {
+    fpr_unlock(&buddy_lock);
+    return 0;
+  }
+  void *blk = split_down(order, want);
+  fpr_unlock(&buddy_lock);
+  *(uw *)blk = (uw)want;
+  return (char *)blk + sizeof(uw);
+}
+/* the same for a free: 1 done, 0 the lock was held (queue it) */
+int buddy_free_try(void *p) {
+  if (!p) return 1;
+  if (!buddy_trylock()) return 0;
+  buddy_free_locked(p);
+  fpr_unlock(&buddy_lock);
+  return 1;
 }
 
 /* introspection for /proc-style reporting and tests */

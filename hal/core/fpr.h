@@ -90,6 +90,11 @@ typedef struct fpr_slab {
   struct fpr_slab *next;
   struct fpr_pool *owner; /* NULL = orphaned (freed when escaped hits 0) */
   uw escaped;             /* promoted objects resident here (ARC lock) */
+  uw holds;               /* an ownerless slab's other keepers (ARC lock):
+                           * the sender still packing messages into it,
+                           * and every dropper whose borrow window is
+                           * still open.  Released when escaped and
+                           * holds are both 0 -- see fpr_msg_copy. */
   char *hp, *end;
 } fpr_slab_t;
 
@@ -197,6 +202,8 @@ void *buddy_realloc(void *p, uw bytes);      /* grow/shrink; in-place when
 void buddy_free(void *p);
 uw buddy_block_usable_size(void *p);
 uw buddy_free_bytes(void);
+void *buddy_alloc_try(uw bytes, int *busy); /* inline when the lock is free */
+int buddy_free_try(void *p);                /* 1 done, 0 the lock was held */
 void *buddy_reserve_range(void *addr, uw bytes);
 void buddy_release_range(void *addr, uw bytes);
 void buddy_init(void *base, uw size);
@@ -237,6 +244,9 @@ typedef struct {
                                    * arena pool shadows the actor's own
                                    * (appended field: nothing in the
                                    * asm contract addresses past fuel) */
+  struct fpr_acb *slp_head; /* actors parked by Sys.sleepUs on this hart,
+                             * each with a deadline; the hart loop wakes
+                             * them (appended, owner-hart only) */
 } fpr_hart_t;
 
 /* the codegen contract for the spill cells: argspill[0] at exactly
@@ -387,6 +397,29 @@ fpr_grant_t fpr_grow_counted(uw want_bytes, uw site); /* the counted gateway;
   3 buckets, 4 big-block, 5 stack -- attributed in the growlog ring */
 const char *fpr_growsite_name(uw site);
 
+/* ---- the MEMORY ACTOR (docs/MEMORY.md: Memory.qa, stage 1) ----------
+ * The image that runs buddy_init (a machine boot, the qosp app over
+ * the arena the host hands it) sets fpr_mem_own and spawns ONE actor
+ * that owns the buddy: every block the runtime needs from actor
+ * context -- slabs, stacks, acb and channel carves, ring growth, the
+ * ARC table -- is a message to it (an Int request: no allocation on
+ * the request path) and the reply lands in the requester's acb with a
+ * wake, never in a mailbox that could be full.  Frees are one-way
+ * messages.  Contexts with no actor to park (boot, the hart loop's
+ * reaper, IRQ delivery), the memory actor itself, and a request that
+ * could not be queued go to the buddy directly -- those direct
+ * callers are why buddy_lock still exists (fpr_mem_direct counts
+ * them).  A loaded process without its own buddy (fpr_mem_own == 0)
+ * keeps the loader-grant path above. */
+extern int fpr_mem_own;            /* 1: this image runs the buddy + the actor */
+void *fpr_mem_take(uw bytes);      /* a buddy block (>= bytes usable); 0 = denied */
+void *fpr_mem_take_direct(uw bytes); /* the same, never waits (under a spinlock) */
+void fpr_mem_give(void *p);        /* one-way; safe from any context */
+void fpr_mem_spawn(void);          /* actors.c: after actor 0, before any hart runs */
+int fpr_hal_sleep_us(uw us);      /* the host sleep: Sys.sleepUs's fallback (runtime.c weak) */
+extern uw fpr_mem_reqs, fpr_mem_waits, fpr_mem_direct, fpr_mem_frees, fpr_mem_denied,
+    fpr_mem_inline; /* takes served on the spot (the lock was free) */
+
 /* elfload.c: a minimal ELF32/ELF64 PT_LOAD segment loader. FIXED-SLOT
  * ONLY -- p_vaddr must already equal the intended physical load
  * address (no relocation is performed; see docs/PROCESS-LOADING.md for
@@ -448,7 +481,12 @@ V fpr_realloc(V obj, V raw_bytes); /* grow to a new payload size (copy-based;
                                     * the freed block recycles exactly) */
 void fpr_free(V obj);     /* returns to the free list (sizes <= 8 KiB) */
 int fpr_in_heap(V v);     /* heap pointer (promotable) vs int/immortal static */
-V fpr_msg_copy(V v);      /* deep copy into one ownerless message slab */
+V fpr_msg_copy(V v);      /* deep copy into the sender's message slab (packed) */
+V fpr_msg_copy_fresh(V v); /* ... into a slab of its own (Sys.arena's transfer) */
+fpr_slab_t **fpr_acb_msg_slot(struct fpr_acb *a); /* actors.c: the packing slab */
+void fpr_slab_unhold(fpr_slab_t *sl, int locked); /* runtime.c: holds--, release
+                                                   * when nothing keeps it */
+void fpr_slabs_unhold(fpr_slab_t **sls, uw n);   /* the same, one lock */
 void fpr_arc_incref(V v);
 void fpr_arc_decref(V v);
 uw fpr_arc_live(void);
