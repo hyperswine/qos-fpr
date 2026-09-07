@@ -241,6 +241,21 @@ screen's list of games scrolls under the wheel the same way.  Text
 that would overflow -- the message line, the panel's status line, card
 names -- is capped and cut with "..".
 
+## The terminal
+
+T opens a terminal over any screen (esc closes it): the model as a data
+console, the same idea as the POS's admin tab.  `get PATH` and `set
+PATH N` read and write the shop of numbers the rules run on -- `me.hq`,
+`en.stock`, `env`, `tno`, `seed`, `music`, a unit at `me.fwd.3` with its
+`.hp .atk .ready .mode .down .chg .vet` -- and `ls` lists the paths.
+`hand me|en` and `board` print the cards and the rows; `deal`, `place`
+and `clear` put cards and units where you want them; `hit me|en N` goes
+through the rules' own HQ damage, so victory and defeat apply.  Typing
+comes from the evdev codes (letters, digits, space . - = , /), so a
+replayed key file types too, and every line with its answer goes to the
+transcript as `term:` lines.  The check types `get me.hq`, `set env 4`
+and `board` from the title and reads the answers back.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
@@ -256,6 +271,7 @@ names -- is capped and cut with "..".
     wheel         scrolls the hand (cursor in the hand) or the Stats list
     esc with nothing selected: pause (Resume / Restart / Cards / Stats / Keys / Quit)
     K keys, S stats, C cards: from the title, the pause menu and game over
+    T terminal (anywhere): get / set the model, deal, place, hit; esc closes
     ENTER on the title screen begins (or continues the saved game; N deals
     fresh); on the game-over screen, a new game
 

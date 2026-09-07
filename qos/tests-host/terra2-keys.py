@@ -10,12 +10,27 @@ buffered key per idle tick, so a replayed game is the same game every run.
 """
 import struct, sys
 
-CODES = {"esc": 1, "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "bksp": 14, "q": 16, "e": 18,
-         "r": 19, "o": 24, "s": 31, "p": 25, "enter": 28, "a": 30, "f": 33, "c": 46, "v": 47,
-         "space": 57, "up": 103, "left": 105, "right": 106, "down": 108, "k": 37, "m": 50, "n": 49}
+CODES = {"esc": 1, "bksp": 14, "enter": 28, "space": 57, "up": 103, "left": 105, "right": 106, "down": 108,
+         "minus": 12, "equal": 13, "dot": 52, "comma": 51, "slash": 53,
+         "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11}
+for row, base in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+    for i, ch in enumerate(row):
+        CODES[ch] = base + i
+PUNCT = {" ": "space", ".": "dot", "-": "minus", "=": "equal", ",": "comma", "/": "slash"}
+
+
+def expand(names):
+    """a `type:...` argument types its text (letters, digits, punctuation)"""
+    out = []
+    for n in names:
+        if n.startswith("type:"):
+            out += [PUNCT.get(ch, ch) for ch in n[5:]]
+        else:
+            out.append(n)
+    return out
 
 def main():
-    out, names = sys.argv[1], sys.argv[2:]
+    out, names = sys.argv[1], expand(sys.argv[2:])
     recs = b""
     t = 1
     for n in names:
