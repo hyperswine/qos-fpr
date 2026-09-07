@@ -483,21 +483,32 @@ subs m = Nil.
 
 view sid m =
   s = sGet m.sess sid;
-  root = case m.theme == 1 of True -> "col gap-3 p-4" | False -> "col gap-3 p-4 day";
+  root = case m.theme == 1 of True -> "col gap-4 p-4 page" | False -> "col gap-4 p-4 page day";
   case strEq s.cashier "" of
     True -> El "div" [Cls root, G.Local "name" "", G.Local "pin" ""] [loginView s]
   | False -> El "div" [Cls root, G.Local "tab" "1", G.Local "open" "0", G.Local "tender" "", G.Local "delta" "10", G.Local "rsku" "", G.Local "cmd" ""]
                (nav m s :: toasts s :: body m s).
 
+# The stylesheet is a function of the tree -- and the page is served
+# from the signed-out view, so the rules the register needs would never
+# be emitted.  The sheet is therefore built over a SAMPLE tree that
+# shows everything: a signed-in session with a cart, receipts with a
+# void, the console -- every class the app can ever use appears once.
+cssAll t = G.cssFor (El "div" Nil (t :: view 1 sampleModel :: Nil)).
+sampleModel =
+  m0 = seed |> List.fold (fn l mm -> apply mm l) initModel;
+  m1 = apply (apply m0 "sale 1 ana 0 0 0 1650 150 FW=3=500") "sale 2 ben 0 1 550 550 50 LB=1=400";
+  m2 = apply m1 "void 1 ana 0";
+  sPut m2 { noSess | sid = 1, cashier = "ana", cart = ("FW", 2) :: ("BR", 1) :: Nil, toast = "sample", role = "ok", con = "> help" :: Nil }.
+
 loginView s =
-  El "div" [Cls "col gap-3 p-6 panel round", Att "style" "max-width:420px"]
+  El "div" [Cls "col gap-3 p-6 panel round mx-auto mt-4 w-full", Att "style" "max-width:420px"]
     [ El "div" [Cls "text-xs upper dim"] [Txt "point of sale"]
     , El "div" [Cls "text-2xl bold"] [Txt "Sign in"]
     , Inp [Cls "field w-full", G.Input "name", Att "placeholder" "cashier", Att "maxlength" "16"]
     , Inp [Cls "field w-full", G.Input "pin", G.OnEnter "login" "name,pin", Att "placeholder" "PIN", Att "type" "password", Att "maxlength" "16"]
     , El "button" [Cls "btn round px-3 py-2 glow", G.OnClick "login" "name,pin"] [Txt "open register"]
-    , El "div" [Cls "warm text-sm"] [Dyn s.toast]
-    , El "div" [Cls "dim text-xs"] [Txt "link: ", El "span" [Att "id" "lv-link"] [Txt "connecting"]] ].
+    , El "div" [Cls "warm text-sm"] [Dyn s.toast] ].
 
 nav m s =
   El "div" [Cls "row between center gap-2 wrap"]
@@ -532,11 +543,11 @@ body m s =
 # ---- register ------------------------------------------------------------------------------------
 
 register m s =
-  El "div" [Cls "row gap-3"]
+  El "div" [Cls "row gap-4"]
     [ El "div" [Cls "row wrap gap-2 grow"] (live m.cat |> List.map (fn p -> productCard m p))
     , cartPanel m s ].
 productCard m p =
-  El "div" [Cls "col gap-1 card round p-3", Att "style" "width:170px"]
+  El "div" [Cls "col gap-2 card round p-3", Att "style" "width:180px"]
     [ El "div" [Cls "bold"] [Txt p.name]
     , El "div" [Cls "row between center"]
         [ El "div" [Cls "tabular"] [Txt "$", Dyn (money p.price)]
@@ -552,7 +563,7 @@ stockText m p = "{p.stock} in stock".
 cartPanel m s =
   sub = subtotal m s.cart;
   tx = taxOn m sub;
-  El "div" [Cls "col gap-2 panel round p-3 w-cart"]
+  El "div" [Cls "col gap-2 panel round p-4 w-cart"]
     [ El "div" [Cls "text-xs upper dim"] [Txt "cart"]
     , El "div" [Cls "col gap-1 scroll"] (cartLines m s.cart)
     , El "div" [Cls "rule"] []
@@ -582,7 +593,7 @@ cartLine m (sku, q) =
 # ---- receipts ---------------------------------------------------------------------------------------
 
 receipts m =
-  El "div" [Cls "col gap-2"]
+  El "div" [Cls "col gap-3"]
     [ El "div" [Cls "row gap-4 center"]
         [ El "div" [Cls "col"] [ El "div" [Cls "text-xs upper dim"] [Txt "receipts"], El "div" [Cls "text-2xl bold tabular"] [Dyn "{List.len m.sales}"] ]
         , El "div" [Cls "col"] [ El "div" [Cls "text-xs upper dim"] [Txt "revenue"], El "div" [Cls "text-2xl bold tabular"] [Txt "$", Dyn (money m.revenue)] ]
@@ -612,7 +623,7 @@ lineWord (sku, q, pr, nm) = "{q}x {nm}".
 # ---- inventory --------------------------------------------------------------------------------------
 
 inventory m =
-  El "div" [Cls "col gap-2"]
+  El "div" [Cls "col gap-3"]
     [ El "div" [Cls "row gap-2 center"]
         [ El "div" [Cls "text-xs upper dim"] [Txt "restock by"]
         , Inp [Cls "field w-24", G.Input "delta", Att "placeholder" "10"] ]
@@ -647,4 +658,4 @@ main =
   me = myself 0;
   disk = device "blk";
   fs = case blkPages disk == 0 of True -> 0 | False -> FS.serve disk;
-  FL.serve { env = (me, fs), css = G.cssFor } (App init update view subs).
+  FL.serve { env = (me, fs), css = cssAll } (App init update view subs).

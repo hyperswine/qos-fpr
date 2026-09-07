@@ -73,6 +73,13 @@ Against the design's invariants:
   `YYYY-MM-DD HH:MM` UTC.
 * Sign-in sends both fields at once: a `data-arg` may name several
   locals, joined by `|` (fprlivejs).
+* The stylesheet is a function of the tree, and the page is served from
+  the signed-out view -- so the rules the register needs would never be
+  emitted.  `cssAll` builds the sheet over a SAMPLE tree that shows
+  everything (a signed-in session with a cart, receipts with a void, the
+  console), so every class the app can use appears once.  The page is a
+  centred 1120 px container; the body's gradient is pinned and never
+  repeats; a toast or console with no text is not shown (`:has`).
 * The theme is a class on the page root, flipped by a message; it is
   the one reshape in steady state, on purpose.
 * One log page per event.  The default 8 MB disk holds about two
