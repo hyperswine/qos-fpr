@@ -15,8 +15,8 @@ cd "$HERE/qos" && make -s portable-gl >/dev/null 2>&1
 # the cursor stays where the last action left it (the placed unit, the
 # attacker), so each turn starts from the board, not the hand
 python3 tests-host/terra2-keys.py /tmp/terra2.evd \
-  enter s right right enter enter space \
-  enter a up up enter p space \
+  p enter s right right enter enter space \
+  enter a up up p enter p space \
   enter a enter down down left enter right enter p space \
   enter a up up enter p space q >/dev/null
 rm -f /tmp/terra2-*.ppm /tmp/terra2.wav

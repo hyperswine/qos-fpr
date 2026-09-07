@@ -18,17 +18,59 @@ laid out like a miniature flexbox (`Row`/`Col`, `Pad`, `Gap`, `W`/`H`,
 `Grow`, `Bg`/`Fg`/`Bord`, `Sc` for text scale) and emitted as thin cubes
 -- one per box, border strip and lit glyph cell of its 5x8 font.
 `S2.buildW (vw, vh) tree` gives the entities; `S2.camAt vh` the camera
-distance.  Pick the virtual size as the window at an integer scale (Terra
-II: 960 x 600 at 2x = 480 x 300) so every glyph cell is a whole number of
-real pixels.
+distance.  Pick the virtual size as the window at an integer scale so
+every glyph cell is a whole number of real pixels (Terra II now runs
+the layer at 960 x 600, one virtual px per window px).
 
-Terra II rebuilds its tree from the model every frame: a status bar and
-the message at the top, a unit panel at the right (name, stats, mode,
-the keys that apply), the banner in the middle, the hand along the bottom
-as cards facing the viewer, the cursor's card lifted and bright.  About
-4,000 cubes a frame for the layer, under the walker's 16,384 per mesh.
+## The second face, and the box treatments
 
-Every box has a rectangle in the 480 x 300 space, and that is what a
+The cell font is honest but it is not modern.  The walker now carries a
+second face: DejaVu Sans Bold baked into a signed-distance-field atlas
+(`fp-risc/tools/mkfont.py` -> `hal/unix/font_sdf.h`, 95 glyphs in 32 x 32
+texel cells, compiled into the host) and a text pass after the meshes.
+A text entity is
+
+    Ent (mode, "string") pen 0 (em, em, 1) colour
+
+with the string in the mesh slot: mode 0 stands it upright in its local
+XY plane, mode 1 lays it flat on the ground; `pen` is the left end of
+the baseline, `em` the size in world milli.  The fragment shader
+thresholds the sampled distance with an `fwidth`-wide ramp, which is
+what keeps a 20 px source crisp at 12 px and at 64 px alike -- and one
+entity per label instead of one cube per lit cell.  The metrics live
+in `mods/fontm.fpr` (advances in milli-em, ascent, line) so layout can
+size and centre text without seeing a glyph; both sides draw from the
+same table.  Text must be in a dynamics or UI list (statics compile to
+instance buffers, which text is not).
+
+In scene2d a `Lbl` or `Slot` with `Fs em` (em in px) uses that face and
+emits one entity.  With it come the box treatments a modern surface
+wants, all flat geometry:
+
+    Round r      corners of radius r: three rects and four quarter
+                 discs (the "corner" mesh, mirrored by sign of scale),
+                 so a translucent shape never draws a texel twice
+    Shadow       a dark translucent copy three px below, one wider
+    Bga (r,g,b,a)  a translucent fill (Bg stays the opaque one)
+    Bord c       with a fill: a one-px ring (the border colour under
+                 the fill inset by one); without: four strips
+    Center       children centred along the axis (when nothing grows)
+    Mid          children centred across it instead of stretched
+
+The walker gained the flat meshes to go with them: `disc` (XY, faces
++Z), `corner` (a quarter of it) and `coin` (XZ, faces +Y, for rings and
+pads on the ground).  Depth per node is now three steps (shadow, border,
+fill; text and children above), still 5 milli each.
+
+Terra II rebuilds its tree from the model every frame: a glass status
+bar with chips for the turn, the sides and the ENV, the message line,
+a unit panel at the right (a header band coloured by kind, stat chips,
+the keys that apply as key caps), the banner in a glass pill, the hand
+along the bottom as rounded, shadowed cards with a kind band, a cost
+badge and big figures, the cursor's card lifted, lit and rimmed amber.
+Under a thousand instances plus a few hundred glyph quads a frame.
+
+Every box has a rectangle in the 960 x 600 space, and that is what a
 mouse will hit-test against: a click is a point in the same space, so
 picking a card or a button is a rectangle test on the tree, no
 raycasting.  Not wired yet -- the walker reports relative mouse motion

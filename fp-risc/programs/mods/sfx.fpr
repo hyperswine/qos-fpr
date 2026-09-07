@@ -18,6 +18,13 @@ unsafe module.
 
 play tones = tones |> List.fold (fn t n -> n + (case sndPlay t < 0 of True -> 0 | False -> 1)) 0.
 playAll riffs = riffs |> List.fold (fn r n -> n + play r) 0.
+# the same, every frequency scaled by a few percent from a seed (the
+# clock): four rifle cracks in a row are four cracks, not one four times
+playVar seed tones =
+  k = 960 + (seed * 7919 / 1000) % 81;
+  tones |> List.fold (fn t n -> n + (case sndPlay (vary t k) < 0 of True -> 0 | False -> 1)) 0.
+vary (w, f0, f1, ms, vol, delay) k = (w, f0 * k / 1000, f1 * k / 1000, ms, vol, delay).
+playAllVar seed riffs = riffs |> List.fold (fn r n -> n + playVar (seed + n * 37) r) 0.
 
 # ---- the UI ------------------------------------------------------------------
 cursor  = (1, 880, 880, 22, 180, 0) :: Nil.

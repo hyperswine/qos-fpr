@@ -63,6 +63,7 @@
 #ifndef FPR_DESKTOP_GL
 #include "drm_scanout.h"
 #endif
+#include "font_sdf.h" /* the text face: an SDF atlas baked by fp-risc/tools/mkfont.py */
 
 /* ==== small math (vecmath.hpp, column-major, ported verbatim) ======== */
 typedef struct { float x, y, z; } v3;
@@ -173,10 +174,54 @@ static void mesh_sphere(rawmesh_t *m) { /* UV sphere r=0.5, 16x24 */
     }
 }
 
+/* a flat unit disc (r = 0.5, 32 segments): "disc" faces +Z (the 2D layer's
+ * rounded corners, badges, dots), "coin" lies in XZ facing +Y (rings and
+ * pads on a ground plane) */
+static void mesh_disc_at(rawmesh_t *m, int up) {
+  const int seg = 32;
+  m->nv = m->ni = 0;
+  float n[3] = {0, up ? 1.0f : 0, up ? 0 : 1.0f};
+  float c[6] = {0, 0, 0, n[0], n[1], n[2]};
+  memcpy(&m->v[m->nv], c, sizeof c); m->nv += 6;
+  for (int j = 0; j < seg; j++) {
+    float th = (float)j / seg * 6.2831853f;
+    float x = cosf(th) * 0.5f, y = sinf(th) * 0.5f;
+    float out[6] = {x, up ? 0 : y, up ? -y : 0, n[0], n[1], n[2]};
+    memcpy(&m->v[m->nv], out, sizeof out); m->nv += 6;
+  }
+  for (int j = 0; j < seg; j++) {
+    uint32_t tri[3] = {0, (uint32_t)(1 + j), (uint32_t)(1 + (j + 1) % seg)};
+    memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 3;
+  }
+}
+static void mesh_disc(rawmesh_t *m) { mesh_disc_at(m, 0); }
+static void mesh_coin(rawmesh_t *m) { mesh_disc_at(m, 1); }
+/* a quarter disc facing +Z: the +x,+y quadrant of a unit-radius circle
+ * with its centre at the origin.  Rounded rectangles are three rects and
+ * four of these (mirrored by a negative scale), so a translucent shape
+ * never overlaps itself */
+static void mesh_corner(rawmesh_t *m) {
+  const int seg = 8;
+  m->nv = m->ni = 0;
+  float c[6] = {0, 0, 0, 0, 0, 1};
+  memcpy(&m->v[m->nv], c, sizeof c); m->nv += 6;
+  for (int j = 0; j <= seg; j++) {
+    float th = (float)j / seg * 1.5707963f;
+    float out[6] = {cosf(th), sinf(th), 0, 0, 0, 1};
+    memcpy(&m->v[m->nv], out, sizeof out); m->nv += 6;
+  }
+  for (int j = 0; j < seg; j++) {
+    uint32_t tri[3] = {0, (uint32_t)(1 + j), (uint32_t)(2 + j)};
+    memcpy(&m->ix[m->ni], tri, sizeof tri); m->ni += 3;
+  }
+}
+
 /* ==== renderer state (RenderCache, fixed-capacity C tables) ========== */
-typedef struct { float model[16]; float color[3]; float pad; } inst_t;
+typedef struct { float model[16]; float color[4]; } inst_t; /* rgb + alpha */
 
 #define MAX_MESHES 16
+#define MAX_TEXT 4096 /* glyphs per frame, all text entities together */
+#define TVF 9         /* floats per text vertex: pos3 uv2 rgba */
 #define MAX_INST 16384 /* per mesh per tier: a 5x8 glyph is up to 40
                             * cube instances, and a text-heavy screen
                             * (the CLI, the browser listing) runs to
@@ -198,8 +243,11 @@ static struct {
 #else
   EGLDisplay dpy; EGLContext ctx;
 #endif
-  GLuint prog; GLint uProj, uView, uLightPos, uLightColor;
+  GLuint prog; GLint uProj, uView, uLightPos, uLightColor, uAmbient, uFog, uFogRange;
   GLuint fbo, fboColor, fboDepth;
+  /* the text pass: one SDF atlas, one streaming quad buffer */
+  GLuint tprog, tvao, tvbo, ttex; GLint tuView, tuProj, tuFog, tuFogRange, tuTex;
+  float *tstage; int ntext;
   int w, h;
   mesh_t meshes[MAX_MESHES]; int nmeshes;
   int staticCompiled;
@@ -343,13 +391,14 @@ static const char *kVS =
     "layout(location=3) in vec4 iM1;\n"
     "layout(location=4) in vec4 iM2;\n"
     "layout(location=5) in vec4 iM3;\n"
-    "layout(location=6) in vec3 iColor;\n"
+    "layout(location=6) in vec4 iColor;\n"
     "uniform mat4 uView; uniform mat4 uProj;\n"
-    "out vec3 vN; out vec3 vW; out vec3 vC;\n"
+    "out vec3 vN; out vec3 vW; out vec3 vC; out float vZ; out float vA;\n"
     "void main(){ mat4 model = mat4(iM0,iM1,iM2,iM3);\n"
     "  vec4 world = model*vec4(inPos,1.0); vW = world.xyz;\n"
-    "  vN = mat3(model)*inNormal; vC = iColor;\n"
-    "  gl_Position = uProj*uView*world; }\n";
+    "  vN = mat3(model)*inNormal; vC = iColor.rgb; vA = iColor.a;\n"
+    "  vec4 eye = uView*world; vZ = -eye.z;\n"
+    "  gl_Position = uProj*eye; }\n";
 static const char *kFS =
 #ifdef FPR_DESKTOP_GL
   "#version 330 core\n"
@@ -357,13 +406,49 @@ static const char *kFS =
     "#version 310 es\n"
     "precision highp float;\n"
 #endif
-    "in vec3 vN; in vec3 vW; in vec3 vC;\n"
+    "in vec3 vN; in vec3 vW; in vec3 vC; in float vZ; in float vA;\n"
     "uniform vec3 uLightPos; uniform vec3 uLightColor;\n"
+    "uniform vec3 uAmbient; uniform vec3 uFog; uniform vec2 uFogRange;\n"
     "out vec4 fragColor;\n"
     "void main(){ vec3 n = normalize(vN);\n"
     "  vec3 l = normalize(uLightPos - vW);\n"
     "  float d = max(dot(n,l), 0.0);\n"
-    "  fragColor = vec4(0.15*vC + d*vC*uLightColor, 1.0); }\n";
+    "  vec3 c = vC*uAmbient + d*vC*uLightColor;\n"
+    "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
+    "  fragColor = vec4(mix(c, uFog, f), vA); }\n";
+
+/* text: streamed quads (pos, uv, colour), unlit, the SDF atlas
+ * thresholded per pixel -- fwidth keeps the edge one pixel soft at
+ * every size, which is the whole reason for a distance field */
+static const char *kTVS =
+#ifdef FPR_DESKTOP_GL
+    "#version 330 core\n"
+#else
+    "#version 310 es\n"
+    "precision highp float;\n"
+#endif
+    "layout(location=0) in vec3 inPos;\n"
+    "layout(location=1) in vec2 inUV;\n"
+    "layout(location=2) in vec4 inCol;\n"
+    "uniform mat4 uView; uniform mat4 uProj;\n"
+    "out vec2 vUV; out vec4 vC; out float vZ;\n"
+    "void main(){ vec4 eye = uView*vec4(inPos,1.0); vZ = -eye.z;\n"
+    "  vUV = inUV; vC = inCol; gl_Position = uProj*eye; }\n";
+static const char *kTFS =
+#ifdef FPR_DESKTOP_GL
+    "#version 330 core\n"
+#else
+    "#version 310 es\n"
+    "precision highp float;\n"
+#endif
+    "in vec2 vUV; in vec4 vC; in float vZ;\n"
+    "uniform sampler2D uTex; uniform vec3 uFog; uniform vec2 uFogRange;\n"
+    "out vec4 fragColor;\n"
+    "void main(){ float s = texture(uTex, vUV).r;\n"
+    "  float w = clamp(fwidth(s) * 0.9, 0.02, 0.25);\n"
+    "  float a = smoothstep(0.5 - w, 0.5 + w, s);\n"
+    "  float f = clamp((vZ - uFogRange.x)/(uFogRange.y - uFogRange.x), 0.0, 1.0);\n"
+    "  fragColor = vec4(mix(vC.rgb, uFog, f), a * vC.a); }\n";
 
 static GLuint gfx_shader(GLenum type, const char *src) {
   GLuint s = glCreateShader(type);
@@ -600,6 +685,46 @@ void gfx_init(int w, int h) { /* raw export: gfx_raw.h */
   G.uView = glGetUniformLocation(G.prog, "uView");
   G.uLightPos = glGetUniformLocation(G.prog, "uLightPos");
   G.uLightColor = glGetUniformLocation(G.prog, "uLightColor");
+  G.uAmbient = glGetUniformLocation(G.prog, "uAmbient");
+  G.uFog = glGetUniformLocation(G.prog, "uFog");
+  G.uFogRange = glGetUniformLocation(G.prog, "uFogRange");
+  {
+    GLuint tvs = gfx_shader(GL_VERTEX_SHADER, kTVS), tfs = gfx_shader(GL_FRAGMENT_SHADER, kTFS);
+    G.tprog = glCreateProgram();
+    glAttachShader(G.tprog, tvs); glAttachShader(G.tprog, tfs);
+    glLinkProgram(G.tprog);
+    GLint tok = 0;
+    glGetProgramiv(G.tprog, GL_LINK_STATUS, &tok);
+    if (!tok) fpr_cpanic("gfx: text program link failed");
+    glDeleteShader(tvs); glDeleteShader(tfs);
+    G.tuView = glGetUniformLocation(G.tprog, "uView");
+    G.tuProj = glGetUniformLocation(G.tprog, "uProj");
+    G.tuFog = glGetUniformLocation(G.tprog, "uFog");
+    G.tuFogRange = glGetUniformLocation(G.tprog, "uFogRange");
+    G.tuTex = glGetUniformLocation(G.tprog, "uTex");
+    glGenTextures(1, &G.ttex);
+    glBindTexture(GL_TEXTURE_2D, G.ttex);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, FONT_ATLAS_W, FONT_ATLAS_H, 0, GL_RED, GL_UNSIGNED_BYTE, font_atlas);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glGenVertexArrays(1, &G.tvao);
+    glBindVertexArray(G.tvao);
+    glGenBuffers(1, &G.tvbo);
+    glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(3 * sizeof(float)));
+    glEnableVertexAttribArray(2);
+    glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, TVF * sizeof(float), (void *)(5 * sizeof(float)));
+    glBindVertexArray(0);
+    G.tstage = malloc((size_t)MAX_TEXT * 6 * TVF * sizeof(float));
+    if (!G.tstage) fpr_cpanic("gfx: text staging alloc");
+    G.ntext = 0;
+  }
 
   /* offscreen target: surfaceless EGL has no default framebuffer */
   G.w = w; G.h = h;
@@ -732,26 +857,154 @@ static mesh_t *gfx_mesh(const char *name, uw len) {
   if (!strcmp(m->name, "cube")) mesh_cube(&raw);
   else if (!strcmp(m->name, "plane")) mesh_plane(&raw);
   else if (!strcmp(m->name, "sphere")) mesh_sphere(&raw);
-  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere, or a glMesh-registered name)");
+  else if (!strcmp(m->name, "disc")) mesh_disc(&raw);
+  else if (!strcmp(m->name, "coin")) mesh_coin(&raw);
+  else if (!strcmp(m->name, "corner")) mesh_corner(&raw);
+  else fpr_cpanic("gfx: unknown mesh id (registry: cube plane sphere disc coin corner, or a glMesh-registered name)");
 
   mesh_upload(m, raw.v, raw.nv, raw.ix, raw.ni);
   if (!m->stage) fpr_cpanic("gfx: instance staging alloc");
   return m;
 }
 
-static void gfx_bind_instances(GLuint vbo) {
+/* bind the instance stream from instance `first` on (no BaseInstance in
+ * ES 3.1: the translucent tail is drawn from an offset pointer) */
+static void gfx_bind_instances_at(GLuint vbo, int first) {
+  size_t base = (size_t)first * sizeof(inst_t);
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   for (int i = 0; i < 4; i++) {
     GLuint loc = (GLuint)(2 + i);
     glEnableVertexAttribArray(loc);
     glVertexAttribPointer(loc, 4, GL_FLOAT, GL_FALSE, sizeof(inst_t),
-                          (void *)(size_t)(i * 4 * sizeof(float)));
+                          (void *)(base + (size_t)(i * 4) * sizeof(float)));
     glVertexAttribDivisor(loc, 1);
   }
   glEnableVertexAttribArray(6);
-  glVertexAttribPointer(6, 3, GL_FLOAT, GL_FALSE, sizeof(inst_t),
-                        (void *)offsetof(inst_t, color));
+  glVertexAttribPointer(6, 4, GL_FLOAT, GL_FALSE, sizeof(inst_t),
+                        (void *)(base + offsetof(inst_t, color)));
   glVertexAttribDivisor(6, 1);
+}
+static void gfx_bind_instances(GLuint vbo) { gfx_bind_instances_at(vbo, 0); }
+
+/* the dynamics of one mesh, drawn: the opaque instances first, then the
+ * translucent ones (alpha < 1) blended, depth-tested but not depth-
+ * written, sorted far to near by view depth.  The stage is partitioned
+ * in place and uploaded here, once the view is known. */
+static float *g_sort_view;
+static float view_z(const inst_t *it) {
+  const float *v = g_sort_view;
+  return v[2] * it->model[12] + v[6] * it->model[13] + v[10] * it->model[14] + v[14];
+}
+static int cmp_view_far_first(const void *a, const void *b) {
+  float za = view_z(a), zb = view_z(b); /* more negative = farther */
+  return za < zb ? -1 : za > zb ? 1 : 0;
+}
+static int draw_dyn(mesh_t *m, const m4 *view, int64_t *bytes) {
+  if (!m->nstage) return 0;
+  int n = m->nstage, nopq = 0;
+  for (int i = 0; i < n; i++)
+    if (m->stage[i].color[3] >= 0.999f) {
+      if (i != nopq) { inst_t t = m->stage[i]; m->stage[i] = m->stage[nopq]; m->stage[nopq] = t; }
+      nopq++;
+    }
+  if (n - nopq > 1) {
+    g_sort_view = (float *)view->m;
+    qsort(m->stage + nopq, (size_t)(n - nopq), sizeof(inst_t), cmp_view_far_first);
+  }
+  if (!m->dynVBO) glGenBuffers(1, &m->dynVBO);
+  glBindBuffer(GL_ARRAY_BUFFER, m->dynVBO);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)n * sizeof(inst_t)), m->stage, GL_DYNAMIC_DRAW);
+  *bytes += (int64_t)((size_t)n * sizeof(inst_t));
+  int draws = 0;
+  glBindVertexArray(m->vao);
+  if (nopq) {
+    gfx_bind_instances_at(m->dynVBO, 0);
+    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, nopq);
+    draws++;
+  }
+  if (n > nopq) {
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    glDepthMask(GL_FALSE);
+    gfx_bind_instances_at(m->dynVBO, nopq);
+    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, n - nopq);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+    draws++;
+  }
+  return draws;
+}
+
+/* ---- text ------------------------------------------------------------
+ * A text entity is Ent (mode, "string") pos yaw (em, em, 1) colour: the
+ * mesh slot carries the string, mode 0 stands the text up in its local
+ * XY plane (the 2D layer; a billboard-ish label), mode 1 lays it flat on
+ * the ground (local y -> world -z, so it reads from +Z looking down).
+ * pos is the PEN: the left end of the baseline.  Each glyph is its whole
+ * atlas cell placed at the pen, so the only per-glyph datum is the
+ * advance.  Six vertices per glyph, streamed each frame, drawn after
+ * the meshes: blended, depth-tested, not depth-written. */
+static void stage_text(int mode, const unsigned char *s, uw len, v3 pos, float yaw, v3 sc, v3 col, float alpha) {
+  m4 model = m4mul(m4translate(pos), m4rotY(yaw));
+  if (mode == 1) {
+    m4 flat = m4id();
+    flat.m[5] = 0; flat.m[6] = -1; flat.m[9] = 1; flat.m[10] = 0;
+    model = m4mul(model, flat);
+  }
+  model = m4mul(model, m4scale(sc));
+  const float cell = (float)FONT_CELL / FONT_EM;
+  const float x0 = -(float)FONT_PEN_X / FONT_EM, ytop = (float)FONT_PEN_Y / FONT_EM, ybot = ytop - cell;
+  const float du = (float)FONT_CELL / FONT_ATLAS_W, dv = (float)FONT_CELL / FONT_ATLAS_H;
+  float pen = 0;
+  for (uw i = 0; i < len; i++) {
+    int c = s[i];
+    if (c < 32 || c > 126) c = '?';
+    int gi = c - 32;
+    if (c != ' ') {
+      if (G.ntext == MAX_TEXT) fpr_cpanic("gfx: too much text in one frame");
+      float u0 = (float)(gi % FONT_COLS) * du, v0 = (float)(gi / FONT_COLS) * dv;
+      float lx0 = pen + x0, lx1 = lx0 + cell;
+      float q[4][4] = {{lx0, ytop, u0, v0}, {lx1, ytop, u0 + du, v0}, {lx1, ybot, u0 + du, v0 + dv}, {lx0, ybot, u0, v0 + dv}};
+      static const int order[6] = {0, 2, 1, 0, 3, 2};
+      float *o = G.tstage + (size_t)G.ntext * 6 * TVF;
+      for (int k = 0; k < 6; k++) {
+        const float *v = q[order[k]];
+        const float *m = model.m;
+        o[0] = m[0] * v[0] + m[4] * v[1] + m[12];
+        o[1] = m[1] * v[0] + m[5] * v[1] + m[13];
+        o[2] = m[2] * v[0] + m[6] * v[1] + m[14];
+        o[3] = v[2]; o[4] = v[3];
+        o[5] = col.x; o[6] = col.y; o[7] = col.z; o[8] = alpha;
+        o += TVF;
+      }
+      G.ntext++;
+    }
+    pen += font_adv[gi];
+  }
+}
+static int draw_text(const m4 *view, const m4 *proj, v3 fog, float fogNear, float fogFar, int64_t *bytes) {
+  if (!G.ntext) return 0;
+  size_t nbytes = (size_t)G.ntext * 6 * TVF * sizeof(float);
+  glUseProgram(G.tprog);
+  glUniformMatrix4fv(G.tuView, 1, GL_FALSE, view->m);
+  glUniformMatrix4fv(G.tuProj, 1, GL_FALSE, proj->m);
+  glUniform3f(G.tuFog, fog.x, fog.y, fog.z);
+  glUniform2f(G.tuFogRange, fogNear, fogFar);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, G.ttex);
+  glUniform1i(G.tuTex, 0);
+  glBindVertexArray(G.tvao);
+  glBindBuffer(GL_ARRAY_BUFFER, G.tvbo);
+  glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nbytes, G.tstage, GL_DYNAMIC_DRAW);
+  *bytes += (int64_t)nbytes;
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDepthMask(GL_FALSE);
+  glDrawArrays(GL_TRIANGLES, 0, G.ntext * 6);
+  glDepthMask(GL_TRUE);
+  glDisable(GL_BLEND);
+  glBindVertexArray(0);
+  return 1;
 }
 
 /* ==== the FPRISC scene walker ======================================== */
@@ -781,11 +1034,32 @@ static v3 walk_v3(V v) {
   V *f = fields(v, 5, "gfx: expected (x, y, z) triple");
   return (v3){fmilli(f[0]), fmilli(f[1]), fmilli(f[2])};
 }
+/* a colour: (r, g, b) opaque, or (r, g, b, a) -- alpha in milli */
+static float walk_color(V v, v3 *col) {
+  if (!ISINT(v) && TID(v) == T_TUP4) {
+    V *f = (V *)((char *)v + 8);
+    *col = (v3){fmilli(f[0]), fmilli(f[1]), fmilli(f[2])};
+    float a = fmilli(f[3]);
+    return a < 0 ? 0 : a > 1 ? 1 : a;
+  }
+  *col = walk_v3(v);
+  return 1.0f;
+}
 /* entity = (mesh, pos, yawMilli, scale, color): stage one instance */
 static void walk_entity(V v) {
   V *f = nfields(v, "gfx: expected entity (Ent mesh pos yaw scale color)");
   V ms = f[0];
-  if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String");
+  if (!ISINT(ms) && TID(ms) == 4) { /* (mode, "text"): a text entity */
+    V *tf = (V *)((char *)ms + 8);
+    if (!ISINT(tf[0]) || ISINT(tf[1]) || TID(tf[1]) != T_STR)
+      fpr_cpanic("gfx: text entity must be Ent (modeInt, String) pos yaw scale color");
+    str_t *ts = (str_t *)tf[1];
+    v3 tcol;
+    float ta = walk_color(f[4], &tcol);
+    stage_text((int)UNTAG(tf[0]), (const unsigned char *)ts->bytes, ts->len, walk_v3(f[1]), fmilli(f[2]), walk_v3(f[3]), tcol, ta);
+    return;
+  }
+  if (ISINT(ms) || TID(ms) != T_STR) fpr_cpanic("gfx: entity mesh must be a String or (mode, text)");
   str_t *s = (str_t *)ms;
   mesh_t *m = gfx_mesh((const char *)s->bytes, s->len);
   if (m->nstage == MAX_INST) fpr_cpanic("gfx: too many instances of one mesh");
@@ -793,10 +1067,11 @@ static void walk_entity(V v) {
   v3 pos = walk_v3(f[1]);
   float yaw = fmilli(f[2]);
   v3 sc = walk_v3(f[3]);
-  v3 col = walk_v3(f[4]);
+  v3 col;
+  float alpha = walk_color(f[4], &col);
   m4 model = m4mul(m4translate(pos), m4mul(m4rotY(yaw), m4scale(sc)));
   memcpy(it->model, model.m, sizeof it->model);
-  it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z;
+  it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z; it->color[3] = alpha;
 }
 static void walk_list(V v, void (*each)(V)) {
   for (;;) {
@@ -810,6 +1085,7 @@ static void walk_list(V v, void (*each)(V)) {
 }
 static void stage_clear(void) {
   for (int i = 0; i < G.nmeshes; i++) G.meshes[i].nstage = 0;
+  G.ntext = 0;
 }
 
 /* ---- packed-dynamics vector reader ----------------------------------
@@ -920,23 +1196,13 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
           m4 model = m4mul(m4translate(pos),
                            m4mul(m4rotY((float)w[3] / 1000.0f), m4scale(sc)));
           memcpy(it->model, model.m, sizeof it->model);
-          it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z;
+          it->color[0] = col.x; it->color[1] = col.y; it->color[2] = col.z; it->color[3] = 1.0f;
         }
         packed = 1;
       }
     }
     if (!packed) walk_list(f[1], walk_entity);
   }
-  for (int i = 0; i < G.nmeshes; i++) {
-    mesh_t *m = &G.meshes[i];
-    if (!m->nstage) continue;
-    if (!m->dynVBO) glGenBuffers(1, &m->dynVBO);
-    glBindBuffer(GL_ARRAY_BUFFER, m->dynVBO);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)m->nstage * sizeof(inst_t)), m->stage,
-                 GL_DYNAMIC_DRAW);
-    dynBytes += (sw)((size_t)m->nstage * sizeof(inst_t));
-  }
-
   /* Camera: an INT is the 2D case -- the eye distance in milli, looking
    * at the origin with the standard fov.  That form exists because a
    * TUPLE here is a heap value nested in a per-frame message, and a
@@ -956,39 +1222,51 @@ static int gfx_render_pass(uint64_t scenev, int64_t *draws_out, int64_t *dyn_byt
     proj = m4persp(fmilli(cam[2]), (float)G.w / (float)G.h, 0.1f, 100.0f);
   }
   v3 lp = {5, 5, 5}, lc = {1, 1, 1};
+  v3 sky = {0.06f, 0.07f, 0.09f}, amb = {0.15f, 0.15f, 0.15f};
+  float fogNear = 1000.0f, fogFar = 2000.0f; /* no sky entry: fog off */
   V lv = f[2];
   if (!ISINT(lv) && TID(lv) == T_LIST && ((hdr_t *)lv)->var == 1) {
     V *lf = (V *)((char *)lv + 8);
     V *l0 = fields(lf[0], 4, "gfx: light must be (pos, color)");
     lp = walk_v3(l0[0]); lc = walk_v3(l0[1]);
+    /* a second entry is the sky: (clearAndFogColor, ambientColor); with
+     * it, distance fog settles the far edge of the world into the sky
+     * between 30 and 78 units from the eye */
+    V rest = lf[1];
+    if (!ISINT(rest) && TID(rest) == T_LIST && ((hdr_t *)rest)->var == 1) {
+      V *rf = (V *)((char *)rest + 8);
+      V *l1 = fields(rf[0], 4, "gfx: sky must be (fogColor, ambient)");
+      sky = walk_v3(l1[0]); amb = walk_v3(l1[1]);
+      fogNear = 30.0f; fogFar = 78.0f;
+    }
   }
 
   glBindFramebuffer(GL_FRAMEBUFFER, G.fbo);
   glViewport(0, 0, G.w, G.h);
   glEnable(GL_DEPTH_TEST);
-  glClearColor(0.06f, 0.07f, 0.09f, 1.0f);
+  glClearColor(sky.x, sky.y, sky.z, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   glUseProgram(G.prog);
   glUniformMatrix4fv(G.uView, 1, GL_FALSE, view.m);
   glUniformMatrix4fv(G.uProj, 1, GL_FALSE, proj.m);
   glUniform3f(G.uLightPos, lp.x, lp.y, lp.z);
   glUniform3f(G.uLightColor, lc.x, lc.y, lc.z);
+  glUniform3f(G.uAmbient, amb.x, amb.y, amb.z);
+  glUniform3f(G.uFog, sky.x, sky.y, sky.z);
+  glUniform2f(G.uFogRange, fogNear, fogFar);
 
   for (int i = 0; i < G.nmeshes; i++) {
     mesh_t *m = &G.meshes[i];
-    if (!m->staticCount && !m->nstage) continue;
+    if (!m->staticCount) continue;
     glBindVertexArray(m->vao);
-    if (m->staticCount) {
-      gfx_bind_instances(m->staticVBO);
-      glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, m->staticCount);
-      draws++;
-    }
-    if (m->nstage) {
-      gfx_bind_instances(m->dynVBO);
-      glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, m->nstage);
-      draws++;
-    }
+    gfx_bind_instances(m->staticVBO);
+    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, m->staticCount);
+    draws++;
   }
+  { int64_t b = 0;
+    for (int i = 0; i < G.nmeshes; i++) draws += draw_dyn(&G.meshes[i], &view, &b);
+    draws += draw_text(&view, &proj, sky, fogNear, fogFar, &b);
+    dynBytes += (sw)b; }
   *draws_out = draws;
   *dyn_bytes_out = dynBytes;
   return 0;
@@ -1031,14 +1309,6 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   int r = gfx_render_pass(scenev, draws_out, dyn_bytes_out);
   stage_clear();
   walk_list((V)uiv, walk_entity);
-  for (int i = 0; i < G.nmeshes; i++) {
-    mesh_t *m = &G.meshes[i];
-    if (!m->nstage) continue;
-    if (!m->dynVBO) glGenBuffers(1, &m->dynVBO);
-    glBindBuffer(GL_ARRAY_BUFFER, m->dynVBO);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)((size_t)m->nstage * sizeof(inst_t)), m->stage, GL_DYNAMIC_DRAW);
-    b2 += (int64_t)((size_t)m->nstage * sizeof(inst_t));
-  }
   float z = (float)dist / 1000.0f;
   m4 view = m4lookAt((v3){0, 0, z}, (v3){0, 0, 0}, (v3){0, 1, 0});
   m4 proj = m4persp(0.927f, (float)G.w / (float)G.h, 0.1f, 100.0f);
@@ -1049,15 +1319,12 @@ int gfx_render_overlay(uint64_t scenev, uint64_t uiv, int64_t dist, int64_t *dra
   glUniformMatrix4fv(G.uView, 1, GL_FALSE, view.m);
   glUniformMatrix4fv(G.uProj, 1, GL_FALSE, proj.m);
   glUniform3f(G.uLightPos, 0.0f, 0.0f, z * 40.0f);
-  glUniform3f(G.uLightColor, 1.0f, 1.0f, 1.0f);
-  for (int i = 0; i < G.nmeshes; i++) {
-    mesh_t *m = &G.meshes[i];
-    if (!m->nstage) continue;
-    glBindVertexArray(m->vao);
-    gfx_bind_instances(m->dynVBO);
-    glDrawElementsInstanced(GL_TRIANGLES, m->indexCount, GL_UNSIGNED_INT, 0, m->nstage);
-    d2++;
-  }
+  glUniform3f(G.uLightColor, 0.85f, 0.85f, 0.85f);
+  glUniform3f(G.uAmbient, 0.15f, 0.15f, 0.15f);
+  glUniform3f(G.uFog, 0.0f, 0.0f, 0.0f);
+  glUniform2f(G.uFogRange, 1000.0f, 2000.0f);
+  for (int i = 0; i < G.nmeshes; i++) d2 += draw_dyn(&G.meshes[i], &view, &b2);
+  d2 += draw_text(&view, &proj, (v3){0, 0, 0}, 1000.0f, 2000.0f, &b2);
   *draws_out += d2;
   *dyn_bytes_out += b2;
   gfx_present();
