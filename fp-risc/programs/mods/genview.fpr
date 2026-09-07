@@ -146,26 +146,43 @@ cssRule "text-4xl" = "font-size:46px".
 cssRule "bold" = "font-weight:700".
 cssRule "mono" = "font-family:ui-monospace,'SF Mono',Menlo,monospace".
 cssRule "upper" = "text-transform:uppercase;letter-spacing:.18em".
-cssRule "dim" = "color:#7c8aa3".
-cssRule "ink" = "color:#e9eff7".
+cssRule "dim" = "color:var(--dim)".
+cssRule "ink" = "color:var(--ink)".
 cssRule "acc" = "color:#57e2d2".
 cssRule "warm" = "color:#ff8a5c".
-cssRule "panel" = "background:linear-gradient(180deg,#0c1424,#080e1a);border:1px solid #1b2740".
-cssRule "card" = "background:#0a1120;border:1px solid #1b2740".
+cssRule "panel" = "background:var(--panel);border:1px solid var(--line)".
+cssRule "card" = "background:var(--card);border:1px solid var(--line)".
 cssRule "round" = "border-radius:14px".
 cssRule "pill" = "border-radius:999px".
-cssRule "btn" = "cursor:pointer;border:1px solid #1b2740;background:#0a1120;color:#7c8aa3;transition:.15s".
+cssRule "btn" = "cursor:pointer;border:1px solid var(--line);background:var(--card);color:var(--dim);transition:.15s".
 cssRule "glow" = "box-shadow:0 0 24px rgba(87,226,210,.22)".
-cssRule "rule" = "border-top:1px solid #14203a".
+cssRule "rule" = "border-top:1px solid var(--line)".
 cssRule "big" = "font-size:64px;line-height:1".
 cssRule "tabular" = "font-variant-numeric:tabular-nums".
-cssRule "field" = "background:#0a1120;border:1px solid #1b2740;color:#e9eff7;padding:8px 12px;border-radius:10px;font:inherit;outline:none".
+cssRule "field" = "background:var(--card);border:1px solid var(--line);color:var(--ink);padding:8px 12px;border-radius:10px;font:inherit;outline:none".
 cssRule "w-full" = "width:100%".
 cssRule "pre" = "white-space:pre-wrap".
+# roles: a badge takes a role, never a colour (red / amber / green carry
+# meaning only); the theme is one class on the page root
+cssRule "badge" = "display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;border:1px solid var(--line);color:var(--dim)".
+cssRule "bad" = "background:#3a1220;border-color:#7a2238;color:#ff7d95".
+cssRule "warn" = "background:#3a2a10;border-color:#7a5a18;color:#ffc65c".
+cssRule "ok" = "background:#0f3328;border-color:#1f6b50;color:#57e2a6".
+cssRule "celebrate" = "background:#2a1a3a;border-color:#6b3f9a;color:#d9a6ff".
+cssRule "toast" = "padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--panel)".
+cssRule "scroll" = "max-height:52vh;overflow:auto".
+cssRule "w-cart" = "width:360px;flex:none".
+cssRule "w-40" = "width:40px".
+cssRule "w-24" = "width:96px".
+cssRule "right" = "text-align:right".
+cssRule "tr" = "border-bottom:1px solid var(--line);padding:6px 0".
+cssRule "day" = "".
 cssRule c = "".
 
 cssBase = "*\{box-sizing:border-box;margin:0}
-body\{background:#060a12;color:#e9eff7;font:15px/1.55 'Archivo',system-ui,sans-serif;
+:root\{--bg:#060a12;--ink:#e9eff7;--dim:#7c8aa3;--card:#0a1120;--panel:linear-gradient(180deg,#0c1424,#080e1a);--line:#1b2740}
+.day\{--bg:#f3f5f9;--ink:#0d1526;--dim:#5b6a86;--card:#ffffff;--panel:linear-gradient(180deg,#ffffff,#eef2f8);--line:#d3dbe8;background:var(--bg);color:var(--ink);background-image:none}
+body\{background:var(--bg);color:var(--ink);font:15px/1.55 'Archivo',system-ui,sans-serif;
   background-image:radial-gradient(900px 500px at 20% -10%,#0f2035 0,transparent 60%),
                    radial-gradient(700px 400px at 95% 5%,#1a1526 0,transparent 55%)}
 a\{color:inherit}

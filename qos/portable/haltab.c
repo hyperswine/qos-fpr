@@ -88,6 +88,8 @@ static void t_mmio_write(uint64_t addr, uint64_t v, uint32_t width) {
   }
 }
 
+static int64_t qosp_clock_now(void) { return (int64_t)time(NULL); }
+
 static qos_hal_t the_table = {
     .version = QOS_ABI_VERSION,
     .nharts = 1, /* main.c raises this (and installs start_hart) at boot */
@@ -137,6 +139,8 @@ static qos_hal_t the_table = {
     /* v10: the 2D layer over the scene */
     .gfx_render_ui = gfx_render_overlay,
 #endif
+    /* v11: the wall clock */
+    .clock_now = qosp_clock_now,
 };
 
 const qos_hal_t *qosp_hal_table(void) { return &the_table; }

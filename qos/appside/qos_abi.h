@@ -19,7 +19,7 @@
 
 #include <stdint.h>
 
-#define QOS_ABI_VERSION 10u
+#define QOS_ABI_VERSION 11u
 
 /* ---- the address plan (linux-x86-64) --------------------------------
  * The host is linked non-PIE (default 0x400000 text); the arena is a
@@ -176,6 +176,12 @@ typedef struct {
    * pixel space (the Int camera at dist milli) over it with the depth
    * cleared -- a UI on top of a 3D board, one present. */
   int (*gfx_render_ui)(uint64_t scene, uint64_t ui, int64_t dist, int64_t *draws, int64_t *dyn_bytes);
+
+  /* ---- v11 additions (appended: earlier offsets unchanged) ----------
+   * the wall clock: seconds since 1970-01-01 UTC, for records that a
+   * person will read back (a receipt's time).  0 where the host has no
+   * clock; the monotonic mtime stays the timer. */
+  int64_t (*clock_now)(void);
 } qos_hal_t;
 
 /* ---- the memory-growth grant ---------------------------------------

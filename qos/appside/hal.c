@@ -332,5 +332,12 @@ FPR_FN(fpr_g_glMesh, h_glMesh, 2);
 FPR_FN(fpr_g_glInit, h_glInit, 2);
 FPR_FN(fpr_g_glRender, h_glRender, 1);
 FPR_FN(fpr_g_glRenderUi, h_glRenderUi, 3);
+/* ---- timeNow u -> epoch seconds (0 on a host without a clock) */
+static V h_timeNow(V u) {
+  (void)u;
+  if (!qos_hal->clock_now) return TAG(0);
+  return TAG((sw)qos_hal->clock_now());
+}
+FPR_FN(fpr_g_timeNow, h_timeNow, 1);
 FPR_FN(fpr_g_glSavePpm, h_glSavePpm, 1);
 FPR_FN(fpr_g_inputPoll, h_inputPoll, 1);
