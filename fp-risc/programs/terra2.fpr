@@ -331,8 +331,9 @@ scrPause = 2.
 scrOver = 3.
 scrKeys = 4.
 scrStats = 5.
+scrCards = 6.
 
-frozen m = m.screen == scrPause or m.screen == scrKeys or m.screen == scrStats.
+frozen m = m.screen == scrPause or m.screen == scrKeys or m.screen == scrStats or m.screen == scrCards.
 show m scr = { m | back = m.screen, screen = scr }.
 goBack m = { m | screen = m.back }.
 
@@ -344,7 +345,7 @@ keymap =
   (2, "A", "attack") :: (2, "O", "overwatch") :: (2, "R", "retreat") ::
   (2, "V", "advance") :: (2, "C", "charge (artillery)") :: (2, "F", "fire (artillery)") ::
   (3, "space", "end the turn") :: (3, "M", "music on / off") :: (3, "K", "keys") ::
-  (3, "S", "stats") :: (3, "P", "screenshot") :: (3, "Q", "quit") :: Nil.
+  (3, "S", "stats") :: (3, "C", "cards") :: (3, "P", "screenshot") :: (3, "Q", "quit") :: Nil.
 
 # ---- the profile ------------------------------------------------------------------
 # One append-only record on the disk (std/fs over the QLOG log at
@@ -385,35 +386,112 @@ intsFrom line i n =
   | False -> Core.parseDigits w :: intsFrom line j n.
 
 # a line for the disk: folded now, written by update's flush
-rec m line = { m | prof = profFold m.prof line, recs = line :: m.recs }.
+rec m line = { m | prof = profFold m.prof line, recs = (profUrl, line) :: m.recs }.
 startRec m = rec m "start {m.seed}".
 endRec m won =
   w = case won of True -> "win" | False -> "loss";
-  rec m "end {m.seed} {w} {m.tno} {Int.max 0 m.me.hq} {Int.max 0 m.en.hq} {m.called} {m.lostU} {m.kills} {m.dmg}".
+  m2 = rec m "end {m.seed} {w} {m.tno} {Int.max 0 m.me.hq} {Int.max 0 m.en.hq} {m.called} {m.lostU} {m.kills} {m.dmg}";
+  { m2 | recs = (gameUrl, "none") :: m2.recs, dirty = 0 }.
+
+# ---- the live game --------------------------------------------------------------
+# The board, saved at terra2/game whenever a turn of yours begins (the
+# state after income, with nothing in flight) and cleared to "none" when
+# an HQ falls.  Boot reads it back; the title then offers Continue.  Only
+# what the rules need is kept -- sides, turn, ENV, the counters -- never
+# the animation, the cursor or the queue.  Units go out as eleven
+# numbers each with the id shifted by one so an empty slot is 0.
+
+gameUrl = "terra2/game".
+gameRec m =
+  "terra2 1\ng {m.seed} {m.turn} {m.tno} {m.env} {m.called} {m.lostU} {m.kills} {m.dmg}\n" + sideRec m.me + sideRec m.en.
+sideRec p =
+  "s {p.hq} {p.stock}\nd {ints p.deck}\nh {ints p.hand}\nf {units p.fwd}\nr {units p.rear}\n".
+ints Nil = "".
+ints (x :: r) = "{x} " + ints r.
+units Nil = "".
+units (u :: r) =
+  "{u.id + 1} {u.hp} {u.atk} {u.mode} {u.ready} {u.down} {u.rdy} {u.chg} {u.vet} {u.age} {u.ow} " + units r.
+
+loadGame m s =
+  ls = Core.lines s;
+  case List.len ls == 12 of
+    False -> m
+  | True -> loadGame2 m ls.
+loadGame2 m ls =
+  g = lineInts (nth ls 1 "");
+  p0 = sideOfLines (nth ls 2 "") (nth ls 3 "") (nth ls 4 "") (nth ls 5 "") (nth ls 6 "");
+  p1 = sideOfLines (nth ls 7 "") (nth ls 8 "") (nth ls 9 "") (nth ls 10 "") (nth ls 11 "");
+  { m | me = p0, en = p1, seed = nth g 0 m.seed, turn = nth g 1 0, tno = nth g 2 0, env = nth g 3 0,
+        called = nth g 4 0, lostU = nth g 5 0, kills = nth g 6 0, dmg = nth g 7 0, cont = 1 }.
+# a line's numbers after its one-letter tag
+lineInts line =
+  n = strlen line;
+  (w, i) = Core.wordAt line 1 n;
+  intsFrom line i n.
+sideOfLines sl dl hl fl rl =
+  sv = lineInts sl;
+  { hq = nth sv 0 15, stock = nth sv 1 0, deck = lineInts dl, hand = lineInts hl,
+    fwd = unitsOf (lineInts fl) 5, rear = unitsOf (lineInts rl) 5 }.
+unitsOf ns 0 = Nil.
+unitsOf ns k = unitOf ns :: unitsOf (dropN ns 11) (k - 1).
+unitOf ns =
+  { noU | id = nth ns 0 0 - 1, hp = nth ns 1 0, atk = nth ns 2 0, mode = nth ns 3 0, ready = nth ns 4 0,
+          down = nth ns 5 0, rdy = nth ns 6 0, chg = nth ns 7 0, vet = nth ns 8 0, age = nth ns 9 0,
+          ow = nth ns 10 0, born = 1000 }.
+dropN l 0 = l.
+dropN Nil n = Nil.
+dropN (x :: r) n = dropN r (n - 1).
+takeN l 0 = Nil.
+takeN Nil n = Nil.
+takeN (x :: r) n = x :: takeN r (n - 1).
+
+saveGame m =
+  _ = print "[terra2] game saved: turn {m.tno}";
+  { m | recs = (gameUrl, gameRec m) :: m.recs, dirty = 0 }.
+# idle with a turn of yours to keep: the save goes out with the records
+idleNow m =
+  An kind s fz fc tz tc t done = m.anim;
+  kind == 0 and (case m.queue of Nil -> True | q -> False) and m.over == 0 and m.turn == 0.
 
 # the disk, read at boot and appended to as the game goes
 loadProf m me 0 =
   _ = print "[terra2] profile: no disk, games are not recorded";
   { m | fsOn = 0 }.
 loadProf m me fs =
+  c = FS.compact me fs;
+  _ = drop c;
   r = FS.replay me fs profUrl;
   p = profOf r;
   _ = drop r;
   _ = print "[terra2] profile: {p.played} games ({p.won} won, {p.lost} lost, {p.gone} abandoned)";
-  { m | prof = p, fsOn = 1 }.
+  g = FS.readLatest me fs gameUrl;
+  m2 = gameOf { m | prof = p, fsOn = 1 } g;
+  _ = drop g;
+  _ = announce m2;
+  m2.
+announce m | m.cont == 1 =
+  _ = print "[terra2] a game is waiting: turn {m.tno}";
+  0.
+announce m = 0.
+gameOf m (Ok s) = loadGame m s.
+gameOf m (Err e) = m.
 profOf (Ok s) = Core.lines s |> List.fold (fn line p -> profFold p line) profEmpty.
 profOf (Err e) = profEmpty.
 
-flush env m = case m.recs of
-    Nil -> m
+flush env m =
+  m1 = case m.dirty == 1 and idleNow m of
+    True -> saveGame m
+  | False -> m;
+  case m1.recs of
+    Nil -> m1
   | rs ->
     (me, fs) = env;
     _ = writeAll me fs (rev rs Nil);
-    { m | recs = Nil }.
+    { m1 | recs = Nil }.
 writeAll me 0 rs = 0.
 writeAll me fs Nil = 0.
-writeAll me fs (r :: rest) =
-  h = FS.append me fs profUrl (r + "\n");
+writeAll me fs ((url, r) :: rest) =
+  h = FS.append me fs url (r + "\n");
   _ = drop h;
   writeAll me fs rest.
 
@@ -442,8 +520,9 @@ initWith s0 s1 =
     sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0, music = 0, puffs = Nil,
     ring = (0, 2400), hov = (0, 0), hovT = 1000, marks = Nil, supV = (0, 0), vt = 0,
     gone = (0 - 1, 1000), dealt = 1000,
-    screen = scrTitle, back = scrTitle, menu = 0, confirm = 0,
-    prof = profEmpty, fsOn = 0, recs = Nil, called = 0, lostU = 0, kills = 0, dmg = 0 }.
+    screen = scrTitle, back = scrTitle, menu = 0, confirm = 0, ccur = (0, 0),
+    prof = profEmpty, fsOn = 0, recs = Nil, called = 0, lostU = 0, kills = 0, dmg = 0,
+    cont = 0, dirty = 0 }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -728,7 +807,9 @@ richest (u :: r) i best bg = richest r (i + 1) best bg.
 
 startAct m a = case a of
     ABeat -> pause m 260
-  | AStart s -> pause (startTurn m s) 900
+  | AStart s ->
+    m2 = startTurn m s;
+    pause { m2 | dirty = bi (s == 0) } 900
   | AEnd s -> pause (endTurn m s) 500
   | ACall s i z c -> flyCard (callCard m s i z c) m s i z c
   | AOver s c -> pause (overwatch m s c) 250
@@ -906,14 +987,17 @@ key m 50 =
   _ = sndMusic musicFile (on * volNow { m | music = on });
   ({ m | music = on, msg = (case on == 1 of True -> "music on" | False -> "music off") }, Nil).
 # the Keys and Stats screens: esc, enter, K or S return
+key m k | m.screen == scrCards = cardsKey m k.
 key m k | m.screen == scrKeys or m.screen == scrStats =
   case k == 1 or k == 28 or k == 37 or k == 31 of
     True -> (cue (goBack m) Sfx.cancel, Nil)
   | False -> (m, Nil).
-# K and S from the title, the pause menu and game over
+# K, S and C from the title, the pause menu and game over
 key m 37 | m.screen != scrPlay = (cue (show m scrKeys) Sfx.pick, Nil).
 key m 31 | m.screen != scrPlay = (cue (show m scrStats) Sfx.pick, Nil).
+key m 46 | m.screen != scrPlay = (cue (show m scrCards) Sfx.pick, Nil).
 key m k | m.screen == scrPause = pauseKey m k.
+key m 49 | m.title == 1 and m.cont == 1 = newGame m.
 key m 28 | m.title == 1 = begin m.
 key m 28 | m.over != 0 = newGame m.
 key m k | m.title == 1 or m.over != 0 = (m, Nil).
@@ -946,6 +1030,9 @@ volNow m | m.music == 0 = 0.
 volNow m | m.screen == scrPause = musicVol / 2.
 volNow m = musicVol.
 
+begin m | m.cont == 1 =
+  _ = sndMusic musicFile musicVol;
+  (cue (note { m | title = 0, screen = scrPlay, bt = 0, queue = Nil, music = 1, cont = 0 } "welcome back: turn {m.tno}") Sfx.open, Nil).
 begin m =
   _ = sndMusic musicFile musicVol;
   (cue (startRec { m | title = 0, screen = scrPlay, bt = 0, queue = AStart 0 :: Nil, msg = "", music = 1 }) Sfx.open, Nil).
@@ -970,14 +1057,35 @@ pauseKey m 1 | m.confirm == 1 = (cue { m | confirm = 0 } Sfx.cancel, Nil).
 pauseKey m 1 = (cue (resume m) Sfx.cancel, Nil).
 pauseKey m 28 | m.confirm == 1 = newGame m.
 pauseKey m 28 = menuPick m m.menu.
-pauseKey m 103 = (cue { m | menu = (m.menu + 4) % 5 } Sfx.cursor, Nil).
-pauseKey m 108 = (cue { m | menu = (m.menu + 1) % 5 } Sfx.cursor, Nil).
+pauseKey m 103 = (cue { m | menu = (m.menu + 5) % 6 } Sfx.cursor, Nil).
+pauseKey m 108 = (cue { m | menu = (m.menu + 1) % 6 } Sfx.cursor, Nil).
 pauseKey m k = (m, Nil).
 menuPick m 0 = (cue (resume m) Sfx.pick, Nil).
 menuPick m 1 = (cue { m | confirm = 1 } Sfx.pick, Nil).
-menuPick m 2 = (cue (show m scrStats) Sfx.pick, Nil).
-menuPick m 3 = (cue (show m scrKeys) Sfx.pick, Nil).
+menuPick m 2 = (cue (show m scrCards) Sfx.pick, Nil).
+menuPick m 3 = (cue (show m scrStats) Sfx.pick, Nil).
+menuPick m 4 = (cue (show m scrKeys) Sfx.pick, Nil).
 menuPick m i = key m 16.
+
+# the Cards screen: a cursor over the two factions' cards
+cardsKey m 105 =
+  (f, i) = m.ccur;
+  (cue { m | ccur = (f, Int.max 0 (i - 1)) } Sfx.cursor, Nil).
+cardsKey m 106 =
+  (f, i) = m.ccur;
+  (cue { m | ccur = (f, Int.min (List.len (facIds f) - 1) (i + 1)) } Sfx.cursor, Nil).
+cardsKey m 103 = cardsFac m.
+cardsKey m 108 = cardsFac m.
+cardsKey m k | k == 1 or k == 28 or k == 46 = (cue (goBack m) Sfx.cancel, Nil).
+cardsKey m k = (m, Nil).
+cardsFac m =
+  (f, i) = m.ccur;
+  f2 = 1 - f;
+  (cue { m | ccur = (f2, Int.min (List.len (facIds f2) - 1) i) } Sfx.cursor, Nil).
+facIds 0 = range 0 14.
+facIds f = range 20 35.
+range a b | a > b = Nil.
+range a b = a :: range (a + 1) b.
 
 # esc: back to where the selection started -- the attacker's slot, the
 # card being placed, or just the selection cleared
@@ -1470,6 +1578,7 @@ keyLineW w k what =
       (Box (Row :: W w :: Pad 3 :: Round 5 :: Bg chip :: Center :: Mid :: Nil) (t 11 ink k :: Nil) ::
        t 12 inkDim what :: Nil).
 
+uiTree m | m.screen == scrCards = cardsTree m.
 uiTree m | m.screen == scrKeys = keysTree m.
 uiTree m | m.screen == scrStats = statsTree m.
 uiTree m | m.title == 1 = titleTree m.
@@ -1483,9 +1592,9 @@ titleTree m =
              (centred (t 64 yellow "TERRA II") ::
               centred (t 14 inkDim "a positional card game  |  Republic VI against the Southern Empire") ::
               spacer 10 ::
-              centred (t 20 blink "press ENTER") ::
+              centred (t 20 blink (case m.cont == 1 of True -> "ENTER  continue turn {m.tno}      N  new game" | False -> "press ENTER")) ::
               spacer 4 ::
-              centred (t 12 inkDim "K  keys      S  stats      M  music      Q  quit") :: Nil);
+              centred (t 12 inkDim "C  cards      K  keys      S  stats      M  music      Q  quit") :: Nil);
   Box (Col :: W uiW :: H uiH :: Nil)
       (grow :: centred logo :: grow :: centred (t 12 inkDim "FP-RISC on QOS Portable") :: spacer 14 :: Nil).
 
@@ -1499,7 +1608,7 @@ pauseTree m =
               (centred (t 14 ink "Abandon this game and deal a new one?") :: spacer 6 ::
                centred (t 12 inkDim "enter  yes      esc  no") :: Nil)
   | False -> menuCard "PAUSED"
-              (menuItems m 0 ("Resume" :: "Restart" :: "Stats" :: "Keys" :: "Quit" :: Nil) +
+              (menuItems m 0 ("Resume" :: "Restart" :: "Cards" :: "Stats" :: "Keys" :: "Quit" :: Nil) +
                (spacer 4 :: centred (t 12 inkDim "arrows  enter      esc  resume") :: Nil));
   Box (Col :: W uiW :: H uiH :: Center :: Mid :: Bga (0, 0, 0, 520) :: Nil) (card :: Nil).
 menuCard title kids =
@@ -1509,6 +1618,44 @@ menuItems m i Nil = Nil.
 menuItems m i (s :: r) = menuItem (m.menu == i) s :: menuItems m (i + 1) r.
 menuItem True s = Box (Row :: Pad 8 :: Round 8 :: Bg chip :: Bord yellow :: Center :: Nil) (t 15 ink s :: Nil).
 menuItem False s = Box (Row :: Pad 8 :: Round 8 :: Center :: Nil) (t 15 inkDim s :: Nil).
+
+# the Cards screen: both factions as small cards, the cursor's in detail
+cardsTree m =
+  (fac, i) = m.ccur;
+  cd = cardOf (nth (facIds fac) i 0);
+  card = Box (Col :: W 920 :: Pad 18 :: Gap 8 :: Round 18 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+             (Box (Row :: Mid :: Nil) (t 30 yellow "CARDS" :: grow :: t 12 inkDim "arrows  browse      esc  back" :: Nil) ::
+              t 11 blueLight "REPUBLIC VI" ::
+              gridOf (facIds 0) (case fac == 0 of True -> i | False -> 0 - 1) ::
+              t 11 redLight "SOUTHERN EMPIRE" ::
+              gridOf (facIds 1) (case fac == 1 of True -> i | False -> 0 - 1) ::
+              Box (Row :: Pad 8 :: Round 8 :: Bg chip :: Mid :: Gap 16 :: Nil) (detailOf cd) :: Nil);
+  Box (Col :: W uiW :: H uiH :: Center :: Mid :: Nil) (card :: Nil).
+gridOf ids seli =
+  Box (Col :: Gap 6 :: Nil)
+      (Box (Row :: Gap 6 :: Nil) (minis (takeN ids 8) 0 seli) ::
+       Box (Row :: Gap 6 :: Nil) (minis (dropN ids 8) 8 seli) :: Nil).
+minis Nil i seli = Nil.
+minis (k :: r) i seli = mini (cardOf k) (i == seli) :: minis r (i + 1) seli.
+mini cd sel =
+  face = case sel of True -> paperLit | False -> paper;
+  rim = case sel of True -> yellow | False -> edge;
+  Box (Col :: W 104 :: H 80 :: Pad 4 :: Gap 3 :: Round 8 :: Bg face :: Bord rim :: Nil)
+      (Box (Row :: H 26 :: Pad 4 :: Round 6 :: Bg (bandOf cd) :: Mid :: Gap 3 :: Nil)
+           (t 11 white (cName cd) :: grow :: costBadge True (cCost cd) :: Nil) ::
+       Box (Row :: Grow :: Center :: Mid :: Nil) (t 9 inkDim (kindName cd) :: Nil) ::
+       Box (Row :: Mid :: Pad 2 :: Nil) (miniStats cd) :: Nil).
+miniStats cd | cKind cd == 1 = t 14 yellow "+{cGen cd}" :: grow :: t 14 ink "{cDef cd}" :: Nil.
+miniStats cd = t 14 ink "{cAtk cd}" :: grow :: t 14 ink "{cDef cd}" :: Nil.
+detailOf cd =
+  t 15 white (cName cd) :: t 12 inkDim (kindName cd) :: t 12 ink "cost {cCost cd}" ::
+  statsText cd :: t 12 ink "drain {cDrain cd}" :: t 12 inkDim (kindText cd) :: Nil.
+statsText cd | cKind cd == 1 = t 12 ink "GEN +{cGen cd}   DEF {cDef cd}".
+statsText cd = t 12 ink "ATK {cAtk cd}   DEF {cDef cd}".
+kindText cd | cKind cd == 1 = "a rear unit: earns supply every turn".
+kindText cd | cKind cd == 2 = "charges, then fires past cover".
+kindText cd | cSoft cd == 1 = "soft: the ENV track bites it".
+kindText cd = "hard: shrugs off ENV, drains supply".
 
 # the Keys screen: the key table in three columns
 keysTree m =

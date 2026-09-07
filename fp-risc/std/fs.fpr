@@ -46,3 +46,6 @@ del me fs url = rpc me fs 4 url "".
 
 stats : unsafe Int -> Int -> String -> Result String String .
 stats me fs url = rpc me fs 5 url "".
+# the GC sweep: live records copied forward, the log truncated (idempotent)
+compact : unsafe Int -> Int -> Result String String .
+compact me fs = rpc me fs 6 "" "".
