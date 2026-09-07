@@ -1129,7 +1129,7 @@ frameWorker self =
   (Bd qx qy qz wx wy wz g2) = bd2;
   _ = send parent (Vw q yawA pitA pw ph lv2);
   _ = send parent (Rq qx qy qz wx wy wz (gi g2) selA);
-  send parent (Bk w3 lm2 ar2 ag2 ab2 fr3 fg3 fb3).
+  drop (send parent (Bk w3 lm2 ar2 ag2 ab2 fr3 fg3 fb3)).
 
 # ============================================================================
 # THE DRIVER.  Long-lived and nearly allocation-free per frame: it

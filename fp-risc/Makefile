@@ -165,8 +165,9 @@ qos-app: build/qosapp.elf tools/mkqa.py
 # ---- QOS app for macOS (Apple Silicon) -----------------------------------
 # qosp's in-process loader consumes fixed-slot ELF on every host.  Apple
 # Clang + lld can cross-link that AArch64 ELF without a Linux sysroot because
-# the app and runtime are freestanding.  Mach-O emission remains available
-# separately for native macOS integration work.
+# the app and runtime are freestanding.  The code still executes under Darwin,
+# where x18 is platform-reserved, so the generic ELF compiler must not use it.
+# Mach-O emission remains available separately for native macOS integration work.
 build/qosapp-a64.s: fprc $(PROG) core/prelude.fpr FORCE
 	@mkdir -p build
 	LC_ALL=C.UTF-8 ./fprc --target=qa64 --prelude=core/prelude.fpr $(PROG) $@
@@ -174,7 +175,7 @@ build/qosapp-a64.s: fprc $(PROG) core/prelude.fpr FORCE
 build/qosapp-a64.elf: build/qosapp-a64.s $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64.S $(QOS)/appside/link-qosapp-a64.ld
 	clang --target=aarch64-none-elf -fuse-ld=lld -O2 -Wall -Wextra \
 	  -ffreestanding -nostdlib -nostartfiles -fno-stack-protector \
-	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x28 \
+	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x18 -ffixed-x28 \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) \
 	  -I$(HAL)/core -I$(QOS)/appside \
 	  -T $(QOS)/appside/link-qosapp-a64.ld -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
