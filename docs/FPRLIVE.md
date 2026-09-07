@@ -176,8 +176,11 @@ harder than anything before it, and turned up five things in
   across it. `tests/fanin.fpr` sends 40 clients through one hub and
   checks every reply is addressed.
 - **A full channel panicked the sender.** A burst that outran a session's
-  render died at 64 queued messages. A full ring is now backpressure:
-  the sender gives its hart away and retries.
+  render died at 64 queued messages. For a while a full ring was
+  backpressure (the sender yielded and retried); now capacity is a
+  spawn-time choice and `send` answers with a Result (docs/MAILBOX.md):
+  the register, the acceptor and every connection actor spawn Dynamic,
+  so a burst grows their rings instead of stalling the sender.
 - **A second enqueue of an actor already on a hart's backlog corrupted
   the list** — a waker's ship racing the receiver's own early un-block,
   then a yield. The tail could point at itself, and the selector walked

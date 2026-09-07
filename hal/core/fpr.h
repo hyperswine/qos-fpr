@@ -454,7 +454,8 @@ void fpr_arc_decref(V v);
 uw fpr_arc_live(void);
 V fpr_apply(V f, V a);
 V fpr_applyN(V f, uw n, V *rargs);
-V fpr_send_as(uw sender_key, V av, V m);
+V fpr_send_as(uw sender_key, V av, V m); /* Result Unit String: Ok queued */
+int fpr_sent(V r);                          /* 1 when a send's Result is Ok */
 void *fpr_syscall_mailbox(void);
 V fpr_syscall_wait_result(void);
 V fpr_mkresult(uw variant, const char *s);

@@ -52,7 +52,7 @@ still DONATE its ready work to the steal FIFO under load, which
 updates the owner hart. Pin services that own devices; let compute
 migrate.
 
-**send : actor -> msg -> Unit** — enqueue on the per-sender SPSC
+**send : actor -> msg -> Result Unit String** — Ok when queued, Err "mailbox full" / "dead actor" otherwise (docs/MAILBOX.md); enqueue on the per-sender SPSC
 channel; promotes the message into shared ARC.
 ```
 u = send boss (n + 1);

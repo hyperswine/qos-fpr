@@ -967,10 +967,21 @@ void fpr_pool_reclaim(struct fpr_acb *a) {
  * equality wants). In the real compiler the RC-insertion pass emits
  * these drops; here the demo program does it by hand to show the
  * protocol working. */
-#define ARC_CAP 1024
+/* THE TABLE GROWS.  It starts as a static 1024-slot array and rehashes
+ * into a buddy block of twice the size whenever live + tombstone slots
+ * pass 70% -- so a long-running hub with ten thousand shared values in
+ * flight costs a bigger table, not a panic (the old fixed table died
+ * at 1024).  Growth happens under arc_lock on the insert path, before
+ * the probe, so a probe never runs on a table it could overrun; the
+ * panic below is unreachable and kept as the last word if allocation
+ * itself fails.  arc_hwm is the most live entries ever held. */
+#define ARC_CAP0 1024
 #define ARC_TOMB ((V)1)
-static struct { V ptr; uw cnt; } arct[ARC_CAP];
-static uw arc_live;
+typedef struct { V ptr; uw cnt; } arcent_t;
+static arcent_t arct0[ARC_CAP0];
+static arcent_t *arct = arct0;
+static uw arc_cap = ARC_CAP0;
+static uw arc_live, arc_used, arc_hwm, arc_grows; /* used = live + tombstones */
 
 /* probe for v; on miss, the returned slot is the best insertion point
  * (first tombstone seen, else the empty that ended the probe) --
@@ -978,19 +989,61 @@ static uw arc_live;
  * with tombstones and kills it (found the hard way: a 100k-hop token
  * ring paniced "ARC table full" at ~1k cycles). */
 static uw arc_probe(V v, int *found) {
-  uw i = ((v >> 4) * (uw)2654435761UL) & (ARC_CAP - 1);
-  uw first_tomb = ARC_CAP;
-  for (uw n = 0; n < ARC_CAP; n++) {
+  uw i = ((v >> 4) * (uw)2654435761UL) & (arc_cap - 1);
+  uw first_tomb = arc_cap;
+  for (uw n = 0; n < arc_cap; n++) {
     V p = arct[i].ptr;
     if (p == v) { *found = 1; return i; }
-    if (p == 0) { *found = 0; return first_tomb != ARC_CAP ? first_tomb : i; }
-    if (p == ARC_TOMB && first_tomb == ARC_CAP) first_tomb = i;
-    i = (i + 1) & (ARC_CAP - 1);
+    if (p == 0) { *found = 0; return first_tomb != arc_cap ? first_tomb : i; }
+    if (p == ARC_TOMB && first_tomb == arc_cap) first_tomb = i;
+    i = (i + 1) & (arc_cap - 1);
   }
   *found = 0;
-  if (first_tomb != ARC_CAP) return first_tomb;
+  if (first_tomb != arc_cap) return first_tomb;
   fpr_cpanic("ARC table full");
 }
+static void *arc_block(uw bytes) {
+  if (!fpr_is_process) return buddy_alloc(bytes);
+  fpr_grant_t g = fpr_grow_counted(bytes, 5); /* site 5: the ARC table */
+  return (g.ptr && g.size >= bytes) ? g.ptr : 0;
+}
+/* under arc_lock: double the table and reinsert the live entries
+ * (tombstones are left behind, which is what makes the rehash also the
+ * table's compaction) */
+static void arc_grow(void) {
+  uw ncap = arc_cap * 2;
+  arcent_t *nt = (arcent_t *)arc_block(ncap * sizeof(arcent_t));
+  if (!nt) return; /* out of memory: the probe's panic stays the last word */
+  __builtin_memset(nt, 0, ncap * sizeof(arcent_t));
+  arcent_t *ot = arct;
+  uw ocap = arc_cap;
+  arct = nt;
+  arc_cap = ncap;
+  arc_used = 0;
+  for (uw k = 0; k < ocap; k++) {
+    if (ot[k].ptr && ot[k].ptr != ARC_TOMB) {
+      int f;
+      uw j = arc_probe(ot[k].ptr, &f);
+      arct[j] = ot[k];
+      arc_used++;
+    }
+  }
+  if (ot != arct0 && !fpr_is_process) buddy_free(ot);
+  arc_grows++;
+}
+/* an insert is coming: make room first (the 70% rule) and account for it */
+static uw arc_slot_for(V v, int *found) {
+  if ((arc_used + 1) * 10 > arc_cap * 7) arc_grow();
+  uw i = arc_probe(v, found);
+  if (!*found) {
+    if (arct[i].ptr == 0) arc_used++; /* a tombstone reused keeps the count */
+    if (arc_live + 1 > arc_hwm) arc_hwm = arc_live + 1;
+  }
+  return i;
+}
+uw fpr_arc_cap(void) { return arc_cap; }
+uw fpr_arc_hwm(void) { return arc_hwm; }
+uw fpr_arc_grows_count(void) { return arc_grows; }
 
 /* one lock for the whole table: promotion happens on SEND, which is
  * rare next to computation -- contention is negligible and the SPSC
@@ -1000,12 +1053,18 @@ static uw arc_probe(V v, int *found) {
 
 static fpr_slab_t *slab_of(V v) { return *(fpr_slab_t **)((char *)v - 8); }
 
+/* an actor handle is the acb itself: immortal, no allocation preheader,
+ * shared raw -- a bare handle as a message (spawn's result passed on)
+ * must not be counted, or the slab lookup reads the word before it */
+static int arc_by_value(V v) {
+  return !fpr_in_heap(v) || TID(v) == T_ACTOR;
+}
 void fpr_arc_incref(V v) {
   if (fpr_sched) { fpr_sched->arc_incref(v); return; }
-  if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
+  if (arc_by_value(v)) return; /* ints, immortal statics, handles: by value */
   fpr_lock(&arc_lock);
   int found;
-  uw i = arc_probe(v, &found);
+  uw i = arc_slot_for(v, &found);
   if (!found) {
     arct[i].ptr = v;
     arct[i].cnt = 0;
@@ -1020,7 +1079,7 @@ void fpr_arc_incref(V v) {
 
 void fpr_arc_decref(V v) {
   if (fpr_sched) { fpr_sched->arc_decref(v); return; }
-  if (!fpr_in_heap(v)) return;
+  if (arc_by_value(v)) return;
   fpr_lock(&arc_lock);
   int found;
   uw i = arc_probe(v, &found);
@@ -1127,10 +1186,10 @@ uw fpr_arc_live_count(void) { return arc_live; }
  * underneath without changing this contract. */
 void fpr_arc_promote_share(V v) {
   if (fpr_sched) { fpr_sched->arc_incref(v); return; }
-  if (!fpr_in_heap(v)) return; /* ints + immortal statics: by value */
+  if (arc_by_value(v)) return; /* ints, immortal statics, handles: by value */
   fpr_lock(&arc_lock);
   int found;
-  uw i = arc_probe(v, &found);
+  uw i = arc_slot_for(v, &found);
   if (!found) {
     arct[i].ptr = v;
     arct[i].cnt = 1; /* the sender's standing share */

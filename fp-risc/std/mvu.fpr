@@ -94,6 +94,8 @@
 # no input (tick-driven apps).
 # ============================================================================
 
+AC = use "actor".
+
 MC   = Type (MQuit | MLog s).
 Ev   = Type (ETick | EKey k | EMsg m a | EResize w h | EWheel dy dx).
 Sub  = Type (STick ms | SKeys | SPort p).
@@ -364,7 +366,7 @@ finish app m fr sc lastR =
 run me cfg app =
   MApp ini upd sk vw vl dn sbs = app;
   vp = svcCall me cfg.render (Dims 0);
-  rw = spawn (renderWorker me cfg.render cfg.env vl);
+  rw = AC.spawnWith (AC.Dynamic 64) (renderWorker me cfg.render cfg.env vl);
   run2 me cfg app rw vp (ini cfg.env).
 run2 me cfg app rw vp m0 =
   (w0, h0) = vp;

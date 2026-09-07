@@ -394,12 +394,14 @@ builtinEnv =
       ("write", mono (TFn tInt (TFn tInt tUnit))),
       -- SMP actors: messages are polymorphic; an actor id is an Int.
       -- send : Actor -> msg -> Unit ; receive : Actor -> msg
-      ("send", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
-      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
-      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) tUnit))),
+      ("send", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
+      ("sendLinear", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
+      ("sendArc", scheme [0] (TFn tInt (TFn (sv 0) (tcon "Result" [tUnit, tStr])))),
       ("receive", scheme [0] (TFn tInt (sv 0))),
       ("receiveRes", scheme [0, 1] (TFn tInt (tcon "Result" [sv 0, sv 1]))),
       ("spawn", scheme [0] (TFn (TFn tInt (sv 0)) tInt)),
+      ("spawnCap", scheme [0] (TFn tInt (TFn tInt (TFn (TFn tInt (sv 0)) tInt)))),
+      ("spawnCapOn", scheme [0] (TFn tInt (TFn tInt (TFn tInt (TFn (TFn tInt (sv 0)) tInt))))),
       ("spawnOn", scheme [0] (TFn tInt (TFn (TFn tInt (sv 0)) tInt))),
       ("myself", mono (TFn tInt tInt)),
       ("yield", scheme [0] (TFn tInt (sv 0))),

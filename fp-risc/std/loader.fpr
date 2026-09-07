@@ -35,10 +35,11 @@
 # ============================================================================
 
 FS = use "fs".
+AC = use "actor".
 
 LMsg = Type (LLoad id | LList u | LReplay u).
 
-serve fs = spawn (loader fs).
+serve fs = AC.spawnWith (AC.Dynamic 64) (loader fs).
 
 # ---- the client side --------------------------------------------------------
 

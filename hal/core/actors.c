@@ -71,19 +71,46 @@
                      * bounded by memory, not by this constant. */
 #define SHIDX (MAXSND - 1) /* the shared ring's slot */
 #define SHARED_KEY ((uw)1) /* its sender key: never an acb address */
-#define RING_CAP 64 /* messages per channel; power of two */
+#define RING_CAP 64  /* the DEFAULT ring: messages per channel, power of
+                      * two, inline in the channel block.  spawnCap sets
+                      * another: Static n never grows (a WCET bound),
+                      * Dynamic n doubles from the buddy when full. */
+#define RING_MAX (1u << 20)
 #define XCAP 64     /* acb pointers per cross-hart wake ring */
 
 #define FUEL_QUANTUM 2000 /* FPRISC function entries per scheduling slice */
 
 enum { ST_READY, ST_BLOCKED, ST_DEAD };
 
+/* the ring IN FORCE for a channel: capacity, slots and (the shared ring
+ * only) the per-entry sender tags, one block -- so a reader that loads
+ * `rv` once sees a consistent (cap, slots) pair.  Growth allocates a
+ * new block, copies [rh, rt) by logical index and swaps the pointer;
+ * the old block stays on the `old` chain until the channel block is
+ * reused (a reader may still hold it), which the epoch limbo already
+ * guarantees is quiescent.  The default lives inline (rv0/slots0). */
+typedef struct ringv {
+  uint32_t cap, pad;
+  V *slots;
+  uw *from;           /* sender tags, the shared ring only; else 0 */
+  struct ringv *old;  /* the ring this one replaced (freed at reuse) */
+} ringv_t;
+#define SLOT(rv, k) ((rv)->slots[(k) & ((rv)->cap - 1)])
+#define TAGAT(rv, k) ((rv)->from[(k) & ((rv)->cap - 1)])
+
 /* one SPSC channel: bound to a single sender for the actor's lifetime */
 typedef struct {
   uw sender;       /* sender id + 1; 0 = unbound (claimed by CAS) */
   uint32_t rh, rt; /* free-running head/tail; count = rt - rh */
-  V ring[RING_CAP];
+  uint32_t dyn;    /* 1 = the ring doubles when full (Dynamic n) */
+  uint32_t pad;
+  ringv_t *rv;     /* the ring in force (producer swaps it; readers
+                    * load it AFTER rt: the producer publishes rv
+                    * before rt, so a seen rt is covered by the rv) */
+  ringv_t rv0;     /* the inline default */
+  V slots0[RING_CAP];
 } chan_t;
+uw fpr_ring_grows, fpr_send_full; /* growths; sends refused for a full ring */
 
 typedef struct fpr_acb {
   uint32_t tid, var; /* var = status word (atomic; doubles as header) */
@@ -95,6 +122,8 @@ typedef struct fpr_acb {
                       * now ~sizeof(acb_t) ~= 250 B, which is what the
                       * "stated ceiling" always meant to say */
   uint32_t scan; /* round-robin cursor for fair receive (owner-only) */
+  uint32_t mbdyn;  /* mailbox policy: 1 = rings grow (Dynamic n) */
+  uint32_t mbcap;  /* initial ring capacity per channel (spawnCap) */
   V entry;       /* PAP to run: body = entry(self); 0 for main */
   struct fpr_acb *next; /* run-queue link (owner hart only) */
   struct fpr_acb *bl_next; /* backlog link (owner hart only) */
@@ -271,7 +300,7 @@ static acb_t *acb_block(void) {
  * per frame forever (pshell exhausted a Pi 4's arena in minutes). */
 typedef struct chblk {
   chan_t ch[MAXSND];
-  uw shfrom[RING_CAP]; /* the shared ring's per-entry sender tags */
+  uw shfrom[RING_CAP]; /* the shared ring's per-entry sender tags (its inline ring) */
   struct chblk *nx;
   uw stamp[FPR_NHARTS];
 } chblk_t;
@@ -288,8 +317,43 @@ static int chb_matured(chblk_t *b) {
   return 1;
 }
 
+/* a channel's rings to their inline default: grown blocks (the `old`
+ * chain above the inline one) go back to the buddy -- inside a process
+ * they are grants, kept until exit like every other grant */
+static void chan_init(chan_t *c, uw *shfrom, int fresh) {
+  /* a reused block (limbo) carries a sane rv chain: free what grew.
+   * A fresh carve or free-list block carries nothing readable. */
+  ringv_t *rv = fresh ? 0 : c->rv;
+  while (rv && rv != &c->rv0) {
+    ringv_t *o = rv->old;
+    if (!fpr_is_process) buddy_free(rv);
+    rv = o;
+  }
+  c->sender = 0;
+  c->rh = c->rt = 0;
+  c->dyn = 0;
+  c->rv0.cap = RING_CAP;
+  c->rv0.slots = c->slots0;
+  c->rv0.from = shfrom;
+  c->rv0.old = 0;
+  c->rv = &c->rv0;
+}
+/* a ring of cap slots (plus tags when the channel is the shared one),
+ * in one block; 0 when there is no memory */
+static ringv_t *ring_block(uint32_t cap, int tagged, ringv_t *old) {
+  uw bytes = sizeof(ringv_t) + (uw)cap * sizeof(V) + (tagged ? (uw)cap * sizeof(uw) : 0);
+  ringv_t *nv = (ringv_t *)big_block(bytes);
+  if (!nv) return 0;
+  nv->cap = cap;
+  nv->pad = 0;
+  nv->slots = (V *)(nv + 1);
+  nv->from = tagged ? (uw *)(nv->slots + cap) : 0;
+  nv->old = old;
+  return nv;
+}
 static chan_t *chb_take(void) {
   chblk_t *b = 0;
+  int fresh = 0;
   fpr_lock(&chb_lock);
   /* matured limbo first, then the free list */
   chblk_t **pp = &chb_limbo;
@@ -302,8 +366,9 @@ static chan_t *chb_take(void) {
     pp = &(*pp)->nx;
   }
   fpr_unlock(&chb_lock);
-  if (!b) b = (chblk_t *)fpr_fl_take(&chb_fl, sizeof(chblk_t));
+  if (!b) { b = (chblk_t *)fpr_fl_take(&chb_fl, sizeof(chblk_t)); fresh = 1; }
   if (!b) {
+    fresh = 1;
     /* fresh backing: the floor-sized block carves several channel
      * blocks; the extras seed the free list (type-stable forever) */
     uw sz = (sizeof(chblk_t) + 15) & ~(uw)15;
@@ -317,15 +382,11 @@ static chan_t *chb_take(void) {
     for (char *q = p + sz; q + sz <= p + got; q += sz)
       fpr_fl_put(&chb_fl, q, sz);
   }
-  for (int i = 0; i < MAXSND; i++) {
-    b->ch[i].sender = 0;
-    b->ch[i].rh = b->ch[i].rt = 0;
-  }
+  for (int i = 0; i < MAXSND; i++) chan_init(&b->ch[i], i == SHIDX ? b->shfrom : 0, fresh);
   b->ch[SHIDX].sender = SHARED_KEY; /* the overflow ring is always bound */
   return b->ch;
 }
 static chan_t *sh_chan(acb_t *a) { return &a->ch[SHIDX]; }
-static uw *sh_from(acb_t *a) { return ((chblk_t *)a->ch)->shfrom; } /* ch is the block's first member */
 
 static void chb_limbo_put(chan_t *ch) {
   chblk_t *b = (chblk_t *)ch; /* ch is the block's first member */
@@ -1022,6 +1083,7 @@ static chan_t *chan_for(acb_t *a, uw skey, int create) {
     if (!create) return 0;
     if (!free_slot) return sh_chan(a); /* the dedicated slots are taken: share */
     if (free_expect == 0) free_slot->rh = free_slot->rt = 0; /* fresh slot */
+    free_slot->dyn = a->mbdyn; /* the actor's mailbox policy (spawnCap) */
     /* a stolen slot keeps rh==rt where they stand: the CAS's acquire
      * side gives the new sender a coherent view of both counters */
     uw expect = free_expect;
@@ -1088,10 +1150,10 @@ static int p_any(acb_t *a, uw unused) {
  * rt was released, so an acquire on rt makes them visible) */
 static int sh_has_from(acb_t *a, uw sid, uint32_t *at) {
   chan_t *c = sh_chan(a);
-  uw *from = sh_from(a);
   uint32_t rt = __atomic_load_n(&c->rt, __ATOMIC_ACQUIRE);
+  ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE); /* after rt */
   for (uint32_t k = c->rh; k != rt; k++)
-    if (from[k % RING_CAP] == sid) { if (at) *at = k; return 1; }
+    if (TAGAT(rv, k) == sid) { if (at) *at = k; return 1; }
   return 0;
 }
 static int p_from(acb_t *a, uw sid) {
@@ -1105,8 +1167,9 @@ static int p_res(acb_t *a, uw unused) {
     chan_t *c = &a->ch[i];
     if (!c->sender) continue;
     uint32_t rt = __atomic_load_n(&c->rt, __ATOMIC_ACQUIRE);
+    ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE);
     for (uint32_t k = c->rh; k != rt; k++) {
-      V m = c->ring[k % RING_CAP];
+      V m = SLOT(rv, k);
       if (!ISINT(m) && TID(m) == T_RESULT) return 1;
     }
   }
@@ -1115,13 +1178,25 @@ static int p_res(acb_t *a, uw unused) {
 
 /* remove the message at logical position k (rh <= k < rt), shifting the
  * head side down one -- all touched slots are consumer-owned (< rt). */
-static V take_at(chan_t *c, uint32_t k, uw *from) { /* from: the shared ring's tags, else 0 */
-  V m = c->ring[k % RING_CAP];
-  for (uint32_t j = k; j > c->rh; j--) {
-    c->ring[j % RING_CAP] = c->ring[(j - 1) % RING_CAP];
-    if (from) from[j % RING_CAP] = from[(j - 1) % RING_CAP];
+static V take_at(acb_t *a, chan_t *c, uint32_t k) {
+  uint32_t rh = c->rh;
+  if (k == rh) { /* the head: no shifting, no lock (the caller loaded rt first) */
+    ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE);
+    V m = SLOT(rv, k);
+    __atomic_store_n(&c->rh, rh + 1, __ATOMIC_RELEASE); /* frees a slot */
+    return m;
   }
-  __atomic_store_n(&c->rh, c->rh + 1, __ATOMIC_RELEASE); /* frees a slot */
+  /* shifting rewrites consumer-owned slots; a producer growing the
+   * ring copies those same slots, so the two exclude each other */
+  fpr_lock(&a->shlock);
+  ringv_t *rv = c->rv;
+  V m = SLOT(rv, k);
+  for (uint32_t j = k; j > rh; j--) {
+    SLOT(rv, j) = SLOT(rv, j - 1);
+    if (rv->from) TAGAT(rv, j) = TAGAT(rv, j - 1);
+  }
+  __atomic_store_n(&c->rh, rh + 1, __ATOMIC_RELEASE);
+  fpr_unlock(&a->shlock);
   return m;
 }
 
@@ -1138,6 +1213,8 @@ void fpr_actors_init(void) { /* hart 0, before fpr_smp_go */
   if (!main_acb.ch) fpr_cpanic("boot: no memory for actor 0's channels");
   main_acb.scan = 0;
   __builtin_memset(&main_acb.shlock, 0, sizeof main_acb.shlock);
+  main_acb.mbdyn = 1; /* actor 0 hosts services: its rings grow */
+  main_acb.mbcap = RING_CAP;
   main_acb.entry = 0; /* trampoline runs fpr_fn_main + fpr_exit */
   main_acb.id = 0;
   main_acb.hart = 0;
@@ -1174,7 +1251,11 @@ static V spawn_on(uw hart, V f, uw pin) {
 }
 /* pid (uw)-1 = inherit from the spawner (the transparent default);
  * the loader passes a fresh pid for a process's root actor */
+static V spawn_on_pid_cap(uw hart, V f, uw pin, uw pid, uint32_t cap, uint32_t dyn);
 static V spawn_on_pid(uw hart, V f, uw pin, uw pid) {
+  return spawn_on_pid_cap(hart, f, pin, pid, RING_CAP, 0);
+}
+static V spawn_on_pid_cap(uw hart, V f, uw pin, uw pid, uint32_t cap, uint32_t dyn) {
   fpr_spawns++;
   if (hart >= fpr_live_harts) fpr_cpanic("spawnOn: no such hart (Sys.harts is the live count)");
   if (ISINT(f) || TID(f) != T_PAP) fpr_cpanic("spawn: argument must be a function");
@@ -1192,6 +1273,17 @@ static V spawn_on_pid(uw hart, V f, uw pin, uw pid) {
   a->var = ST_READY;
   a->ch = chb_take(); /* cleared by chb_take */
   if (!a->ch) fpr_cpanic("spawn: no memory for a channel block");
+  a->mbdyn = dyn;
+  a->mbcap = cap;
+  for (int i = 0; i < MAXSND; i++) {
+    a->ch[i].dyn = dyn;
+    if (cap > RING_CAP) { /* a bigger first ring than the inline one */
+      ringv_t *rv = ring_block(cap, i == SHIDX, a->ch[i].rv);
+      if (!rv) fpr_cpanic("spawn: no memory for the mailbox rings (spawnCap)");
+      a->ch[i].rv = rv;
+    } else
+      a->ch[i].rv0.cap = cap; /* a smaller ring in the inline slots (masked) */
+  }
   a->scan = 0;
   __builtin_memset(&a->shlock, 0, sizeof a->shlock);
   a->in_bl = 0;
@@ -1223,6 +1315,28 @@ static V a_spawn(V f) {
   if (fpr_sched) return fpr_sched->spawn(f);
   return spawn_on(fpr_hart()->id, f, 0);
 }
+/* spawnCap mode n f / spawnCapOn hart mode n f: the mailbox policy --
+ * mode 0 Static n (rings of n, never grow: a WCET bound), 1 Dynamic n
+ * (rings start at n and double when full).  n rounds up to a power of
+ * two, 8..RING_MAX.  On the shared plane a process's actors keep the
+ * plane's default (the policy is not routed through the table yet). */
+static uint32_t cap_of(V nv) {
+  if (!ISINT(nv)) fpr_cpanic("spawnCap: n must be an Int");
+  sw n = UNTAG(nv);
+  uint32_t c = 8;
+  while ((sw)c < n && c < RING_MAX) c <<= 1;
+  return c;
+}
+static V a_spawn_cap(V modev, V nv, V f) {
+  if (fpr_sched) return fpr_sched->spawn(f);
+  if (!ISINT(modev)) fpr_cpanic("spawnCap: mode must be an Int");
+  return spawn_on_pid_cap(fpr_hart()->id, f, 0, (uw)-1, cap_of(nv), UNTAG(modev) != 0);
+}
+static V a_spawn_cap_on(V hv, V modev, V nv, V f) {
+  if (fpr_sched) return fpr_sched->spawn_at(hv, f);
+  if (!ISINT(hv) || !ISINT(modev)) fpr_cpanic("spawnCapOn: hart and mode must be Ints");
+  return spawn_on_pid_cap((uw)UNTAG(hv), f, 1, (uw)-1, cap_of(nv), UNTAG(modev) != 0);
+}
 static V a_spawn_at(V hv, V f) {
   if (fpr_sched) return fpr_sched->spawn_at(hv, f);
   if (ISINT(hv) == 0) fpr_cpanic("spawnOn: hart must be an Int");
@@ -1243,58 +1357,84 @@ FPR_FN(fpr_g_myPid, a_mypid, 1);
  * the SYSCALL TRAMPOLINE (process.c) passes its dormant reply mailbox
  * so a loaded process -- which lives in its own scheduler world -- can
  * still publish into System.qa's storage actor. */
-/* a full ring is BACKPRESSURE, not a fault: the sender gives its hart
- * away and tries again (a burst outrunning a slow consumer used to
- * panic at 64 messages).  Outside an actor (the syscall trampoline) it
- * spins.  A cycle -- two actors each waiting on the other's full ring
- * -- would spin rather than trip the deadlock detector; drivers here
- * never wait on their own clients. */
-static void send_yield(void) {
-  fpr_hart_t *h = fpr_hart();
-  if (h && h->current) {
-    TR(h->current, 15);
-    enq(h, h->current);
-    to_sched();
-  } else
-    __asm__ volatile("" ::: "memory");
+/* A FULL RING IS AN ANSWER, not a wait: send returns Result Unit
+ * String -- Ok when the message is queued, Err "mailbox full" when a
+ * Static ring has no room (or a Dynamic one cannot grow), Err "dead
+ * actor" for a target that has exited.  Nothing in the runtime ever
+ * spins or yields for mailbox space any more (the old backpressure
+ * could deadlock two actors waiting on each other's full rings, and
+ * hid every burst that outran a consumer).  The sender decides: retry,
+ * back off, drop, or die -- std wraps the common policies, and
+ * services spawn Dynamic so a burst costs memory, not messages. */
+static const struct { hdr_t h; V f; } ok_unit_s = {{T_RESULT, 0}, (V)&fpr_unit};
+#define OK_UNIT ((V)&ok_unit_s)
+static V send_err(const char *why) { fpr_send_full++; return fpr_mkresult(1, why); }
+int fpr_sent(V r) { return !ISINT(r) && TID(r) == T_RESULT && ((hdr_t *)r)->var == 0; }
+
+/* grow c's ring by doubling, under a->shlock: the new block, [rh, rt)
+ * copied by logical index, the pointer published (before any rt that
+ * lands in it).  0 = no memory, or the ceiling. */
+static ringv_t *ring_grow(acb_t *a, chan_t *c) {
+  ringv_t *ov = c->rv;
+  if (ov->cap >= RING_MAX) return 0;
+  ringv_t *nv = ring_block(ov->cap * 2, ov->from != 0, ov);
+  if (!nv) return 0;
+  uint32_t rh = __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE), rt = c->rt;
+  for (uint32_t k = rh; k != rt; k++) {
+    SLOT(nv, k) = SLOT(ov, k);
+    if (nv->from) TAGAT(nv, k) = TAGAT(ov, k);
+  }
+  __atomic_store_n(&c->rv, nv, __ATOMIC_RELEASE);
+  fpr_ring_grows++;
+  return nv;
 }
-/* place m (already copied and pinned) on channel c of a; blocks for space */
-static void ring_push(acb_t *a, chan_t *c, uw key, V m) {
+/* place m (already copied and pinned) on channel c of a: 1 queued, 0 full */
+static int ring_push(acb_t *a, chan_t *c, uw key, V m) {
   if (c->sender == SHARED_KEY) { /* many producers: the lock orders them */
-    for (;;) {
-      fpr_lock(&a->shlock);
-      uint32_t rt = c->rt;
-      if (rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) < RING_CAP) {
-        sh_from(a)[rt % RING_CAP] = key;
-        c->ring[rt % RING_CAP] = m;
-        __atomic_store_n(&c->rt, rt + 1, __ATOMIC_RELEASE); /* publish */
-        fpr_unlock(&a->shlock);
-        return;
-      }
-      fpr_unlock(&a->shlock);
-      send_yield();
+    fpr_lock(&a->shlock);
+    uint32_t rt = c->rt;
+    ringv_t *rv = c->rv;
+    if (rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == rv->cap) {
+      rv = c->dyn ? ring_grow(a, c) : 0;
+      if (!rv) { fpr_unlock(&a->shlock); return 0; }
     }
+    TAGAT(rv, rt) = key;
+    SLOT(rv, rt) = m;
+    __atomic_store_n(&c->rt, rt + 1, __ATOMIC_RELEASE); /* publish */
+    fpr_unlock(&a->shlock);
+    return 1;
   }
   /* single producer: our rt is private; check the consumer's rh */
-  while (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP) send_yield();
-  c->ring[c->rt % RING_CAP] = m;
+  ringv_t *rv = c->rv;
+  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == rv->cap) {
+    if (!c->dyn) return 0;
+    fpr_lock(&a->shlock);
+    rv = ring_grow(a, c);
+    fpr_unlock(&a->shlock);
+    if (!rv) return 0;
+  }
+  SLOT(rv, c->rt) = m;
   __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE); /* publish */
+  return 1;
 }
 V fpr_send_as(uw sender_key, V av, V m) {
   if (fpr_sched) return fpr_sched->send_as(sender_key, av, m);
   if (ISINT(av) || TID(av) != T_ACTOR) fpr_cpanic("send: target is not an actor");
   acb_t *a = (acb_t *)av;
   if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD)
-    return (V)&fpr_unit; /* silent no-op */
+    return send_err("dead actor");
   chan_t *c = chan_for(a, sender_key, 1);
   m = fpr_msg_copy(m); /* DEEP COPY: the receiver gets a self-contained
                         * slab; nothing the sender does afterward can
                         * touch it, and drop-of-root frees all of it */
   fpr_arc_incref(m); /* promotion: heap values become shared on send */
-  ring_push(a, c, sender_key, m);
+  if (!ring_push(a, c, sender_key, m)) {
+    fpr_arc_decref(m); /* the copy goes back: nobody will receive it */
+    return send_err("mailbox full");
+  }
   __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
   wake(a);
-  return (V)&fpr_unit;
+  return OK_UNIT;
 }
 
 static V a_send(V av, V m) {
@@ -1331,7 +1471,7 @@ static V a_send_linear(V av, V m) {
     if (movable) fpr_arc_decref(m); /* the drop the receiver would have done */
     else if (!ISINT(m) && fpr_in_heap(m) && TID(m) == T_VEC)
       fpr_vec_release(m);
-    return (V)&fpr_unit;
+    return send_err("dead actor");
   }
   chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
   if (!movable) {
@@ -1341,10 +1481,13 @@ static V a_send_linear(V av, V m) {
     if (!ISINT(orig) && fpr_in_heap(orig) && TID(orig) == T_VEC)
       fpr_vec_release(orig); /* the bulk case: consume frees it now */
   }
-  ring_push(a, c, (uw)fpr_hart()->current, m);
+  if (!ring_push(a, c, (uw)fpr_hart()->current, m)) {
+    fpr_arc_decref(m); /* consumed either way: the value left the sender */
+    return send_err("mailbox full");
+  }
   __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
   wake(a);
-  return (V)&fpr_unit;
+  return OK_UNIT;
 }
 
 /* ---- the SYSCALL MAILBOX (process.c's trampoline) -------------------
@@ -1361,6 +1504,7 @@ void *fpr_syscall_mailbox(void) {
     syscall_mb.var = ST_READY; /* pinned: wake CAS never matches */
     syscall_mb.hart = 0;
     static chblk_t syscall_chb; /* static: the mailbox never dies */
+    for (int i = 0; i < MAXSND; i++) chan_init(&syscall_chb.ch[i], i == SHIDX ? syscall_chb.shfrom : 0, 1);
     syscall_chb.ch[SHIDX].sender = SHARED_KEY;
     syscall_mb.ch = syscall_chb.ch;
   }
@@ -1374,9 +1518,10 @@ V fpr_syscall_wait_result(void) {
       chan_t *c = &a->ch[i];
       if (!__atomic_load_n(&c->sender, __ATOMIC_ACQUIRE)) continue;
       uint32_t rt = __atomic_load_n(&c->rt, __ATOMIC_ACQUIRE);
+      ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE);
       for (uint32_t k = c->rh; k != rt; k++) {
-        V m = c->ring[k % RING_CAP];
-        if (!ISINT(m) && TID(m) == T_RESULT) return take_at(c, k, c == sh_chan(a) ? sh_from(a) : 0);
+        V m = SLOT(rv, k);
+        if (!ISINT(m) && TID(m) == T_RESULT) return take_at(a, c, k);
       }
     }
     __asm__ volatile("" ::: "memory"); /* spin; hart 1 serves storage */
@@ -1396,7 +1541,7 @@ static V a_receive(V me) {
       chan_t *c = &a->ch[(a->scan + n) % MAXSND];
       if (c->sender && ch_count(c)) {
         a->scan = (a->scan + n + 1) % MAXSND;
-        return take_at(c, c->rh, c == sh_chan(a) ? sh_from(a) : 0);
+        return take_at(a, c, c->rh);
       }
     }
     block_unless(a, p_any, 0);
@@ -1416,9 +1561,9 @@ static V a_receive_from(V me, V fromv) {
   uw sid = (uw)fromv; /* the key IS the sender's acb */
   for (;;) {
     chan_t *c = chan_for(a, sid, 0);
-    if (c && ch_count(c)) return take_at(c, c->rh, 0);
+    if (c && ch_count(c)) return take_at(a, c, c->rh);
     uint32_t k;
-    if (sh_has_from(a, sid, &k)) return take_at(sh_chan(a), k, sh_from(a));
+    if (sh_has_from(a, sid, &k)) return take_at(a, sh_chan(a), k);
     block_unless(a, p_from, sid);
   }
 }
@@ -1436,9 +1581,10 @@ static V a_receive_res(V me) {
       chan_t *c = &a->ch[(a->scan + n) % MAXSND];
       if (!c->sender) continue;
       uint32_t rt = __atomic_load_n(&c->rt, __ATOMIC_ACQUIRE);
+      ringv_t *rv = __atomic_load_n(&c->rv, __ATOMIC_ACQUIRE);
       for (uint32_t k = c->rh; k != rt; k++) {
-        V m = c->ring[k % RING_CAP];
-        if (!ISINT(m) && TID(m) == T_RESULT) return take_at(c, k, c == sh_chan(a) ? sh_from(a) : 0);
+        V m = SLOT(rv, k);
+        if (!ISINT(m) && TID(m) == T_RESULT) return take_at(a, c, k);
       }
     }
     block_unless(a, p_res, 0);
@@ -1506,6 +1652,8 @@ static V g_fuel_preempts(V d) {
 
 /* ---- the discoverable-symbol table ------------------------------------ */
 FPR_FN(fpr_g_spawn, a_spawn, 1);
+FPR_FN(fpr_g_spawnCap, a_spawn_cap, 3);
+FPR_FN(fpr_g_spawnCapOn, a_spawn_cap_on, 4);
 FPR_FN(fpr_g_spawnOn, a_spawn_at, 2);
 /* sendArc: SHARE by explicit promotion (docs/MEMORY.md v2) -- the
  * only path by which an object becomes cross-actor shared.  The
@@ -1523,16 +1671,16 @@ static V a_send_arc(V av, V m) {
     fpr_cpanic("sendArc: a Vector is linear bulk -- sendLinear moves it, send copies it");
   acb_t *a = (acb_t *)av;
   if (__atomic_load_n(&a->var, __ATOMIC_ACQUIRE) == ST_DEAD)
-    return (V)&fpr_unit; /* no promotion happened; sender keeps sole ownership */
+    return send_err("dead actor"); /* no promotion happened; sender keeps sole ownership */
   chan_t *c = chan_for(a, (uw)fpr_hart()->current, 1);
-  if (c->rt - __atomic_load_n(&c->rh, __ATOMIC_ACQUIRE) == RING_CAP)
-    fpr_cpanic("sendArc: per-sender channel full");
   fpr_arc_promote_share(m);
-  c->ring[c->rt % RING_CAP] = m;
-  __atomic_store_n(&c->rt, c->rt + 1, __ATOMIC_RELEASE);
+  if (!ring_push(a, c, (uw)fpr_hart()->current, m)) {
+    fpr_arc_decref(m); /* the receiver's share, returned */
+    return send_err("mailbox full");
+  }
   __atomic_thread_fence(__ATOMIC_SEQ_CST); /* Dekker: publish before flag read */
   wake(a);
-  return (V)&fpr_unit;
+  return OK_UNIT;
 }
 
 FPR_FN(fpr_g_send, a_send, 2);
