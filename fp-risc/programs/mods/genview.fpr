@@ -171,25 +171,34 @@ cssRule "ok" = "background:#0f3328;border-color:#1f6b50;color:#57e2a6".
 cssRule "celebrate" = "background:#2a1a3a;border-color:#6b3f9a;color:#d9a6ff".
 cssRule "toast" = "padding:10px 14px;border-radius:12px;border:1px solid var(--line);background:var(--panel)".
 cssRule "scroll" = "max-height:52vh;overflow:auto".
-cssRule "w-cart" = "width:360px;flex:none".
+cssRule "w-cart" = "width:400px;flex:none".
 cssRule "w-40" = "width:40px".
 cssRule "w-24" = "width:96px".
 cssRule "right" = "text-align:right".
 cssRule "tr" = "border-bottom:1px solid var(--line);padding:6px 0".
+cssRule "page" = "max-width:1120px;margin:0 auto;width:100%".
+cssRule "mx-auto" = "margin-left:auto;margin-right:auto".
+cssRule "gap-5" = "gap:22px".
+cssRule "p-5" = "padding:22px".
 cssRule "day" = "".
 cssRule c = "".
 
 cssBase = "*\{box-sizing:border-box;margin:0}
 :root\{--bg:#060a12;--ink:#e9eff7;--dim:#7c8aa3;--card:#0a1120;--panel:linear-gradient(180deg,#0c1424,#080e1a);--line:#1b2740}
-.day\{--bg:#f3f5f9;--ink:#0d1526;--dim:#5b6a86;--card:#ffffff;--panel:linear-gradient(180deg,#ffffff,#eef2f8);--line:#d3dbe8;background:var(--bg);color:var(--ink);background-image:none}
-body\{background:var(--bg);color:var(--ink);font:15px/1.55 'Archivo',system-ui,sans-serif;
+.day\{--bg:#f3f5f9;--ink:#0d1526;--dim:#5b6a86;--card:#ffffff;--panel:linear-gradient(180deg,#ffffff,#eef2f8);--line:#d3dbe8;color:var(--ink)}
+html\{min-height:100%}
+body\{min-height:100vh;background:var(--bg);color:var(--ink);font:15px/1.55 'Archivo',system-ui,sans-serif;
   background-image:radial-gradient(900px 500px at 20% -10%,#0f2035 0,transparent 60%),
-                   radial-gradient(700px 400px at 95% 5%,#1a1526 0,transparent 55%)}
+                   radial-gradient(700px 400px at 95% 5%,#1a1526 0,transparent 55%);
+  background-repeat:no-repeat;background-attachment:fixed}
+body:has(.day)\{background:#f3f5f9;background-image:radial-gradient(900px 500px at 20% -10%,#dfe8f7 0,transparent 60%);color:#0d1526}
 a\{color:inherit}
 .btn:hover\{color:#e9eff7;border-color:#31456b}
-.btn.is-on\{background:#e9eff7;color:#060a12;border-color:#e9eff7}
+.btn.is-on\{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 [data-slot]\{transition:color .2s}
 .lv-flash\{animation:lvf .55s ease-out}
+.toast:has(>[data-slot]:empty),.pre:has(>[data-slot]:empty)\{display:none}
+button\{font:inherit}
 @keyframes lvf\{from\{color:#57e2d2;text-shadow:0 0 16px rgba(87,226,210,.9)}to\{color:inherit}}
 ".
 
