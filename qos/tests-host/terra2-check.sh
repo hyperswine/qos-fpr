@@ -62,7 +62,7 @@ done
 # Restart through its confirm, Stats from the menu, quit
 for f in /tmp/terra2-*.ppm; do mv "$f" "${f/terra2-/terra2-game-}"; done
 python3 tests-host/terra2-keys.py /tmp/terra2-life.evd \
-  k p esc s p esc c p right right down p esc t "type:get me.hq" enter "type:set env 4" enter "type:board" enter p esc \
+  k p esc s p esc c p right right down p esc t "type:get me.hq" enter "type:set env 4" enter "type:board" enter f1 esc \
   enter esc p down enter p enter esc down down down enter p esc q >/dev/null
 FPR_DISK=/tmp/terra2.disk FPR_SND_MUSIC=0 FPR_ASSETS=../fp-risc/models/music FPR_EVDEV=/tmp/terra2-life.evd \
   timeout 120 xvfb-run -a ./qosp-gl --yes ../fp-risc/app.qa > /tmp/terra2-life.log 2>&1 || true

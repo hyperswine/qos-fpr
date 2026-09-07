@@ -350,7 +350,7 @@ keymap =
   (2, "A", "attack") :: (2, "O", "overwatch") :: (2, "R", "retreat") ::
   (2, "V", "advance") :: (2, "C", "charge (artillery)") :: (2, "F", "fire (artillery)") ::
   (3, "space", "end the turn") :: (3, "M", "music on / off") :: (3, "K", "keys") ::
-  (3, "S", "stats") :: (3, "C", "cards") :: (3, "T", "terminal") :: (3, "P", "screenshot") :: (3, "Q", "quit") :: Nil.
+  (3, "S", "stats") :: (3, "C", "cards") :: (3, "T", "terminal") :: (3, "P / F1", "screenshot") :: (3, "Q", "quit") :: Nil.
 
 # ---- the profile ------------------------------------------------------------------
 # One append-only record on the disk (std/fs over the QLOG log at
@@ -991,6 +991,7 @@ key m k | m.screen == scrTerm = termKey m k.
 key m 20 = (cue (show { m | tin = "" } scrTerm) Sfx.pick, Nil).
 key m 16 = (cue { m | qt = 600, msg = "bye" } Sfx.close, Nil).
 key m 25 = ({ m | snap = m.snap + 1 }, Nil).
+key m 59 = ({ m | snap = m.snap + 1 }, Nil).
 key m 50 =
   on = 1 - m.music;
   _ = sndMusic musicFile (on * volNow { m | music = on });
@@ -1103,6 +1104,7 @@ range a b = a :: range (a + 1) b.
 # closes.  Every line and its answer also go to the transcript.
 
 termKey m 1 = (cue (goBack m) Sfx.cancel, Nil).
+termKey m 59 = ({ m | snap = m.snap + 1 }, Nil).
 termKey m 28 = (runTerm m, Nil).
 termKey m 14 = ({ m | tin = dropLast m.tin }, Nil).
 termKey m k =

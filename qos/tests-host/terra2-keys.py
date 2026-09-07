@@ -11,7 +11,7 @@ buffered key per idle tick, so a replayed game is the same game every run.
 import struct, sys
 
 CODES = {"esc": 1, "bksp": 14, "enter": 28, "space": 57, "up": 103, "left": 105, "right": 106, "down": 108,
-         "minus": 12, "equal": 13, "dot": 52, "comma": 51, "slash": 53,
+         "minus": 12, "equal": 13, "dot": 52, "comma": 51, "slash": 53, "f1": 59, "f2": 60,
          "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11}
 for row, base in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
     for i, ch in enumerate(row):

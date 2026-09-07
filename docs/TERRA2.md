@@ -266,7 +266,7 @@ and `board` from the title and reads the answers back.
     on a unit     A attack  O overwatch (toggle)  R retreat  V advance
                   C charge  F fire  (artillery)
     1-5           jump to a column      space / E   end the turn
-    P screenshot  S auto-screenshot at every animation midpoint   Q quit
+    P (or F1, which types nothing) screenshot   S auto-screenshot at every animation midpoint   Q quit
     M music on / off (Sunrise Over The Spire starts with the game)
     wheel         scrolls the hand (cursor in the hand) or the Stats list
     esc with nothing selected: pause (Resume / Restart / Cards / Stats / Keys / Quit)
