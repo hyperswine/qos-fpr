@@ -173,6 +173,38 @@ The title is a glass card with the name at 64 px.  On the board the unit
 labels, the HQ figure, the ambush "?" and the damage tags are text
 entities standing over their units instead of glyph cells.
 
+## The lifecycle
+
+A packaged game has screens, and the model now says which one is up:
+title, playing, paused, game over, keys, stats (`screen`).  Paused,
+Keys and Stats freeze the tick -- animations, the AI and the supply
+ticker stop, only keys are taken -- and the music ducks to half while
+paused.  Esc with nothing selected pauses: a glass menu over the veiled
+board with Resume, Restart, Stats, Keys and Quit, arrows and enter.
+Restart asks first ("Abandon this game and deal a new one?") so a stray
+key cannot wipe a game; the new deal keeps the profile, the settings
+and the snapshot counter.  K and S open the Keys and Stats screens from
+the title, the menu and game over, and esc, enter, K or S return to
+where you came from.  The Keys screen is a table (`keymap`) that is also
+the source of the unit panel's key caps, so the two cannot drift.
+
+## The profile
+
+The disk keeps a profile: one append-only record at `terra2/profile`
+on the QLOG log through `std/fs` (the same service POS uses), a line per
+event -- `start <seed>` when a game is dealt and `end <seed> win|loss
+<rounds> <hqMe> <hqEn> <called> <lost> <destroyed> <damage>` when an HQ
+falls.  Boot replays the log and folds it into totals; every line the
+game writes is folded into the model's copy first, so the Stats screen
+never lags the disk, and update flushes the pending lines after each
+step (the rules never touch the service).  A start with no end is a
+game abandoned.  Stats shows played / won / lost / abandoned and the
+win rate, the best win in rounds, the average length, units called and
+lost, and the recent games one line each.  The GL host opens
+`qosp.disk` beside it (or `FPR_DISK`), so `./qos.py run` and a packed
+bundle keep the profile between runs without any flag; with no disk the
+game says so on the Stats screen and plays on.
+
 ## Keys
 
     arrows        cursor: left/right a card or a column, up/down a zone
@@ -185,6 +217,8 @@ entities standing over their units instead of glyph cells.
     1-5           jump to a column      space / E   end the turn
     P screenshot  S auto-screenshot at every animation midpoint   Q quit
     M music on / off (Sunrise Over The Spire starts with the game)
+    esc with nothing selected: pause (Resume / Restart / Stats / Keys / Quit)
+    K keys, S stats: from the title, the pause menu and game over
     ENTER on the title screen begins; on the game-over screen, a new game
 
 ## Verified
@@ -195,7 +229,10 @@ transcript the rules print: your call, the lane attack on the HQ (15 ->
 13), the AI's turn and call, a forward unit destroyed by the second
 attack, a clean quit; plus the frames read back mid-lunge (960x600, not
 blank) and the sound dump (a WAV as long as the run, 60+ tones in 25+
-distinct bursts over 60% silence).  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
+distinct bursts over 60% silence).  A second run on the same fresh disk
+walks the lifecycle -- the Keys and Stats screens, pause, Restart through
+its confirm, Stats from the menu, quit -- and reads the first run's
+start record back as one abandoned game.  25 s under llvmpipe.  Frame cost: the whole board is ~2000-3000
 cube instances a frame, well inside the walker's 16384 per mesh.
 
 ## Not in this cut

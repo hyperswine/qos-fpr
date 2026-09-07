@@ -57,10 +57,22 @@ wants, all flat geometry:
     Center       children centred along the axis (when nothing grows)
     Mid          children centred across it instead of stretched
 
-The walker gained the flat meshes to go with them: `disc` (XY, faces
-+Z), `corner` (a quarter of it) and `coin` (XZ, faces +Y, for rings and
+The walker gained the flat meshes to go with them: `quad` (the fill
+itself -- single-sided, so a translucent one blends exactly once, where
+a thin cube's back face blended too and came out three times darker
+than its alpha), `disc` (XY, faces +Z), `corner` (a quarter of it),
+`arc` (a quarter ring: a rounded one-px border is four strips and four
+of these, never under the fill) and `coin` (XZ, faces +Y, for rings and
 pads on the ground).  Depth per node is now three steps (shadow, border,
-fill; text and children above), still 5 milli each.
+fill; text and children above), still 5 milli each.  A second tree can
+be laid over the first from a deeper start (`S2.buildAt vp tree d0`):
+Terra II's pause menu is one, over a veil, over the game's own layer.
+
+For that to come out right the walker's translucent pass is one sorted
+stream: after every mesh's opaque instances, all translucent instances
+of all meshes AND the text glyphs are sorted far to near together and
+drawn in runs, so a veil (a quad) dims the chips (corners, arcs) and
+the labels (text) beneath it whatever mesh they use.
 
 Terra II rebuilds its tree from the model every frame: a glass status
 bar with chips for the turn, the sides and the ENV, the message line,

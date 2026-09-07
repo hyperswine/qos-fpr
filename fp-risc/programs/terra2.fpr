@@ -49,6 +49,8 @@ MV = use "../std/mvu".
 GL = use "mods/glsvc".
 S2 = use "mods/scene2d".
 Fm = use "mods/fontm".
+FS = use "../std/fs".
+Core = use "mods/coreutil".
 Sfx = use "mods/sfx".
 Tank = use "../models/tank/tank".
 Inf = use "../models/infantry/infantry".
@@ -317,6 +319,104 @@ txt es s x y z cell col =
 txtC es s x y z cell col = txt es s (x - textW s (cell * 9) / 2) y z cell col.
 textW s em = Fm.width s * em / 1000.
 
+# ---- the screens ------------------------------------------------------------------
+# One value says what the player is looking at.  title and over stay as
+# facts on the model (the drifting camera, the frozen board) and are kept
+# in step with it at every transition.  Paused, Keys and Stats freeze the
+# tick: animations, the AI and the supply ticker stop; only keys are taken.
+
+scrTitle = 0.
+scrPlay = 1.
+scrPause = 2.
+scrOver = 3.
+scrKeys = 4.
+scrStats = 5.
+
+frozen m = m.screen == scrPause or m.screen == scrKeys or m.screen == scrStats.
+show m scr = { m | back = m.screen, screen = scr }.
+goBack m = { m | screen = m.back }.
+
+# the key table: one source for the Keys screen and the panel's key caps
+# (group 1 cursor, 2 unit actions, 3 the game)
+keymap =
+  (1, "arrows", "move the cursor") :: (1, "1-5", "jump to a column") ::
+  (1, "enter", "pick / confirm") :: (1, "esc", "cancel, or pause") ::
+  (2, "A", "attack") :: (2, "O", "overwatch") :: (2, "R", "retreat") ::
+  (2, "V", "advance") :: (2, "C", "charge (artillery)") :: (2, "F", "fire (artillery)") ::
+  (3, "space", "end the turn") :: (3, "M", "music on / off") :: (3, "K", "keys") ::
+  (3, "S", "stats") :: (3, "P", "screenshot") :: (3, "Q", "quit") :: Nil.
+
+# ---- the profile ------------------------------------------------------------------
+# One append-only record on the disk (std/fs over the QLOG log at
+# terra2/profile), a line per event: "start <seed>" when a game begins,
+# "end <seed> win|loss <rounds> <hqMe> <hqEn> <called> <lost> <destroyed>
+# <damage>" when an HQ falls.  Replayed at boot and folded into the
+# totals; every line the game writes is folded into the model's copy
+# too, so the Stats screen never lags the disk.  A start with no end is
+# a game abandoned (a restart, a quit).
+
+profUrl = "terra2/profile".
+profEmpty = { played = 0, won = 0, lost = 0, gone = 0, rounds = 0, best = 0, calls = 0, losses = 0, recent = Nil }.
+
+profFold p line =
+  n = strlen line;
+  (w, i) = Core.wordAt line 1 n;
+  case Core.strEq w "start" of
+    True -> { p | played = p.played + 1, gone = p.gone + 1 }
+  | False -> (case Core.strEq w "end" of
+      True -> profEnd p line i n
+    | False -> p).
+profEnd p line i n =
+  (sd, i2) = Core.wordAt line i n;
+  (res, i3) = Core.wordAt line i2 n;
+  ws = intsFrom line i3 n;
+  won = Core.strEq res "win";
+  rounds = nth ws 0 0;
+  best2 = case won and (p.best == 0 or rounds < p.best) of True -> rounds | False -> p.best;
+  { p | gone = Int.max 0 (p.gone - 1), won = p.won + bi won, lost = p.lost + bi (not won),
+        rounds = p.rounds + rounds, best = best2,
+        calls = p.calls + nth ws 3 0, losses = p.losses + nth ws 4 0,
+        recent = (bi won, rounds, nth ws 1 0, nth ws 2 0, nth ws 3 0, nth ws 4 0, nth ws 5 0, nth ws 6 0) :: p.recent }.
+intsFrom line i n | i > n = Nil.
+intsFrom line i n =
+  (w, j) = Core.wordAt line i n;
+  case strlen w == 0 of
+    True -> intsFrom line j n
+  | False -> Core.parseDigits w :: intsFrom line j n.
+
+# a line for the disk: folded now, written by update's flush
+rec m line = { m | prof = profFold m.prof line, recs = line :: m.recs }.
+startRec m = rec m "start {m.seed}".
+endRec m won =
+  w = case won of True -> "win" | False -> "loss";
+  rec m "end {m.seed} {w} {m.tno} {Int.max 0 m.me.hq} {Int.max 0 m.en.hq} {m.called} {m.lostU} {m.kills} {m.dmg}".
+
+# the disk, read at boot and appended to as the game goes
+loadProf m me 0 =
+  _ = print "[terra2] profile: no disk, games are not recorded";
+  { m | fsOn = 0 }.
+loadProf m me fs =
+  r = FS.replay me fs profUrl;
+  p = profOf r;
+  _ = drop r;
+  _ = print "[terra2] profile: {p.played} games ({p.won} won, {p.lost} lost, {p.gone} abandoned)";
+  { m | prof = p, fsOn = 1 }.
+profOf (Ok s) = Core.lines s |> List.fold (fn line p -> profFold p line) profEmpty.
+profOf (Err e) = profEmpty.
+
+flush env m = case m.recs of
+    Nil -> m
+  | rs ->
+    (me, fs) = env;
+    _ = writeAll me fs (rev rs Nil);
+    { m | recs = Nil }.
+writeAll me 0 rs = 0.
+writeAll me fs Nil = 0.
+writeAll me fs (r :: rest) =
+  h = FS.append me fs profUrl (r + "\n");
+  _ = drop h;
+  writeAll me fs rest.
+
 # ---- the model --------------------------------------------------------------------
 # sel: SNone | SCard i | SPlace i z | SUnit z c | STarget z c (the attacker)
 # zone: the cursor's zone (0 hand, 1 my fwd, 2 my rear; under STarget 1 enemy
@@ -341,7 +441,9 @@ initWith s0 s1 =
     snap = 0, auto = 0, banner = "TERRA II", bt = 100000, seed = 99, over = 0, fx = Nil, ms = 0, log = Nil,
     sfx = Nil, nums = Nil, shake = 0, title = 1, qt = 0, music = 0, puffs = Nil,
     ring = (0, 2400), hov = (0, 0), hovT = 1000, marks = Nil, supV = (0, 0), vt = 0,
-    gone = (0 - 1, 1000), dealt = 1000 }.
+    gone = (0 - 1, 1000), dealt = 1000,
+    screen = scrTitle, back = scrTitle, menu = 0, confirm = 0,
+    prof = profEmpty, fsOn = 0, recs = Nil, called = 0, lostU = 0, kills = 0, dmg = 0 }.
 initModel = initWith 8675309 4242.
 note m s = { m | msg = s, log = s :: m.log }.
 # a sound cue: queued on the model, played by the tick (like the log)
@@ -383,7 +485,8 @@ damageUnit m s z c dmg =
   u = slotOf p z c;
   hp2 = u.hp - dmg;
   u2 = { u | hp = hp2, flash = 250 };
-  m2 = cue (number (note (setSide m s (setSlot p z c u2)) "{cName (uCard u)} takes {dmg}") (posOf s z c) "-{dmg}") Sfx.hit;
+  m1 = { m | dmg = m.dmg + (case s == 1 of True -> dmg | False -> 0) };
+  m2 = cue (number (note (setSide m1 s (setSlot p z c u2)) "{cName (uCard u)} takes {dmg}") (posOf s z c) "-{dmg}") Sfx.hit;
   case alive u and hp2 <= 0 of
     True -> slay m2 s z c
   | False -> m2.
@@ -393,18 +496,19 @@ slay m s z c =
   m2 = setSide m s (setSlot p z c { u | dead = 1, dt = 0, hp = 0 });
   (mx, my, mz) = posOf s z c;
   cue (note { m2 | env = Int.min 10 (m2.env + (case uSoft u == 1 of True -> 1 | False -> 2)),
-                   fx = sparks m2.fx (posOf s z c) 6, shake = 160, marks = (mx, mz, 0) :: m2.marks } "{cName (uCard u)} destroyed") Sfx.kill.
+                   fx = sparks m2.fx (posOf s z c) 6, shake = 160, marks = (mx, mz, 0) :: m2.marks,
+                   lostU = m2.lostU + bi (s == 0), kills = m2.kills + bi (s == 1) } "{cName (uCard u)} destroyed") Sfx.kill.
 damageHq m s dmg =
   p = sideOf m s;
   hq2 = p.hq - dmg;
-  m2 = setSide m s { p | hq = hq2 };
+  m2 = setSide { m | dmg = m.dmg + (case s == 1 of True -> dmg | False -> 0) } s { p | hq = hq2 };
   (hx, hy, hz) = hqPos s;
   m3 = cue (number (note { m2 | fx = sparks m2.fx (hqPos s) 8, shake = 320,
                                marks = (hx + (p.hq * 1237) % 2400 - 1200, hz - dirOf s * ((p.hq * 811) % 900 + 300), 0) :: m2.marks }
                         "HQ hit for {dmg}: {hq2} left") (hqPos s) "-{dmg}") Sfx.hqHit;
   case hq2 <= 0 of
-    True -> cue (note { m3 | over = 1 + (1 - s), banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil,
-                             msg = "press ENTER for a new game, Q to quit" }
+    True -> cue (note (endRec { m3 | over = 1 + (1 - s), screen = scrOver, banner = (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"), bt = 100000, queue = Nil,
+                                     msg = "ENTER  new game      S  stats      Q  quit" } (s == 1))
                       (case s == 1 of True -> "VICTORY" | False -> "DEFEAT"))
                 (case s == 1 of True -> Sfx.victory | False -> Sfx.defeat)
   | False -> m3.
@@ -532,7 +636,7 @@ callCard m s i z c =
   | True -> called m s p i z c cd (mkU cd down) cost.
 called m s p i z c cd u cost =
   p2 = setSlot { p | stock = p.stock - cost, hand = delAt p.hand i } z c { u | born = 0 - 380 };
-  m2 = case s == 0 of True -> setSide { m | gone = (i, 0) } s p2 | False -> setSide m s p2;
+  m2 = case s == 0 of True -> setSide { m | gone = (i, 0), called = m.called + 1 } s p2 | False -> setSide m s p2;
   cue (note m2 "{sideName s}: {cName cd} called to {zoneName z} {c + 1}") Sfx.call.
 sideName 0 = "you".
 sideName s = "enemy".
@@ -717,6 +821,11 @@ tickMs = 40.
 
 tick m | m.qt > 0 and m.qt <= tickMs = (m, MQuit :: Nil).
 tick m | m.qt > 0 = ({ m | qt = m.qt - tickMs }, Nil).
+tick m | frozen m =
+  (m2, cs) = takeKey { m | ms = m.ms + tickMs, log = Nil, sfx = Nil };
+  _ = say (rev m2.log Nil);
+  _ = Sfx.playAllVar m2.ms (rev m2.sfx Nil);
+  (m2, cs).
 tick m =
   m1 = ageAll { m | ms = m.ms + tickMs, log = Nil, sfx = Nil } tickMs;
   An kind s fz fc tz tc t done = m1.anim;
@@ -792,19 +901,25 @@ musicVol = 450.
 
 key m 16 = (cue { m | qt = 600, msg = "bye" } Sfx.close, Nil).
 key m 25 = ({ m | snap = m.snap + 1 }, Nil).
-key m 31 = ({ m | auto = 1 - m.auto, msg = "auto snapshots {1 - m.auto}" }, Nil).
-key m 28 | m.title == 1 =
-  _ = sndMusic musicFile musicVol;
-  (cue { m | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "", music = 1 } Sfx.open, Nil).
 key m 50 =
   on = 1 - m.music;
-  _ = sndMusic musicFile (on * musicVol);
+  _ = sndMusic musicFile (on * volNow { m | music = on });
   ({ m | music = on, msg = (case on == 1 of True -> "music on" | False -> "music off") }, Nil).
-key m 28 | m.over != 0 =
-  m2 = initWith (rnd m.seed) (rnd (rnd m.seed));
-  (cue { m2 | title = 0, bt = 0, queue = AStart 0 :: Nil, msg = "", seed = rnd m.seed, snap = m.snap, auto = m.auto } Sfx.open, Nil).
+# the Keys and Stats screens: esc, enter, K or S return
+key m k | m.screen == scrKeys or m.screen == scrStats =
+  case k == 1 or k == 28 or k == 37 or k == 31 of
+    True -> (cue (goBack m) Sfx.cancel, Nil)
+  | False -> (m, Nil).
+# K and S from the title, the pause menu and game over
+key m 37 | m.screen != scrPlay = (cue (show m scrKeys) Sfx.pick, Nil).
+key m 31 | m.screen != scrPlay = (cue (show m scrStats) Sfx.pick, Nil).
+key m k | m.screen == scrPause = pauseKey m k.
+key m 28 | m.title == 1 = begin m.
+key m 28 | m.over != 0 = newGame m.
 key m k | m.title == 1 or m.over != 0 = (m, Nil).
+key m 1 | idleSel m = pauseGame m.
 key m k | m.turn != 0 = ({ m | msg = "enemy turn" }, Nil).
+key m 31 = ({ m | auto = 1 - m.auto, msg = "auto snapshots {1 - m.auto}" }, Nil).
 key m 57 = (cue { m | queue = AEnd 0 :: Nil, sel = SNone, msg = "end of turn" } Sfx.turnOver, Nil).
 key m 18 = key m 57.
 key m 1 = (cue (cancel m) Sfx.cancel, Nil).
@@ -822,6 +937,47 @@ key m 46 = (unitKey m 46, Nil).
 key m 33 = (unitKey m 33, Nil).
 key m 47 = (unitKey m 47, Nil).
 key m k = (m, Nil).
+
+idleSel m = case m.sel of SNone -> True | s -> False.
+
+# ---- the lifecycle: begin, pause, restart --------------------------------------------------
+# the music's volume for the screen: half while paused
+volNow m | m.music == 0 = 0.
+volNow m | m.screen == scrPause = musicVol / 2.
+volNow m = musicVol.
+
+begin m =
+  _ = sndMusic musicFile musicVol;
+  (cue (startRec { m | title = 0, screen = scrPlay, bt = 0, queue = AStart 0 :: Nil, msg = "", music = 1 }) Sfx.open, Nil).
+# a fresh deal from the next seed; the profile, the settings and the
+# snapshot counter carry over
+newGame m =
+  m2 = initWith (rnd m.seed) (rnd (rnd m.seed));
+  m3 = { m2 | title = 0, screen = scrPlay, bt = 0, queue = AStart 0 :: Nil, msg = "", seed = rnd m.seed,
+              snap = m.snap, auto = m.auto, music = m.music, prof = m.prof, fsOn = m.fsOn, keys = m.keys };
+  _ = sndMusic musicFile (volNow m3);
+  (cue (note (startRec m3) "restart: a new game") Sfx.open, Nil).
+pauseGame m =
+  m2 = { m | screen = scrPause, menu = 0, confirm = 0 };
+  _ = sndMusic musicFile (volNow m2);
+  (cue (note m2 "paused") Sfx.toggle, Nil).
+resume m =
+  m2 = { m | screen = scrPlay, msg = "" };
+  _ = sndMusic musicFile (volNow m2);
+  m2.
+# the menu: Resume, Restart (asks first), Stats, Keys, Quit
+pauseKey m 1 | m.confirm == 1 = (cue { m | confirm = 0 } Sfx.cancel, Nil).
+pauseKey m 1 = (cue (resume m) Sfx.cancel, Nil).
+pauseKey m 28 | m.confirm == 1 = newGame m.
+pauseKey m 28 = menuPick m m.menu.
+pauseKey m 103 = (cue { m | menu = (m.menu + 4) % 5 } Sfx.cursor, Nil).
+pauseKey m 108 = (cue { m | menu = (m.menu + 1) % 5 } Sfx.cursor, Nil).
+pauseKey m k = (m, Nil).
+menuPick m 0 = (cue (resume m) Sfx.pick, Nil).
+menuPick m 1 = (cue { m | confirm = 1 } Sfx.pick, Nil).
+menuPick m 2 = (cue (show m scrStats) Sfx.pick, Nil).
+menuPick m 3 = (cue (show m scrKeys) Sfx.pick, Nil).
+menuPick m i = key m 16.
 
 # esc: back to where the selection started -- the attacker's slot, the
 # card being placed, or just the selection cleared
@@ -917,7 +1073,7 @@ markEnts ((x, z, t) :: r) es =
 veil m es | m.turn == 0 and m.vt == 0 = es.
 veil m es =
   a = 330 * m.vt / 400;
-  Ent "cube" (0, 5200, 0) 0 (40000, 10, 40000) (20, 20, 40, a) :: es.
+  Ent "plane" (0, 5200, 0) 0 (20000, 1000, 20000) (20, 20, 40, a) :: es.
 # floating damage numbers: white on a dark tag, in front of the target,
 # rising and shrinking over 750 ms
 numEnts Nil es = es.
@@ -1293,7 +1449,8 @@ uiW = 960.
 uiH = 600.
 ui m =
   (ents, slots) = S2.buildW (uiW, uiH) (uiTree m);
-  (ents, S2.camAt uiH).
+  all = case m.screen == scrPause of True -> ents + pauseEnts m | False -> ents;
+  (all, S2.camAt uiH).
 
 grow = Box (Grow :: Nil) Nil.
 spacer h = Box (H h :: W 1 :: Nil) Nil.
@@ -1307,11 +1464,14 @@ tag bg fg s = Box (Row :: Pad 5 :: Round 9 :: Bg bg :: Mid :: Nil) (t 12 fg s ::
 stat cap col v =
   Box (Row :: Gap 5 :: Mid :: Nil) (t 10 inkDim cap :: t 15 col v :: Nil).
 # a key cap and what it does
-keyLine k what =
+keyLine k what = keyLineW 26 k what.
+keyLineW w k what =
   Box (Row :: Gap 7 :: Mid :: Nil)
-      (Box (Row :: W 26 :: Pad 3 :: Round 5 :: Bg chip :: Center :: Mid :: Nil) (t 11 ink k :: Nil) ::
+      (Box (Row :: W w :: Pad 3 :: Round 5 :: Bg chip :: Center :: Mid :: Nil) (t 11 ink k :: Nil) ::
        t 12 inkDim what :: Nil).
 
+uiTree m | m.screen == scrKeys = keysTree m.
+uiTree m | m.screen == scrStats = statsTree m.
 uiTree m | m.title == 1 = titleTree m.
 uiTree m =
   Box (Col :: W uiW :: H uiH :: Nil)
@@ -1325,9 +1485,79 @@ titleTree m =
               spacer 10 ::
               centred (t 20 blink "press ENTER") ::
               spacer 4 ::
-              centred (t 12 inkDim "arrows  enter  esc     space ends the turn     M music     Q quit") :: Nil);
+              centred (t 12 inkDim "K  keys      S  stats      M  music      Q  quit") :: Nil);
   Box (Col :: W uiW :: H uiH :: Nil)
       (grow :: centred logo :: grow :: centred (t 12 inkDim "FP-RISC on QOS Portable") :: spacer 14 :: Nil).
+
+# the pause menu, over the game's own layer (a deeper depth so it wins)
+pauseEnts m =
+  (es, sl) = S2.buildAt (uiW, uiH) (pauseTree m) 40;
+  es.
+pauseTree m =
+  card = case m.confirm == 1 of
+    True -> menuCard "RESTART?"
+              (centred (t 14 ink "Abandon this game and deal a new one?") :: spacer 6 ::
+               centred (t 12 inkDim "enter  yes      esc  no") :: Nil)
+  | False -> menuCard "PAUSED"
+              (menuItems m 0 ("Resume" :: "Restart" :: "Stats" :: "Keys" :: "Quit" :: Nil) +
+               (spacer 4 :: centred (t 12 inkDim "arrows  enter      esc  resume") :: Nil));
+  Box (Col :: W uiW :: H uiH :: Center :: Mid :: Bga (0, 0, 0, 520) :: Nil) (card :: Nil).
+menuCard title kids =
+  Box (Col :: W 340 :: Pad 20 :: Gap 8 :: Round 16 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+      (centred (t 26 yellow title) :: spacer 6 :: kids).
+menuItems m i Nil = Nil.
+menuItems m i (s :: r) = menuItem (m.menu == i) s :: menuItems m (i + 1) r.
+menuItem True s = Box (Row :: Pad 8 :: Round 8 :: Bg chip :: Bord yellow :: Center :: Nil) (t 15 ink s :: Nil).
+menuItem False s = Box (Row :: Pad 8 :: Round 8 :: Center :: Nil) (t 15 inkDim s :: Nil).
+
+# the Keys screen: the key table in three columns
+keysTree m =
+  card = Box (Col :: W 780 :: Pad 24 :: Gap 16 :: Round 18 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+             (t 30 yellow "KEYS" ::
+              Box (Row :: Gap 28 :: Nil) (keyGroup 1 "CURSOR" :: keyGroup 2 "UNIT ACTIONS" :: keyGroup 3 "GAME" :: Nil) ::
+              centred (t 12 inkDim "esc  back") :: Nil);
+  Box (Col :: W uiW :: H uiH :: Center :: Mid :: Nil) (card :: Nil).
+keyGroup g name = Box (Col :: Grow :: Gap 7 :: Nil) (t 11 inkDim name :: keyRows (ofGroup g keymap)).
+keyRows Nil = Nil.
+keyRows ((g, k, what) :: r) = keyLineW 62 k what :: keyRows r.
+ofGroup g Nil = Nil.
+ofGroup g ((gg, k, w) :: r) | gg == g = (gg, k, w) :: ofGroup g r.
+ofGroup g (e :: r) = ofGroup g r.
+
+# the Stats screen: the profile's totals and its recent games
+statsTree m =
+  p = m.prof;
+  fin = p.won + p.lost;
+  rate = case fin > 0 of True -> p.won * 100 / fin | False -> 0;
+  avg = case fin > 0 of True -> p.rounds / fin | False -> 0;
+  saved = case m.fsOn == 1 of True -> "kept on the disk" | False -> "no disk: this session is not kept";
+  card = Box (Col :: W 760 :: Pad 24 :: Gap 12 :: Round 18 :: Shadow :: Bga glass :: Bord yellow :: Nil)
+             (Box (Row :: Mid :: Nil) (t 30 yellow "STATS" :: grow :: t 12 inkDim saved :: Nil) ::
+              Box (Row :: Gap 10 :: Nil)
+                  (chipOf "PLAYED" "{p.played}" :: chipOf "WON" "{p.won}" :: chipOf "LOST" "{p.lost}" ::
+                   chipOf "ABANDONED" "{p.gone}" :: chipOf "WIN RATE" "{rate}%" :: Nil) ::
+              Box (Row :: Gap 10 :: Nil)
+                  (chipOf "BEST WIN" (bestStr p.best) :: chipOf "AVG ROUNDS" "{avg}" ::
+                   chipOf "UNITS CALLED" "{p.calls}" :: chipOf "UNITS LOST" "{p.losses}" :: Nil) ::
+              t 11 inkDim "RECENT GAMES   Republic VI against the Southern Empire" ::
+              recentBox p.recent ::
+              centred (t 12 inkDim "esc  back") :: Nil);
+  Box (Col :: W uiW :: H uiH :: Center :: Mid :: Nil) (card :: Nil).
+bestStr 0 = "-".
+bestStr b = "{b} rounds".
+recentBox Nil = t 13 inkDim "no game finished yet -- play one through".
+recentBox rs = Box (Col :: Gap 4 :: Nil) (recentRows rs 0).
+recentRows Nil i = Nil.
+recentRows r i | i == 7 = Nil.
+recentRows (g :: r) i =
+  (won, rounds, hqMe, hqEn, cl, lo, ki, dm) = g;
+  res = case won == 1 of True -> "WIN" | False -> "LOSS";
+  col = case won == 1 of True -> yellow | False -> danger;
+  Box (Row :: Gap 16 :: Mid :: Pad 5 :: Round 6 :: Bg chip :: Nil)
+      (Box (Row :: W 48 :: Nil) (t 13 col res :: Nil) ::
+       Box (Row :: W 90 :: Nil) (t 13 ink "{rounds} rounds" :: Nil) ::
+       Box (Row :: W 90 :: Nil) (t 12 inkDim "HQ {hqMe} : {hqEn}" :: Nil) ::
+       t 12 inkDim "called {cl}   lost {lo}   destroyed {ki}   damage {dm}" :: Nil) :: recentRows r (i + 1).
 
 topBar m =
   Box (Row :: H 46 :: Pad 8 :: Gap 14 :: Mid :: Bga glass :: Nil)
@@ -1463,9 +1693,14 @@ kindName cd = "ARMOUR".
 
 # ---- the elm four ---------------------------------------------------------------------------
 
-init env = initModel.
+init env =
+  (me, fs) = env;
+  loadProf initModel me fs.
 
-update env ev m = case ev of
+update env ev m =
+  (m2, cs) = step ev m;
+  (flush env m2, cs).
+step ev m = case ev of
     ETick -> tick m
   | EKey k -> keyIn m k
   | e -> (m, Nil).
@@ -1482,7 +1717,9 @@ main =
   clint = device "clint";
   mt = reg32 clint 49144;
   gl = spawn (GL.serve 960 600 "terra2" models);
-  cfg = { env = 0, mt = mt, tick = 160000, input = gl, render = gl };
+  disk = device "blk";
+  fs = case blkPages disk == 0 of True -> 0 | False -> FS.serve disk;
+  cfg = { env = (me, fs), mt = mt, tick = 160000, input = gl, render = gl };
   MV.game me cfg (App init update subs view).
 
 # ---- not in this cut --------------------------------------------------------------------------

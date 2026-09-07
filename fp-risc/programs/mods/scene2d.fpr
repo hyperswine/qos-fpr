@@ -202,6 +202,10 @@ C2 = Type (C2 ents slots vw).
 build root = buildW (320, 240) root.
 buildW vp root =
   fin (node (C2 Nil Nil vp) root 0 0 0).
+# the same from depth d0: a second tree laid over the first (a menu over
+# a game) starts above everything the first could reach
+buildAt vp root d0 =
+  fin (node (C2 Nil Nil vp) root 0 0 d0).
 fin (C2 es sl vp) = (rev Nil es, rev Nil sl).
 
 rev acc Nil = acc.
@@ -311,12 +315,14 @@ widen k dx dy =
 pxm = 25.
 
 # every fill goes out with a 4-tuple colour (alpha in milli); opaque
-# readers are widened by `opaque`
+# readers are widened by `opaque`.  The mesh is the single-sided quad:
+# a translucent fill must blend exactly once (a thin cube's back face
+# would blend too)
 exent vp x y w h d col =
   (vw, vh) = vp;
   wx = idiv2 ((2 * x + w - vw) * pxm);
   wy = idiv2 ((vh - 2 * y - h) * pxm);
-  Ent "cube" (wx, wy, d * 5) 0 (w * pxm, h * pxm, 2) col.
+  Ent "quad" (wx, wy, d * 5) 0 (w * pxm, h * pxm, 1) col.
 opaque (r, g, b) = (r, g, b, 1000).
 
 # a disc of radius r centred on (cx, cy)
@@ -388,17 +394,30 @@ boxShadow c a x y w h d =
 addEnt (C2 es sl vp) e = C2 (e :: es) sl vp.
 vpOf (C2 es sl vp) = vp.
 
-# the border: a full rect in the border colour under the (inset) fill.
-# Without a fill it is drawn as four one-px strips, as before.
+# the border: a one-px ring -- four strips, and with Round four quarter
+# arcs at the corners (the "arc" mesh at scale r).  It never lies under
+# the fill, so a translucent fill keeps its own tint inside it.
 boxBord c a x y w h d =
   (has, col) = bordOf a;
-  (hasBg, cb) = bgOf a;
-  (hasA, ca) = bgaOf a;
+  r = roundOf a;
   case has of
-    True -> (case hasBg or hasA of
-      True -> rrect c x y w h (roundOf a) d (opaque col)
+    True -> (case r > 0 of
+      True -> ring c x y w h (imin r (imin (w / 2) (h / 2))) d (opaque col)
     | False -> strips c x y w h d (opaque col))
   | False -> c.
+ring c x y w h r d col =
+  vp = vpOf c;
+  c1 = addEnt c (exent vp (x + r) y (w - 2 * r) 1 d col);
+  c2 = addEnt c1 (exent vp (x + r) (y + h - 1) (w - 2 * r) 1 d col);
+  c3 = addEnt c2 (exent vp x (y + r) 1 (h - 2 * r) d col);
+  c4 = addEnt c3 (exent vp (x + w - 1) (y + r) 1 (h - 2 * r) d col);
+  c5 = addEnt c4 (arcEnt vp (x + r) (y + r) r (0 - 1) 1 d col);
+  c6 = addEnt c5 (arcEnt vp (x + w - r) (y + r) r 1 1 d col);
+  c7 = addEnt c6 (arcEnt vp (x + r) (y + h - r) r (0 - 1) (0 - 1) d col);
+  addEnt c7 (arcEnt vp (x + w - r) (y + h - r) r 1 (0 - 1) d col).
+arcEnt vp cx cy r sx sy d col =
+  (vw, vh) = vp;
+  Ent "arc" (idiv2 ((2 * cx - vw) * pxm), idiv2 ((vh - 2 * cy) * pxm), d * 5) 0 (sx * r * pxm, sy * r * pxm, 1) col.
 strips c x y w h d col =
   vp = vpOf c;
   c1 = addEnt c (exent vp x y w 1 d col);
