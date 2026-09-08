@@ -152,7 +152,7 @@ dumpTabStats env = case vmTab env of
       ( \(n, st) -> case st of
           TOn tref -> do
             t <- readIORef tref
-            putStrLn ("[table] " ++ n ++ ": " ++ show (ttHits t) ++ " hits / " ++ show (ttMiss t) ++ " misses / " ++ show (ttEvict t) ++ " evict (" ++ show (M.size (ttMap t)) ++ " cached)")
+            hPutStrLn stderr ("[table] " ++ n ++ ": " ++ show (ttHits t) ++ " hits / " ++ show (ttMiss t) ++ " misses / " ++ show (ttEvict t) ++ " evict (" ++ show (M.size (ttMap t)) ++ " cached)")
           TIneligible -> pure ()
       )
       (M.toList m)
@@ -181,7 +181,7 @@ execFn env name args = case vmTab env of
             -- is pure overhead — drop it and stop probing forever.
             when ((t1 - t0) * 1e6 < tabMinUs && ttHits t + ttMiss t < 8) $ do
               modifyIORef' ref (M.insert name TIneligible)
-              putStrLn ("[table] " ++ name ++ ": dropped (first call " ++ show (round ((t1 - t0) * 1e6) :: Int) ++ "us, " ++ show (ttHits t + ttMiss t) ++ " probes — below SOL_TABLE_MIN)")
+              hPutStrLn stderr ("[table] " ++ name ++ ": dropped (first call " ++ show (round ((t1 - t0) * 1e6) :: Int) ++ "us, " ++ show (ttHits t + ttMiss t) ++ " probes — below SOL_TABLE_MIN)")
             pure v
           else do
             modifyIORef' ref (M.insert name TIneligible)
@@ -887,6 +887,24 @@ mkHal cons scriptArgs tx preempts rt =
       ("strlen", (1, \[v] -> VInt . fromIntegral . length <$> vsStr v)),
       ("charAt", (2, charAtH)),
       ("substr", (3, substrH)),
+      -- the O(n) string tier: one pass each, no re-slicing of the rest
+      -- (Str.split / indexOf / replace / upper / lower / trim / join in
+      -- the preamble dispatch here; semantics are the preamble's own:
+      -- split "" = [], a trailing separator ends the list, indexOf is
+      -- 1-based with 0 = miss and "" never found, replace is leftmost
+      -- non-overlapping, case folding is ASCII, trim strips 32/9/10/13)
+      ("strSplit", (2, \[VInt c, sv] -> vsStr sv >>= \s -> pure (strList (splitCodes (toEnum (fromIntegral c)) s)))),
+      ("strIndexOf", (2, \[pv, sv] -> liftA2 (\p s -> VInt (fromIntegral (indexOfStr p s))) (vsStr pv) (vsStr sv))),
+      ("strReplace", (3, \[ov, nv, sv] -> do o <- vsStr ov; n <- vsStr nv; s <- vsStr sv; pure (VStr (replaceStr o n s)))),
+      ("strUpper", (1, \[v] -> VStr . map (\ch -> if ch >= 'a' && ch <= 'z' then toEnum (fromEnum ch - 32) else ch) <$> vsStr v)),
+      ("strLower", (1, \[v] -> VStr . map (\ch -> if ch >= 'A' && ch <= 'Z' then toEnum (fromEnum ch + 32) else ch) <$> vsStr v)),
+      ("strTrim", (1, \[v] -> VStr . trimStr <$> vsStr v)),
+      ("strJoin", (2, \[sepv, lv] -> do sep <- vsStr sepv; xs <- mapM vsStr (listItems lv); pure (VStr (intercalate sep xs)))),
+      -- Str.cmp: -1 / 0 / 1 by code (the sort comparator the prelude's
+      -- Int-only < could not be); Str.codes: the characters as a list of
+      -- codes, one pass -- a scanner walks that instead of charAt s i
+      ("strCmp", (2, \[av, bv] -> liftA2 (\a b -> VInt (case compare a b of LT -> -1; EQ -> 0; GT -> 1)) (vsStr av) (vsStr bv))),
+      ("strCodes", (1, \[v] -> vsStr v >>= \s -> pure (foldr (\ch acc -> VData listT 1 [VInt (fromIntegral (fromEnum ch)), acc]) (VData listT 0 []) s))),
       ("chr", (1, \[VInt c] -> pure (VStr [toEnum (fromIntegral c)]))),
       -- VBStr ops: O(1) amortised; declared as a separate HAL surface so the
       -- linearity checker treats them the same as Vec.* (the BStr 1 prelude
@@ -1240,6 +1258,35 @@ mkHal cons scriptArgs tx preempts rt =
                   else (o1, min l1 (length s - (o1 - 1)))
           pure (VStr (take l (drop (o - 1) s)))
     substrH _ = vmPanic "substr: bad args"
+    listItems :: Value -> [Value]
+    listItems (VData t 1 [x, r]) | t == listT = x : listItems r
+    listItems _ = []
+    splitCodes :: Char -> String -> [String]
+    splitCodes _ "" = []
+    splitCodes c s = case break (== c) s of
+      (pre, []) -> [pre]
+      (pre, _ : rest) -> pre : splitCodes c rest
+    indexOfStr :: String -> String -> Int
+    indexOfStr "" _ = 0
+    indexOfStr p s = go 1 s
+      where
+        go _ [] = 0
+        go i t@(_ : r) = if startsWithStr p t then i else go (i + 1) r
+    startsWithStr :: String -> String -> Bool
+    startsWithStr [] _ = True
+    startsWithStr _ [] = False
+    startsWithStr (a : as) (b : bs) = a == b && startsWithStr as bs
+    replaceStr :: String -> String -> String -> String
+    replaceStr "" _ s = s
+    replaceStr o n s = go s
+      where
+        go [] = []
+        go t@(ch : r) = if startsWithStr o t then n ++ go (drop (length o) t) else ch : go r
+    trimStr :: String -> String
+    trimStr = dropWhileEnd' isSp . dropWhile isSp
+      where
+        isSp ch = ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+        dropWhileEnd' f = reverse . dropWhile f . reverse
 
     indexH [xs, VInt i] = idx xs i
       where

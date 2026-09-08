@@ -58,6 +58,19 @@ solBuiltins =
       ("Try.readPath", mono (TFn tStr (tcon "Result" [tStr, tStr]))),
       ("charAt", mono (TFn tStr (TFn tInt tInt))), -- returns the char CODE
       ("substr", mono (TFn tStr (TFn tInt (TFn tInt tStr)))),
+      -- the O(n) string tier (VM.hs): what Str.split / indexOf / replace /
+      -- upper / lower / trim / join dispatch to -- the preamble versions
+      -- re-sliced the rest of the string per separator, which made
+      -- Str.lines of a 100 KB file a minute's work
+      ("strSplit", mono (TFn tInt (TFn tStr (tList tStr)))),
+      ("strIndexOf", mono (TFn tStr (TFn tStr tInt))),
+      ("strReplace", mono (TFn tStr (TFn tStr (TFn tStr tStr)))),
+      ("strUpper", mono (TFn tStr tStr)),
+      ("strLower", mono (TFn tStr tStr)),
+      ("strTrim", mono (TFn tStr tStr)),
+      ("strJoin", mono (TFn tStr (TFn (tList tStr) tStr))),
+      ("strCmp", mono (TFn tStr (TFn tStr tInt))),
+      ("strCodes", mono (TFn tStr (tList tInt))),
       ("chr", mono (TFn tInt tStr)),
       -- read/write: THE two HAL doors. What comes back (read) or is
       -- accepted (write) depends on the path/query value the HAL decodes,
