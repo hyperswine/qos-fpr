@@ -1589,11 +1589,38 @@ V fpr_prim_fn__x3e(V a, V b) { return BOOL(UNTAG(a) > UNTAG(b)); }
 V fpr_prim_fn__x3c_x3d(V a, V b) { return BOOL(UNTAG(a) <= UNTAG(b)); }
 V fpr_prim_fn__x3e_x3d(V a, V b) { return BOOL(UNTAG(a) >= UNTAG(b)); }
 
-/* == : ints by value; strings by content; other data SHALLOW (header
- * only) -- enough for bools/units/nullary tags. PoC limitation, on
- * purpose: deep structural equality needs per-type field counts. */
-static int veq(V a, V b) {
+/* == : ints by value, strings by content, and DEEP over the fields of
+ * lists, tuples, constructors and records.
+ *
+ * This used to stop at the header ("enough for bools/units/nullary
+ * tags"), on the stated grounds that deep equality needs per-type field
+ * counts.  It does -- and the allocation header has carried them all
+ * along: the deep copier derives a cell's field count from its total
+ * size (dc_size's default arm), so equality derives it the same way.
+ * The old behaviour was not a missing feature but a WRONG ANSWER:
+ * `(1, 2) == (3, 4)` and `[1, 2] == [3, 4]` were both True, because two
+ * tuples share a tid and a var, and nothing else was read.  Every
+ * program comparing structured values was silently wrong.
+ *
+ * The rules, in order:
+ *   ints            by value
+ *   same pointer    equal (and the cheap exit for shared structure)
+ *   tid/var differ  not equal
+ *   String          by content
+ *   opaque/bulk     by IDENTITY -- a Vector is linear and an actor
+ *                   handle, PAP, device or register is a thing, not a
+ *                   value; walking their innards is meaningless
+ *   anything else   field by field, when BOTH sides carry an allocation
+ *                   preheader.  A static literal has no preheader (its
+ *                   size is not recorded), so two statics keep the old
+ *                   header-only answer rather than a wild read.
+ * The depth cap is a cycle guard: nothing in the language builds a
+ * cyclic value today, and a runaway compare should not take the hart. */
+#define VEQ_MAX_DEPTH 64
+static int veq_go(V a, V b, int depth) {
   if (ISINT(a) || ISINT(b)) return a == b;
+  if (a == b) return 1;
+  if (!a || !b) return 0;
   hdr_t *x = (hdr_t *)a, *y = (hdr_t *)b;
   if (x->tid != y->tid || x->var != y->var) return 0;
   if (x->tid == T_STR) {
@@ -1601,9 +1628,26 @@ static int veq(V a, V b) {
     if (s->len != t->len) return 0;
     for (uw i = 0; i < s->len; i++)
       if (s->bytes[i] != t->bytes[i]) return 0;
+    return 1;
   }
+  switch (x->tid) {
+    case T_VEC: case T_ACTOR: case T_PAP:
+    case T_DEVICE: case T_REGISTER: case T_BITS: case T_SSTR:
+      return 0; /* identity only, and a == b was already taken above */
+    default: break;
+  }
+  if (depth >= VEQ_MAX_DEPTH) return 1;
+  if (!fpr_in_heap(a) || !fpr_in_heap(b)) return 1; /* statics: no counts */
+  uw ta = *(uw *)((char *)a - 16), tb = *(uw *)((char *)b - 16);
+  if (ta != tb) return 0;
+  if (ta < 24) return 1; /* header only: a nullary tag */
+  uw nf = (ta - 16 - 8) / sizeof(uw);
+  V *fa = (V *)((char *)a + 8), *fb = (V *)((char *)b + 8);
+  for (uw i = 0; i < nf; i++)
+    if (!veq_go(fa[i], fb[i], depth + 1)) return 0;
   return 1;
 }
+static int veq(V a, V b) { return veq_go(a, b, 0); }
 V fpr_prim_fn__x3d_x3d(V a, V b) { return BOOL(veq(a, b)); }
 V fpr_prim_fn__x21_x3d(V a, V b) { return BOOL(!veq(a, b)); }
 
