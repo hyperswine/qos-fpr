@@ -122,3 +122,24 @@ With a specific kind of entry point that allows easy startup
 It also defines a supervisor and certain signals that must be accepted
 As well as permissions required for accessing various system resources.
 These all have to be declared upfront
+
+=================
+
+Startup and Shutdown.
+
+The startup is basically like a way to bring up the bare metal system into the base assumption state for FP-RISC.QOS QA format applications to start running.
+So it basically just has to do whatever minimal stuff for the first .QA services to work, such as System.qa, Memory.qa, Files.qa. Loader figures it out.
+
+There is a simple sleep mode that just puts all processors on low power until an interrupt or other wake-up event occurs.
+As well as any peripheral power management, ensuring that unused peripherals are also put into low power states to conserve energy.
+
+Shutdown is the process of bringing the system down from its operational state to a safe and low-power state. This involves stopping all running tasks, saving necessary state information, and ensuring that all peripherals are properly powered down. The goal is to leave the system in a consistent and recoverable state for the next startup.
+
+=================
+
+Services.
+
+All services on QOS are mapped to the URL-VFS by System.qa. They are addressed by a URL in /services such as /services/keyboard.
+All services are just .qa applications that are like any other app, but have more specific WCET and declarative resource requirements including more privileged permission wants.
+Services are just an application that abides by the QA format. They have a supervisor, and are typically a sort of model-update genserver.
+They may have quite a few actors, and typically a single main actor that talks with other clients. Typically the service_pid.main_actor.
