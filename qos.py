@@ -1021,6 +1021,8 @@ SMOKE = [
     ("disk v2",           "tests/qdisk2.fpr",   "qosp", "torn=True"),
     ("dtree == GHC",      "tests/dtree.fpr",    "qosp", "root split: col 1"),
     ("bigfree",           "tests/bigfree.fpr",  "qosp", "BIGFREE HOLDS"),
+    ("equality is deep",  "tests/eq.fpr",       "qosp", "ok  (1, 2) == (3, 4)"),
+    ("dungeon rules",     "tests/dungeon.fpr",  "qosp", "dungeon rules: done"),
     ("fmath / virt",      "tests/fmath.fpr",    "virt", "FMATH HOLDS"),
     ("autodrop / virt",   "tests/autodrop.fpr", "virt", "AUTODROP HOLDS"),
     ("bigframe / virt",   "tests/bigframe.fpr", "virt", "sum3=57569"),
