@@ -15,7 +15,7 @@
 # a fallible step of our own: same shape as any Try.* primitive
 half n = case n % 2 of
   0 -> Ok (n / 2)
-  | m -> Err "cannot halve odd {n}".
+| m -> Err "cannot halve odd {n}".
 
 # chains short-circuit on the first Err
 > r1 = Try.parseInt "84" |>? half |>? half;
@@ -53,6 +53,6 @@ half n = case n % 2 of
 
 # and the honest spelling when you want to branch yourself
 > f = case Try.readPath @/tmp/sol-tryops-never.txt of
-    Ok s -> "exists: {s}"
-    | Err e -> "as expected: {e}";
+        Ok s -> "exists: {s}"
+      | Err e -> "as expected: {e}";
   print f.

@@ -15,12 +15,11 @@ decimalText raw =
   front = case Str.at raw 1 == 46 of True -> "0{raw}" | False -> raw;
   case Str.at front (Str.len front) == 46 of
     True -> "{front}0"
-    | False -> front.
+  | False -> front.
 
 numberToken raw column = case raw == "." of
   True -> Err "expected a number at column {column}"
-  | False -> Try.parseNum (decimalText raw)
-      |> mapOk (fn value -> CalcNum value column).
+| False -> Try.parseNum (decimalText raw) |> mapOk (fn value -> CalcNum value column).
 
 symbolToken c column = case c of
   43 -> Ok (CalcOp AddOp 1 column)
@@ -42,12 +41,12 @@ lexChars s i limit mode raw start acc =
     True -> (case mode of
       0 -> lexChars s (i + 1) limit 1 (Str.fromCode c) i acc
       | _ -> lexChars s (i + 1) limit 1 "{raw}{Str.fromCode c}" start acc)
-    | False -> (case Str.isSpace c of
+  | False -> (case Str.isSpace c of
       True -> (case mode of
         0 -> lexChars s (i + 1) limit 0 "" 0 acc
         | _ -> numberToken raw start
             |>? (fn token -> lexChars s (i + 1) limit 0 "" 0 (token :: acc)))
-      | False -> (case mode of
+    | False -> (case mode of
         0 -> symbolToken c i
             |>? (fn token -> lexChars s (i + 1) limit 0 "" 0 (token :: acc))
         | _ -> numberToken raw start
@@ -60,30 +59,29 @@ isUnary op = case op of NegOp -> True | PosOp -> True | _ -> False.
 isLeft op = case op of LeftOp -> True | _ -> False.
 
 applyOperator op column values = case op of
-  NegOp -> (case values of
-    value :: rest -> Ok ((0 - value) :: rest)
-    | _ -> Err "missing value for unary '-' at column {column}")
+    NegOp -> (case values of
+        value :: rest -> Ok ((0 - value) :: rest)
+      | _ -> Err "missing value for unary '-' at column {column}")
   | PosOp -> (case values of
-    value :: rest -> Ok (value :: rest)
+      value :: rest -> Ok (value :: rest)
     | _ -> Err "missing value for unary '+' at column {column}")
   | _ -> (case values of
-    right :: left :: rest -> (case op of
-      AddOp -> Ok ((left + right) :: rest)
-      | SubOp -> Ok ((left - right) :: rest)
-      | MulOp -> Ok ((left * right) :: rest)
-      | DivOp -> (case right == 0 of
-          True -> Err "division by zero"
-          | False -> Ok ((Numeric.div left right) :: rest))
-      | _ -> Err "unknown calculator operator")
+      right :: left :: rest -> (case op of
+          AddOp -> Ok ((left + right) :: rest)
+        | SubOp -> Ok ((left - right) :: rest)
+        | MulOp -> Ok ((left * right) :: rest)
+        | DivOp -> (case right == 0 of
+              True -> Err "division by zero"
+            | False -> Ok ((Numeric.div left right) :: rest))
+        | _ -> Err "unknown calculator operator")
     | _ -> Err "missing value for operator at column {column}").
 
 reduceUnary : (operators : List (CalcOperator, Int, Int) | measure operators) -> List Int -> Result (List Int, List (CalcOperator, Int, Int)) String .
 reduceUnary operators values = case operators of
   [] -> Ok (values, [])
   | (op, priority, column) :: rest -> case isUnary op of
-      False -> Ok (values, operators)
-      | True -> applyOperator op column values
-          |>? (fn nextValues -> reduceUnary rest nextValues).
+        False -> Ok (values, operators)
+      | True -> applyOperator op column values |>? (fn nextValues -> reduceUnary rest nextValues).
 
 reduceFor : (operators : List (CalcOperator, Int, Int) | measure operators) -> List Int -> Int -> Result (List Int, List (CalcOperator, Int, Int)) String .
 reduceFor operators values incoming = case operators of
@@ -104,26 +102,25 @@ reduceGroup operators values closeColumn = case operators of
 finishOperators : (operators : List (CalcOperator, Int, Int) | measure operators) -> List Int -> Result (List Int) String .
 finishOperators operators values = case operators of
   [] -> Ok values
-  | (op, priority, column) :: rest -> case isLeft op of
-      True -> Err "unmatched '(' at column {column}"
-      | False -> applyOperator op column values
-          |>? (fn nextValues -> finishOperators rest nextValues).
+| (op, priority, column) :: rest -> case isLeft op of
+    True -> Err "unmatched '(' at column {column}"
+  | False -> applyOperator op column values |>? (fn nextValues -> finishOperators rest nextValues).
 
 finishValue values = case values of
   [value] -> Ok value
-  | _ -> Err "incomplete expression".
+| _ -> Err "incomplete expression".
 
 # Shunting-yard state: value stack, operator stack, then whether a value is
 # expected. Every recursive call consumes the strict tail of `tokens`.
 consume : (tokens : List CalcToken | measure tokens) -> List Int -> List (CalcOperator, Int, Int) -> Bool -> Result Int String .
 consume tokens values operators expectValue = case tokens of
   [] -> (case expectValue of
-    True -> Err "expected a number or '(' at end of input"
+      True -> Err "expected a number or '(' at end of input"
     | False -> finishOperators operators values |>? finishValue)
   | token :: rest -> case token of
     CalcNum value column -> (case expectValue of
       False -> Err "expected an operator at column {column}"
-      | True -> reduceUnary operators (value :: values)
+    | True -> reduceUnary operators (value :: values)
           |>? (fn state -> (nextValues, nextOperators) = state;
                 consume rest nextValues nextOperators False))
     | CalcLeft column -> (case expectValue of
@@ -131,7 +128,7 @@ consume tokens values operators expectValue = case tokens of
       | True -> consume rest values ((LeftOp, 0, column) :: operators) True)
     | CalcRight column -> (case expectValue of
         True -> Err "expected a number before ')' at column {column}"
-        | False -> reduceGroup operators values column
+      | False -> reduceGroup operators values column
             |>? (fn grouped -> (groupValues, groupOperators) = grouped;
                   reduceUnary groupOperators groupValues)
             |>? (fn state -> (nextValues, nextOperators) = state;
@@ -139,11 +136,11 @@ consume tokens values operators expectValue = case tokens of
     | CalcOp op priority column -> (case expectValue of
         True -> (case op of
           AddOp -> consume rest values ((PosOp, 3, column) :: operators) True
-          | SubOp -> consume rest values ((NegOp, 3, column) :: operators) True
-          | _ -> Err "expected a number before operator at column {column}")
-        | False -> reduceFor operators values priority
+        | SubOp -> consume rest values ((NegOp, 3, column) :: operators) True
+        | _ -> Err "expected a number before operator at column {column}")
+      | False -> reduceFor operators values priority
             |>? (fn state -> (nextValues, nextOperators) = state;
-                  consume rest nextValues ((op, priority, column) :: nextOperators) True)).
+                              consume rest nextValues ((op, priority, column) :: nextOperators) True)).
 
 evaluate source = tokenize source |>? (fn tokens -> consume tokens [] [] True).
 
@@ -161,7 +158,7 @@ repl turns =
   line = Str.trim (readLineNow Unit);
   case or (line == "") (or (line == "quit") (line == "exit")) of
     True -> print "bye"
-    | False -> shown = print (resultText (evaluate line));
-               repl (turns - 1).
+  | False -> shown = print (resultText (evaluate line));
+                     repl (turns - 1).
 
 > repl 1000000.
