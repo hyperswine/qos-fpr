@@ -19,6 +19,25 @@ you actually drive it with:
 Everything delegates to make for staleness, so a fresh tree costs one
 compile and an up-to-date one costs nothing.
 
+## Install
+
+One toolchain, one command, macOS and Linux (docs/INSTALL.md):
+
+    brew tap hyperswine/tap && brew install qos-fpr
+    ./qos.py install --prefix ~/.local          # the same layout, from a checkout
+
+    qos new myapp && qos run myapp/app.fpr      # a project of your own
+    sol script.sol                              # the sol profile (= fpr sol)
+    fpr compile app.fpr app.s                   # the prelude is found beside the binary
+
+Nothing a run does writes into the installed tree: the `.qa`, the
+intermediates, the host's disk and the app's kv state land in `.qos/`
+under the directory you invoke from, packs in `dist/` beside it.  A
+project outside the tree reaches the library with `use "std/mvu"` --
+resolved under the toolchain's home after the file-relative path
+misses.  `qos/tests-host/install-check.sh` installs to a scratch prefix
+and proves all of that from an empty directory.
+
 ## Versions and releases
 
 Three layers, each built from the one below (docs/VERSIONING.md):

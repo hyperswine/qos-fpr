@@ -24,6 +24,12 @@ QOSHARTS ?= 8
 ARENA_MB ?= 2048
 CROSS  = riscv64-unknown-elf-
 QEMU   = qemu-system-riscv64
+# outputs qos.py redirects into the project's .qos/ (an installed tree is
+# never written to); the host binaries qosp / qosp-gl stay beside this file
+BUILD  ?= build
+KERNEL ?= qos-native.elf
+DISK   ?= disk.img
+PDISK  ?= qosp.disk
 ACCEL  = -accel tcg,thread=multi
 TIMEOUT := $(shell command -v timeout 2>/dev/null || echo "")
 UNAME_S := $(shell uname -s)
@@ -95,26 +101,26 @@ CFLAGS = $(ARCHFLAGS) -DFPR_NHARTS=$(HARTS) \
 
 # the rodata fallback registry: placeholder .qa's from the manifests
 QAPPS = TUIAppLauncher TUINotes TUIClock HelloProc
-build/qa0/%.qa: $(FPR)/apps/%.toml $(FPR)/tools/mkqa.py
-	@mkdir -p build/qa0
+$(BUILD)/qa0/%.qa: $(FPR)/apps/%.toml $(FPR)/tools/mkqa.py
+	@mkdir -p $(BUILD)/qa0
 	python3 $(FPR)/tools/mkqa.py $< -o $@
 
-build/apps_data.c: $(patsubst %,build/qa0/%.qa,$(QAPPS)) $(FPR)/tools/genapps.py
-	python3 $(FPR)/tools/genapps.py --entries --out $@ -- $(patsubst %,build/qa0/%.qa,$(QAPPS))
+$(BUILD)/apps_data.c: $(patsubst %,$(BUILD)/qa0/%.qa,$(QAPPS)) $(FPR)/tools/genapps.py
+	python3 $(FPR)/tools/genapps.py --entries --out $@ -- $(patsubst %,$(BUILD)/qa0/%.qa,$(QAPPS))
 
-build/system.s: $(FPRC) $(FPR)/programs/system.fpr $(FPR)/core/prelude.fpr FORCE
-	@mkdir -p build
+$(BUILD)/system.s: $(FPRC) $(FPR)/programs/system.fpr $(FPR)/core/prelude.fpr FORCE
+	@mkdir -p $(BUILD)
 	LC_ALL=C.UTF-8 $(FPRC) --profile=qos-native --prelude=$(FPR)/core/prelude.fpr \
 	  $(FPR)/programs/system.fpr $@
 
-native: build/system.s build/apps_data.c $(RT_VIRT) $(RT_CORE) $(HAL)/virt/link.ld
+native: $(BUILD)/system.s $(BUILD)/apps_data.c $(RT_VIRT) $(RT_CORE) $(HAL)/virt/link.ld
 	$(CROSS)gcc $(CFLAGS) -T $(HAL)/virt/link.ld -I$(HAL)/core -I$(HAL)/virt \
-	  $(RT_VIRT) build/system.s $$(cat build/system.s.units) $(RT_CORE) \
-	  $(HAL)/core/apps.c build/apps_data.c $(HAL)/core/qaimg.c $(HAL)/core/process.c \
-	  -o qos-native.elf
+	  $(RT_VIRT) $(BUILD)/system.s $$(cat $(BUILD)/system.s.units) $(RT_CORE) \
+	  $(HAL)/core/apps.c $(BUILD)/apps_data.c $(HAL)/core/qaimg.c $(HAL)/core/process.c \
+	  -o $(KERNEL)
 
-disk.img: $(FPR)/tools/mkdisk.py
-	python3 $(FPR)/tools/mkdisk.py disk.img 8
+$(DISK): $(FPR)/tools/mkdisk.py
+	python3 $(FPR)/tools/mkdisk.py $(DISK) 8
 
 # ---- the portable disk ---------------------------------------------------
 # qosp.disk is a QLOG image -- the SAME format native-run's disk.img
@@ -124,12 +130,12 @@ disk.img: $(FPR)/tools/mkdisk.py
 # apps/<Id>.qa records plus the apps/index, ready for the System.qa
 # loading path.
 disk-seed: $(FPR)/tools/mkdisk.py
-	python3 $(FPR)/tools/mkdisk.py qosp.disk 8 $(QAS)
+	python3 $(FPR)/tools/mkdisk.py $(PDISK) 8 $(QAS)
 
-native-run: native disk.img
+native-run: native $(DISK)
 	$(TIMEOUT) 25 $(QEMU) $(ACCEL) -machine virt -smp $(HARTS) -m 256M \
-	  -nographic -bios none -kernel qos-native.elf \
-	  -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
+	  -nographic -bios none -kernel $(KERNEL) \
+	  -drive file=$(DISK),if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0
 
 clean:
 	rm -rf build qosp qos-native.elf disk.img

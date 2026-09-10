@@ -47,7 +47,16 @@ directories or thread app.qa paths by hand again.
     ./qos.py release 0.2.0 --push   cut a release: commit the modules, lock,
                                     smoke, stamped dist bundles, tag v0.2.0
     ./qos.py test                   the fast smoke set;  --all = check-all.sh
+    ./qos.py install --prefix DIR   the tree as a toolchain: DIR/bin/{fpr,qos,sol}
     ./qos.py clean
+
+Artifacts never land in the tree.  Every run writes to the WORKSPACE:
+`.qos/` under the directory you invoke from (QOS_OUT overrides) holds
+the program's .qa, its build/ intermediates, and the host's qosp.disk
+and qos-store/ state; packs go to `dist/` beside it.  From the repo
+root that is ./.qos and ./dist; from your own project it is yours.  An
+installed tree (`qos.py install`, `brew install qos-fpr`) is read-only
+to every command, and its fpr and qosp are shipped, never rebuilt.
 
 Everything delegates to make for staleness (an up-to-date tree is a
 no-op), so this adds no second dependency graph -- just one honest
@@ -68,6 +77,56 @@ from typing import NoReturn
 ROOT = Path(__file__).resolve().parent
 FPR = ROOT / "fp-risc"
 QOS = ROOT / "qos"
+# an installed tree (`qos.py install`, the Homebrew formula) carries this
+# marker: its fpr / qosp are shipped, never rebuilt, and nothing below
+# ROOT is written -- every artifact goes to the workspace
+INSTALLED = (ROOT / ".installed").is_file()
+
+
+class Workspace:
+    """Where one invocation's artifacts go.  The TREE (ROOT) holds the
+    toolchain -- fpr, qosp, std, hal -- and is read-only to a run; the
+    WORKSPACE is the project you invoke qos from: `.qos/` under the
+    current directory (QOS_OUT overrides) for the per-program .qa, the
+    intermediates under build/, the host's qosp.disk and qos-store/
+    state, and `dist/` beside it for packs.  In a checkout, run from
+    the repo root, that is ROOT/.qos and ROOT/dist; installed, it is
+    your project's own directory -- the same code path either way."""
+
+    def __init__(self):
+        self.project = Path.cwd()
+        env = os.environ.get("QOS_OUT")
+        self.out = Path(env).resolve() if env else self.project / ".qos"
+        self.build = self.out / "build"
+        self.dist = self.project / "dist"
+
+    def qa(self, prog):
+        return self.out / f"{Path(prog).stem}.qa"
+
+    def image(self, prog):
+        return self.out / f"{Path(prog).stem}.elf"
+
+    def path(self, name):
+        return self.out / name
+
+    def mk(self):
+        self.build.mkdir(parents=True, exist_ok=True)
+        return self
+
+    def make_vars(self):
+        """the Makefile knobs that move every per-program output here"""
+        return [f"BUILD={self.build}"]
+
+
+WS = Workspace()
+
+
+def rel(p):
+    """a path as the user would type it from where they are"""
+    try:
+        return os.path.relpath(p, Path.cwd())
+    except ValueError:
+        return str(p)
 
 
 def say(msg):
@@ -165,6 +224,10 @@ def prog_directives(path):
 # ---- the stages -------------------------------------------------------------
 
 def build_fpr():
+    if INSTALLED:
+        if not (FPR / "fpr").is_file():
+            die(f"installed tree at {ROOT} has no fpr: reinstall (qos.py install / brew reinstall qos-fpr)")
+        return
     say("fpr (compiler; no-op when fresh)")
     sh(["make", "-s", "fpr"], cwd=FPR, quiet=True)
 
@@ -172,22 +235,31 @@ def build_fpr():
 def build_qosp(gfx=False):
     target = "portable-gl" if gfx else "portable"
     host = "qosp-gl" if gfx else "qosp"
+    if INSTALLED:
+        if not (QOS / host).is_file():
+            die(f"installed tree at {ROOT} has no {host}" + (" (built only where GLFW was found at install)" if gfx else "") + ": reinstall")
+        return
     say(f"{host} (portable host; no-op when fresh)")
     sh(["make", "-s", target], cwd=QOS, quiet=True)
 
 
 def build_native():
-    say("qos-native.elf + disk.img")
-    sh(["make", "-s", "native", "disk.img"], cwd=QOS, quiet=True)
+    say(f"{rel(WS.path('qos-native.elf'))} + disk.img")
+    WS.mk()
+    disk = WS.path("disk.img")
+    sh(["make", "-s", "native", str(disk), f"KERNEL={WS.path('qos-native.elf')}", f"DISK={disk}"]
+       + WS.make_vars(), cwd=QOS, quiet=True)
 
 
 def build_app(prog, harts=None):
-    say(f"qos-app {prog}")
+    qa = WS.mk().qa(prog)
+    say(f"qos-app {prog} -> {rel(qa)}")
     target = "qos-app-macos" if sys.platform == "darwin" and os.uname().machine == "arm64" else "qos-app"
-    cmd = ["make", "-s", target, f"PROG={prog}"]
+    cmd = ["make", "-s", target, f"PROG={prog}", f"QA_OUT={qa}"] + WS.make_vars()
     if harts:
         cmd.append(f"HARTS={harts}")
     sh(cmd, cwd=FPR, quiet=True)
+    return qa
 
 
 def build_plugins(prog, plugins, size_mb=8):
@@ -196,18 +268,20 @@ def build_plugins(prog, plugins, size_mb=8):
     the livereload harness: plugsyms after the shell build, then one
     plugin-qa per module, then mkdisk."""
     mac = sys.platform == "darwin" and os.uname().machine == "arm64"
-    sh(["make", "-s", "plugsyms-macos" if mac else "plugsyms"], cwd=FPR, quiet=True)
+    sh(["make", "-s", "plugsyms-macos" if mac else "plugsyms"] + WS.make_vars(), cwd=FPR, quiet=True)
     qas = []
     for slot, p in enumerate(plugins):
-        rel = resolve_prog(p)
-        say(f"plugin-qa {rel} (sub-slot {slot})")
+        r = resolve_prog(p)
+        out = WS.build / f"{Path(r).stem}.qa"
+        say(f"plugin-qa {r} (sub-slot {slot})")
         sh(["make", "-s", "plugin-qa-macos" if mac else "plugin-qa",
-            f"PROG={rel}", f"PLUGSLOT={slot}"], cwd=FPR, quiet=True)
-        qas.append(Path(rel).stem + ".qa")
-    img = FPR / "build" / f"plugdisk-{Path(prog).stem}.img"
-    say(f"disk: {img.relative_to(ROOT)} <- {' '.join(qas)}")
+            f"PROG={r}", f"PLUGSLOT={slot}", f"PLUG_OUT={out}", f"QA_OUT={WS.qa(prog)}"] + WS.make_vars(),
+           cwd=FPR, quiet=True)
+        qas.append(str(out))
+    img = WS.build / f"plugdisk-{Path(prog).stem}.img"
+    say(f"disk: {rel(img)} <- {' '.join(Path(q).name for q in qas)}")
     sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), str(img), str(size_mb)] + qas,
-       cwd=FPR, quiet=True)
+       cwd=WS.build, quiet=True)
     return img
 
 
@@ -264,11 +338,12 @@ def cmd_run(a):
         die("--disk and plugins together: an explicit image is used verbatim (pass --no-plugins, or drop --disk to seed one)")
 
     if prog.endswith(".sol") or a.on == "sol": # type: ignore
+        # a script runs where YOU are: its paths, its files, its cwd
         say(f"sol profile: {prog}")
-        return run_scan([str(FPR / "fpr"), "sol", prog], cwd=FPR, expect=expect)
+        return run_scan([str(FPR / "fpr"), "sol", str((FPR / prog).resolve())], cwd=Path.cwd(), expect=expect)
     if a.on == "virt":
         say(f"bare-metal QEMU virt: {prog}")
-        cmd = ["make", "-s", "bare-metal-run", f"PROG={prog}"]
+        cmd = ["make", "-s", "bare-metal-run", f"PROG={prog}", f"IMAGE={WS.mk().image(prog)}"] + WS.make_vars()
         if a.harts:
             cmd.append(f"HARTS={a.harts}")
         return run_scan(cmd, cwd=FPR, expect=expect)
@@ -276,7 +351,7 @@ def cmd_run(a):
     # the default: host the .qa on qosp
     gfx = a.gfx or wants_gl(prog)
     host = "qosp-gl" if gfx else "qosp"
-    build_app(prog, a.harts)
+    qa = build_app(prog, a.harts)
     build_qosp(gfx=gfx)
     env = asset_env(prog)
     if a.port:
@@ -289,22 +364,24 @@ def cmd_run(a):
         env["FPR_DISK"] = str(Path(a.disk).resolve())
         say(f"disk: {a.disk} (as given)")
     if a.fresh_disk:
-        (QOS / "qosp.disk").unlink(missing_ok=True)
+        WS.path("qosp.disk").unlink(missing_ok=True)
         say("qosp.disk: fresh")
     # `#: fprd` (or --fprd): the program compiles/packages at runtime
     # through Sys.compile, so start the host compiler daemon for the run
     fprd_proc = None
     if a.fprd or "fprd" in d:
-        sock = str(FPR / "build" / f"fprd-{os.getpid()}.sock")
-        say(f"fprd: compiler daemon on {os.path.relpath(sock, ROOT)}")
+        sock = str(WS.build / f"fprd-{os.getpid()}.sock")
+        say(f"fprd: compiler daemon on {rel(sock)}")
         fprd_proc = subprocess.Popen(
-            [sys.executable, "tools/fprd.py", sock], cwd=FPR,
+            [sys.executable, "tools/fprd.py", sock], cwd=FPR, env={**os.environ, "FPRD_BUILD": str(WS.build)},
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
         env["FPRD_SOCK"] = sock
         time.sleep(0.8)
     say(f"{host}: {prog}" + (f"  (port {a.port})" if a.port else ""))
+    # the host runs IN the workspace: qosp.disk and qos-store/ (the
+    # app's durable state) are the project's, not the toolchain's
     try:
-        rc = run_scan([f"./{host}", "--yes", "../fp-risc/app.qa"], cwd=QOS, env=env, expect=expect)
+        rc = run_scan([str(QOS / host), "--yes", str(qa)], cwd=WS.out, env=env, expect=expect)
     finally:
         if fprd_proc:
             fprd_proc.terminate()
@@ -327,12 +404,12 @@ def cmd_pack(a):
     build_fpr()
     gfx = a.gfx or wants_gl(prog)
     host = "qosp-gl" if gfx else "qosp"
-    build_app(prog, a.harts)
+    built = build_app(prog, a.harts)
     build_qosp(gfx=gfx)
-    out = Path(a.out).resolve() if a.out else ROOT / "dist" / name
+    out = Path(a.out).resolve() if a.out else WS.dist / name
     out.mkdir(parents=True, exist_ok=True)
     qa = out / f"{name}.qa"
-    shutil.copy2(FPR / "app.qa", qa)
+    shutil.copy2(built, qa)
     pieces = [f"{qa.name} ({qa.stat().st_size // 1024}KB)"]
     for f in d.get("music", []):
         src = (FPR / prog).parent / f
@@ -418,7 +495,7 @@ def cmd_dev(a):
     while True:
         t0 = time.time()
         try:
-            r = subprocess.run([str(FPR / "fpr"), "sol", prog], cwd=FPR, env=e).returncode
+            r = subprocess.run([str(FPR / "fpr"), "sol", str((FPR / prog).resolve())], cwd=Path.cwd(), env=e).returncode
             say(f"dev: exit {r} in {time.time() - t0:.1f}s")
         except KeyboardInterrupt:
             print()
@@ -441,11 +518,11 @@ def cmd_dev(a):
 def cmd_serve(a):
     prog = resolve_prog(a.prog)
     build_fpr()
-    build_app(prog)
+    qa = build_app(prog)
     build_qosp()
     say(f"serving {prog} at http://127.0.0.1:{a.port}/  (Ctrl-C stops)")
 
-    return run_scan(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, env={"FPR_PORT": a.port})
+    return run_scan([str(QOS / "qosp"), "--yes", str(qa)], cwd=WS.out, env={"FPR_PORT": a.port})
 
 
 # ---- scaffolding templates (qos.py new) -------------------------------------
@@ -691,36 +768,43 @@ def cmd_new(a):
     name = a.name
     if not name.replace("_", "").isalnum() or not name[0].islower():
         die(f"name {name!r}: lowercase start, alphanumeric/underscore only (it becomes fn-safe identifiers)")
-    dest = FPR / "apps" / name
+    # inside the checkout the app joins fp-risc/apps/ and reaches std by
+    # the relative path every other program uses; anywhere else it is a
+    # project of its own, right here, and `use "std/..."` resolves under
+    # the toolchain's home (compiler/Home.hs)
+    in_tree = not INSTALLED and Path.cwd().resolve().is_relative_to(ROOT)
+    dest = FPR / "apps" / name if in_tree else Path.cwd() / name
+    std = "../../std" if in_tree else "std"
     if dest.exists():
-        die(f"{dest.relative_to(ROOT)} already exists")
+        die(f"{rel(dest)} already exists")
     dest.mkdir(parents=True)
     for fn, body in tpl.items():
-        (dest / fn).write_text(body.replace("__NAME__", name).replace("__STD__", "../../std"))
-    rel = dest.relative_to(ROOT)
-    say(f"new {a.template} app: {rel}/ ({', '.join(tpl)})")
-    say(f"run it:   ./qos.py run apps/{name}/app.fpr   (its `#: expect` line IS the check)")
-    say(f"ship it:  ./qos.py pack apps/{name}/app.fpr --bundle")
+        (dest / fn).write_text(body.replace("__NAME__", name).replace("__STD__", std))
+    r = rel(dest)
+    me = "./qos.py" if in_tree else "qos"
+    say(f"new {a.template} app: {r}/ ({', '.join(tpl)})")
+    say(f"run it:   {me} run {r}/app.fpr   (its `#: expect` line IS the check)")
+    say(f"ship it:  {me} pack {r}/app.fpr --bundle")
 
 
 def cmd_native(a):
     build_fpr()
     build_native()
-    disk = QOS / "disk.img"
+    disk = WS.path("disk.img")
     if a.apps:
-        disk = QOS / "disk-seeded.img"
+        disk = WS.path("disk-seeded.img")
         say(f"seeding {disk.name} with {len(a.apps)} app(s)")
         sh([sys.executable, str(FPR / "tools" / "mkdisk.py"), str(disk),
-            "8"] + [str(Path(p).resolve()) for p in a.apps], cwd=QOS)
+            "8"] + [str(Path(p).resolve()) for p in a.apps], cwd=WS.out)
     qemu = ["qemu-system-riscv64", "-accel", "tcg,thread=multi",
             "-machine", "virt", "-smp", str(a.smp), "-m", a.mem,
-            "-nographic", "-bios", "none", "-kernel", "qos-native.elf",
+            "-nographic", "-bios", "none", "-kernel", str(WS.path("qos-native.elf")),
             "-drive", f"file={disk},if=none,format=raw,id=hd0",
             "-device", "virtio-blk-device,drive=hd0"]
     if a.smoke:
         say("smoke boot (scripted, ~10s)")
 
-        p = subprocess.Popen(qemu, cwd=QOS, stdin=subprocess.PIPE,
+        p = subprocess.Popen(qemu, cwd=WS.out, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL)
 
@@ -743,7 +827,7 @@ def cmd_native(a):
         return 0
 
     say(f"booting QOS Native ({a.smp} harts, {a.mem}, {disk.name}) -- " "q quits the launcher; C-a x kills QEMU")
-    return subprocess.call(qemu, cwd=QOS)
+    return subprocess.call(qemu, cwd=WS.out)
 
 def cmd_disk(a):
     build_fpr()  # apps may have just been rebuilt; mkdisk itself is pure
@@ -970,7 +1054,7 @@ def cmd_release(a):
     elif not a.skip_tests:
         cmd_test(argparse.Namespace(all=False, legs=[]))
     # 4. the artifacts: one stamped bundle per app
-    out = ROOT / "dist" / f"qos-fpr-{tag}"
+    out = WS.dist / f"qos-fpr-{tag}"
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
@@ -994,7 +1078,7 @@ def cmd_release(a):
     tarball = out.with_name(f"{out.name}-{os.uname().sysname.lower()}-{os.uname().machine}.tar.gz")
     with tarfile.open(tarball, "w:gz") as tf:
         tf.add(out, arcname=out.name)
-    say(f"dist: {out.relative_to(ROOT)}/ + {tarball.name} ({tarball.stat().st_size // 1024}KB)")
+    say(f"dist: {rel(out)}/ + {tarball.name} ({tarball.stat().st_size // 1024}KB)")
     # 5. identity in git: the version files, then the tag
     if do_git:
         git("add", "release.toml", str(LOCK_PATH.relative_to(ROOT)), "fp-risc/.fpr")
@@ -1041,11 +1125,12 @@ def cmd_test(a):
         if a.legs and not any(k in label or k in prog for k in a.legs):
             continue
         if backend == "qosp":
-            build_app(prog)
-            r = subprocess.run(["./qosp", "--yes", "../fp-risc/app.qa"], cwd=QOS, capture_output=True, timeout=180)
+            qa = build_app(prog)
+            r = subprocess.run([str(QOS / "qosp"), "--yes", str(qa)], cwd=WS.out, capture_output=True, timeout=180)
             out = r.stdout.decode("utf-8", "replace")
         else:
-            r = subprocess.run(["make", "-s", "bare-metal-run", f"PROG={prog}"], cwd=FPR, capture_output=True, timeout=300)
+            r = subprocess.run(["make", "-s", "bare-metal-run", f"PROG={prog}", f"IMAGE={WS.mk().image(prog)}"] + WS.make_vars(),
+                               cwd=FPR, capture_output=True, timeout=300)
             out = r.stdout.decode("utf-8", "replace")
         ok = expect in out
         ran += 1
@@ -1065,9 +1150,87 @@ def cmd_test(a):
         die("failed: " + ", ".join(fails))
 
 def cmd_clean(a):
-    sh(["make", "-s", "clean"], cwd=FPR, quiet=True, check=False)
-    sh(["make", "-s", "clean"], cwd=QOS, quiet=True, check=False)
-    say("clean")
+    if WS.build.exists():
+        shutil.rmtree(WS.build)
+    for f in list(WS.out.glob("*.qa")) + list(WS.out.glob("*.elf")):
+        f.unlink()
+    say(f"{rel(WS.out)}/: build/, .qa, .elf removed (qosp.disk and qos-store/ kept: that is the app's state)")
+    if not INSTALLED:
+        sh(["make", "-s", "clean"], cwd=FPR, quiet=True, check=False)
+        sh(["make", "-s", "clean"], cwd=QOS, quiet=True, check=False)
+        say("tree clean")
+
+
+# ---- install: the tree as a toolchain under a prefix --------------------------
+# What `brew install` lays down, and what a checkout can lay down for
+# itself (`./qos.py install --prefix ~/.local`):
+#
+#   PREFIX/libexec/qos-fpr/    the tree -- fpr, qosp[-gl], core/, std/,
+#                              programs/, sol/, hal/, qos/appside+portable,
+#                              tests/, the .fpr store, docs -- plus the
+#                              .installed marker that makes qos.py treat
+#                              it as shipped (never rebuilt, never written)
+#   PREFIX/bin/fpr             -> libexec/qos-fpr/fp-risc/fpr  (a symlink:
+#                              the binary finds core/ and std/ beside its
+#                              REAL path -- compiler/Home.hs)
+#   PREFIX/bin/qos             -> libexec/qos-fpr/qos.py
+#   PREFIX/bin/sol             exec fpr sol "$@"
+#
+# Sources ship because the QOS side is compiled per program (a .qa links
+# hal/ and qos/appside for the host it runs on, or cross for virt); the
+# Haskell is shipped as the binary, with compiler/ beside it for anyone
+# who wants to rebuild.  Relative symlinks, so the prefix can move.
+
+INSTALL_TREE = [
+    "qos.py", "release.toml", "README.md", "docs",
+    "fp-risc/fpr", "fp-risc/Makefile", "fp-risc/fp-risc.cabal", "fp-risc/cabal.project", "fp-risc/Setup.hs",
+    "fp-risc/core", "fp-risc/std", "fp-risc/programs", "fp-risc/sol", "fp-risc/tools", "fp-risc/models",
+    "fp-risc/apps", "fp-risc/tests", "fp-risc/compiler", "fp-risc/.fpr", "fp-risc/fpr.lock",
+    "hal",
+    "qos/Makefile", "qos/appside", "qos/portable", "qos/tests-host", "qos/qosp", "qos/qosp-gl",
+]
+INSTALL_SKIP = shutil.ignore_patterns("*.o", "*.hi", "*.qa", "*.disk", "*.img", "build", "dist-newstyle",
+                                      "qos-store", "__pycache__", ".DS_Store", "*.s", "*.units", "*.elf")
+
+
+def cmd_install(a):
+    t0 = time.time()
+    prefix = Path(a.prefix).resolve()
+    lib = prefix / "libexec" / "qos-fpr"
+    bin_ = prefix / "bin"
+    if not INSTALLED:
+        build_fpr()
+        build_qosp()
+        # the GL host wants GLFW; a machine without it still gets fpr + qosp
+        if sh(["make", "-s", "portable-gl"], cwd=QOS, quiet=True, check=False) != 0:
+            say("qosp-gl: not built (no GLFW dev package found) -- `#: host gl` programs need it")
+    if lib.exists():
+        shutil.rmtree(lib)
+    for item in INSTALL_TREE:
+        src = ROOT / item
+        if not src.exists():
+            continue
+        dst = lib / item
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=INSTALL_SKIP, symlinks=True)
+        else:
+            shutil.copy2(src, dst)
+    (lib / "fp-risc" / "fprc").symlink_to("fpr")     # the Makefiles' name for it
+    ver = read_release()["version"]
+    (lib / ".installed").write_text(f"qos-fpr {ver} installed {time.strftime('%Y-%m-%d')} from {ROOT}\n")
+    bin_.mkdir(parents=True, exist_ok=True)
+    for name, target in (("fpr", lib / "fp-risc" / "fpr"), ("qos", lib / "qos.py")):
+        link = bin_ / name
+        link.unlink(missing_ok=True)
+        link.symlink_to(os.path.relpath(target, bin_))
+    sol = bin_ / "sol"
+    sol.write_text('#!/bin/sh\n# sol -- the HostedBytecode profile is a subcommand of fpr\nexec "$(dirname "$0")/fpr" sol "$@"\n')
+    sol.chmod(0o755)
+    hosts = [h for h in ("qosp", "qosp-gl") if (lib / "qos" / h).is_file()]
+    say(f"installed qos-fpr {ver} -> {lib} ({', '.join(['fpr'] + hosts)}); {bin_}/{{fpr,qos,sol}}")
+    say(f"try: cd /tmp && {bin_}/qos new hello && {bin_}/qos run hello/app.fpr")
+    say(f"install done in {time.time() - t0:.1f}s")
 
 def main():
     ap = argparse.ArgumentParser(prog="qos.py", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1151,6 +1314,10 @@ def main():
     p.add_argument("legs", nargs="*", help="filter by label/prog substring")
     p.add_argument("--all", action="store_true")
     p.set_defaults(f=cmd_test)
+
+    p = sub.add_parser("install", help="lay the tree down as a toolchain under a prefix (what brew runs)")
+    p.add_argument("--prefix", required=True, help="e.g. ~/.local or $(brew --prefix)/Cellar/qos-fpr/X.Y.Z")
+    p.set_defaults(f=cmd_install)
 
     p = sub.add_parser("clean")
     p.set_defaults(f=cmd_clean)

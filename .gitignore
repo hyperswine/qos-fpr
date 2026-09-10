@@ -37,3 +37,6 @@ fp-risc/build/ck-uneg*.fpr
 fp-risc/build/ck-m*.s
 fp-risc/tests/_cksuf.fpr
 dist/
+
+# the workspace: every run's artifacts (qos.py), never the tree
+.qos/
