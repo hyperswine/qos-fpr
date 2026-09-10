@@ -30,6 +30,7 @@ executable fpr
       Commit
       Compile
       FPRISC
+      Home
       Infer
       Modules
       Precond

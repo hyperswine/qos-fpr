@@ -19,6 +19,7 @@ import System.Environment (lookupEnv)
 import Struct (erasePSig, expandStructs, sigTable, specialize, structTable)
 import Modules (LoadResult (..), ModExport (..), hashAST, loadProgram)
 import Precond (PreNote (..), PreStatus (..), applyPreconds, preTable, renderNote, validatePre)
+import Home (underHome)
 import System.Directory (createDirectoryIfMissing, doesFileExist)
 import System.Environment (getArgs)
 import StdBridge (runStdCheck)
@@ -115,7 +116,15 @@ compileMain = do
   (inp, out) <- case oFiles opts of
     [i, o] -> pure (i, o)
     _ -> putStrLn "usage: fprc [--profile=bare-metal|qos-native|qos-portable] [--target=rv32|rv64|a64|a64mac|x64|qx64|qa64|qa64single|qa64mac] [--plugin] [--rvv] [--stdcheck] [--prelude=FILE] <in.fpr> <out.s>" >> exitFailure >> pure ("", "")
-  (preludeSrc, preludeTops) <- maybe (pure ("", [])) parseFileSrc (oPrelude opts)
+  -- --prelude=FILE as given; no flag = the prelude beside the binary
+  -- (core/prelude.fpr under Home.fprHome), so `fpr compile x.fpr x.s`
+  -- means the same thing from any directory; --prelude= (empty) = none
+  prelude <- case oPrelude opts of
+    Just "" -> pure Nothing
+    Just f -> pure (Just f)
+    Nothing -> underHome ("core" </> "prelude.fpr")
+  let opts' = opts {oPrelude = prelude}
+  (preludeSrc, preludeTops) <- maybe (pure ("", [])) parseFileSrc prelude
   (rootSrc, rootTops0) <- parseFileSrc inp
   -- ONE grammar, profile-gated views: `>` top-level statements are the
   -- sol/HostedBytecode surface.  Outside that view they are a profile
@@ -141,13 +150,13 @@ compileMain = do
       let anchors =
             M.unions
               [ bindAnchors inp rootSrc rootTops0,
-                maybe M.empty (\pp -> bindAnchors pp preludeSrc preludeTops) (oPrelude opts),
+                maybe M.empty (\pp -> bindAnchors pp preludeSrc preludeTops) (oPrelude opts'),
                 unitAnchors
               ]
           sources =
             M.unions
               [ M.singleton inp rootSrc,
-                maybe M.empty (`M.singleton` preludeSrc) (oPrelude opts),
+                maybe M.empty (`M.singleton` preludeSrc) (oPrelude opts'),
                 unitSources
               ]
           anchored = map (anchorMsg sources anchors)

@@ -28,6 +28,7 @@ import Control.Monad (filterM)
 import Data.Bits (xor)
 import Data.Char (ord)
 import Data.List (foldl', isPrefixOf, isSuffixOf, partition)
+import Home (underHome)
 import Data.Word (Word64)
 import Sol.Lang (STop, program, stripPosTops)
 import Sol.Txn (childCommitMarker)
@@ -77,7 +78,13 @@ resolveModule prefExt baseDir spec = do
       cands = if explicit then [name] else [name ++ e | e <- exts]
       mkPath f = if take 1 f == "/" then f else baseDir </> f
   hits <- filterM (doesFileExist . mkPath) cands
-  let path = mkPath (case hits of f : _ -> f; [] -> head cands)
+  -- importer-relative first; then the toolchain home (Home.hs), so a
+  -- script anywhere can `use "sol/lib/base"` against the installed lib
+  homeHits <- if null hits && take 1 name /= "/" then mapM underHome cands else pure []
+  let path = case (hits, [h | Just h <- homeHits]) of
+        (f : _, _) -> mkPath f
+        ([], h : _) -> h
+        _ -> mkPath (head cands)
   r <- parseModuleFile path
   pure $ case r of
     Left e -> Left e
