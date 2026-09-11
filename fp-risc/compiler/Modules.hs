@@ -50,6 +50,7 @@ import qualified Data.Set as S
 import Data.Word (Word64)
 import FPRISC
 import Numeric (showHex)
+import Home (underHome)
 import System.Directory (canonicalizePath, doesFileExist)
 import System.FilePath (takeDirectory, (</>))
 import Text.Megaparsec (errorBundlePretty, parse)
@@ -147,8 +148,20 @@ loadDeps cache stack dir tops = do
     step (Left e) _ = pure (Left e)
     step (Right (as, ns)) (alias, spec) = do
       let (nm, wantHash) = specParts spec
-          path = specFile dir nm
-      r0 <- loadModule cache stack path
+          path0 = specFile dir nm
+      -- importer-relative first, as always; a miss then looks under the
+      -- toolchain's home (Home.hs), so a program OUTSIDE the tree can say
+      -- `use "std/mvu"` and find the installed std.  The error names
+      -- both places, because "no such module file" with one path was
+      -- exactly the message that used to send people cd-ing around.
+      here <- doesFileExist path0
+      homeHit <- if here || take 1 nm == "/" then pure Nothing else underHome (specFile "" nm)
+      let path = maybe path0 id homeHit
+      r00 <- loadModule cache stack path
+      let r0 = case (r00, homeHit, here) of
+            (Left _, Nothing, False) ->
+              Left ("use: no such module file: " ++ path0 ++ "  (nor " ++ specFile "$FPR_HOME" nm ++ ")")
+            _ -> r00
       -- the committed-version fallback: a pinned use whose scratch file
       -- is missing OR has drifted from the pin resolves from the local
       -- .fpr store (fpr commit's content blobs) — the scratch file is a
@@ -156,8 +169,13 @@ loadDeps cache stack dir tops = do
       r <- case r0 of
         Right mu | null wantHash || muHash mu == wantHash -> pure r0
         _ | not (null wantHash) -> do
-          let sp = ".fpr/store/" ++ wantHash ++ ".fpr"
-          inStore <- doesFileExist sp
+          -- the store: this tree's first, the toolchain home's second
+          -- (an installed fpr carries the versions its std was released with)
+          let sp0 = ".fpr/store/" ++ wantHash ++ ".fpr"
+          local <- doesFileExist sp0
+          homeStore <- if local then pure Nothing else underHome sp0
+          let sp = maybe sp0 id homeStore
+              inStore = local || homeStore /= Nothing
           if not inStore
             then pure r0
             else do

@@ -21,6 +21,11 @@ CROSS    = riscv64-unknown-elf-
 PROG    ?= tests/demo.fpr
 FILE    ?= std/checkdemo.fpr
 QA_OUT  ?= app.qa
+# where per-program intermediates go (qos.py points this at the
+# project's .qos/build so an installed tree is never written to); the
+# host stamp and the compiler's own build stay under build/
+BUILD   ?= build
+IMAGE   ?= image.elf
 
 RT_CORE = $(HAL)/core/runtime.c $(HAL)/core/actors.c $(HAL)/core/bits.c \
           $(HAL)/core/vec.c $(HAL)/core/sstr.c $(HAL)/core/mod.c $(HAL)/core/buddy.c
@@ -72,10 +77,17 @@ else
 GLLIBS := -lEGL -lGL
 endif
 $(FPR_HOST_STAMP):
-	@mkdir -p build
+	@mkdir -p $(BUILD)
 	@rm -f build/.fpr-host-*
 	@touch $@
 
+# an INSTALLED tree (../.installed, written by `qos.py install`) ships
+# the binary: the rule is then a presence check, so `make qos-app` never
+# reaches for ghc through the fprc prerequisite
+ifneq ($(wildcard ../.installed),)
+fpr:
+	@test -x fpr || { echo "installed tree without fpr: reinstall (qos.py install / brew reinstall qos-fpr)"; exit 1; }
+else
 fpr: $(FPR_HOST_STAMP) compiler/*.hs compiler/Sol/*.hs compiler/cbits/fsx.c compiler/cbits/vecgpu.c compiler/cbits/handjit.c
 	@if command -v cabal >/dev/null 2>&1; then \
 	  cabal build exe:fpr && cp "$$(cabal list-bin fpr)" fpr; \
@@ -86,6 +98,7 @@ fpr: $(FPR_HOST_STAMP) compiler/*.hs compiler/Sol/*.hs compiler/cbits/fsx.c comp
 	  cd compiler && ghc -O0 -i. -o ../fpr Main.hs cbits/fsx.o cbits/vecgpu.o cbits/handjit.o $(GLLIBS); \
 	fi
 	ln -sf fpr fprc
+endif
 
 # build through cabal (declared FFI/libs in fp-risc.cabal).  Uses
 # cabal-install when present, else the classic Setup path -- which
@@ -109,17 +122,17 @@ stdcheck: fprc
 	./fprc --stdcheck $(FILE)
 
 # ---- BareMetal profile -------------------------------------------------
-build/prog.s: fprc $(PROG) core/prelude.fpr FORCE
-	@mkdir -p build
+$(BUILD)/prog.s: fprc $(PROG) core/prelude.fpr FORCE
+	@mkdir -p $(BUILD)
 	LC_ALL=C.UTF-8 ./fprc --profile=bare-metal $(FPRC_FLAGS) --prelude=core/prelude.fpr $(PROG) $@
 
-bare-metal: build/prog.s $(RT_VIRT) $(RT_CORE) $(HAL)/virt/link.ld
+bare-metal: $(BUILD)/prog.s $(RT_VIRT) $(RT_CORE) $(HAL)/virt/link.ld
 	$(CROSS)gcc $(CFLAGS) -T $(HAL)/virt/link.ld -I$(HAL)/core -I$(HAL)/virt \
-	  $(RT_VIRT) build/prog.s $$(cat build/prog.s.units) $(RT_CORE) -o image.elf
+	  $(RT_VIRT) $(BUILD)/prog.s $$(cat $(BUILD)/prog.s.units) $(RT_CORE) -o $(IMAGE)
 
 bare-metal-run: bare-metal
 	$(TIMEOUT) 20 $(QEMU) $(ACCEL) -machine virt -smp $(HARTS) -m 256M \
-	  -nographic -bios none -kernel image.elf
+	  -nographic -bios none -kernel $(IMAGE)
 
 # ---- QOSPortable profile: the app side ---------------------------------
 # The .qa is freestanding at the published slot; every effect goes
@@ -139,11 +152,11 @@ QOSAPP_RT_COMMON = $(QOS)/appside/entry.c $(QOS)/appside/hal.c $(QOS)/appside/su
 				   $(HAL)/core/buddy.c
 QOSAPP_RT = $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_x64.S
 
-build/qosapp-prog.s: fprc $(PROG) core/prelude.fpr FORCE
-	@mkdir -p build
+$(BUILD)/qosapp-prog.s: fprc $(PROG) core/prelude.fpr FORCE
+	@mkdir -p $(BUILD)
 	LC_ALL=C.UTF-8 ./fprc --profile=qos-portable --prelude=core/prelude.fpr $(PROG) $@
 
-build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOS)/appside/link-qosapp.ld
+$(BUILD)/qosapp.elf: $(BUILD)/qosapp-prog.s $(QOSAPP_RT) $(QOS)/appside/link-qosapp.ld
 	gcc -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic -mcmodel=large \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) \
@@ -152,14 +165,14 @@ build/qosapp.elf: build/qosapp-prog.s $(QOSAPP_RT) $(QOS)/appside/link-qosapp.ld
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
 	  -Wl,--defsym=_proc_arena_end=$(PROC_ARENA_END) \
 	  -Wl,--build-id=none -Wl,-z,noexecstack \
-	  build/qosapp-prog.s $$(cat build/qosapp-prog.s.units) $(QOSAPP_RT) -o $@
+	  $(BUILD)/qosapp-prog.s $$(cat $(BUILD)/qosapp-prog.s.units) $(QOSAPP_RT) -o $@
 
-qos-app: build/qosapp.elf tools/mkqa.py
-	@MF=build/qosapp-gen.toml; ID=$$(basename $(PROG) .fpr); \
+qos-app: $(BUILD)/qosapp.elf tools/mkqa.py
+	@MF=$(BUILD)/qosapp-gen.toml; ID=$$(basename $(PROG) .fpr); \
 	ABIV=$$(grep -m1 'define QOS_ABI_VERSION' $(QOS)/appside/qos_abi.h | grep -o '[0-9]\+' | head -1); \
-	REV=$$(cat build/qosapp-prog.s.abirev 2>/dev/null || echo 0); \
+	REV=$$(cat $(BUILD)/qosapp-prog.s.abirev 2>/dev/null || echo 0); \
 	printf 'name = "%s"\nid = "%s"\nentry = "n/a"\nversion = "1"\nloadMode = "process"\nabi = "%s.%s"\n' $$ID $$ID $$ABIV $$REV > $$MF; \
-	python3 tools/mkqa.py $$MF build/qosapp.elf -o $(QA_OUT)
+	python3 tools/mkqa.py $$MF $(BUILD)/qosapp.elf -o $(QA_OUT)
 	@echo "$(QA_OUT) built — run with: (cd ../qos && make portable && ./qosp --yes ../fp-risc/$(QA_OUT))"
 
 # ---- QOS app for macOS (Apple Silicon) -----------------------------------
@@ -168,11 +181,11 @@ qos-app: build/qosapp.elf tools/mkqa.py
 # the app and runtime are freestanding.  The code still executes under Darwin,
 # where x18 is platform-reserved, so the generic ELF compiler must not use it.
 # Mach-O emission remains available separately for native macOS integration work.
-build/qosapp-a64.s: fprc $(PROG) core/prelude.fpr FORCE
-	@mkdir -p build
+$(BUILD)/qosapp-a64.s: fprc $(PROG) core/prelude.fpr FORCE
+	@mkdir -p $(BUILD)
 	LC_ALL=C.UTF-8 ./fprc --target=qa64 --prelude=core/prelude.fpr $(PROG) $@
 
-build/qosapp-a64.elf: build/qosapp-a64.s $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64.S $(QOS)/appside/link-qosapp-a64.ld
+$(BUILD)/qosapp-a64.elf: $(BUILD)/qosapp-a64.s $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64.S $(QOS)/appside/link-qosapp-a64.ld
 	clang --target=aarch64-none-elf -fuse-ld=lld -O2 -Wall -Wextra \
 	  -ffreestanding -nostdlib -nostartfiles -fno-stack-protector \
 	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x18 -ffixed-x28 \
@@ -181,15 +194,15 @@ build/qosapp-a64.elf: build/qosapp-a64.s $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64
 	  -T $(QOS)/appside/link-qosapp-a64.ld -Wl,--defsym=QOS_SLOT_BASE=$(QOS_SLOT_BASE) \
 	  -Wl,--defsym=_heap_start=_proc_image_end -Wl,--defsym=_heap_end=_proc_image_end \
 	  -Wl,--defsym=_proc_arena_end=$(PROC_ARENA_END) \
-	  build/qosapp-a64.s $$(cat build/qosapp-a64.s.units) \
+	  $(BUILD)/qosapp-a64.s $$(cat $(BUILD)/qosapp-a64.s.units) \
 	  $(QOSAPP_RT_COMMON) $(HAL)/unix/ctx_a64.S -o $@
 
-qos-app-macos: build/qosapp-a64.elf tools/mkqa.py
-	@MF=build/qosapp-a64-gen.toml; ID=$$(basename $(PROG) .fpr); \
+qos-app-macos: $(BUILD)/qosapp-a64.elf tools/mkqa.py
+	@MF=$(BUILD)/qosapp-a64-gen.toml; ID=$$(basename $(PROG) .fpr); \
 	ABIV=$$(grep -m1 'define QOS_ABI_VERSION' $(QOS)/appside/qos_abi.h | grep -o '[0-9]\+' | head -1); \
-	REV=$$(cat build/qosapp-a64.s.abirev 2>/dev/null || echo 0); \
+	REV=$$(cat $(BUILD)/qosapp-a64.s.abirev 2>/dev/null || echo 0); \
 	printf 'name = "%s"\nid = "%s"\nentry = "n/a"\nversion = "1"\nloadMode = "process"\nabi = "%s.%s"\n' $$ID $$ID $$ABIV $$REV > $$MF; \
-	python3 tools/mkqa.py $$MF build/qosapp-a64.elf -o $(QA_OUT)
+	python3 tools/mkqa.py $$MF $(BUILD)/qosapp-a64.elf -o $(QA_OUT)
 	@echo "$(QA_OUT) built for Apple Silicon"
 
 # ---- plugin .qa: a library image loaded into the RUNNING shell -----------
@@ -209,60 +222,61 @@ qos-app-macos: build/qosapp-a64.elf tools/mkqa.py
 #   2. qosp + app.qa + all plugin .qa's install as a matched set.
 PLUGSLOT ?= 0
 PLUGID    = $(basename $(notdir $(PROG)))
+PLUG_OUT ?= $(PLUGID).qa
 PLUGBASE  = $(shell printf '0x%x' $$(( 0x408000000 + $(PLUGSLOT) * 4194304 )))
 
 plugsyms:
-	@test -f build/qosapp.elf || { echo "build the shell first: make qos-app PROG=<shell>"; exit 1; }
-	nm --defined-only build/qosapp.elf | \
-	  awk '$$2 ~ /^[A-Z]$$/ && $$3 != "" && $$3 !~ /^\$$/ { printf "PROVIDE(%s = 0x%s);\n", $$3, $$1 }' > build/plugsyms-x64.ld
-	@echo "plugsyms-x64.ld: $$(wc -l < build/plugsyms-x64.ld) shell symbols"
+	@test -f $(BUILD)/qosapp.elf || { echo "build the shell first: make qos-app PROG=<shell>"; exit 1; }
+	nm --defined-only $(BUILD)/qosapp.elf | \
+	  awk '$$2 ~ /^[A-Z]$$/ && $$3 != "" && $$3 !~ /^\$$/ { printf "PROVIDE(%s = 0x%s);\n", $$3, $$1 }' > $(BUILD)/plugsyms-x64.ld
+	@echo "plugsyms-x64.ld: $$(wc -l < $(BUILD)/plugsyms-x64.ld) shell symbols"
 
 plugsyms-macos:
-	@test -f build/qosapp-a64.elf || { echo "build the shell first: make qos-app-macos PROG=<shell>"; exit 1; }
-	nm --defined-only build/qosapp-a64.elf | \
-	  awk '$$2 ~ /^[A-Z]$$/ && $$3 != "" && $$3 !~ /^\$$/ { printf "PROVIDE(%s = 0x%s);\n", $$3, $$1 }' > build/plugsyms-a64.ld
-	@echo "plugsyms-a64.ld: $$(wc -l < build/plugsyms-a64.ld) shell symbols"
+	@test -f $(BUILD)/qosapp-a64.elf || { echo "build the shell first: make qos-app-macos PROG=<shell>"; exit 1; }
+	nm --defined-only $(BUILD)/qosapp-a64.elf | \
+	  awk '$$2 ~ /^[A-Z]$$/ && $$3 != "" && $$3 !~ /^\$$/ { printf "PROVIDE(%s = 0x%s);\n", $$3, $$1 }' > $(BUILD)/plugsyms-a64.ld
+	@echo "plugsyms-a64.ld: $$(wc -l < $(BUILD)/plugsyms-a64.ld) shell symbols"
 
 plugin-qa: fprc core/prelude.fpr
-	@test -f build/plugsyms-x64.ld || { echo "no plugsyms: make plugsyms first (after the shell build)"; exit 1; }
-	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --target=qx64 --plugin --prelude=core/prelude.fpr $(PROG) build/plug-$(PLUGID).s
+	@test -f $(BUILD)/plugsyms-x64.ld || { echo "no plugsyms: make plugsyms first (after the shell build)"; exit 1; }
+	@mkdir -p $(BUILD)
+	LC_ALL=C.UTF-8 ./fprc --target=qx64 --plugin --prelude=core/prelude.fpr $(PROG) $(BUILD)/plug-$(PLUGID).s
 	gcc -O2 -Wall -Wextra -ffreestanding -nostdlib -nostartfiles -static \
 	  -fno-stack-protector -fno-asynchronous-unwind-tables -fno-pic -mcmodel=large \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) -I$(HAL)/core -I$(QOS)/appside \
-	  -T $(QOS)/appside/link-qosplug.ld -T build/plugsyms-x64.ld \
+	  -T $(QOS)/appside/link-qosplug.ld -T $(BUILD)/plugsyms-x64.ld \
 	  -Wl,--defsym=PLUG_BASE=$(PLUGBASE) -Wl,--build-id=none -Wl,-z,noexecstack \
-	  build/plug-$(PLUGID).s $$(cat build/plug-$(PLUGID).s.units) -o build/plug-$(PLUGID).elf
-	@MF=build/plug-$(PLUGID)-gen.toml; \
+	  $(BUILD)/plug-$(PLUGID).s $$(cat $(BUILD)/plug-$(PLUGID).s.units) -o $(BUILD)/plug-$(PLUGID).elf
+	@MF=$(BUILD)/plug-$(PLUGID)-gen.toml; \
 	printf 'name = "%s"\nid = "%s"\nentry = "fpr_modtab"\nversion = "1"\nloadMode = "plugin"\n' $(PLUGID) $(PLUGID) > $$MF; \
-	python3 tools/mkqa.py $$MF build/plug-$(PLUGID).elf -o $(PLUGID).qa --shell-of app.qa
-	@echo "$(PLUGID).qa built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
+	python3 tools/mkqa.py $$MF $(BUILD)/plug-$(PLUGID).elf -o $(PLUG_OUT) --shell-of $(QA_OUT)
+	@echo "$(PLUG_OUT) built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
 
 plugin-qa-macos: fprc core/prelude.fpr
-	@test -f build/plugsyms-a64.ld || { echo "no plugsyms: make plugsyms-macos first (after the shell build)"; exit 1; }
-	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --target=qa64 --plugin --prelude=core/prelude.fpr $(PROG) build/plug-$(PLUGID)-a64.s
+	@test -f $(BUILD)/plugsyms-a64.ld || { echo "no plugsyms: make plugsyms-macos first (after the shell build)"; exit 1; }
+	@mkdir -p $(BUILD)
+	LC_ALL=C.UTF-8 ./fprc --target=qa64 --plugin --prelude=core/prelude.fpr $(PROG) $(BUILD)/plug-$(PLUGID)-a64.s
 	clang --target=aarch64-none-elf -fuse-ld=lld -O2 -Wall -Wextra \
 	  -ffreestanding -nostdlib -nostartfiles -fno-stack-protector \
 	  -fno-asynchronous-unwind-tables -fno-pic -ffixed-x28 \
 	  -DFPR_POSIX -DFPR_QOSAPP -DFPR_NHARTS=$(QOSHARTS) -DFPR_SLAB_SZ=$(QOSSLAB) -DFPR_STACK_SZ=$(QOSSTACK) $(QOSCFLAGS_EXTRA) -I$(HAL)/core -I$(QOS)/appside \
-	  -T $(QOS)/appside/link-qosplug.ld -T build/plugsyms-a64.ld \
+	  -T $(QOS)/appside/link-qosplug.ld -T $(BUILD)/plugsyms-a64.ld \
 	  -Wl,--defsym=PLUG_BASE=$(PLUGBASE) \
-	  build/plug-$(PLUGID)-a64.s $$(cat build/plug-$(PLUGID)-a64.s.units) -o build/plug-$(PLUGID)-a64.elf
-	@MF=build/plug-$(PLUGID)-a64-gen.toml; \
+	  $(BUILD)/plug-$(PLUGID)-a64.s $$(cat $(BUILD)/plug-$(PLUGID)-a64.s.units) -o $(BUILD)/plug-$(PLUGID)-a64.elf
+	@MF=$(BUILD)/plug-$(PLUGID)-a64-gen.toml; \
 	printf 'name = "%s"\nid = "%s"\nentry = "fpr_modtab"\nversion = "1"\nloadMode = "plugin"\n' $(PLUGID) $(PLUGID) > $$MF; \
-	python3 tools/mkqa.py $$MF build/plug-$(PLUGID)-a64.elf -o $(PLUGID).qa --shell-of app.qa
-	@echo "$(PLUGID).qa built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
+	python3 tools/mkqa.py $$MF $(BUILD)/plug-$(PLUGID)-a64.elf -o $(PLUG_OUT) --shell-of $(QA_OUT)
+	@echo "$(PLUG_OUT) built at sub-slot $(PLUGSLOT) ($(PLUGBASE)) -- install: make -C ../qos disk-seed QAS=..."
 
 qos-app-macos-run: qos-app-macos
 	$(MAKE) -C $(QOS) portable
-	$(QOS)/qosp --yes app.qa
+	$(QOS)/qosp --yes $(QA_OUT)
 
 qos-app-macos-object: fprc $(PROG) core/prelude.fpr
-	@mkdir -p build
-	LC_ALL=C.UTF-8 ./fprc --target=qa64mac --prelude=core/prelude.fpr $(PROG) build/qosapp-mac.s
-	clang --target=arm64-apple-macos11 -c build/qosapp-mac.s -o build/qosapp-mac.o
-	@echo "emitted build/qosapp-mac.s (Mach-O syntax, QOS-app cells)"
+	@mkdir -p $(BUILD)
+	LC_ALL=C.UTF-8 ./fprc --target=qa64mac --prelude=core/prelude.fpr $(PROG) $(BUILD)/qosapp-mac.s
+	clang --target=arm64-apple-macos11 -c $(BUILD)/qosapp-mac.s -o $(BUILD)/qosapp-mac.o
+	@echo "emitted $(BUILD)/qosapp-mac.s (Mach-O syntax, QOS-app cells)"
 
 # ---- HostedBytecode profile: the sol package ---------------------------
 sol: fpr

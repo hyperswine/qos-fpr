@@ -69,8 +69,11 @@ def package_plugin(slot, plugid, source):
     plugsyms from the CURRENT shell image before every package; the
     caller's contract is that the running app IS the last-built one
     (true for the qos.py pipeline, which builds then hosts)."""
-    os.makedirs("build/fprd-src", exist_ok=True)
-    src = os.path.join("build", "fprd-src", plugid + ".fpr")
+    # intermediates go where the caller's run keeps them (qos.py passes
+    # its workspace build dir); a bare `fprd.py` from fp-risc/ uses build/
+    bdir = os.environ.get("FPRD_BUILD", "build")
+    os.makedirs(os.path.join(bdir, "fprd-src"), exist_ok=True)
+    src = os.path.join(bdir, "fprd-src", plugid + ".fpr")
     with open(src, "wb") as f:
         f.write(source)
     mac = sys.platform == "darwin" and platform.machine() == "arm64"
