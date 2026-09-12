@@ -19,6 +19,13 @@ you actually drive it with:
 Everything delegates to make for staleness, so a fresh tree costs one
 compile and an up-to-date one costs nothing.
 
+## Where it is going
+
+`SEMANTICS.md` is the contract 2.0 commits to -- the language and the
+OS, one clause per rule, a test slot on each; `docs/V2.md` is the plan
+around it: the bounds register, the std inventory, hardware, the order.
+Dot points for now, systematic later.
+
 ## Install
 
 One toolchain, one command, macOS and Linux (docs/INSTALL.md):
